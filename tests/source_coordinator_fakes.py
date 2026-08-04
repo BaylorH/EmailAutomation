@@ -93,11 +93,21 @@ class FakeCollectionReference:
 
 
 class FakeQuery:
-    def __init__(self, collection, *, filters=(), ordering=()):
+    def __init__(
+        self,
+        collection,
+        *,
+        filters=(),
+        ordering=(),
+        limit_count=None,
+        start_after_path=None,
+    ):
         self._collection = collection
         self._store = collection._store
         self._filters = tuple(filters)
         self._ordering = tuple(ordering)
+        self._limit_count = limit_count
+        self._start_after_path = start_after_path
 
     def where(self, field_path, operator, value):
         if type(field_path) is not str or not field_path:
@@ -108,6 +118,8 @@ class FakeQuery:
             self._collection,
             filters=(*self._filters, (field_path, operator, deepcopy(value))),
             ordering=self._ordering,
+            limit_count=self._limit_count,
+            start_after_path=self._start_after_path,
         )
 
     def order_by(self, field_path):
@@ -117,6 +129,30 @@ class FakeQuery:
             self._collection,
             filters=self._filters,
             ordering=(*self._ordering, field_path),
+            limit_count=self._limit_count,
+            start_after_path=self._start_after_path,
+        )
+
+    def limit(self, count):
+        if isinstance(count, bool) or type(count) is not int or count < 1:
+            raise ValueError("fake query limit must be a positive integer")
+        return FakeQuery(
+            self._collection,
+            filters=self._filters,
+            ordering=self._ordering,
+            limit_count=count,
+            start_after_path=self._start_after_path,
+        )
+
+    def start_after(self, snapshot):
+        if not isinstance(snapshot, FakeDocumentSnapshot):
+            raise TypeError("fake query cursor requires a document snapshot")
+        return FakeQuery(
+            self._collection,
+            filters=self._filters,
+            ordering=self._ordering,
+            limit_count=self._limit_count,
+            start_after_path=snapshot.reference.path,
         )
 
 
@@ -268,6 +304,12 @@ class FakeTransaction:
             key=lambda item: tuple(item[1].get(field) for field in query._ordering)
             + (item[0],)
         )
+        if query._start_after_path is not None:
+            matching = [
+                item for item in matching if item[0] > query._start_after_path
+            ]
+        if query._limit_count is not None:
+            matching = matching[: query._limit_count]
         return [
             FakeDocumentSnapshot(
                 FakeDocumentReference(self._store, tuple(path.split("/"))),
@@ -353,6 +395,10 @@ class FakeTransaction:
                 self._store.before_next_commit_hook = None
                 self._store.events.append(("before_commit_hook",))
                 hook()
+
+            if self._store.before_commit_hook is not None:
+                self._store.events.append(("before_commit_inspection_hook",))
+                self._store.before_commit_hook(self)
 
             self._validate_read_versions()
             staged = deepcopy(self._store.data)
@@ -445,6 +491,7 @@ class FakeFirestore:
         self.fail_next_commit = None
         self.apply_then_raise_next_commit = None
         self.before_next_commit_hook = None
+        self.before_commit_hook = None
         self.before_commit_barrier = None
         self._lock = RLock()
         self._versions = {}

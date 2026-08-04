@@ -2383,12 +2383,14 @@ class InventoryContractTests(unittest.TestCase):
         )
 
     def test_classification_gate_allows_current_processing_with_future_import(self):
-        source = (
-            "from email_automation.source_coordinator import SourceCoordinator\n"
-            + (REPO_ROOT / "email_automation/processing.py").read_text(
-                encoding="utf-8"
-            )
+        source = (REPO_ROOT / "email_automation/processing.py").read_text(
+            encoding="utf-8"
         )
+        constructor_import = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+        )
+        if constructor_import not in source:
+            source = constructor_import + source
         self.assertEqual(
             [],
             _source_admission_contract_violations(

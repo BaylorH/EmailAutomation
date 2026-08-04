@@ -40,6 +40,16 @@ COLLECTIONS_TO_WIPE = [
     "msgIndex",
     "convIndex",
     "processedMessages",
+    "sourceIdentities",
+    "sourceAliases",
+    "sourceClassifications",
+    "sourceTransitionOwners",
+    "threadTransitionHeads",
+    "sourceWorkLedgers",
+    "sourceDeferredWork",
+    "inboundPendingAdmissions",
+    "blockedSources",
+    "sourceSettlements",
     "optedOutContacts",
     "sheetChangeLog",
     "sync",
@@ -56,9 +66,34 @@ NESTED_COLLECTIONS = {
 }
 
 
+def iter_collection_pages(collection_ref, page_size=100):
+    """Materialize deterministic pages before any slow per-document work."""
+    if type(page_size) is not int or page_size <= 0:
+        raise ValueError("collection page size must be a positive integer")
+    cursor = None
+    while True:
+        query = collection_ref.order_by("__name__").limit(page_size)
+        if cursor is not None:
+            query = query.start_after(cursor)
+        page = list(query.stream())
+        if not page:
+            return
+        yield page
+        if len(page) < page_size:
+            return
+        cursor = page[-1]
+
+
 def delete_collection_batched(db, collection_ref, batch_size=50, dry_run=True):
     """Delete all documents in a collection using batched deletes."""
     deleted = 0
+
+    if dry_run:
+        for page in iter_collection_pages(collection_ref, batch_size):
+            for doc in page:
+                print(f"    [DRY RUN] Would delete: {doc.reference.path}")
+                deleted += 1
+        return deleted
 
     while True:
         # Get a batch of documents
@@ -71,15 +106,11 @@ def delete_collection_batched(db, collection_ref, batch_size=50, dry_run=True):
         batch = db.batch()
 
         for doc in docs:
-            if dry_run:
-                print(f"    [DRY RUN] Would delete: {doc.reference.path}")
-            else:
-                batch.delete(doc.reference)
+            batch.delete(doc.reference)
             deleted += 1
 
-        if not dry_run:
-            batch.commit()
-            print(f"    Deleted batch of {len(docs)} documents...")
+        batch.commit()
+        print(f"    Deleted batch of {len(docs)} documents...")
 
         # If we got fewer than batch_size, we're done
         if len(docs) < batch_size:
@@ -108,16 +139,19 @@ def wipe_user_data(db, user_id, dry_run=True):
 
         if nested:
             print(f"\n  Processing {collection_name} (with nested: {nested})...")
-            # Get parent docs first, then delete nested
-            parent_docs = list(collection_ref.limit(500).stream())
-
-            for parent_doc in parent_docs:
-                for nested_name in nested:
-                    nested_ref = parent_doc.reference.collection(nested_name)
-                    nested_deleted = delete_collection_batched(
-                        db, nested_ref, batch_size=100, dry_run=dry_run
-                    )
-                    stats["nested_deleted"] += nested_deleted
+            # Materialize each parent page before child work so the Firestore
+            # response stream cannot expire while nested collections are deleted.
+            for parent_page in iter_collection_pages(
+                collection_ref,
+                page_size=100,
+            ):
+                for parent_doc in parent_page:
+                    for nested_name in nested:
+                        nested_ref = parent_doc.reference.collection(nested_name)
+                        nested_deleted = delete_collection_batched(
+                            db, nested_ref, batch_size=100, dry_run=dry_run
+                        )
+                        stats["nested_deleted"] += nested_deleted
 
         print(f"  Deleting {collection_name}...")
         deleted = delete_collection_batched(db, collection_ref, batch_size=100, dry_run=dry_run)

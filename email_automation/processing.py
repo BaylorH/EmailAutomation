@@ -1,3 +1,5 @@
+from email_automation.source_coordinator import SourceCoordinator
+
 import re
 import requests
 import hashlib
@@ -9,7 +11,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Mapping, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from googleapiclient.errors import HttpError
@@ -131,9 +134,32 @@ from .campaign_safety import (
     get_client_automation_decision,
     stopped_followup_patch,
 )
+from .source_coordinator import (
+    CoordinatorMode,
+    MAX_SOURCE_ALIASES,
+    MAX_UNSETTLED_SOURCE_ADMISSIONS,
+    SourceCoordinatorAmbiguous,
+    SourceCoordinatorConfigError,
+    SourceCoordinatorRetryable,
+    SourceSettlementNotReady,
+    SourceSettlementResult,
+    advance_scan_cursor_if_source_authority_clear,
+    canonical_json_hash,
+    consume_durable_source_resume_context,
+    durable_source_resume_contexts,
+    normalize_source_alias,
+    resolve_source_coordinator_mode,
+    release_settled_source_generations,
+    source_alias_key,
+    verify_settled_source_dispatch_binding,
+)
 from .system_health import RESOLVED_DEAD_LETTER_STATUSES
 
 logger = logging.getLogger(__name__)
+
+MAX_ENFORCED_INBOX_SCAN_PAGES = 100
+MAX_ENFORCED_INBOX_SCAN_MESSAGES = 5000
+_GRAPH_INBOX_MESSAGES_PATH = "/v1.0/me/mailFolders/Inbox/messages"
 
 
 @dataclass(frozen=True)
@@ -147,6 +173,104 @@ class ReplySendOutcome:
     campaign_decision: Optional[Any] = None
     campaign_suppression_kind: Optional[str] = None
     exact_sent_evidence: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class SourceProcessingAuthority:
+    canonical_source_id: str
+    snapshot_hash: str
+    selection_hash: str
+    owner_kind: str
+    owner_key: str | None
+    ledger_hash: str
+
+
+@dataclass(frozen=True)
+class SourceProcessingDisposition:
+    """Structured result used by enforced inbox admission and its scanner."""
+
+    mode: CoordinatorMode
+    state: str
+    authority: SourceProcessingAuthority | None = None
+    settlement: SourceSettlementResult | None = None
+    blocker_canonical_source_id: str | None = None
+    thread_id: str | None = None
+    source_alias_keys: tuple[str, ...] = ()
+
+    def __bool__(self):
+        return self.state == "settled" and self.settlement is not None
+
+
+def _is_full_sha256(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _source_alias_keys_for_message(
+    user_id: str,
+    message: Mapping[str, Any],
+) -> tuple[str, ...]:
+    aliases = [normalize_source_alias("graph", message.get("id"))]
+    internet_message_id = message.get("internetMessageId")
+    if internet_message_id is not None:
+        aliases.append(
+            normalize_source_alias(
+                "internet_message_id",
+                internet_message_id,
+            )
+        )
+    return tuple(sorted(source_alias_key(user_id, alias) for alias in aliases))
+
+
+def _is_bound_exact_source_settlement(
+    result: Any,
+    *,
+    user_id: str,
+    thread_id: str,
+    message: Mapping[str, Any],
+) -> bool:
+    if not (
+        isinstance(result, SourceProcessingDisposition)
+        and result.mode is CoordinatorMode.ENFORCED
+        and result.state == "settled"
+        and result.thread_id == thread_id
+        and isinstance(result.settlement, SourceSettlementResult)
+        and isinstance(result.authority, SourceProcessingAuthority)
+    ):
+        return False
+    expected_alias_keys = _source_alias_keys_for_message(user_id, message)
+    authority = result.authority
+    settlement = result.settlement
+    return (
+        result.source_alias_keys == expected_alias_keys
+        and all(_is_full_sha256(key) for key in result.source_alias_keys)
+        and settlement.canonical_source_id == authority.canonical_source_id
+        and _is_full_sha256(settlement.settlement_hash)
+        and type(settlement.settlement_revision) is int
+        and settlement.settlement_revision == 1
+        and type(settlement.alias_projection_count) is int
+        and len(expected_alias_keys)
+        <= settlement.alias_projection_count
+        <= MAX_SOURCE_ALIASES
+        and type(settlement.repaired_projection_count) is int
+        and 0 <= settlement.repaired_projection_count
+        <= settlement.alias_projection_count
+        and _is_full_sha256(authority.snapshot_hash)
+        and _is_full_sha256(authority.selection_hash)
+        and _is_full_sha256(authority.ledger_hash)
+        and authority.owner_kind
+        in {"none", "contact_optout", "terminal", "human_decision"}
+        and (
+            (authority.owner_kind == "none" and authority.owner_key is None)
+            or (
+                authority.owner_kind != "none"
+                and _is_full_sha256(authority.owner_key)
+            )
+        )
+    )
 
 
 _REPLY_SEND_OUTCOME = ContextVar("reply_send_outcome", default=ReplySendOutcome())
@@ -11682,6 +11806,372 @@ def _persist_inbound_message_history(
         print(f"⚠️ Failed to update thread timestamp: {exc}")
 
 
+def _source_processing_datetime(value: Any, *, field_name: str) -> datetime:
+    if type(value) is not str or not value.strip():
+        raise SourceCoordinatorConfigError(
+            f"exact-source {field_name} must be an ISO datetime"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SourceCoordinatorConfigError(
+            f"exact-source {field_name} is not an ISO datetime"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise SourceCoordinatorConfigError(
+            f"exact-source {field_name} must be timezone-aware"
+        )
+    return parsed
+
+
+def _persist_strict_source_history_and_index(
+    *,
+    user_id: str,
+    thread_id: str,
+    canonical_source_id: str,
+    message_record: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Retain first-observed history while binding retries by semantic content."""
+    incoming_message = copy.deepcopy(dict(message_record))
+    semantic_message = copy.deepcopy(incoming_message)
+    semantic_headers = semantic_message.get("headers")
+    if isinstance(semantic_headers, dict):
+        semantic_headers.pop("internetMessageId", None)
+    semantic_envelope = semantic_message.get("sourceMessage")
+    if isinstance(semantic_envelope, dict):
+        semantic_envelope.pop("graphMessageId", None)
+        semantic_envelope.pop("internetMessageId", None)
+    history_material = {
+        "schemaVersion": 1,
+        "canonicalSourceId": canonical_source_id,
+        "threadId": thread_id,
+        "message": incoming_message,
+    }
+    history_hash = canonical_json_hash(history_material)
+    semantic_history_hash = canonical_json_hash(
+        {
+            "schemaVersion": 1,
+            "canonicalSourceId": canonical_source_id,
+            "threadId": thread_id,
+            "message": semantic_message,
+        }
+    )
+    history_document = {
+        **incoming_message,
+        "canonicalSourceId": canonical_source_id,
+        "historyHash": history_hash,
+        "semanticHistoryHash": semantic_history_hash,
+    }
+    history_ref = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection("threads")
+        .document(thread_id)
+        .collection("messages")
+        .document(canonical_source_id)
+    )
+    try:
+        before = history_ref.get()
+        before_data = before.to_dict() if before.exists else None
+    except Exception as exc:
+        raise SourceCoordinatorRetryable(
+            "exact-source inbound history is unreadable"
+        ) from exc
+    retained_data = before_data
+    if before_data is None:
+        try:
+            history_ref.create(copy.deepcopy(history_document))
+            retained_data = history_document
+        except Exception as create_error:
+            try:
+                readback = history_ref.get()
+                readback_data = readback.to_dict() if readback.exists else None
+            except Exception as readback_error:
+                raise SourceCoordinatorAmbiguous(
+                    "exact-source inbound history create outcome is unreadable"
+                ) from readback_error
+            if readback_data is None:
+                raise SourceCoordinatorRetryable(
+                    "exact-source inbound history create was not applied"
+                ) from create_error
+            retained_data = readback_data
+
+    def validate_retained_history(data: Any) -> str:
+        if type(data) is not dict:
+            raise SourceCoordinatorAmbiguous(
+                "exact-source inbound history is malformed"
+            )
+        retained = copy.deepcopy(data)
+        retained_canonical_source_id = retained.pop(
+            "canonicalSourceId",
+            None,
+        )
+        retained_history_hash = retained.pop("historyHash", None)
+        retained_semantic_hash = retained.pop("semanticHistoryHash", None)
+        retained_semantic_message = copy.deepcopy(retained)
+        retained_headers = retained_semantic_message.get("headers")
+        if isinstance(retained_headers, dict):
+            retained_headers.pop("internetMessageId", None)
+        retained_envelope = retained_semantic_message.get("sourceMessage")
+        if isinstance(retained_envelope, dict):
+            retained_envelope.pop("graphMessageId", None)
+            retained_envelope.pop("internetMessageId", None)
+        expected_history_hash = canonical_json_hash(
+            {
+                "schemaVersion": 1,
+                "canonicalSourceId": canonical_source_id,
+                "threadId": thread_id,
+                "message": retained,
+            }
+        )
+        expected_semantic_hash = canonical_json_hash(
+            {
+                "schemaVersion": 1,
+                "canonicalSourceId": canonical_source_id,
+                "threadId": thread_id,
+                "message": retained_semantic_message,
+            }
+        )
+        if (
+            retained_canonical_source_id != canonical_source_id
+            or retained_history_hash != expected_history_hash
+            or retained_semantic_hash != expected_semantic_hash
+            or retained_semantic_hash != semantic_history_hash
+        ):
+            raise SourceCoordinatorAmbiguous(
+                "exact-source inbound history conflicts with retained evidence"
+            )
+        return retained_history_hash
+
+    retained_history_hash = validate_retained_history(retained_data)
+
+    try:
+        verified = history_ref.get()
+        verified_data = verified.to_dict() if verified.exists else None
+    except Exception as exc:
+        raise SourceCoordinatorAmbiguous(
+            "exact-source inbound history readback is unavailable"
+        ) from exc
+    verified_history_hash = validate_retained_history(verified_data)
+    if verified_data != retained_data or verified_history_hash != retained_history_hash:
+        raise SourceCoordinatorAmbiguous(
+            "exact-source inbound history readback differs from authority"
+        )
+
+    saved_history_binding = {
+        "schemaVersion": 1,
+        "canonicalSourceId": canonical_source_id,
+        "threadId": thread_id,
+        "historyDocumentId": canonical_source_id,
+        "historyHash": retained_history_hash,
+    }
+    index_binding = {
+        "schemaVersion": 1,
+        "canonicalSourceId": canonical_source_id,
+        "threadId": thread_id,
+        "identityDocumentId": canonical_source_id,
+    }
+    return saved_history_binding, index_binding
+
+
+def _read_source_classification_input(
+    *,
+    canonical_source_id: str,
+    thread_id: str,
+    hydrated_message: Mapping[str, Any],
+    message_text: str,
+    internet_message_headers,
+    local_source_disposition: str | None = None,
+) -> Mapping[str, Any]:
+    """Acquire the exact, provider-free input later fenced by classification."""
+    from_info = hydrated_message.get("from", {}).get("emailAddress", {})
+    stable_headers = []
+    for header in internet_message_headers or []:
+        if not isinstance(header, Mapping):
+            stable_headers.append(copy.deepcopy(header))
+            continue
+        if str(header.get("name", "")).strip().lower() == "message-id":
+            continue
+        stable_headers.append(copy.deepcopy(dict(header)))
+    classification_input = {
+        "schemaVersion": 1,
+        "canonicalSourceId": canonical_source_id,
+        "message": {
+            "threadId": thread_id,
+            "subject": hydrated_message.get("subject", ""),
+            "from": from_info.get("address", ""),
+            "body": message_text,
+            "hasAttachments": bool(hydrated_message.get("hasAttachments")),
+            "internetMessageHeaders": stable_headers,
+        },
+    }
+    if local_source_disposition is not None:
+        if local_source_disposition not in {
+            "ignored_auto_reply",
+            "ignored_self_sender",
+        }:
+            raise SourceCoordinatorConfigError(
+                "exact-source local disposition is unsupported"
+            )
+        classification_input["localSourceDisposition"] = (
+            local_source_disposition
+        )
+    return classification_input
+
+
+def _classify_source_proposal(
+    classification_input: Mapping[str, Any],
+):
+    """B1 has no production model adapter; tests inject the fenced callback."""
+    raise SourceCoordinatorConfigError(
+        "exact-source classifier adapter is unavailable until B4"
+    )
+
+
+def _verify_local_source_policy(
+    classification_input: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Verify provider-free local ignore policy before any model request starts."""
+    local_source_disposition = classification_input.get(
+        "localSourceDisposition"
+    )
+    evidence_kind = {
+        "ignored_auto_reply": "local_ignore_auto_reply",
+        "ignored_self_sender": "local_ignore_self_sender",
+    }.get(local_source_disposition)
+    if evidence_kind is None:
+        return None
+    return {
+        "schemaVersion": 1,
+        "evidenceKind": evidence_kind,
+        "evidenceHash": canonical_json_hash(
+            {
+                "hashKind": "source-local-policy-v1",
+                "canonicalSourceId": classification_input.get(
+                    "canonicalSourceId"
+                ),
+                "localSourceDisposition": local_source_disposition,
+            }
+        ),
+    }
+
+
+def _consume_source_authority(
+    _authority: SourceProcessingAuthority,
+    _snapshot,
+    _ledger,
+) -> Mapping[str, Any]:
+    """B1 defaults to a durable block until downstream adapters are adopted."""
+    return {
+        "state": "blocked",
+        "reason": "exact-source downstream adapter is unavailable until B4",
+    }
+
+
+def _source_authority_consumer_available() -> bool:
+    """B1 exposes no effectful downstream adapter before B3/B4 adoption."""
+    return False
+
+
+def _consume_durable_source_resume_context(
+    context,
+    execution_ledger,
+) -> Mapping[str, Any]:
+    authority = SourceProcessingAuthority(
+        canonical_source_id=context.canonical_source_id,
+        snapshot_hash=context.snapshot.snapshot_immutable_hash,
+        selection_hash=context.snapshot.selection_hash,
+        owner_kind=context.owner["ownerKind"],
+        owner_key=context.owner["ownerKey"],
+        ledger_hash=context.ledger["ledgerHash"],
+    )
+    return _consume_source_authority(
+        authority,
+        context.snapshot,
+        execution_ledger,
+    )
+
+
+def _drain_durable_source_queue(user_id: str) -> int:
+    """Recover retained releases and source work without Graph message state."""
+    release_settled_source_generations(
+        _fs,
+        user_id=user_id,
+        max_records=MAX_UNSETTLED_SOURCE_ADMISSIONS,
+    )
+    processed_count = 0
+    remaining_budget = MAX_UNSETTLED_SOURCE_ADMISSIONS
+    attempted_source_ids = set()
+    while remaining_budget > 0:
+        contexts = durable_source_resume_contexts(
+            _fs,
+            user_id=user_id,
+            max_records=MAX_UNSETTLED_SOURCE_ADMISSIONS,
+        )
+        unattempted = [
+            context
+            for context in contexts
+            if context.canonical_source_id not in attempted_source_ids
+        ]
+        if not unattempted:
+            break
+        for context in unattempted:
+            if remaining_budget <= 0:
+                break
+            remaining_budget -= 1
+            attempted_source_ids.add(context.canonical_source_id)
+            resume_result = consume_durable_source_resume_context(
+                _fs,
+                user_id=user_id,
+                context=context,
+                consumer=(
+                    _consume_durable_source_resume_context
+                    if _source_authority_consumer_available()
+                    else None
+                ),
+            )
+            if resume_result.state != "settled":
+                continue
+            settlement = resume_result.settlement
+            valid_settlement = (
+                settlement is not None
+                and verify_settled_source_dispatch_binding(
+                    _fs,
+                    user_id=user_id,
+                    canonical_source_id=context.canonical_source_id,
+                    thread_id=context.thread_id,
+                    source_alias_keys=context.source_alias_keys,
+                    snapshot_hash=context.snapshot.snapshot_immutable_hash,
+                    selection_hash=context.snapshot.selection_hash,
+                    owner_kind=context.owner["ownerKind"],
+                    owner_key=context.owner["ownerKey"],
+                    ledger_hash=context.ledger["ledgerHash"],
+                    settlement_hash=settlement.settlement_hash,
+                    settlement_revision=settlement.settlement_revision,
+                    alias_projection_count=settlement.alias_projection_count,
+                )
+            )
+            if not valid_settlement:
+                raise SourceCoordinatorAmbiguous(
+                    "durable source resume settlement failed readback"
+                )
+            processed_count += 1
+    if remaining_budget == 0:
+        remaining = durable_source_resume_contexts(
+            _fs,
+            user_id=user_id,
+            max_records=MAX_UNSETTLED_SOURCE_ADMISSIONS,
+        )
+        if any(
+            context.canonical_source_id not in attempted_source_ids
+            for context in remaining
+        ):
+            raise SourceCoordinatorConfigError(
+                "durable source resume exceeded its safe bound"
+            )
+    return processed_count
+
+
 def process_inbox_message(
     user_id: str,
     headers: Dict[str, str],
@@ -11691,8 +12181,23 @@ def process_inbox_message(
     operator_replay_attempt_id: Optional[str] = None,
 ):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
-    if not allow_outbound_reply:
-        _reset_reply_send_outcome()
+    source_mode = resolve_source_coordinator_mode(os.environ)
+    if source_mode is CoordinatorMode.SHADOW:
+        return SourceProcessingDisposition(
+            mode=source_mode,
+            state="shadow_no_effect",
+        )
+    if source_mode is CoordinatorMode.ENFORCED:
+        coordinator = SourceCoordinator(
+            _fs,
+            uuid_factory=lambda: str(uuid4()),
+            now_factory=lambda: datetime.now(timezone.utc),
+            local_source_policy_verifier=_verify_local_source_policy,
+        )
+
+    # A worker may process many sources in one context.  Never let a prior
+    # source's send/suppression result influence the next exact source.
+    _reset_reply_send_outcome()
     msg_id = msg.get("id")
     subject = msg.get("subject", "")
     from_info = msg.get("from", {}).get("emailAddress", {})
@@ -11729,12 +12234,28 @@ def process_inbox_message(
                 timeout=30
             )
         ).json() or {}
+        if (
+            source_mode is CoordinatorMode.ENFORCED
+            and (
+                type(full_msg) is not dict
+                or type(full_msg.get("body")) is not dict
+            )
+        ):
+            raise SourceCoordinatorRetryable(
+                "exact-source Graph hydration returned no authoritative body"
+            )
         full_body_resp = full_msg.get("body", {}) or {}
         has_attachments = bool(has_attachments or full_msg.get("hasAttachments"))
         _raw_content = full_body_resp.get("content", "") or ""
         _ctype = (full_body_resp.get("contentType") or "Text").upper()
         _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
     except Exception as e:
+        if source_mode is CoordinatorMode.ENFORCED:
+            if isinstance(e, SourceCoordinatorRetryable):
+                raise
+            raise SourceCoordinatorRetryable(
+                "exact-source Graph body hydration failed"
+            ) from e
         print(f"⚠️ Could not fetch full body for {msg_id}: {e}")
         _full_text = body_preview or ""
 
@@ -11762,10 +12283,52 @@ def process_inbox_message(
                     timeout=30
                 )
             )
-            internet_message_headers = response.json().get("internetMessageHeaders", [])
+            response_status = getattr(response, "status_code", None)
+            if (
+                source_mode is CoordinatorMode.ENFORCED
+                and type(response_status) is int
+                and not 200 <= response_status < 300
+            ):
+                raise SourceCoordinatorRetryable(
+                    "exact-source Graph header hydration was not successful"
+                )
+            header_payload = response.json()
+            if source_mode is CoordinatorMode.ENFORCED:
+                if (
+                    type(header_payload) is not dict
+                    or "internetMessageHeaders" not in header_payload
+                    or type(header_payload["internetMessageHeaders"]) is not list
+                ):
+                    raise SourceCoordinatorRetryable(
+                        "exact-source Graph header hydration was not authoritative"
+                    )
+                internet_message_headers = header_payload[
+                    "internetMessageHeaders"
+                ]
+            else:
+                internet_message_headers = header_payload.get(
+                    "internetMessageHeaders", []
+                )
         except Exception as e:
+            if source_mode is CoordinatorMode.ENFORCED:
+                if isinstance(e, SourceCoordinatorRetryable):
+                    raise
+                raise SourceCoordinatorRetryable(
+                    "exact-source Graph header hydration failed"
+                ) from e
             print(f"⚠️ Could not fetch headers for {msg_id}: {e}")
             internet_message_headers = []
+
+    if source_mode is CoordinatorMode.ENFORCED:
+        if type(internet_message_headers) is not list or any(
+            type(header) is not dict
+            or type(header.get("name")) is not str
+            or type(header.get("value")) is not str
+            for header in internet_message_headers
+        ):
+            raise SourceCoordinatorRetryable(
+                "exact-source Graph headers are malformed"
+            )
     
     # Extract reply headers and check for auto-replies
     in_reply_to = None
@@ -11801,11 +12364,16 @@ def process_inbox_message(
     if _is_auto_reply_subject(subject, has_auto_reply_signal=auto_reply_signal):
         is_auto_reply = True
 
-    # SAFETY: Skip auto-replies to prevent processing OOO messages as real data
+    local_source_disposition = None
+
+    # SAFETY: Disabled mode retains the legacy early return. Enforced mode still
+    # admits and settles the exact source under an empty local-policy proposal.
     if is_auto_reply:
         print(f"⏭️ Skipping auto-reply from {from_addr}: {subject}")
         print(f"   Auto-reply emails are not processed to prevent data corruption")
-        return
+        if source_mode is not CoordinatorMode.ENFORCED:
+            return
+        local_source_disposition = "ignored_auto_reply"
 
     # SAFETY: Skip emails from ourselves (e.g., forwarded back via auto-forward rules)
     # This prevents our own outbound emails from being processed as broker replies
@@ -11821,7 +12389,15 @@ def process_inbox_message(
         )
         if my_email_resp.status_code == 200:
             my_data = my_email_resp.json()
-            my_email = (my_data.get("mail") or my_data.get("userPrincipalName") or "").lower()
+            if source_mode is CoordinatorMode.ENFORCED and type(my_data) is not dict:
+                raise SourceCoordinatorRetryable(
+                    "exact-source self identity response is malformed"
+                )
+            my_email_value = (
+                my_data.get("mail") or my_data.get("userPrincipalName") or ""
+            )
+            if isinstance(my_email_value, str):
+                my_email = my_email_value.strip().lower()
 
         # Fallback: get our email from a sent message (works for personal accounts)
         if not my_email:
@@ -11833,15 +12409,40 @@ def process_inbox_message(
             )
             if sent_resp.status_code == 200:
                 sent_data = sent_resp.json()
-                if sent_data.get("value"):
-                    my_email = (sent_data["value"][0].get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+                if source_mode is CoordinatorMode.ENFORCED and type(sent_data) is not dict:
+                    raise SourceCoordinatorRetryable(
+                        "exact-source sent identity response is malformed"
+                    )
+                sent_values = sent_data.get("value")
+                if isinstance(sent_values, list) and sent_values:
+                    sent_email_value = (
+                        sent_values[0]
+                        .get("from", {})
+                        .get("emailAddress", {})
+                        .get("address")
+                        or ""
+                    )
+                    if isinstance(sent_email_value, str):
+                        my_email = sent_email_value.strip().lower()
+
+        if source_mode is CoordinatorMode.ENFORCED and not my_email:
+            raise SourceCoordinatorRetryable(
+                "exact-source self identity could not be verified"
+            )
 
         if my_email and from_addr.lower() == my_email:
             print(f"⏭️ Skipping self-email (forwarded back): {subject}")
             print(f"   Sender {from_addr} matches our own address - likely auto-forwarded")
-            return
+            if source_mode is not CoordinatorMode.ENFORCED:
+                return
+            if local_source_disposition is None:
+                local_source_disposition = "ignored_self_sender"
     except Exception as e:
-        # Don't fail the whole process if this check fails
+        if source_mode is CoordinatorMode.ENFORCED:
+            raise SourceCoordinatorRetryable(
+                "exact-source self-sender verification failed"
+            ) from e
+        # Don't fail the whole legacy process if this check fails.
         print(f"⚠️ Could not check for self-email: {e}")
 
     print(f"📧 Processing: {subject} from {from_addr}")
@@ -11899,6 +12500,258 @@ def process_inbox_message(
         raise RetryableProcessingError(
             f"authoritative terminal thread read failed: {e}"
         ) from e
+
+    if source_mode is CoordinatorMode.ENFORCED:
+        strict_message_record = {
+            "direction": "inbound",
+            "subject": subject,
+            "from": from_addr,
+            "sender": sender_addr,
+            "to": to_recipients,
+            "cc": cc_recipients,
+            "replyTo": reply_to_recipients,
+            "sentDateTime": sent_dt,
+            "receivedDateTime": received_dt,
+            "headers": {
+                "internetMessageId": internet_message_id,
+                "inReplyTo": in_reply_to,
+                "references": references,
+            },
+            "body": {
+                "contentType": "Text",
+                "content": _full_text,
+                "preview": safe_preview(_full_text),
+            },
+            "hasAttachments": has_attachments,
+            "sourceMessage": source_envelope,
+        }
+        existing_canonical_source_id = (
+            coordinator.resolve_existing_canonical_source_id(
+                user_id=user_id,
+                hydrated_message=merged_msg,
+                evidence_kind="graph_hydration",
+                thread_id=thread_id,
+            )
+        )
+        if existing_canonical_source_id is not None:
+            saved_history_binding, index_binding = (
+                _persist_strict_source_history_and_index(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    canonical_source_id=existing_canonical_source_id,
+                    message_record=strict_message_record,
+                )
+            )
+        identity = coordinator.admit_or_repair_source_identity(
+            user_id=user_id,
+            hydrated_message=merged_msg,
+            evidence_kind="graph_hydration",
+            thread_id=thread_id,
+        )
+        if (
+            existing_canonical_source_id is not None
+            and identity.canonical_source_id != existing_canonical_source_id
+        ):
+            raise SourceCoordinatorAmbiguous(
+                "source identity changed after retained history validation"
+            )
+        disposition_binding = {
+            "thread_id": thread_id,
+            "source_alias_keys": _source_alias_keys_for_message(
+                user_id,
+                merged_msg,
+            ),
+        }
+        if existing_canonical_source_id is None:
+            saved_history_binding, index_binding = (
+                _persist_strict_source_history_and_index(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    canonical_source_id=identity.canonical_source_id,
+                    message_record=strict_message_record,
+                )
+            )
+        classification_input = _read_source_classification_input(
+            canonical_source_id=identity.canonical_source_id,
+            thread_id=thread_id,
+            hydrated_message=merged_msg,
+            message_text=_text_for_ai,
+            internet_message_headers=internet_message_headers,
+            local_source_disposition=local_source_disposition,
+        )
+        snapshot = coordinator.classify_source_once(
+            user_id=user_id,
+            canonical_source_id=identity.canonical_source_id,
+            lease_seconds=60,
+            classification_input=classification_input,
+            classifier=lambda: _classify_source_proposal(classification_input),
+        )
+        owner = coordinator.elect_transition_owner_from_snapshot(
+            user_id=user_id,
+            canonical_source_id=identity.canonical_source_id,
+        )
+        ledger = coordinator.create_or_verify_source_work_ledger(
+            user_id=user_id,
+            canonical_source_id=identity.canonical_source_id,
+        )
+        received_at = _source_processing_datetime(
+            received_dt,
+            field_name="receivedDateTime",
+        )
+        sent_at = _source_processing_datetime(
+            sent_dt,
+            field_name="sentDateTime",
+        )
+        authority = SourceProcessingAuthority(
+            canonical_source_id=identity.canonical_source_id,
+            snapshot_hash=snapshot.snapshot_immutable_hash,
+            selection_hash=snapshot.selection_hash,
+            owner_kind=owner["ownerKind"],
+            owner_key=owner["ownerKey"],
+            ledger_hash=ledger["ledgerHash"],
+        )
+        required_alias_key = next(
+            (
+                alias.key
+                for alias in identity.aliases
+                if alias.alias_type == "graph"
+            ),
+            identity.aliases[0].key,
+        )
+
+        blocker_canonical_source_id = None
+        if owner["ownerKind"] == "none":
+            admission = coordinator.admit_pending_inbound(
+                user_id=user_id,
+                canonical_source_id=identity.canonical_source_id,
+                received_at=received_at,
+                sent_at=sent_at,
+                saved_history_binding=saved_history_binding,
+                index_binding=index_binding,
+            )
+            if admission.state == "settled":
+                settlement = coordinator.settle_source_markers_if_ready(
+                    user_id=user_id,
+                    canonical_source_id=identity.canonical_source_id,
+                    ledger_hash=ledger["ledgerHash"],
+                    required_source_alias_key=required_alias_key,
+                )
+                return SourceProcessingDisposition(
+                    mode=source_mode,
+                    state="settled",
+                    authority=authority,
+                    settlement=settlement,
+                    **disposition_binding,
+                )
+        else:
+            try:
+                retained_settlement = coordinator.settle_source_markers_if_ready(
+                    user_id=user_id,
+                    canonical_source_id=identity.canonical_source_id,
+                    ledger_hash=ledger["ledgerHash"],
+                    required_source_alias_key=required_alias_key,
+                )
+            except SourceSettlementNotReady:
+                retained_settlement = None
+            if retained_settlement is not None:
+                coordinator.release_settled_generation_if_needed(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    canonical_source_id=identity.canonical_source_id,
+                )
+                return SourceProcessingDisposition(
+                    mode=source_mode,
+                    state="settled",
+                    authority=authority,
+                    settlement=retained_settlement,
+                    **disposition_binding,
+                )
+            transition = coordinator.claim_or_resume_thread_transition(
+                user_id=user_id,
+                canonical_source_id=identity.canonical_source_id,
+                received_at=received_at,
+                sent_at=sent_at,
+                saved_history_binding=saved_history_binding,
+                index_binding=index_binding,
+            )
+            blocker_canonical_source_id = transition.blocker_canonical_source_id
+            if transition.disposition == "blocked":
+                return SourceProcessingDisposition(
+                    mode=source_mode,
+                    state="blocked",
+                    authority=authority,
+                    blocker_canonical_source_id=blocker_canonical_source_id,
+                    **disposition_binding,
+                )
+
+        if all(
+            entry["state"] in {"completed", "delegated", "dominated"}
+            for entry in ledger["entries"]
+        ):
+            settlement = coordinator.settle_source_markers_if_ready(
+                user_id=user_id,
+                canonical_source_id=identity.canonical_source_id,
+                ledger_hash=ledger["ledgerHash"],
+                required_source_alias_key=required_alias_key,
+            )
+            if owner["ownerKind"] != "none":
+                coordinator.release_settled_generation_if_needed(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    canonical_source_id=identity.canonical_source_id,
+                )
+            return SourceProcessingDisposition(
+                mode=source_mode,
+                state="settled",
+                authority=authority,
+                settlement=settlement,
+                **disposition_binding,
+            )
+
+        work_result = coordinator.consume_source_work_once(
+            user_id=user_id,
+            canonical_source_id=identity.canonical_source_id,
+            ledger_hash=ledger["ledgerHash"],
+            consumer=(
+                (
+                    lambda execution_ledger: _consume_source_authority(
+                        authority,
+                        snapshot,
+                        execution_ledger,
+                    )
+                )
+                if _source_authority_consumer_available()
+                else None
+            ),
+        )
+        if work_result["state"] == "blocked":
+            return SourceProcessingDisposition(
+                mode=source_mode,
+                state="blocked",
+                authority=authority,
+                blocker_canonical_source_id=blocker_canonical_source_id,
+                **disposition_binding,
+            )
+
+        settlement = coordinator.settle_source_markers_if_ready(
+            user_id=user_id,
+            canonical_source_id=identity.canonical_source_id,
+            ledger_hash=ledger["ledgerHash"],
+            required_source_alias_key=required_alias_key,
+        )
+        if owner["ownerKind"] != "none":
+            coordinator.release_settled_generation_if_needed(
+                user_id=user_id,
+                thread_id=thread_id,
+                canonical_source_id=identity.canonical_source_id,
+            )
+        return SourceProcessingDisposition(
+            mode=source_mode,
+            state="settled",
+            authority=authority,
+            settlement=settlement,
+            **disposition_binding,
+        )
 
     exact_terminal_saga = _terminal_saga_for_source(
         thread_data,
@@ -13207,8 +14060,6 @@ def process_inbox_message(
                 elif event_type == "close_conversation":
                     # Mark thread as closed and notify user
                     try:
-                        from datetime import datetime
-
                         close_reason = _close_reason_from_event(event)
                         if not _close_event_can_bypass_missing_fields(event):
                             tab_title = _get_first_tab_title(sheets, sheet_id)
@@ -13312,7 +14163,6 @@ def process_inbox_message(
                                 sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum, client_id=client_id)
 
                                 # Add comment explaining why
-                                from datetime import datetime
                                 current_date = datetime.now().strftime("%m/%d/%Y")
                                 optout_comment = f"[{current_date}] Contact opted out: {reason_labels.get(reason, reason)}"
 
@@ -13501,7 +14351,6 @@ def process_inbox_message(
                             comments_col_idx = find_client_comment_column_index(header)
 
                             if comments_col_idx:
-                                from datetime import datetime
                                 current_date = datetime.now().strftime("%m/%d/%Y")
                                 issue_comment = f"[{current_date}] ⚠️ PROPERTY ISSUE ({severity.upper()}): {issue}"
 
@@ -13999,6 +14848,49 @@ To complete the property details, could you please provide:
             )
             raise RetryableProcessingError("OpenAI proposal was unavailable or invalid JSON")
 
+
+def _validated_enforced_inbox_next_link(
+    value: Any,
+    *,
+    seen_page_urls: set[str],
+    completed_page_count: int,
+) -> str | None:
+    """Accept only a bounded, acyclic continuation of the exact Graph inbox query."""
+    if value is None:
+        return None
+    if type(value) is not str or not value or value != value.strip():
+        raise SourceCoordinatorRetryable(
+            "exact-source Graph inbox pagination is malformed"
+        )
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError) as parse_error:
+        raise SourceCoordinatorRetryable(
+            "exact-source Graph inbox pagination is malformed"
+        ) from parse_error
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != "graph.microsoft.com"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or parsed.path.rstrip("/") != _GRAPH_INBOX_MESSAGES_PATH
+    ):
+        raise SourceCoordinatorRetryable(
+            "exact-source Graph inbox pagination left the approved resource"
+        )
+    if value in seen_page_urls:
+        raise SourceCoordinatorRetryable(
+            "exact-source Graph inbox pagination repeated a page"
+        )
+    if completed_page_count >= MAX_ENFORCED_INBOX_SCAN_PAGES:
+        raise SourceCoordinatorRetryable(
+            "exact-source Graph inbox pagination exceeded its safe bound"
+        )
+    return value
+
 def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread: bool = True, top: int = 50):
     """
     Idempotent scan of inbox for replies with early exit on processed messages.
@@ -14006,6 +14898,30 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     BATCHING: Groups multiple unprocessed messages in the same thread together
     to prevent conflicting auto-responses when contact sends multiple emails quickly.
     """
+    source_mode = resolve_source_coordinator_mode(os.environ)
+    if source_mode is CoordinatorMode.SHADOW:
+        return SourceProcessingDisposition(
+            mode=source_mode,
+            state="shadow_no_effect",
+        )
+
+    durable_processed_before_scan = 0
+    if source_mode is CoordinatorMode.ENFORCED:
+        try:
+            durable_processed_before_scan = _drain_durable_source_queue(user_id)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "operation": "inbox_scan",
+                "error": f"durable source recovery failed: {exc}",
+                "scanned": 0,
+                "processed": 0,
+                "batched": 0,
+                "skipped": 0,
+                "orphaned": 0,
+                "unsettled": 1,
+            }
+
     base = "https://graph.microsoft.com/v1.0"
 
     # Calculate 5-hour cutoff
@@ -14045,15 +14961,66 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
 
     try:
         url = f"{base}/me/mailFolders/Inbox/messages"
+        seen_page_urls: set[str] = set()
+        completed_page_count = 0
 
         while url:
+            if source_mode is CoordinatorMode.ENFORCED:
+                if url in seen_page_urls:
+                    raise SourceCoordinatorRetryable(
+                        "exact-source Graph inbox pagination repeated a page"
+                    )
+                if completed_page_count >= MAX_ENFORCED_INBOX_SCAN_PAGES:
+                    raise SourceCoordinatorRetryable(
+                        "exact-source Graph inbox pagination exceeded its safe bound"
+                    )
+                seen_page_urls.add(url)
             response = exponential_backoff_request(
                 lambda: requests.get(url, headers=headers, params=params, timeout=30)
             )
+            completed_page_count += 1
             data = response.json()
+            if source_mode is CoordinatorMode.ENFORCED and (
+                type(data) is not dict
+                or "value" not in data
+                or type(data["value"]) is not list
+            ):
+                raise SourceCoordinatorRetryable(
+                    "exact-source Graph inbox page is malformed"
+                )
             messages = data.get("value", [])
+            if source_mode is CoordinatorMode.ENFORCED and any(
+                type(message) is not dict
+                or not any(
+                    type(message.get(field)) is str
+                    and bool(message.get(field).strip())
+                    for field in ("id", "internetMessageId")
+                )
+                for message in messages
+            ):
+                raise SourceCoordinatorRetryable(
+                    "exact-source Graph inbox message identity is malformed"
+                )
+            next_url = data.get("@odata.nextLink")
+            if source_mode is CoordinatorMode.ENFORCED:
+                next_url = _validated_enforced_inbox_next_link(
+                    next_url,
+                    seen_page_urls=seen_page_urls,
+                    completed_page_count=completed_page_count,
+                )
+                if (
+                    scanned_count + len(messages)
+                    > MAX_ENFORCED_INBOX_SCAN_MESSAGES
+                ):
+                    raise SourceCoordinatorRetryable(
+                        "exact-source Graph inbox scan exceeded its message bound"
+                    )
 
             if not messages:
+                if next_url:
+                    url = next_url
+                    params = {}
+                    continue
                 break
 
             if scanned_count == 0:  # First batch
@@ -14080,7 +15047,19 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
 
                 # Resolve active/settled/ordinary from one authoritative thread
                 # snapshot before generic processed/manual/batch behavior.
-                thread_id = _match_message_to_thread(user_id, msg, headers)
+                thread_id = _match_message_to_thread(
+                    user_id,
+                    msg,
+                    headers,
+                    strict=source_mode is CoordinatorMode.ENFORCED,
+                )
+                if source_mode is CoordinatorMode.ENFORCED:
+                    if thread_id:
+                        thread_messages[thread_id].append(msg)
+                    else:
+                        skipped_count += 1
+                    continue
+
                 disposition = {"kind": "ordinary"}
                 if thread_id:
                     disposition = _terminal_retry_disposition(
@@ -14121,7 +15100,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                     orphan_messages.append(msg)
 
             # Handle pagination
-            url = data.get("@odata.nextLink")
+            url = next_url
             if url:
                 params = {}  # nextLink includes all parameters
 
@@ -14129,6 +15108,139 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         state = _graph_operation_error_state("inbox_scan", e)
         print(f"❌ Failed to scan inbox: {state.get('error')}")
         return state
+
+    if source_mode is CoordinatorMode.ENFORCED:
+        processed_count = durable_processed_before_scan
+        unsettled_count = 0
+        first_unsettled_error = None
+        globally_ordered_messages = sorted(
+            (
+                (thread_id, message)
+                for thread_id, messages in thread_messages.items()
+                for message in messages
+            ),
+            key=lambda item: (
+                item[1].get("receivedDateTime")
+                or item[1].get("sentDateTime")
+                or "",
+                item[1].get("id") or "",
+            ),
+        )
+        blocked_thread_ids = set()
+        for thread_id, message in globally_ordered_messages:
+            if thread_id in blocked_thread_ids:
+                continue
+            processed_key = (
+                message.get("internetMessageId") or message.get("id")
+            )
+            try:
+                result = process_inbox_message(user_id, headers, message)
+                valid_settlement = _is_bound_exact_source_settlement(
+                    result,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    message=message,
+                )
+                if valid_settlement:
+                    valid_settlement = verify_settled_source_dispatch_binding(
+                        _fs,
+                        user_id=user_id,
+                        canonical_source_id=(
+                            result.authority.canonical_source_id
+                        ),
+                        thread_id=thread_id,
+                        source_alias_keys=result.source_alias_keys,
+                        snapshot_hash=result.authority.snapshot_hash,
+                        selection_hash=result.authority.selection_hash,
+                        owner_kind=result.authority.owner_kind,
+                        owner_key=result.authority.owner_key,
+                        ledger_hash=result.authority.ledger_hash,
+                        settlement_hash=result.settlement.settlement_hash,
+                        settlement_revision=(
+                            result.settlement.settlement_revision
+                        ),
+                        alias_projection_count=(
+                            result.settlement.alias_projection_count
+                        ),
+                    )
+                if not valid_settlement:
+                    unsettled_count += 1
+                    blocked_thread_ids.add(thread_id)
+                    first_unsettled_error = first_unsettled_error or (
+                        "exact source did not produce a canonical settlement"
+                    )
+                    print(
+                        "⏸️ Exact source remains unsettled; leaving it and every "
+                        "later same-thread source enumerable"
+                    )
+                    continue
+                processed_count += 1
+            except Exception as exc:
+                unsettled_count += 1
+                blocked_thread_ids.add(thread_id)
+                first_unsettled_error = first_unsettled_error or str(exc)
+                print(f"❌ Failed to settle exact source {processed_key}: {exc}")
+
+        try:
+            processed_count += _drain_durable_source_queue(user_id)
+        except Exception as exc:
+            unsettled_count += 1
+            first_unsettled_error = first_unsettled_error or (
+                f"durable source recovery failed: {exc}"
+            )
+
+        result = {
+            "status": "healthy" if unsettled_count == 0 else "error",
+            "operation": "inbox_scan",
+            "scanned": scanned_count,
+            "processed": processed_count,
+            "batched": 0,
+            "skipped": skipped_count,
+            "orphaned": len(orphan_messages),
+        }
+        if unsettled_count:
+            result.update(
+                {
+                    "error": first_unsettled_error
+                    or "one or more exact sources remain unsettled",
+                    "unsettled": unsettled_count,
+                }
+            )
+            return result
+
+        try:
+            outstanding_admissions = advance_scan_cursor_if_source_authority_clear(
+                _fs,
+                user_id=user_id,
+                last_scan_iso=now_iso.replace("+00:00", "Z"),
+            )
+        except Exception as exc:
+            result.update(
+                {
+                    "status": "error",
+                    "error": f"durable source admission audit failed: {exc}",
+                    "unsettled": 1,
+                }
+            )
+            return result
+        if outstanding_admissions:
+            result.update(
+                {
+                    "status": "error",
+                    "error": (
+                        "durable exact sources remain unsettled outside the "
+                        "current Graph scan window"
+                    ),
+                    "unsettled": len(outstanding_admissions),
+                }
+            )
+            return result
+
+        print(
+            f"📥 Scanned {scanned_count}; independently settled "
+            f"{processed_count} exact sources; skipped {skipped_count}"
+        )
+        return result
 
     # PHASE 2: Process messages - batched by thread
     processed_count = 0
@@ -14420,14 +15532,85 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     }
 
 
-def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional[str]:
+def _strict_thread_index_read(
+    user_id: str,
+    *,
+    collection_name: str,
+    document_id: str,
+) -> str | None:
+    snapshot = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection(collection_name)
+        .document(document_id)
+        .get()
+    )
+    if snapshot.exists is False:
+        return None
+    if snapshot.exists is not True:
+        raise SourceCoordinatorRetryable(
+            "exact-source thread index returned ambiguous existence"
+        )
+    data = snapshot.to_dict()
+    if (
+        type(data) is not dict
+        or type(data.get("threadId")) is not str
+        or not data["threadId"]
+    ):
+        raise SourceCoordinatorRetryable(
+            "exact-source thread index is malformed"
+        )
+    return data["threadId"]
+
+
+def _strict_lookup_thread_by_message_id(
+    user_id: str,
+    message_id: str,
+) -> str | None:
+    normalized_message_id = normalize_message_id(message_id)
+    legacy_raw_message_id = (message_id or "").strip()
+    candidates = []
+    for candidate in (normalized_message_id, legacy_raw_message_id):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        thread_id = _strict_thread_index_read(
+            user_id,
+            collection_name="msgIndex",
+            document_id=b64url_id(candidate),
+        )
+        if thread_id is not None:
+            return thread_id
+    return None
+
+
+def _match_message_to_thread(
+    user_id: str,
+    msg: dict,
+    headers: dict,
+    *,
+    strict: bool = False,
+) -> Optional[str]:
     """
     Try to match an inbox message to an existing thread.
-    Returns thread_id if found, None otherwise.
+    Returns thread_id if found, None after an authoritative no-match.
+
+    The enforced scanner sets ``strict=True`` so unreadable or malformed
+    message headers cannot collapse into the same result as a confirmed
+    untracked message.
     """
+    if type(strict) is not bool:
+        raise SourceCoordinatorConfigError(
+            "strict inbox thread matching must be a boolean"
+        )
     # Get headers if not present
     internet_message_headers = msg.get("internetMessageHeaders")
-    if not internet_message_headers:
+    needs_header_hydration = (
+        "internetMessageHeaders" not in msg
+        if strict
+        else not internet_message_headers
+    )
+    if needs_header_hydration:
         try:
             response = exponential_backoff_request(
                 lambda: requests.get(
@@ -14438,9 +15621,37 @@ def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional
                     timeout=30
                 )
             )
-            internet_message_headers = response.json().get("internetMessageHeaders", [])
-        except Exception:
+            payload = response.json()
+            if strict and (
+                type(payload) is not dict
+                or "internetMessageHeaders" not in payload
+                or type(payload["internetMessageHeaders"]) is not list
+            ):
+                raise SourceCoordinatorRetryable(
+                    "exact-source Graph header hydration was not authoritative"
+                )
+            internet_message_headers = payload.get("internetMessageHeaders", [])
+        except Exception as header_error:
+            if strict:
+                if isinstance(header_error, SourceCoordinatorRetryable):
+                    raise
+                raise SourceCoordinatorRetryable(
+                    "exact-source Graph header hydration failed during matching"
+                ) from header_error
             internet_message_headers = []
+
+    if strict and (
+        type(internet_message_headers) is not list
+        or any(
+            type(header) is not dict
+            or type(header.get("name")) is not str
+            or type(header.get("value")) is not str
+            for header in internet_message_headers
+        )
+    ):
+        raise SourceCoordinatorRetryable(
+            "exact-source Graph headers are malformed during matching"
+        )
 
     # Extract reply headers
     in_reply_to = None
@@ -14456,25 +15667,48 @@ def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional
 
     conversation_id = msg.get("conversationId")
 
-    # Try In-Reply-To first
-    if in_reply_to:
-        thread_id = lookup_thread_by_message_id(user_id, in_reply_to)
-        if thread_id:
-            return thread_id
+    try:
+        message_index_lookup = (
+            _strict_lookup_thread_by_message_id
+            if strict
+            else lookup_thread_by_message_id
+        )
 
-    # Try References (newest to oldest)
-    if references:
-        for ref in reversed(references):
-            ref = normalize_message_id(ref)
-            thread_id = lookup_thread_by_message_id(user_id, ref)
+        # Try In-Reply-To first
+        if in_reply_to:
+            thread_id = message_index_lookup(user_id, in_reply_to)
             if thread_id:
                 return thread_id
 
-    # Fallback to conversation ID
-    if conversation_id:
-        thread_id = lookup_thread_by_conversation_id(user_id, conversation_id)
-        if thread_id:
-            return thread_id
+        # Try References (newest to oldest)
+        if references:
+            for ref in reversed(references):
+                ref = normalize_message_id(ref)
+                thread_id = message_index_lookup(user_id, ref)
+                if thread_id:
+                    return thread_id
+
+        # Fallback to conversation ID
+        if conversation_id:
+            if strict:
+                thread_id = _strict_thread_index_read(
+                    user_id,
+                    collection_name="convIndex",
+                    document_id=conversation_id,
+                )
+            else:
+                thread_id = lookup_thread_by_conversation_id(
+                    user_id,
+                    conversation_id,
+                )
+            if thread_id:
+                return thread_id
+    except Exception as lookup_error:
+        if strict:
+            raise SourceCoordinatorRetryable(
+                "exact-source thread authority lookup failed"
+            ) from lookup_error
+        raise
 
     return None
 

@@ -470,11 +470,18 @@ class SourceIdentityTests(unittest.TestCase):
             if event[0] in {"create", "set", "update", "delete"}
         ]
 
+    def source_authority_revision(self):
+        return self.fake.data[
+            "users/user-1/sync/inbox"
+        ]["sourceAuthorityRevision"]
+
     def assertOnlyIdentityWrites(self):
         for event in self.write_events():
-            self.assertRegex(
-                event[1],
-                r"^users/user-1/source(?:Identities|Aliases)/",
+            self.assertTrue(
+                event[1].startswith("users/user-1/sourceIdentities/")
+                or event[1].startswith("users/user-1/sourceAliases/")
+                or event[1] == "users/user-1/sync/inbox",
+                event,
             )
 
     def test_graph_first_then_graph_and_rfc_enrichment_retains_identity(self):
@@ -502,6 +509,49 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertEqual(1, self.uuids.calls)
         self.assertEqual(2, len(self.alias_paths()))
         self.assertOnlyIdentityWrites()
+
+    def test_identity_create_and_alias_repair_advance_authority_revision_once(self):
+        created = self.admit({"id": "graph-revision"})
+        created_revision = self.source_authority_revision()
+
+        repaired = self.admit(
+            {
+                "id": "graph-revision",
+                "internetMessageId": "<revision@example.test>",
+            }
+        )
+        repaired_revision = self.source_authority_revision()
+        replay = self.admit(
+            {
+                "id": "graph-revision",
+                "internetMessageId": "<revision@example.test>",
+            }
+        )
+
+        self.assertTrue(created.created)
+        self.assertTrue(repaired.repaired)
+        self.assertFalse(replay.created)
+        self.assertFalse(replay.repaired)
+        self.assertEqual(1, created_revision)
+        self.assertEqual(2, repaired_revision)
+        self.assertEqual(2, self.source_authority_revision())
+
+    def test_existing_identity_cannot_repair_when_authority_revision_is_missing(self):
+        self.admit({"id": "graph-missing-revision"})
+        del self.fake.data["users/user-1/sync/inbox"][
+            "sourceAuthorityRevision"
+        ]
+        before = deepcopy(self.fake.data)
+
+        with self.assertRaises(self.module.SourceCoordinatorAmbiguous):
+            self.admit(
+                {
+                    "id": "graph-missing-revision",
+                    "internetMessageId": "<missing-revision@example.test>",
+                }
+            )
+
+        self.assertEqual(before, self.fake.data)
 
     def test_rfc_first_then_rfc_and_graph_enrichment_retains_identity(self):
         created = self.admit({"internetMessageId": "<rfc-1@example.test>"})
@@ -3013,6 +3063,26 @@ class ThreadHeadAndWakeTests(unittest.TestCase):
             if event[0] in {"create", "set", "update", "delete"}
         ]
 
+    def test_admission_and_combined_head_claim_each_advance_revision_once(self):
+        source_id = self.prepare_authority("graph-verdict-revision")
+        sync_path = "users/user-1/sync/inbox"
+        identity_revision = self.fake.data[sync_path][
+            "sourceAuthorityRevision"
+        ]
+
+        self.admit(source_id)
+        admission_revision = self.fake.data[sync_path][
+            "sourceAuthorityRevision"
+        ]
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        claim_revision = self.fake.data[sync_path]["sourceAuthorityRevision"]
+
+        self.assertEqual(identity_revision + 1, admission_revision)
+        self.assertEqual(admission_revision + 1, claim_revision)
+
     def test_two_worker_race_leaves_one_head_and_one_durable_block(self):
         first = self.prepare_authority("graph-race-a")
         second = self.prepare_authority("graph-race-b")
@@ -3308,6 +3378,7 @@ class ThreadHeadAndWakeTests(unittest.TestCase):
             self.fake.data[oldest_path]["blockedLifecycleState"],
         )
         self.assertEqual("consumed", self.fake.data[oldest_path]["wakeState"])
+
         for remaining in candidates[:2]:
             path = f"users/user-1/inboundPendingAdmissions/{remaining}"
             projection = f"users/user-1/blockedSources/{remaining}"
@@ -3333,6 +3404,50 @@ class ThreadHeadAndWakeTests(unittest.TestCase):
         )
         self.assertEqual(claimed, claim_retry)
         self.assertEqual([], self.write_events())
+
+    def test_claim_or_resume_atomically_queues_and_consumes_eligible_wake(self):
+        active = self.prepare_authority("graph-resume-active")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        blocked = self.prepare_authority("graph-resume-blocked")
+        blocked_arguments = self.admission_arguments(
+            blocked,
+            received_offset=1,
+            sent_offset=1,
+        )
+
+        queued = self.coordinator.claim_or_resume_thread_transition(
+            **blocked_arguments
+        )
+
+        self.assertEqual("blocked", queued.disposition)
+        blocked_path = f"users/user-1/inboundPendingAdmissions/{blocked}"
+        self.assertEqual("blocked", self.fake.data[blocked_path]["admissionState"])
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+        self.assertEqual(blocked, released.next_canonical_source_id)
+
+        resumed = self.coordinator.claim_or_resume_thread_transition(
+            **blocked_arguments
+        )
+
+        self.assertEqual("claimed", resumed.disposition)
+        self.assertEqual(blocked, resumed.canonical_source_id)
+        self.assertEqual(
+            "processing",
+            self.fake.data[blocked_path]["admissionState"],
+        )
+        self.assertEqual("consumed", self.fake.data[blocked_path]["wakeState"])
+        head = self.fake.data["users/user-1/threadTransitionHeads/thread-queue"]
+        self.assertEqual(blocked, head["activeCanonicalSourceId"])
 
     def test_empty_queue_release_clears_head_and_retry_fails_closed(self):
         active = self.prepare_authority("graph-wake-empty")
@@ -3695,12 +3810,15 @@ class LedgerTransitionAndSettlementTests(unittest.TestCase):
             **self.work_arguments("field_update")
         )
         self.assertEqual("applying", applying.state)
+        self.assertTrue(applying.newly_started)
         self.assertIsNone(self.stored_entry("field_update")["resolutionEvidence"])
         writes = list(self.write_events())
         retry = self.coordinator.record_source_work_applying(
             **self.work_arguments("field_update")
         )
-        self.assertEqual(applying, retry)
+        self.assertEqual(applying.state, retry.state)
+        self.assertEqual(applying.ledger_revision, retry.ledger_revision)
+        self.assertFalse(retry.newly_started)
         self.assertEqual(writes, self.write_events())
 
         with self.assertRaises(self.module.SourceWorkTransitionConflict):
@@ -3748,6 +3866,138 @@ class LedgerTransitionAndSettlementTests(unittest.TestCase):
             )
         self.assertEqual(before, self.fake.data)
         self.assertEqual([], self.write_events())
+
+    def test_source_work_consumer_is_latched_before_callback_and_not_replayed(self):
+        expected_preserved_keys = {
+            entry["workKey"]
+            for entry in self.ledger["entries"]
+            if entry["dominanceOutcome"] == "preserve"
+        }
+        consumer_calls = []
+
+        def consumer(execution_ledger):
+            applying = {
+                entry["workKey"]
+                for entry in execution_ledger["entries"]
+                if entry["state"] == "applying"
+            }
+            self.assertEqual(expected_preserved_keys, applying)
+            consumer_calls.append(tuple(sorted(applying)))
+            return {
+                "state": "completed",
+                "completionRecords": {
+                    entry["workKey"]: self.completion_record(
+                        entry["kind"],
+                        self.module.canonical_json_hash(
+                            {"completedWorkKey": entry["workKey"]}
+                        ),
+                    )
+                    for entry in execution_ledger["entries"]
+                    if entry["state"] == "applying"
+                },
+            }
+
+        result = self.coordinator.consume_source_work_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            ledger_hash=self.ledger["ledgerHash"],
+            consumer=consumer,
+        )
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(1, len(consumer_calls))
+        self.assertTrue(
+            all(
+                entry["state"] in {"completed", "delegated", "dominated"}
+                for entry in self.fake.data[self.ledger_path]["entries"]
+            )
+        )
+
+        retry_consumer = mock.Mock(side_effect=AssertionError("consumer replayed"))
+        retry = self.coordinator.consume_source_work_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            ledger_hash=self.ledger["ledgerHash"],
+            consumer=retry_consumer,
+        )
+        self.assertEqual("completed", retry["state"])
+        retry_consumer.assert_not_called()
+
+    def test_unavailable_consumer_keeps_preserved_work_pending(self):
+        result = self.coordinator.consume_source_work_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            ledger_hash=self.ledger["ledgerHash"],
+            consumer=None,
+        )
+        self.assertEqual("blocked", result["state"])
+        stored = self.fake.data[self.ledger_path]["entries"]
+        self.assertTrue(
+            all(
+                entry["state"] == "pending"
+                for entry in stored
+                if entry["dominanceOutcome"] == "preserve"
+            )
+        )
+        self.assertTrue(all(entry["state"] == "pending" for entry in stored))
+
+    def test_existing_applying_work_blocks_without_consumer_replay(self):
+        self.coordinator.record_source_work_applying(
+            **self.work_arguments("field_update")
+        )
+        consumer = mock.Mock(side_effect=AssertionError("consumer replayed"))
+        result = self.coordinator.consume_source_work_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            ledger_hash=self.ledger["ledgerHash"],
+            consumer=consumer,
+        )
+        self.assertEqual("blocked", result["state"])
+        self.assertEqual("execution_outcome_ambiguous", result["reason"])
+        consumer.assert_not_called()
+
+    def test_consumer_block_after_latch_is_not_replayed(self):
+        consumer = mock.Mock(return_value={"state": "blocked"})
+        first = self.coordinator.consume_source_work_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            ledger_hash=self.ledger["ledgerHash"],
+            consumer=consumer,
+        )
+        second = self.coordinator.consume_source_work_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            ledger_hash=self.ledger["ledgerHash"],
+            consumer=consumer,
+        )
+        self.assertEqual("blocked", first["state"])
+        self.assertEqual("execution_outcome_ambiguous", first["reason"])
+        self.assertEqual("blocked", second["state"])
+        self.assertEqual("execution_outcome_ambiguous", second["reason"])
+        consumer.assert_called_once()
+
+    def test_two_worker_apply_race_grants_one_local_latch(self):
+        arguments = self.work_arguments("field_update")
+        self.fake.before_commit_barrier = Barrier(2)
+        results = []
+        errors = []
+
+        def contend():
+            try:
+                results.append(
+                    self.coordinator.record_source_work_applying(**arguments)
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        workers = [Thread(target=contend) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual([], errors)
+        self.assertEqual([False, True], sorted(result.newly_started for result in results))
 
     def test_delegation_is_atomic_idempotent_and_split_brain_blocks(self):
         delegated = self.coordinator.delegate_source_work_entry(
@@ -3797,6 +4047,11 @@ class LedgerTransitionAndSettlementTests(unittest.TestCase):
             **self.work_arguments("field_update")
         )
         self.assertEqual("applying", applying.state)
+        self.assertTrue(applying.newly_started)
+        retry = self.coordinator.record_source_work_applying(
+            **self.work_arguments("field_update")
+        )
+        self.assertFalse(retry.newly_started)
 
         self.fake.apply_then_raise_next_commit = RuntimeError("unknown delegation")
         delegated = self.coordinator.delegate_source_work_entry(
@@ -4187,7 +4442,34 @@ class LedgerTransitionAndSettlementTests(unittest.TestCase):
             repaired.settlement_hash,
         )
         self.assertIn(late_projection_path, self.fake.data)
-        self.assertEqual(1, len(self.write_events()))
+        self.assertEqual(
+            {
+                late_projection_path,
+                "users/user-1/sync/inbox",
+            },
+            {event[1] for event in self.write_events()},
+        )
+
+    def test_processed_projection_repair_advances_authority_revision(self):
+        self.settle_all_work()
+        self.settle()
+        identity_path = f"users/user-1/sourceIdentities/{self.source_id}"
+        alias_key = self.fake.data[identity_path]["verifiedAliases"][0][
+            "sourceAliasKey"
+        ]
+        projection_path = f"users/user-1/processedMessages/{alias_key}"
+        del self.fake.data[projection_path]
+        sync_path = "users/user-1/sync/inbox"
+        revision_before = self.fake.data[sync_path]["sourceAuthorityRevision"]
+
+        repaired = self.settle()
+
+        self.assertEqual(1, repaired.repaired_projection_count)
+        self.assertIn(projection_path, self.fake.data)
+        self.assertEqual(
+            revision_before + 1,
+            self.fake.data[sync_path]["sourceAuthorityRevision"],
+        )
 
     def test_marker_partial_commit_blocks_cursor(self):
         self.settle_all_work()
@@ -4220,9 +4502,590 @@ class LedgerTransitionAndSettlementTests(unittest.TestCase):
         cursor_writes = [
             event
             for event in self.write_events()
-            if "sync/inbox" in event[1] or "cursor" in event[1]
+            if (
+                "sync/inbox" in event[1]
+                and (
+                    "lastScanISO" in (event[2] or {})
+                    or "sourceAuthorityAuditRevision" in (event[2] or {})
+                )
+            )
+            or "cursor" in event[1]
         ]
         self.assertEqual([], cursor_writes)
+
+
+class SourceAuthorityAuditTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_source_coordinator(self)
+        self.fake = FakeFirestore()
+        self.ids = SequentialUUIDs()
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.ids,
+            now_factory=lambda: FROZEN_NOW,
+        )
+
+    def settle_none_source(self, *, graph_id, thread_id):
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": graph_id},
+            evidence_kind="graph_hydration",
+            thread_id=thread_id,
+        )
+        self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+            lease_seconds=60,
+            classification_input={
+                "schemaVersion": 1,
+                "message": {"id": graph_id},
+            },
+            classifier=lambda: (
+                {
+                    "schemaVersion": 1,
+                    "transitionCandidates": [],
+                    "ordinaryObligations": [],
+                },
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        owner = self.coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+        )
+        self.assertEqual("none", owner["ownerKind"])
+        ledger = self.coordinator.create_or_verify_source_work_ledger(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+        )
+        self.coordinator.admit_pending_inbound(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+            received_at=FROZEN_NOW,
+            sent_at=FROZEN_NOW,
+            saved_history_binding={
+                "schemaVersion": 1,
+                "historyKey": graph_id,
+            },
+            index_binding={
+                "schemaVersion": 1,
+                "indexKey": graph_id,
+            },
+        )
+        self.coordinator.settle_source_markers_if_ready(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+            ledger_hash=ledger["ledgerHash"],
+        )
+        return identity
+
+    def prepare_owned_source(self, *, graph_id, thread_id):
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": graph_id},
+            evidence_kind="graph_hydration",
+            thread_id=thread_id,
+        )
+        source_id = identity.canonical_source_id
+        self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=source_id,
+            lease_seconds=60,
+            classification_input={
+                "schemaVersion": 1,
+                "message": {"id": graph_id},
+            },
+            classifier=lambda: (
+                deepcopy(COMPLETE_PROPOSAL),
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        owner = self.coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        self.assertNotEqual("none", owner["ownerKind"])
+        ledger = self.coordinator.create_or_verify_source_work_ledger(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        return identity, ledger
+
+    def complete_owned_source_work(self, *, source_id, ledger):
+        for entry in ledger["entries"]:
+            work_arguments = {
+                "user_id": "user-1",
+                "canonical_source_id": source_id,
+                "ledger_hash": ledger["ledgerHash"],
+                "work_key": entry["workKey"],
+                "payload_hash": entry["payloadHash"],
+            }
+            if entry["dominanceOutcome"] == "delegate_owner":
+                self.coordinator.delegate_source_work_entry(**work_arguments)
+            elif entry["dominanceOutcome"] == "preserve":
+                self.coordinator.record_source_work_applying(**work_arguments)
+                self.coordinator.complete_source_work_entry(
+                    **work_arguments,
+                    completion_record={
+                        "schemaVersion": 1,
+                        "evidenceKind": "work_completion",
+                        "workKind": entry["kind"],
+                        "resultHash": "f" * 64,
+                    },
+                )
+            else:  # pragma: no cover - fixture contract
+                self.fail("owned audit fixture has an unsupported work outcome")
+
+    def settle_owned_source(self, *, graph_id, thread_id):
+        identity, ledger = self.prepare_owned_source(
+            graph_id=graph_id,
+            thread_id=thread_id,
+        )
+        source_id = identity.canonical_source_id
+        self.coordinator.admit_pending_inbound(
+            user_id="user-1",
+            canonical_source_id=source_id,
+            received_at=FROZEN_NOW,
+            sent_at=FROZEN_NOW,
+            saved_history_binding={
+                "schemaVersion": 1,
+                "historyKey": graph_id,
+            },
+            index_binding={
+                "schemaVersion": 1,
+                "indexKey": graph_id,
+            },
+        )
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        self.complete_owned_source_work(source_id=source_id, ledger=ledger)
+        self.coordinator.settle_source_markers_if_ready(
+            user_id="user-1",
+            canonical_source_id=source_id,
+            ledger_hash=ledger["ledgerHash"],
+        )
+        return identity
+
+    def detached_source(self, *, source_id, graph_id, classify):
+        fake = FakeFirestore()
+        coordinator = self.module.SourceCoordinator(
+            fake,
+            uuid_factory=lambda: source_id,
+            now_factory=lambda: FROZEN_NOW,
+        )
+        identity = coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": graph_id},
+            evidence_kind="graph_hydration",
+            thread_id=f"thread-{source_id}",
+        )
+        if classify:
+            coordinator.classify_source_once(
+                user_id="user-1",
+                canonical_source_id=source_id,
+                lease_seconds=60,
+                classification_input={
+                    "schemaVersion": 1,
+                    "message": {"id": graph_id},
+                },
+                classifier=lambda: (
+                    deepcopy(COMPLETE_PROPOSAL),
+                    deepcopy(MODEL_PROPOSAL_EVIDENCE),
+                ),
+            )
+        self.assertEqual(source_id, identity.canonical_source_id)
+        return fake
+
+    def test_settled_lifetime_can_exceed_outstanding_bound_across_pages(self):
+        first = self.settle_none_source(
+            graph_id="graph-audit-one",
+            thread_id="thread-audit-one",
+        )
+        second = self.settle_none_source(
+            graph_id="graph-audit-two",
+            thread_id="thread-audit-two",
+        )
+        cursor = "2026-08-03T12:00:00Z"
+
+        outstanding = self.coordinator.advance_scan_cursor_if_source_authority_clear(
+            user_id="user-1",
+            last_scan_iso=cursor,
+            max_records=1,
+            page_size=1,
+        )
+
+        self.assertEqual((), outstanding)
+        self.assertNotEqual(
+            first.canonical_source_id,
+            second.canonical_source_id,
+        )
+        sync = self.fake.data["users/user-1/sync/inbox"]
+        self.assertEqual(cursor, sync["lastScanISO"])
+        self.assertEqual(
+            sync["sourceAuthorityRevision"],
+            sync["sourceAuthorityAuditRevision"],
+        )
+        identity_queries = [
+            event
+            for event in self.fake.events
+            if event[:2] == ("query", "users/user-1/sourceIdentities")
+        ]
+        self.assertGreaterEqual(len(identity_queries), 3)
+
+    def test_malformed_clear_head_blocks_cursor_advance(self):
+        self.settle_none_source(
+            graph_id="graph-clear-head",
+            thread_id="thread-source",
+        )
+        head_path = "users/user-1/threadTransitionHeads/thread-clear"
+        head = self.module._build_thread_head_document(
+            thread_id="thread-clear",
+            canonical_source_id=None,
+            owner_data=None,
+            generation=0,
+            state="clear",
+            revision=1,
+            now=FROZEN_NOW,
+        )
+        head["headHash"] = "0" * 64
+        self.fake.data[head_path] = head
+
+        with self.assertRaises(self.module.ThreadTransitionConflict):
+            self.coordinator.advance_scan_cursor_if_source_authority_clear(
+                user_id="user-1",
+                last_scan_iso="2026-08-03T12:00:00Z",
+                page_size=1,
+            )
+
+        self.assertNotIn(
+            "lastScanISO",
+            self.fake.data["users/user-1/sync/inbox"],
+        )
+
+    def test_settled_owned_source_missing_head_blocks_cursor_advance(self):
+        identity = self.settle_owned_source(
+            graph_id="graph-missing-owned-head",
+            thread_id="thread-missing-owned-head",
+        )
+        source_id = identity.canonical_source_id
+        head_path = (
+            "users/user-1/threadTransitionHeads/thread-missing-owned-head"
+        )
+        self.assertIn(head_path, self.fake.data)
+        del self.fake.data[head_path]
+        sync_path = "users/user-1/sync/inbox"
+        revision_before = self.fake.data[sync_path]["sourceAuthorityRevision"]
+
+        with self.assertRaises(self.module.ThreadTransitionConflict):
+            self.coordinator.advance_scan_cursor_if_source_authority_clear(
+                user_id="user-1",
+                last_scan_iso="2026-08-03T12:00:00Z",
+                page_size=1,
+            )
+
+        sync = self.fake.data[sync_path]
+        self.assertEqual(revision_before, sync["sourceAuthorityRevision"])
+        self.assertNotIn("lastScanISO", sync)
+        self.assertNotIn("sourceAuthorityAuditRevision", sync)
+
+    def test_orphan_classification_blocks_cursor_advance(self):
+        self.settle_none_source(
+            graph_id="graph-retained-classification-root",
+            thread_id="thread-retained-classification-root",
+        )
+        orphan_id = "source-orphan-classification"
+        detached = self.detached_source(
+            source_id=orphan_id,
+            graph_id="graph-orphan-classification",
+            classify=True,
+        )
+        classification_path = (
+            f"users/user-1/sourceClassifications/{orphan_id}"
+        )
+        self.fake.data[classification_path] = deepcopy(
+            detached.data[classification_path]
+        )
+        sync_path = "users/user-1/sync/inbox"
+
+        with self.assertRaises(self.module.SourceIdentityMissing):
+            self.coordinator.advance_scan_cursor_if_source_authority_clear(
+                user_id="user-1",
+                last_scan_iso="2026-08-03T12:00:00Z",
+                page_size=1,
+            )
+
+        self.assertNotIn("lastScanISO", self.fake.data[sync_path])
+        self.assertNotIn(
+            "sourceAuthorityAuditRevision",
+            self.fake.data[sync_path],
+        )
+
+    def test_extra_alias_projection_blocks_cursor_advance(self):
+        retained = self.settle_none_source(
+            graph_id="graph-retained-alias-root",
+            thread_id="thread-retained-alias-root",
+        )
+        detached = self.detached_source(
+            source_id="source-detached-alias",
+            graph_id="graph-extra-alias",
+            classify=False,
+        )
+        detached_alias_path = next(
+            path for path in detached.data if "/sourceAliases/" in path
+        )
+        alias_key = detached_alias_path.rsplit("/", 1)[1]
+        projection = deepcopy(detached.data[detached_alias_path])
+        projection["canonicalSourceId"] = retained.canonical_source_id
+        self.fake.data[f"users/user-1/sourceAliases/{alias_key}"] = projection
+        sync_path = "users/user-1/sync/inbox"
+
+        with self.assertRaises(self.module.SourceAliasConflict):
+            self.coordinator.advance_scan_cursor_if_source_authority_clear(
+                user_id="user-1",
+                last_scan_iso="2026-08-03T12:00:00Z",
+                page_size=1,
+            )
+
+        self.assertNotIn("lastScanISO", self.fake.data[sync_path])
+        self.assertNotIn(
+            "sourceAuthorityAuditRevision",
+            self.fake.data[sync_path],
+        )
+
+    def test_first_identity_requires_every_support_inventory_to_be_empty(self):
+        for collection_name in (
+            "sourceAliases",
+            "sourceClassifications",
+            "sourceTransitionOwners",
+            "sourceWorkLedgers",
+            "sourceDeferredWork",
+            "blockedSources",
+            "sourceSettlements",
+        ):
+            with self.subTest(collection=collection_name):
+                fake = FakeFirestore()
+                fake.data[
+                    f"users/user-1/{collection_name}/orphan-support-document"
+                ] = {"orphan": True}
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=lambda: "source-first",
+                    now_factory=lambda: FROZEN_NOW,
+                )
+
+                with self.assertRaises(self.module.SourceCoordinatorAmbiguous):
+                    coordinator.admit_or_repair_source_identity(
+                        user_id="user-1",
+                        hydrated_message={"id": "graph-first"},
+                        evidence_kind="graph_hydration",
+                        thread_id="thread-first",
+                    )
+
+    def test_woken_settlement_refreshes_blocked_projection_before_audit(self):
+        thread_id = "thread-woken-support-audit"
+        first, first_ledger = self.prepare_owned_source(
+            graph_id="graph-woken-support-first",
+            thread_id=thread_id,
+        )
+        first_id = first.canonical_source_id
+        self.coordinator.admit_pending_inbound(
+            user_id="user-1",
+            canonical_source_id=first_id,
+            received_at=FROZEN_NOW,
+            sent_at=FROZEN_NOW,
+            saved_history_binding={
+                "schemaVersion": 1,
+                "historyKey": "history-woken-support-first",
+            },
+            index_binding={
+                "schemaVersion": 1,
+                "indexKey": "index-woken-support-first",
+            },
+        )
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=first_id,
+        )
+        self.complete_owned_source_work(
+            source_id=first_id,
+            ledger=first_ledger,
+        )
+        self.coordinator.settle_source_markers_if_ready(
+            user_id="user-1",
+            canonical_source_id=first_id,
+            ledger_hash=first_ledger["ledgerHash"],
+        )
+
+        second, second_ledger = self.prepare_owned_source(
+            graph_id="graph-woken-support-second",
+            thread_id=thread_id,
+        )
+        second_id = second.canonical_source_id
+        self.coordinator.enqueue_blocked_source(
+            user_id="user-1",
+            canonical_source_id=second_id,
+            received_at=FROZEN_NOW + timedelta(seconds=1),
+            sent_at=FROZEN_NOW + timedelta(seconds=1),
+            saved_history_binding={
+                "schemaVersion": 1,
+                "historyKey": "history-woken-support-second",
+            },
+            index_binding={
+                "schemaVersion": 1,
+                "indexKey": "index-woken-support-second",
+            },
+        )
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id=thread_id,
+            canonical_source_id=first_id,
+        )
+        self.coordinator.claim_wake_and_rebind_generation(
+            user_id="user-1",
+            thread_id=thread_id,
+            canonical_source_id=second_id,
+            wake_token=released.wake_token,
+            wake_claim_id="wake-claim-support-audit",
+        )
+        self.complete_owned_source_work(
+            source_id=second_id,
+            ledger=second_ledger,
+        )
+        self.coordinator.settle_source_markers_if_ready(
+            user_id="user-1",
+            canonical_source_id=second_id,
+            ledger_hash=second_ledger["ledgerHash"],
+        )
+
+        admission = self.fake.data[
+            f"users/user-1/inboundPendingAdmissions/{second_id}"
+        ]
+        projection = self.fake.data[
+            f"users/user-1/blockedSources/{second_id}"
+        ]
+        self.assertEqual(admission["revision"], projection["admissionRevision"])
+        self.module._validate_blocked_projection_document(
+            projection,
+            admission=admission,
+        )
+        self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id=thread_id,
+            canonical_source_id=second_id,
+        )
+
+        outstanding = self.coordinator.advance_scan_cursor_if_source_authority_clear(
+            user_id="user-1",
+            last_scan_iso="2026-08-03T12:00:00Z",
+            page_size=1,
+        )
+
+        self.assertEqual((), outstanding)
+
+    def test_revision_race_before_cursor_commit_fails_without_cursor_write(self):
+        self.settle_none_source(
+            graph_id="graph-before-race",
+            thread_id="thread-before-race",
+        )
+        racing_coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=lambda: "source-race",
+            now_factory=lambda: FROZEN_NOW,
+        )
+
+        def insert_source_before_cursor_commit(transaction):
+            if not any(
+                reference.path == "users/user-1/sync/inbox"
+                and payload is not None
+                and "lastScanISO" in payload
+                for _operation, reference, payload, _merge in transaction._operations
+            ):
+                return
+            self.fake.before_commit_hook = None
+            racing_coordinator.admit_or_repair_source_identity(
+                user_id="user-1",
+                hydrated_message={"id": "graph-racing-insert"},
+                evidence_kind="graph_hydration",
+                thread_id="thread-racing-insert",
+            )
+
+        self.fake.before_commit_hook = insert_source_before_cursor_commit
+
+        with self.assertRaises(self.module.SourceCoordinatorRetryable):
+            self.coordinator.advance_scan_cursor_if_source_authority_clear(
+                user_id="user-1",
+                last_scan_iso="2026-08-03T12:00:00Z",
+                page_size=1,
+            )
+
+        sync = self.fake.data["users/user-1/sync/inbox"]
+        self.assertNotIn("lastScanISO", sync)
+        self.assertNotIn("sourceAuthorityAuditRevision", sync)
+        self.assertTrue(
+            any(path.endswith("/source-race") for path in self.fake.data)
+        )
+
+    def test_ambiguous_cursor_readback_requires_exact_current_revision(self):
+        self.settle_none_source(
+            graph_id="graph-ambiguous-readback",
+            thread_id="thread-ambiguous-readback",
+        )
+        sync_path = "users/user-1/sync/inbox"
+        original_snapshot = self.fake._snapshot
+        revision_advanced = False
+
+        def arm_apply_then_raise(transaction):
+            if not any(
+                reference.path == sync_path
+                and payload is not None
+                and "lastScanISO" in payload
+                for _operation, reference, payload, _merge in transaction._operations
+            ):
+                return
+            self.fake.before_commit_hook = None
+            self.fake.apply_then_raise_next_commit = RuntimeError(
+                "ambiguous cursor commit"
+            )
+
+        def advance_revision_before_readback(document_ref):
+            nonlocal revision_advanced
+            if (
+                not revision_advanced
+                and document_ref.path == sync_path
+                and any(
+                    event[0] == "commit_raised_after_apply"
+                    for event in self.fake.events
+                )
+            ):
+                revision_advanced = True
+                self.fake.data[sync_path]["sourceAuthorityRevision"] += 1
+            return original_snapshot(document_ref)
+
+        self.fake.before_commit_hook = arm_apply_then_raise
+        self.fake._snapshot = advance_revision_before_readback
+
+        with self.assertRaises(self.module.SourceCoordinatorRetryable):
+            self.coordinator.advance_scan_cursor_if_source_authority_clear(
+                user_id="user-1",
+                last_scan_iso="2026-08-03T12:00:00Z",
+                page_size=1,
+            )
+
+        self.assertTrue(revision_advanced)
+        self.assertEqual(
+            "2026-08-03T12:00:00Z",
+            self.fake.data[sync_path]["lastScanISO"],
+        )
+
+    def test_audit_page_size_cannot_exceed_configured_bound(self):
+        with self.assertRaises(self.module.SourceCoordinatorConfigError):
+            self.coordinator.advance_scan_cursor_if_source_authority_clear(
+                user_id="user-1",
+                last_scan_iso="2026-08-03T12:00:00Z",
+                page_size=self.module.SOURCE_AUTHORITY_AUDIT_PAGE_SIZE + 1,
+            )
 
 
 if __name__ == "__main__":

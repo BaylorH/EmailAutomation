@@ -55,6 +55,7 @@ class FakeTs:
 class FakeDocSnap:
     def __init__(self, ref, data):
         self.reference = ref
+        self.id = ref.path[-1]
         self._data = data
 
     def to_dict(self):
@@ -212,8 +213,129 @@ class FirestoreCleanupFuzz(unittest.TestCase):
         }, store=store)
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.get_json()["success"])
-        # dead-letter + processed + changelog + thread + thread-message
-        self.assertGreaterEqual(len(ctrl.deleted), 5)
+        # Old-thread deletion is disabled until every writer shares a
+        # coordinated maintenance lock; the other three requested cleanups run.
+        self.assertEqual(3, len(ctrl.deleted))
+
+    def test_processed_cleanup_preserves_complete_and_partial_b1_authority(self):
+        store = {
+            "u1": {
+                "processedMessages": [
+                    {"id": "legacy", "data": {"processedAt": FakeTs(0.0)}},
+                    {
+                        "id": "b1-complete",
+                        "data": {
+                            "schemaVersion": 1,
+                            "sourceAliasKey": "a" * 64,
+                            "aliasType": "graph",
+                            "normalizedValueHash": "b" * 64,
+                            "canonicalSourceId": "source-1",
+                            "settlementRevision": 1,
+                            "settlementHash": "c" * 64,
+                            "processedAt": FakeTs(0.0),
+                        },
+                    },
+                    {
+                        "id": "b1-partial",
+                        "data": {
+                            "canonicalSourceId": "source-ambiguous",
+                            "processedAt": FakeTs(0.0),
+                        },
+                    },
+                ]
+            }
+        }
+
+        response, ctrl = self._post(
+            {
+                "clear_processed_messages": True,
+                "user_id": "u1",
+            },
+            store=store,
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            [("users", "u1", "processedMessages", "legacy")],
+            ctrl.deleted,
+        )
+
+    def test_old_thread_cleanup_is_disabled_without_writer_lock(self):
+        store = {
+            "u1": {
+                "threads": [
+                    {
+                        "id": "thread-legacy",
+                        "data": {"updatedAt": FakeTs(0.0)},
+                        "messages": ["message-legacy"],
+                    },
+                    {
+                        "id": "thread-b1",
+                        "data": {"updatedAt": FakeTs(0.0)},
+                        "messages": ["source-b1"],
+                    },
+                ],
+                "sourceIdentities": [
+                    {
+                        "id": "source-b1",
+                        "data": {"threadId": "thread-b1"},
+                    }
+                ],
+                "inboundPendingAdmissions": [
+                    {
+                        "id": "source-b1",
+                        "data": {"threadId": "thread-b1"},
+                    }
+                ],
+            }
+        }
+
+        response, ctrl = self._post(
+            {
+                "clear_old_threads": 30,
+                "user_id": "u1",
+            },
+            store=store,
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([], ctrl.deleted)
+        self.assertIn(
+            "disabled until a coordinated writer lock is available",
+            response.get_json()["results"]["u1"]["threads"],
+        )
+
+    def test_enforced_mode_disables_racy_legacy_old_thread_cleanup(self):
+        store = {
+            "u1": {
+                "threads": [
+                    {
+                        "id": "thread-race",
+                        "data": {"updatedAt": FakeTs(0.0)},
+                        "messages": ["source-race"],
+                    }
+                ]
+            }
+        }
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            response, ctrl = self._post(
+                {
+                    "clear_old_threads": 30,
+                    "user_id": "u1",
+                },
+                store=store,
+            )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([], ctrl.deleted)
+        self.assertIn(
+            "disabled until a coordinated writer lock is available",
+            response.get_json()["results"]["u1"]["threads"],
+        )
 
     # =====================================================================
     # ROBUST no-ops / graceful handling (expected green)

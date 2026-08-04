@@ -142,6 +142,8 @@ def _ordinary_terminal_retry_disposition_for_test(*_args, **_kwargs):
 
 class ProcessingRetryabilityTests(unittest.TestCase):
     def setUp(self):
+        processing._reset_reply_send_outcome()
+        self.addCleanup(processing._reset_reply_send_outcome)
         self._campaign_decision_patch = patch.object(
             processing,
             "get_client_automation_decision",
@@ -641,6 +643,54 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertEqual("campaign_stopped", outcome)
         queue_pending.assert_not_called()
         reconcile.assert_not_called()
+
+    def test_processing_entry_resets_prior_source_reply_outcome(self):
+        processing._set_reply_send_outcome(
+            outcome="blocked_campaign_terminal",
+            error="prior source stopped",
+            campaign_suppression_kind="terminal",
+        )
+        hydrated = MagicMock()
+        hydrated.json.return_value = {
+            "body": {"contentType": "Text", "content": "Automated reply"},
+            "hasAttachments": False,
+        }
+        message = {
+            "id": "graph-context-reset",
+            "internetMessageId": "<context-reset@example.test>",
+            "subject": "Automatic reply",
+            "from": {
+                "emailAddress": {
+                    "address": "sender@example.test",
+                    "name": "Sender",
+                }
+            },
+            "internetMessageHeaders": [
+                {"name": "Auto-Submitted", "value": "auto-replied"},
+            ],
+            "bodyPreview": "Automated reply",
+            "hasAttachments": False,
+        }
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+            clear=False,
+        ), patch.object(
+            processing,
+            "exponential_backoff_request",
+            return_value=hydrated,
+        ):
+            processing.process_inbox_message(
+                "uid-1",
+                {"Authorization": "Bearer local-test"},
+                message,
+            )
+
+        self.assertEqual(
+            processing.ReplySendOutcome(),
+            processing._get_reply_send_outcome(),
+        )
 
     def test_scan_records_unexpected_processing_crash_without_marking_processed(self):
         fake_fs = _ThreadLookupFirestore("uid-1", "thread-1", "client-1")

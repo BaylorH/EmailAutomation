@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
+from uuid import uuid4
 
 from google.cloud.firestore_v1 import transactional
 
@@ -26,6 +27,34 @@ MAX_SOURCE_WORK_ENTRIES = 128
 MAX_SOURCE_WORK_LEDGER_BYTES = 600 * 1024
 MAX_SOURCE_WORK_TRANSACTION_WRITES = 400
 MAX_BLOCKED_SOURCES_PER_THREAD = 100
+MAX_UNSETTLED_SOURCE_ADMISSIONS = 500
+SOURCE_AUTHORITY_AUDIT_PAGE_SIZE = 200
+_SOURCE_AUTHORITY_REVISION_FIELD = "sourceAuthorityRevision"
+_SOURCE_AUTHORITY_AUDIT_REVISION_FIELD = "sourceAuthorityAuditRevision"
+_SOURCE_AUTHORITY_VERDICT_COLLECTIONS = {
+    "sourceIdentities",
+    "inboundPendingAdmissions",
+    "threadTransitionHeads",
+}
+_SOURCE_AUTHORITY_SUPPORT_COLLECTIONS = (
+    "sourceAliases",
+    "sourceClassifications",
+    "sourceTransitionOwners",
+    "sourceWorkLedgers",
+    "sourceDeferredWork",
+    "blockedSources",
+    "sourceSettlements",
+)
+_SOURCE_AUTHORITY_INVENTORY_COLLECTIONS = {
+    *_SOURCE_AUTHORITY_VERDICT_COLLECTIONS,
+    *_SOURCE_AUTHORITY_SUPPORT_COLLECTIONS,
+}
+_SOURCE_PROCESSED_OWNERSHIP_FIELDS = {
+    "canonicalSourceId",
+    "settlementRevision",
+    "settlementHash",
+    "sourceAliasKey",
+}
 _SOURCE_ALIAS_KEY_DOMAIN = "source-alias-v2"
 _SOURCE_ALIAS_TYPES = {"graph", "internet_message_id"}
 _SOURCE_ADMISSION_EVIDENCE_KINDS = {"graph_hydration", "operator_replay"}
@@ -125,6 +154,10 @@ _HARD_OPTOUT_EVIDENCE_FIELDS = {
     "schemaVersion",
     "evidenceKind",
     "evidenceHash",
+}
+_LOCAL_SOURCE_POLICY_EVIDENCE_KINDS = {
+    "local_ignore_auto_reply",
+    "local_ignore_self_sender",
 }
 _TRANSITION_OWNER_SCHEMA_VERSION = 1
 _SOURCE_WORK_LEDGER_SCHEMA_VERSION = 1
@@ -333,6 +366,19 @@ _PENDING_ADMISSION_FIELDS = {
     "revision",
     "createdAt",
     "updatedAt",
+}
+_SAVED_HISTORY_BINDING_FIELDS = {
+    "schemaVersion",
+    "canonicalSourceId",
+    "threadId",
+    "historyDocumentId",
+    "historyHash",
+}
+_SOURCE_INDEX_BINDING_FIELDS = {
+    "schemaVersion",
+    "canonicalSourceId",
+    "threadId",
+    "identityDocumentId",
 }
 _BLOCKED_SOURCE_FIELDS = {
     "schemaVersion",
@@ -567,6 +613,7 @@ class SourceWorkTransitionResult:
     ledger_hash: str
     ledger_revision: int
     evidence_hash: str | None
+    newly_started: bool = False
 
 
 @dataclass(frozen=True)
@@ -590,6 +637,37 @@ class SourceSettlementResult:
 
 
 @dataclass(frozen=True)
+class DurableSourceResumeContext:
+    canonical_source_id: str
+    thread_id: str
+    resume_state: str
+    received_at: datetime
+    sent_at: datetime
+    saved_history_binding: Mapping[str, Any]
+    index_binding: Mapping[str, Any]
+    source_alias_keys: tuple[str, ...]
+    required_source_alias_key: str
+    snapshot: ClassificationSnapshot
+    owner: Mapping[str, Any]
+    ledger: Mapping[str, Any]
+    retained_history: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class DurableSourceResumeResult:
+    canonical_source_id: str
+    thread_id: str
+    state: str
+    settlement: SourceSettlementResult | None
+
+
+@dataclass(frozen=True)
+class SettledSourceReleaseCandidate:
+    canonical_source_id: str
+    thread_id: str
+
+
+@dataclass(frozen=True)
 class _SourceAdmissionEnvelope:
     aliases: Sequence[SourceAlias]
     evidence_kind: str
@@ -601,6 +679,7 @@ class _SourceIdentityTransactionPlan:
     result: SourceIdentityResult
     identity_ref: Any
     alias_refs: Sequence[Any]
+    revision_ref: Any | None
     before_state: Mapping[str, Mapping[str, Any] | None]
     expected_state: Mapping[str, Mapping[str, Any] | None]
 
@@ -696,6 +775,16 @@ class _VerifiedHardOptoutEvidence:
 
     def __init__(self, *, evidence: dict[str, Any]):
         object.__setattr__(self, "evidence", _freeze_json(deepcopy(evidence)))
+
+
+@dataclass(frozen=True, init=False)
+class _VerifiedDeterministicEvidence:
+    evidence: Mapping[str, Any]
+    hard_optout: bool
+
+    def __init__(self, *, evidence: dict[str, Any], hard_optout: bool):
+        object.__setattr__(self, "evidence", _freeze_json(deepcopy(evidence)))
+        object.__setattr__(self, "hard_optout", hard_optout)
 
 
 @dataclass(frozen=True)
@@ -887,6 +976,62 @@ def _snapshot_data(snapshot: Any) -> dict[str, Any] | None:
     if type(data) is not dict:
         raise SourceCoordinatorAmbiguous("source authority snapshot is malformed")
     return data
+
+
+def _source_authority_revision_from_sync(
+    data: Mapping[str, Any] | None,
+    *,
+    allow_missing: bool,
+) -> int | None:
+    if data is not None and type(data) is not dict:
+        raise SourceCoordinatorAmbiguous(
+            "source authority revision document is malformed"
+        )
+    has_revision = (
+        data is not None and _SOURCE_AUTHORITY_REVISION_FIELD in data
+    )
+    revision = (
+        data.get(_SOURCE_AUTHORITY_REVISION_FIELD) if has_revision else None
+    )
+    if revision is None:
+        if has_revision or not allow_missing:
+            raise SourceCoordinatorAmbiguous(
+                "source authority revision is missing"
+            )
+    elif type(revision) is not int or revision < 1:
+        raise SourceCoordinatorAmbiguous(
+            "source authority revision is malformed"
+        )
+    if data is not None and _SOURCE_AUTHORITY_AUDIT_REVISION_FIELD in data:
+        audited_revision = data[_SOURCE_AUTHORITY_AUDIT_REVISION_FIELD]
+        if (
+            type(audited_revision) is not int
+            or audited_revision < 0
+            or (revision is None and audited_revision != 0)
+            or (revision is not None and audited_revision > revision)
+        ):
+            raise SourceCoordinatorAmbiguous(
+                "source authority audit revision is malformed"
+            )
+    return revision
+
+
+def _scan_cursor_datetime(value: str, *, field_name: str) -> datetime:
+    if type(value) is not str or not value:
+        raise SourceCoordinatorConfigError(
+            f"{field_name} must be an aware ISO timestamp"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise SourceCoordinatorConfigError(
+            f"{field_name} must be an aware ISO timestamp"
+        ) from exc
+    if not _is_aware_datetime(parsed):
+        raise SourceCoordinatorConfigError(
+            f"{field_name} must be an aware ISO timestamp"
+        )
+    return parsed.astimezone(timezone.utc)
 
 
 def _validate_user_id(user_id: str) -> None:
@@ -2401,6 +2546,89 @@ def _validate_pending_admission_document(
         )
 
 
+def _validate_source_resume_bindings(
+    admission: Mapping[str, Any],
+    *,
+    canonical_source_id: str,
+    thread_id: str,
+) -> None:
+    history_binding = admission["savedHistoryBinding"]
+    index_binding = admission["indexBinding"]
+    if (
+        type(history_binding) is not dict
+        or set(history_binding) != _SAVED_HISTORY_BINDING_FIELDS
+        or not _is_exact_schema_version(history_binding.get("schemaVersion"), 1)
+        or history_binding.get("canonicalSourceId") != canonical_source_id
+        or history_binding.get("threadId") != thread_id
+        or history_binding.get("historyDocumentId") != canonical_source_id
+        or not _is_sha256(history_binding.get("historyHash"))
+    ):
+        raise SourceCoordinatorAmbiguous(
+            "durable source history binding is malformed"
+        )
+    if (
+        type(index_binding) is not dict
+        or set(index_binding) != _SOURCE_INDEX_BINDING_FIELDS
+        or not _is_exact_schema_version(index_binding.get("schemaVersion"), 1)
+        or index_binding.get("canonicalSourceId") != canonical_source_id
+        or index_binding.get("threadId") != thread_id
+        or index_binding.get("identityDocumentId") != canonical_source_id
+    ):
+        raise SourceCoordinatorAmbiguous(
+            "durable source index binding is malformed"
+        )
+
+
+def _validate_retained_source_history_document(
+    data: Mapping[str, Any],
+    *,
+    canonical_source_id: str,
+    thread_id: str,
+    expected_history_hash: str,
+) -> None:
+    if type(data) is not dict:
+        raise SourceCoordinatorAmbiguous(
+            "durable source history document is malformed"
+        )
+    retained = deepcopy(data)
+    retained_canonical_source_id = retained.pop("canonicalSourceId", None)
+    retained_history_hash = retained.pop("historyHash", None)
+    retained_semantic_hash = retained.pop("semanticHistoryHash", None)
+    retained_semantic_message = deepcopy(retained)
+    retained_headers = retained_semantic_message.get("headers")
+    if isinstance(retained_headers, dict):
+        retained_headers.pop("internetMessageId", None)
+    retained_envelope = retained_semantic_message.get("sourceMessage")
+    if isinstance(retained_envelope, dict):
+        retained_envelope.pop("graphMessageId", None)
+        retained_envelope.pop("internetMessageId", None)
+    expected_full_hash = canonical_json_hash(
+        {
+            "schemaVersion": 1,
+            "canonicalSourceId": canonical_source_id,
+            "threadId": thread_id,
+            "message": retained,
+        }
+    )
+    expected_semantic_hash = canonical_json_hash(
+        {
+            "schemaVersion": 1,
+            "canonicalSourceId": canonical_source_id,
+            "threadId": thread_id,
+            "message": retained_semantic_message,
+        }
+    )
+    if (
+        retained_canonical_source_id != canonical_source_id
+        or retained_history_hash != expected_full_hash
+        or retained_history_hash != expected_history_hash
+        or retained_semantic_hash != expected_semantic_hash
+    ):
+        raise SourceCoordinatorAmbiguous(
+            "durable source history conflicts with admission authority"
+        )
+
+
 def _initial_pending_admission_document(
     immutable: Mapping[str, Any],
     *,
@@ -2558,7 +2786,11 @@ def _build_classification_snapshot_material(
         _derive_classification_selection(
             canonical_source_id=canonical_source_id,
             complete_proposal=normalized_proposal,
-            deterministic_hard_optout=copied_deterministic_evidence is not None,
+            deterministic_hard_optout=(
+                copied_deterministic_evidence is not None
+                and copied_deterministic_evidence.get("evidenceKind")
+                not in _LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
+            ),
         )
     )
     complete_proposal_hash = canonical_json_hash(normalized_proposal)
@@ -2947,6 +3179,7 @@ class SourceCoordinator:
         uuid_factory,
         now_factory,
         hard_optout_verifier=None,
+        local_source_policy_verifier=None,
     ):
         if (
             firestore_client is None
@@ -2956,6 +3189,10 @@ class SourceCoordinator:
                 hard_optout_verifier is not None
                 and not callable(hard_optout_verifier)
             )
+            or (
+                local_source_policy_verifier is not None
+                and not callable(local_source_policy_verifier)
+            )
         ):
             raise SourceCoordinatorConfigError(
                 "source coordinator dependencies are invalid"
@@ -2964,6 +3201,7 @@ class SourceCoordinator:
         self._uuid_factory = uuid_factory
         self._now_factory = now_factory
         self._hard_optout_verifier = hard_optout_verifier
+        self._local_source_policy_verifier = local_source_policy_verifier
 
     def _classification_refs(self, *, user_id: str, canonical_source_id: str):
         user_ref = self._firestore.collection("users").document(user_id)
@@ -3176,6 +3414,135 @@ class SourceCoordinator:
             else:
                 transaction.set(reference, deepcopy(expected))
 
+    @staticmethod
+    def _source_sync_ref(user_ref):
+        return user_ref.collection("sync").document("inbox")
+
+    def _read_source_authority_revision(
+        self,
+        *,
+        transaction,
+        user_ref,
+        allow_missing: bool,
+    ) -> tuple[Any, Mapping[str, Any] | None, int | None]:
+        sync_ref = self._source_sync_ref(user_ref)
+        sync_data = _snapshot_data(sync_ref.get(transaction=transaction))
+        revision = _source_authority_revision_from_sync(
+            sync_data,
+            allow_missing=allow_missing,
+        )
+        return sync_ref, sync_data, revision
+
+    def _require_source_authority_revision(
+        self,
+        *,
+        transaction,
+        user_ref,
+        expected_revision: int | None,
+    ) -> tuple[Any, Mapping[str, Any] | None]:
+        sync_ref, sync_data, revision = self._read_source_authority_revision(
+            transaction=transaction,
+            user_ref=user_ref,
+            allow_missing=expected_revision is None,
+        )
+        if revision != expected_revision:
+            raise SourceCoordinatorRetryable(
+                "source authority changed during cursor audit"
+            )
+        return sync_ref, sync_data
+
+    def _require_empty_source_authority_inventory(
+        self,
+        *,
+        transaction,
+        user_ref,
+    ) -> None:
+        for collection_name in sorted(_SOURCE_AUTHORITY_INVENTORY_COLLECTIONS):
+            query = user_ref.collection(collection_name).order_by(
+                "__name__"
+            ).limit(1)
+            if list(transaction.get(query)):
+                raise SourceCoordinatorAmbiguous(
+                    "source authority exists without an inventory revision"
+                )
+
+    def _next_source_authority_revision_mutation(
+        self,
+        *,
+        transaction,
+        user_ref,
+        allow_first_identity: bool,
+    ) -> tuple[Any, Mapping[str, Any] | None, Mapping[str, Any]]:
+        sync_ref, sync_before, revision = self._read_source_authority_revision(
+            transaction=transaction,
+            user_ref=user_ref,
+            allow_missing=allow_first_identity,
+        )
+        if revision is None:
+            if not allow_first_identity:
+                raise SourceCoordinatorAmbiguous(
+                    "source authority revision is missing"
+                )
+            self._require_empty_source_authority_inventory(
+                transaction=transaction,
+                user_ref=user_ref,
+            )
+            next_revision = 1
+        else:
+            next_revision = revision + 1
+        sync_expected = deepcopy(sync_before) if sync_before is not None else {}
+        sync_expected.update(
+            {
+                _SOURCE_AUTHORITY_REVISION_FIELD: next_revision,
+                "updatedAt": self._current_time(),
+            }
+        )
+        return sync_ref, sync_before, sync_expected
+
+    def _stage_source_authority_mutations(
+        self,
+        transaction,
+        *,
+        user_ref,
+        mutations,
+    ) -> tuple[
+        tuple[Any, Mapping[str, Any] | None, Mapping[str, Any] | None], ...
+    ]:
+        staged = tuple(mutations)
+
+        def affects_audit_verdict(reference, before, expected) -> bool:
+            path_parts = reference.path.split("/")
+            if len(path_parts) < 2:
+                return False
+            collection_name = path_parts[-2]
+            if collection_name in _SOURCE_AUTHORITY_VERDICT_COLLECTIONS:
+                return True
+            if collection_name != "processedMessages":
+                return False
+            return any(
+                type(value) is dict
+                and any(
+                    field in value
+                    for field in _SOURCE_PROCESSED_OWNERSHIP_FIELDS
+                )
+                for value in (before, expected)
+            )
+
+        verdict_change = any(
+            affects_audit_verdict(reference, before, expected)
+            for reference, before, expected in staged
+            if before != expected
+        )
+        if verdict_change:
+            revision_mutation = self._next_source_authority_revision_mutation(
+                transaction=transaction,
+                user_ref=user_ref,
+                allow_first_identity=False,
+            )
+            staged = (*staged, revision_mutation)
+        self._stage_document_mutations(transaction, staged)
+        return staged
+
     def _read_source_authority_bundle(
         self,
         *,
@@ -3281,6 +3648,1656 @@ class SourceCoordinator:
             admissions.append((snapshot.reference, data))
         admissions.sort(key=lambda item: item[1]["canonicalSourceId"])
         return admissions
+
+    def _run_source_authority_audit_read(
+        self,
+        *,
+        user_ref,
+        expected_revision: int | None,
+        read,
+    ):
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "source authority audit transaction is unavailable"
+            ) from transaction_error
+
+        @transactional
+        def read_once(active_transaction):
+            self._require_source_authority_revision(
+                transaction=active_transaction,
+                user_ref=user_ref,
+                expected_revision=expected_revision,
+            )
+            return read(active_transaction)
+
+        try:
+            return read_once(transaction)
+        except SourceCoordinatorError:
+            raise
+        except Exception as read_error:
+            raise SourceCoordinatorRetryable(
+                "source authority audit read is unavailable"
+            ) from read_error
+
+    def _source_authority_query_pages(
+        self,
+        *,
+        user_ref,
+        expected_revision: int | None,
+        query,
+        page_size: int,
+    ):
+        cursor = None
+        while True:
+            def read_page(transaction):
+                page_query = query.limit(page_size)
+                if cursor is not None:
+                    page_query = page_query.start_after(cursor)
+                return tuple(transaction.get(page_query))
+
+            page = self._run_source_authority_audit_read(
+                user_ref=user_ref,
+                expected_revision=expected_revision,
+                read=read_page,
+            )
+            if not page:
+                return
+            if expected_revision is None:
+                raise SourceCoordinatorAmbiguous(
+                    "source authority exists without an inventory revision"
+                )
+            yield page
+            if len(page) < page_size:
+                return
+            cursor = page[-1]
+
+    def _audit_source_identity(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+    ) -> bool:
+        identity_collection = user_ref.collection("sourceIdentities")
+        admission_collection = user_ref.collection("inboundPendingAdmissions")
+        identity_data = self._require_source_identity_snapshot(
+            identity_collection.document(canonical_source_id).get(
+                transaction=transaction
+            ),
+            canonical_source_id=canonical_source_id,
+        )
+        admission_data = _snapshot_data(
+            admission_collection.document(canonical_source_id).get(
+                transaction=transaction
+            )
+        )
+        if admission_data is None:
+            return True
+        thread_id = admission_data.get("threadId")
+        _validate_document_id(thread_id, field_name="thread id")
+        _validate_pending_admission_document(
+            admission_data,
+            canonical_source_id=canonical_source_id,
+            thread_id=thread_id,
+        )
+        bundle = self._read_source_authority_bundle(
+            transaction=transaction,
+            user_ref=user_ref,
+            canonical_source_id=canonical_source_id,
+            expected_thread_id=thread_id,
+        )
+        _validate_admission_authority_bindings(
+            admission_data,
+            identity_data=bundle[0][1],
+            classification_data=bundle[1][1],
+            owner_data=bundle[2][1],
+            ledger_data=bundle[3][1],
+        )
+        if admission_data["admissionState"] != "settled":
+            return True
+        settlement_data = _snapshot_data(
+            user_ref.collection("sourceSettlements")
+            .document(canonical_source_id)
+            .get(transaction=transaction)
+        )
+        if settlement_data is None:
+            raise SourceSettlementConflict(
+                "settled admission lacks canonical settlement authority"
+            )
+        aliases = _validated_identity_descriptors(
+            identity_data,
+            canonical_source_id=canonical_source_id,
+        )
+        _validate_source_settlement_document(
+            settlement_data,
+            canonical_source_id=canonical_source_id,
+            identity_data=identity_data,
+            classification_data=bundle[1][1],
+            owner_data=bundle[2][1],
+            ledger_data=bundle[3][1],
+            current_aliases=aliases,
+        )
+        if bundle[2][1]["ownerKind"] != "none":
+            self._audit_settled_owned_source_head(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+                admission_data=admission_data,
+                owner_data=bundle[2][1],
+                settlement_data=settlement_data,
+            )
+        for descriptor in aliases:
+            alias_key = descriptor["sourceAliasKey"]
+            alias_owner_data = _snapshot_data(
+                user_ref.collection("sourceAliases")
+                .document(alias_key)
+                .get(transaction=transaction)
+            )
+            if alias_owner_data is None:
+                raise SourceSettlementConflict(
+                    "settled source alias lacks retained owner authority"
+                )
+            _validate_alias_projection(
+                alias_owner_data,
+                descriptor=descriptor,
+                canonical_source_id=canonical_source_id,
+            )
+            processed_data = _snapshot_data(
+                user_ref.collection("processedMessages")
+                .document(alias_key)
+                .get(transaction=transaction)
+            )
+            if processed_data is None:
+                raise SourceSettlementConflict(
+                    "settled source alias lacks processed projection"
+                )
+            _validate_processed_alias_projection(
+                processed_data,
+                descriptor=descriptor,
+                canonical_source_id=canonical_source_id,
+                settlement_data=settlement_data,
+            )
+        return False
+
+    def _audit_settled_owned_source_head(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+        admission_data: Mapping[str, Any],
+        owner_data: Mapping[str, Any],
+        settlement_data: Mapping[str, Any],
+    ) -> None:
+        thread_id = admission_data["threadId"]
+        head_data = _snapshot_data(
+            user_ref.collection("threadTransitionHeads")
+            .document(thread_id)
+            .get(transaction=transaction)
+        )
+        if head_data is None:
+            raise ThreadTransitionConflict(
+                "settled owned source lacks a thread head outcome"
+            )
+        _validate_thread_head_document(head_data, thread_id=thread_id)
+        retained_generation = admission_data["wakeGeneration"]
+        minimum_generation = (
+            retained_generation if retained_generation is not None else 1
+        )
+        if head_data["activeCanonicalSourceId"] == canonical_source_id:
+            if (
+                head_data["activeState"] not in {"active", "releasing"}
+                or head_data["activeOwnerKind"] != owner_data["ownerKind"]
+                or head_data["activeOwnerKey"] != owner_data["ownerKey"]
+                or (
+                    retained_generation is not None
+                    and head_data["activeGeneration"] != retained_generation
+                )
+            ):
+                raise ThreadTransitionConflict(
+                    "settled owned source conflicts with its thread head outcome"
+                )
+            return
+        if (
+            head_data["activeGeneration"] < minimum_generation
+            or head_data["threadHeadRevision"] < 2
+            or head_data["updatedAt"] < settlement_data["settledAt"]
+            or (
+                head_data["activeState"] != "clear"
+                and head_data["activeGeneration"] <= minimum_generation
+            )
+        ):
+            raise ThreadTransitionConflict(
+                "settled owned source lacks a valid post-release head outcome"
+            )
+
+    def _audit_source_admission(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+    ) -> None:
+        admission_data = _snapshot_data(
+            user_ref.collection("inboundPendingAdmissions")
+            .document(canonical_source_id)
+            .get(transaction=transaction)
+        )
+        if admission_data is None:
+            raise SourceCoordinatorAmbiguous(
+                "canonical source audit returned an absent admission"
+            )
+        thread_id = admission_data.get("threadId")
+        _validate_document_id(thread_id, field_name="thread id")
+        _validate_pending_admission_document(
+            admission_data,
+            canonical_source_id=canonical_source_id,
+            thread_id=thread_id,
+        )
+        self._require_source_identity_snapshot(
+            user_ref.collection("sourceIdentities")
+            .document(canonical_source_id)
+            .get(transaction=transaction),
+            canonical_source_id=canonical_source_id,
+        )
+
+    @staticmethod
+    def _require_support_document(
+        *,
+        transaction,
+        user_ref,
+        collection_name: str,
+        document_id: str,
+    ) -> Mapping[str, Any]:
+        data = _snapshot_data(
+            user_ref.collection(collection_name)
+            .document(document_id)
+            .get(transaction=transaction)
+        )
+        if data is None:
+            raise SourceCoordinatorAmbiguous(
+                "source authority support audit returned an absent document"
+            )
+        return data
+
+    def _audit_source_alias_support(
+        self,
+        *,
+        transaction,
+        user_ref,
+        alias_key: str,
+    ) -> None:
+        if not _is_sha256(alias_key):
+            raise SourceAliasConflict("source alias document key is malformed")
+        alias_data = self._require_support_document(
+            transaction=transaction,
+            user_ref=user_ref,
+            collection_name="sourceAliases",
+            document_id=alias_key,
+        )
+        canonical_source_id = alias_data.get("canonicalSourceId")
+        try:
+            _validate_document_id(
+                canonical_source_id,
+                field_name="canonical source id",
+            )
+        except SourceCoordinatorConfigError as source_error:
+            raise SourceAliasConflict(
+                "source alias owner is malformed"
+            ) from source_error
+        identity_data = self._require_source_identity_snapshot(
+            user_ref.collection("sourceIdentities")
+            .document(canonical_source_id)
+            .get(transaction=transaction),
+            canonical_source_id=canonical_source_id,
+        )
+        descriptors = _validated_identity_descriptors(
+            identity_data,
+            canonical_source_id=canonical_source_id,
+        )
+        descriptor = next(
+            (
+                candidate
+                for candidate in descriptors
+                if candidate["sourceAliasKey"] == alias_key
+            ),
+            None,
+        )
+        if descriptor is None:
+            raise SourceAliasConflict(
+                "source alias projection is absent from identity authority"
+            )
+        _validate_alias_projection(
+            alias_data,
+            descriptor=descriptor,
+            canonical_source_id=canonical_source_id,
+        )
+
+    def _audit_source_classification_support(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+    ) -> Mapping[str, Any]:
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        self._require_source_identity_snapshot(
+            user_ref.collection("sourceIdentities")
+            .document(canonical_source_id)
+            .get(transaction=transaction),
+            canonical_source_id=canonical_source_id,
+        )
+        classification_data = self._require_support_document(
+            transaction=transaction,
+            user_ref=user_ref,
+            collection_name="sourceClassifications",
+            document_id=canonical_source_id,
+        )
+        _validate_classification_document(
+            classification_data,
+            canonical_source_id=canonical_source_id,
+        )
+        return classification_data
+
+    def _audit_source_owner_support(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+    ) -> Mapping[str, Any]:
+        classification_data = self._audit_source_classification_support(
+            transaction=transaction,
+            user_ref=user_ref,
+            canonical_source_id=canonical_source_id,
+        )
+        if classification_data["classificationState"] != "snapshot_ready":
+            raise TransitionOwnerConflict(
+                "transition owner lacks snapshot-ready classification authority"
+            )
+        owner_data = self._require_support_document(
+            transaction=transaction,
+            user_ref=user_ref,
+            collection_name="sourceTransitionOwners",
+            document_id=canonical_source_id,
+        )
+        _validate_transition_owner_document(
+            owner_data,
+            canonical_source_id=canonical_source_id,
+            classification_data=classification_data,
+        )
+        return owner_data
+
+    def _audit_source_ledger_support(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+    ) -> tuple[
+        tuple[Any, Mapping[str, Any]],
+        tuple[Any, Mapping[str, Any]],
+        tuple[Any, Mapping[str, Any]],
+        tuple[Any, Mapping[str, Any]],
+    ]:
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        return self._read_source_authority_bundle(
+            transaction=transaction,
+            user_ref=user_ref,
+            canonical_source_id=canonical_source_id,
+        )
+
+    def _audit_source_deferred_work_support(
+        self,
+        *,
+        transaction,
+        user_ref,
+        work_key: str,
+    ) -> None:
+        if not _is_sha256(work_key):
+            raise DeferredWorkConflict(
+                "source deferred-work document key is malformed"
+            )
+        deferred_data = self._require_support_document(
+            transaction=transaction,
+            user_ref=user_ref,
+            collection_name="sourceDeferredWork",
+            document_id=work_key,
+        )
+        canonical_source_id = deferred_data.get("canonicalSourceId")
+        try:
+            _validate_document_id(
+                canonical_source_id,
+                field_name="canonical source id",
+            )
+        except SourceCoordinatorConfigError as source_error:
+            raise DeferredWorkConflict(
+                "source deferred-work owner is malformed"
+            ) from source_error
+        bundle = self._audit_source_ledger_support(
+            transaction=transaction,
+            user_ref=user_ref,
+            canonical_source_id=canonical_source_id,
+        )
+        ledger_data = bundle[3][1]
+        try:
+            _entry_index, entry = _find_bound_source_work_entry(
+                ledger_data,
+                ledger_hash=deferred_data.get("ledgerHash"),
+                work_key=work_key,
+                payload_hash=deferred_data.get("entryPayloadHash"),
+            )
+            expected_immutable = _source_deferred_work_immutable_material(
+                canonical_source_id=canonical_source_id,
+                ledger_hash=ledger_data["ledgerHash"],
+                entry=entry,
+            )
+        except SourceCoordinatorError as binding_error:
+            raise DeferredWorkConflict(
+                "source deferred work lacks a bound ledger entry"
+            ) from binding_error
+        _validate_source_deferred_work_document(
+            deferred_data,
+            expected_immutable=expected_immutable,
+        )
+        if (
+            entry["state"] != "delegated"
+            or entry["resolutionEvidence"]["deferredBindingHash"]
+            != deferred_data["bindingHash"]
+        ):
+            raise DeferredWorkConflict(
+                "source deferred work lacks delegated ledger authority"
+            )
+
+    def _audit_blocked_source_support(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+    ) -> None:
+        bundle = self._audit_source_ledger_support(
+            transaction=transaction,
+            user_ref=user_ref,
+            canonical_source_id=canonical_source_id,
+        )
+        identity_data = bundle[0][1]
+        admission_data = _snapshot_data(
+            user_ref.collection("inboundPendingAdmissions")
+            .document(canonical_source_id)
+            .get(transaction=transaction)
+        )
+        if admission_data is None:
+            raise ThreadTransitionConflict(
+                "blocked source projection lacks an admission"
+            )
+        _validate_pending_admission_document(
+            admission_data,
+            canonical_source_id=canonical_source_id,
+            thread_id=identity_data["threadId"],
+        )
+        _validate_admission_authority_bindings(
+            admission_data,
+            identity_data=identity_data,
+            classification_data=bundle[1][1],
+            owner_data=bundle[2][1],
+            ledger_data=bundle[3][1],
+        )
+        projection_data = self._require_support_document(
+            transaction=transaction,
+            user_ref=user_ref,
+            collection_name="blockedSources",
+            document_id=canonical_source_id,
+        )
+        _validate_blocked_projection_document(
+            projection_data,
+            admission=admission_data,
+        )
+
+    def _audit_source_settlement_support(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+    ) -> None:
+        bundle = self._audit_source_ledger_support(
+            transaction=transaction,
+            user_ref=user_ref,
+            canonical_source_id=canonical_source_id,
+        )
+        identity_data = bundle[0][1]
+        admission_data = _snapshot_data(
+            user_ref.collection("inboundPendingAdmissions")
+            .document(canonical_source_id)
+            .get(transaction=transaction)
+        )
+        if admission_data is None:
+            raise SourceSettlementConflict(
+                "source settlement lacks an admission"
+            )
+        _validate_pending_admission_document(
+            admission_data,
+            canonical_source_id=canonical_source_id,
+            thread_id=identity_data["threadId"],
+        )
+        _validate_admission_authority_bindings(
+            admission_data,
+            identity_data=identity_data,
+            classification_data=bundle[1][1],
+            owner_data=bundle[2][1],
+            ledger_data=bundle[3][1],
+        )
+        if admission_data["admissionState"] != "settled":
+            raise SourceSettlementConflict(
+                "source settlement lacks settled admission authority"
+            )
+        settlement_data = self._require_support_document(
+            transaction=transaction,
+            user_ref=user_ref,
+            collection_name="sourceSettlements",
+            document_id=canonical_source_id,
+        )
+        _validate_source_settlement_document(
+            settlement_data,
+            canonical_source_id=canonical_source_id,
+            identity_data=identity_data,
+            classification_data=bundle[1][1],
+            owner_data=bundle[2][1],
+            ledger_data=bundle[3][1],
+            current_aliases=_validated_identity_descriptors(
+                identity_data,
+                canonical_source_id=canonical_source_id,
+            ),
+        )
+
+    def _audit_source_authority_support_document(
+        self,
+        *,
+        transaction,
+        user_ref,
+        collection_name: str,
+        document_id: str,
+    ) -> None:
+        if collection_name == "sourceAliases":
+            self._audit_source_alias_support(
+                transaction=transaction,
+                user_ref=user_ref,
+                alias_key=document_id,
+            )
+            return
+        if collection_name == "sourceClassifications":
+            self._audit_source_classification_support(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=document_id,
+            )
+            return
+        if collection_name == "sourceTransitionOwners":
+            self._audit_source_owner_support(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=document_id,
+            )
+            return
+        if collection_name == "sourceWorkLedgers":
+            self._audit_source_ledger_support(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=document_id,
+            )
+            return
+        if collection_name == "sourceDeferredWork":
+            self._audit_source_deferred_work_support(
+                transaction=transaction,
+                user_ref=user_ref,
+                work_key=document_id,
+            )
+            return
+        if collection_name == "blockedSources":
+            self._audit_blocked_source_support(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=document_id,
+            )
+            return
+        if collection_name == "sourceSettlements":
+            self._audit_source_settlement_support(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=document_id,
+            )
+            return
+        raise SourceCoordinatorConfigError(
+            "source authority support collection is unsupported"
+        )
+
+    def _audit_source_authority_support_collection(
+        self,
+        *,
+        user_ref,
+        expected_revision: int | None,
+        collection_name: str,
+        page_size: int,
+    ) -> None:
+        query = user_ref.collection(collection_name).order_by("__name__")
+        for page in self._source_authority_query_pages(
+            user_ref=user_ref,
+            expected_revision=expected_revision,
+            query=query,
+            page_size=page_size,
+        ):
+            for snapshot in page:
+                self._run_source_authority_audit_read(
+                    user_ref=user_ref,
+                    expected_revision=expected_revision,
+                    read=lambda transaction, document_id=snapshot.id: (
+                        self._audit_source_authority_support_document(
+                            transaction=transaction,
+                            user_ref=user_ref,
+                            collection_name=collection_name,
+                            document_id=document_id,
+                        )
+                    ),
+                )
+
+    def _audit_thread_head(
+        self,
+        *,
+        transaction,
+        user_ref,
+        thread_id: str,
+    ) -> str | None:
+        head_data = _snapshot_data(
+            user_ref.collection("threadTransitionHeads")
+            .document(thread_id)
+            .get(transaction=transaction)
+        )
+        if head_data is None:
+            raise SourceCoordinatorAmbiguous(
+                "thread head audit returned an absent document"
+            )
+        _validate_thread_head_document(head_data, thread_id=thread_id)
+        if head_data["activeState"] == "clear":
+            return None
+        canonical_source_id = head_data["activeCanonicalSourceId"]
+        admission_data = _snapshot_data(
+            user_ref.collection("inboundPendingAdmissions")
+            .document(canonical_source_id)
+            .get(transaction=transaction)
+        )
+        if admission_data is None:
+            raise ThreadTransitionConflict(
+                "actionable thread head lacks source admission"
+            )
+        _validate_pending_admission_document(
+            admission_data,
+            canonical_source_id=canonical_source_id,
+            thread_id=thread_id,
+        )
+        bundle = self._read_source_authority_bundle(
+            transaction=transaction,
+            user_ref=user_ref,
+            canonical_source_id=canonical_source_id,
+            expected_thread_id=thread_id,
+        )
+        _validate_admission_authority_bindings(
+            admission_data,
+            identity_data=bundle[0][1],
+            classification_data=bundle[1][1],
+            owner_data=bundle[2][1],
+            ledger_data=bundle[3][1],
+        )
+        owner_data = bundle[2][1]
+        if (
+            head_data["activeOwnerKind"] != owner_data["ownerKind"]
+            or head_data["activeOwnerKey"] != owner_data["ownerKey"]
+        ):
+            raise ThreadTransitionConflict(
+                "actionable thread head conflicts with source owner authority"
+            )
+        if head_data["activeState"] == "releasing":
+            if admission_data["admissionState"] != "settled":
+                raise WakeReleaseConflict(
+                    "releasing thread head lacks settled source authority"
+                )
+        elif admission_data["admissionState"] not in {"processing", "settled"}:
+            raise ThreadTransitionConflict(
+                "active thread head lacks processing source authority"
+            )
+        return canonical_source_id
+
+    def _source_authority_audit(
+        self,
+        *,
+        user_id: str,
+        max_records: int,
+        page_size: int,
+    ) -> tuple[int | None, tuple[str, ...]]:
+        user_ref = self._firestore.collection("users").document(user_id)
+        try:
+            _sync_ref, sync_data, expected_revision = (
+                self._read_source_authority_revision(
+                    transaction=None,
+                    user_ref=user_ref,
+                    allow_missing=True,
+                )
+            )
+        except SourceCoordinatorError:
+            raise
+        except Exception as revision_error:
+            raise SourceCoordinatorRetryable(
+                "source authority revision is unavailable"
+            ) from revision_error
+        del sync_data
+        unsettled: set[str] = set()
+
+        def add_unsettled(canonical_source_id: str) -> None:
+            unsettled.add(canonical_source_id)
+            if len(unsettled) > max_records:
+                raise SourceCoordinatorConfigError(
+                    "unsettled canonical source count exceeds its safe bound"
+                )
+
+        identity_query = user_ref.collection("sourceIdentities").order_by(
+            "__name__"
+        )
+        for page in self._source_authority_query_pages(
+            user_ref=user_ref,
+            expected_revision=expected_revision,
+            query=identity_query,
+            page_size=page_size,
+        ):
+            for snapshot in page:
+                canonical_source_id = snapshot.id
+                is_unsettled = self._run_source_authority_audit_read(
+                    user_ref=user_ref,
+                    expected_revision=expected_revision,
+                    read=lambda transaction, source_id=canonical_source_id: (
+                        self._audit_source_identity(
+                            transaction=transaction,
+                            user_ref=user_ref,
+                            canonical_source_id=source_id,
+                        )
+                    ),
+                )
+                if is_unsettled:
+                    add_unsettled(canonical_source_id)
+
+        admission_query = user_ref.collection(
+            "inboundPendingAdmissions"
+        ).order_by("__name__")
+        for page in self._source_authority_query_pages(
+            user_ref=user_ref,
+            expected_revision=expected_revision,
+            query=admission_query,
+            page_size=page_size,
+        ):
+            for snapshot in page:
+                canonical_source_id = snapshot.id
+                self._run_source_authority_audit_read(
+                    user_ref=user_ref,
+                    expected_revision=expected_revision,
+                    read=lambda transaction, source_id=canonical_source_id: (
+                        self._audit_source_admission(
+                            transaction=transaction,
+                            user_ref=user_ref,
+                            canonical_source_id=source_id,
+                        )
+                    ),
+                )
+
+        head_query = user_ref.collection("threadTransitionHeads").order_by(
+            "__name__"
+        )
+        for page in self._source_authority_query_pages(
+            user_ref=user_ref,
+            expected_revision=expected_revision,
+            query=head_query,
+            page_size=page_size,
+        ):
+            for snapshot in page:
+                actionable_source_id = self._run_source_authority_audit_read(
+                    user_ref=user_ref,
+                    expected_revision=expected_revision,
+                    read=lambda transaction, head_id=snapshot.id: (
+                        self._audit_thread_head(
+                            transaction=transaction,
+                            user_ref=user_ref,
+                            thread_id=head_id,
+                        )
+                    ),
+                )
+                if actionable_source_id is not None:
+                    add_unsettled(actionable_source_id)
+
+        for collection_name in _SOURCE_AUTHORITY_SUPPORT_COLLECTIONS:
+            self._audit_source_authority_support_collection(
+                user_ref=user_ref,
+                expected_revision=expected_revision,
+                collection_name=collection_name,
+                page_size=page_size,
+            )
+
+        self._run_source_authority_audit_read(
+            user_ref=user_ref,
+            expected_revision=expected_revision,
+            read=lambda _transaction: None,
+        )
+        return expected_revision, tuple(sorted(unsettled))
+
+    def unsettled_source_admission_ids(
+        self,
+        *,
+        user_id: str,
+        max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+        page_size: int = SOURCE_AUTHORITY_AUDIT_PAGE_SIZE,
+    ) -> tuple[str, ...]:
+        """Boundedly prove every retained canonical identity is settled."""
+        _validate_user_id(user_id)
+        max_records = _validate_positive_integer(
+            max_records,
+            field_name="unsettled admission audit limit",
+        )
+        page_size = _validate_positive_integer(
+            page_size,
+            field_name="source authority audit page size",
+        )
+        if page_size > SOURCE_AUTHORITY_AUDIT_PAGE_SIZE:
+            raise SourceCoordinatorConfigError(
+                "source authority audit page size exceeds its safe bound"
+            )
+        _revision, unsettled = self._source_authority_audit(
+            user_id=user_id,
+            max_records=max_records,
+            page_size=page_size,
+        )
+        return unsettled
+
+    def advance_scan_cursor_if_source_authority_clear(
+        self,
+        *,
+        user_id: str,
+        last_scan_iso: str,
+        max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+        page_size: int = SOURCE_AUTHORITY_AUDIT_PAGE_SIZE,
+    ) -> tuple[str, ...]:
+        """Audit all B1 source authority before one fenced cursor write."""
+        _validate_user_id(user_id)
+        requested_cursor = _scan_cursor_datetime(
+            last_scan_iso,
+            field_name="last scan cursor",
+        )
+        max_records = _validate_positive_integer(
+            max_records,
+            field_name="unsettled admission audit limit",
+        )
+        page_size = _validate_positive_integer(
+            page_size,
+            field_name="source authority audit page size",
+        )
+        if page_size > SOURCE_AUTHORITY_AUDIT_PAGE_SIZE:
+            raise SourceCoordinatorConfigError(
+                "source authority audit page size exceeds its safe bound"
+            )
+        expected_revision, unsettled = self._source_authority_audit(
+            user_id=user_id,
+            max_records=max_records,
+            page_size=page_size,
+        )
+        if unsettled:
+            return unsettled
+
+        user_ref = self._firestore.collection("users").document(user_id)
+        expected_sync_data = None
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "source cursor transaction is unavailable"
+            ) from transaction_error
+
+        @transactional
+        def advance_once(active_transaction):
+            nonlocal expected_sync_data
+            sync_ref, sync_before = self._require_source_authority_revision(
+                transaction=active_transaction,
+                user_ref=user_ref,
+                expected_revision=expected_revision,
+            )
+            if expected_revision is None:
+                self._require_empty_source_authority_inventory(
+                    transaction=active_transaction,
+                    user_ref=user_ref,
+                )
+            current_cursor_value = (
+                sync_before.get("lastScanISO")
+                if sync_before is not None
+                else None
+            )
+            if current_cursor_value is not None:
+                try:
+                    current_cursor = _scan_cursor_datetime(
+                        current_cursor_value,
+                        field_name="stored last scan cursor",
+                    )
+                except SourceCoordinatorConfigError as cursor_error:
+                    raise SourceCoordinatorAmbiguous(
+                        "stored last scan cursor is malformed"
+                    ) from cursor_error
+                if current_cursor > requested_cursor:
+                    return False
+            expected_sync_data = (
+                deepcopy(sync_before) if sync_before is not None else {}
+            )
+            expected_sync_data.update(
+                {
+                    "lastScanISO": last_scan_iso,
+                    _SOURCE_AUTHORITY_AUDIT_REVISION_FIELD: (
+                        0 if expected_revision is None else expected_revision
+                    ),
+                    "updatedAt": self._current_time(),
+                }
+            )
+            active_transaction.set(sync_ref, expected_sync_data)
+            return True
+
+        try:
+            advance_once(transaction)
+            return ()
+        except SourceCoordinatorError:
+            raise
+        except Exception as cursor_error:
+            try:
+                sync_data = _snapshot_data(self._source_sync_ref(user_ref).get())
+                current_revision = _source_authority_revision_from_sync(
+                    sync_data,
+                    allow_missing=expected_revision is None,
+                )
+            except Exception as readback_error:
+                raise SourceCoordinatorAmbiguous(
+                    "source cursor commit outcome is unreadable"
+                ) from readback_error
+            audited_revision = 0 if expected_revision is None else expected_revision
+            if (
+                sync_data is not None
+                and current_revision == expected_revision
+                and sync_data.get("lastScanISO") == last_scan_iso
+                and sync_data.get(_SOURCE_AUTHORITY_AUDIT_REVISION_FIELD)
+                == audited_revision
+            ):
+                return ()
+            if current_revision != expected_revision:
+                raise SourceCoordinatorRetryable(
+                    "source authority changed before cursor commit"
+                ) from cursor_error
+            if expected_sync_data is None or sync_data != expected_sync_data:
+                raise SourceCoordinatorRetryable(
+                    "source cursor commit was not applied"
+                ) from cursor_error
+            raise SourceCoordinatorAmbiguous(
+                "source cursor commit outcome is ambiguous"
+            ) from cursor_error
+
+    def durable_source_resume_contexts(
+        self,
+        *,
+        user_id: str,
+        max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+    ) -> tuple[DurableSourceResumeContext, ...]:
+        """Load claimed or claimable authority without provider mail state."""
+        _validate_user_id(user_id)
+        max_records = _validate_positive_integer(
+            max_records,
+            field_name="durable source resume limit",
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+        admission_collection = user_ref.collection("inboundPendingAdmissions")
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "durable source resume transaction is unavailable"
+            ) from transaction_error
+
+        @transactional
+        def load_once(active_transaction):
+            snapshots_by_id = {}
+            actionable_queries = (
+                admission_collection.where(
+                    "admissionState",
+                    "==",
+                    "pending",
+                ).order_by("__name__"),
+                admission_collection.where(
+                    "admissionState",
+                    "==",
+                    "processing",
+                ).order_by("__name__"),
+                admission_collection.where(
+                    "wakeState",
+                    "==",
+                    "eligible",
+                ).order_by("__name__"),
+            )
+            for query in actionable_queries:
+                for snapshot in active_transaction.get(
+                    query.limit(max_records + 1)
+                ):
+                    snapshots_by_id.setdefault(snapshot.id, snapshot)
+                    if len(snapshots_by_id) > max_records:
+                        raise SourceCoordinatorConfigError(
+                            "actionable durable source resume count exceeds its "
+                            "safe bound"
+                        )
+            snapshots = [
+                snapshots_by_id[canonical_source_id]
+                for canonical_source_id in sorted(snapshots_by_id)
+            ]
+            contexts = []
+            for snapshot in snapshots:
+                canonical_source_id = snapshot.id
+                admission_data = _snapshot_data(snapshot)
+                if admission_data is None:
+                    raise SourceCoordinatorAmbiguous(
+                        "durable source resume returned an absent admission"
+                    )
+                thread_id = admission_data.get("threadId")
+                _validate_document_id(thread_id, field_name="thread id")
+                _validate_pending_admission_document(
+                    admission_data,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                )
+                is_eligible = (
+                    admission_data["admissionState"] == "blocked"
+                    and admission_data["blockedLifecycleState"] == "eligible"
+                    and admission_data["wakeState"] == "eligible"
+                )
+                is_processing = admission_data["admissionState"] == "processing"
+                is_pending = admission_data["admissionState"] == "pending"
+                if not (is_eligible or is_processing or is_pending):
+                    continue
+                _validate_source_resume_bindings(
+                    admission_data,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                )
+                bundle = self._read_source_authority_bundle(
+                    transaction=active_transaction,
+                    user_ref=user_ref,
+                    canonical_source_id=canonical_source_id,
+                    expected_thread_id=thread_id,
+                )
+                identity_data = bundle[0][1]
+                classification_data = bundle[1][1]
+                owner_data = bundle[2][1]
+                ledger_data = bundle[3][1]
+                _validate_admission_authority_bindings(
+                    admission_data,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                )
+                if is_pending and owner_data["ownerKind"] != "none":
+                    raise ThreadTransitionConflict(
+                        "pending source resume requires an explicit none owner"
+                    )
+                if (is_eligible or is_processing) and (
+                    owner_data["ownerKind"] == "none"
+                ):
+                    raise WakeClaimConflict(
+                        "durable source resume cannot hold an explicit none owner"
+                    )
+                if is_processing:
+                    head_data = _snapshot_data(
+                        user_ref.collection("threadTransitionHeads")
+                        .document(thread_id)
+                        .get(transaction=active_transaction)
+                    )
+                    if head_data is None:
+                        raise ThreadTransitionConflict(
+                            "processing source resume lacks a thread head"
+                        )
+                    _validate_thread_head_document(
+                        head_data,
+                        thread_id=thread_id,
+                    )
+                    if (
+                        head_data["activeState"] != "active"
+                        or head_data["activeCanonicalSourceId"]
+                        != canonical_source_id
+                        or head_data["activeOwnerKind"]
+                        != owner_data["ownerKind"]
+                        or head_data["activeOwnerKey"] != owner_data["ownerKey"]
+                    ):
+                        raise ThreadTransitionConflict(
+                            "processing source resume conflicts with its head"
+                        )
+                aliases = _validated_identity_descriptors(
+                    identity_data,
+                    canonical_source_id=canonical_source_id,
+                )
+                required_alias = next(
+                    (
+                        descriptor
+                        for descriptor in aliases
+                        if descriptor["aliasType"] == "graph"
+                    ),
+                    aliases[0],
+                )
+                history_binding = admission_data["savedHistoryBinding"]
+                history_ref = (
+                    user_ref.collection("threads")
+                    .document(thread_id)
+                    .collection("messages")
+                    .document(history_binding["historyDocumentId"])
+                )
+                history_data = _snapshot_data(
+                    history_ref.get(transaction=active_transaction)
+                )
+                if history_data is None:
+                    raise SourceCoordinatorAmbiguous(
+                        "durable source resume lacks retained history"
+                    )
+                _validate_retained_source_history_document(
+                    history_data,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                    expected_history_hash=history_binding["historyHash"],
+                )
+                contexts.append(
+                    DurableSourceResumeContext(
+                        canonical_source_id=canonical_source_id,
+                        thread_id=thread_id,
+                        resume_state=(
+                            "eligible"
+                            if is_eligible
+                            else "processing"
+                            if is_processing
+                            else "pending"
+                        ),
+                        received_at=admission_data["receivedAt"],
+                        sent_at=admission_data["sentAt"],
+                        saved_history_binding=_freeze_json(
+                            deepcopy(admission_data["savedHistoryBinding"])
+                        ),
+                        index_binding=_freeze_json(
+                            deepcopy(admission_data["indexBinding"])
+                        ),
+                        source_alias_keys=tuple(
+                            descriptor["sourceAliasKey"]
+                            for descriptor in aliases
+                        ),
+                        required_source_alias_key=required_alias[
+                            "sourceAliasKey"
+                        ],
+                        snapshot=_classification_snapshot_from_data(
+                            classification_data
+                        ),
+                        owner=_freeze_json(deepcopy(owner_data)),
+                        ledger=_freeze_json(deepcopy(ledger_data)),
+                        retained_history=_freeze_json(deepcopy(history_data)),
+                    )
+                )
+            contexts.sort(
+                key=lambda context: (
+                    context.received_at,
+                    context.sent_at,
+                    context.thread_id,
+                    context.canonical_source_id,
+                )
+            )
+            return tuple(contexts)
+
+        try:
+            return load_once(transaction)
+        except SourceCoordinatorError:
+            raise
+        except Exception as load_error:
+            raise SourceCoordinatorRetryable(
+                "durable source resume authority is unavailable"
+            ) from load_error
+
+    def settled_source_release_candidates(
+        self,
+        *,
+        user_id: str,
+        max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+    ) -> tuple[SettledSourceReleaseCandidate, ...]:
+        """Load settled non-none owners whose thread release is recoverable."""
+        _validate_user_id(user_id)
+        max_records = _validate_positive_integer(
+            max_records,
+            field_name="settled source release limit",
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+        admission_collection = user_ref.collection("inboundPendingAdmissions")
+        settlement_collection = user_ref.collection("sourceSettlements")
+        head_collection = user_ref.collection("threadTransitionHeads")
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "settled source release transaction is unavailable"
+            ) from transaction_error
+
+        @transactional
+        def load_once(active_transaction):
+            heads_by_thread_id = {}
+            for active_state in ("active", "releasing"):
+                query = (
+                    head_collection.where(
+                        "activeState",
+                        "==",
+                        active_state,
+                    ).order_by("__name__")
+                )
+                for snapshot in active_transaction.get(
+                    query.limit(max_records + 1)
+                ):
+                    heads_by_thread_id.setdefault(snapshot.id, snapshot)
+                    if len(heads_by_thread_id) > max_records:
+                        raise SourceCoordinatorConfigError(
+                            "actionable settled source release count exceeds its "
+                            "safe bound"
+                        )
+            candidates = []
+            for thread_id in sorted(heads_by_thread_id):
+                head_data = _snapshot_data(heads_by_thread_id[thread_id])
+                if head_data is None:
+                    raise SourceCoordinatorAmbiguous(
+                        "settled source release returned an absent thread head"
+                    )
+                _validate_thread_head_document(
+                    head_data,
+                    thread_id=thread_id,
+                )
+                if head_data["activeState"] not in {"active", "releasing"}:
+                    raise ThreadTransitionConflict(
+                        "settled source release query returned an inactive head"
+                    )
+                canonical_source_id = head_data["activeCanonicalSourceId"]
+                admission_data = _snapshot_data(
+                    admission_collection.document(canonical_source_id).get(
+                        transaction=active_transaction
+                    )
+                )
+                if admission_data is None:
+                    raise ThreadTransitionConflict(
+                        "actionable thread head lacks source admission"
+                    )
+                _validate_pending_admission_document(
+                    admission_data,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                )
+                bundle = self._read_source_authority_bundle(
+                    transaction=active_transaction,
+                    user_ref=user_ref,
+                    canonical_source_id=canonical_source_id,
+                    expected_thread_id=thread_id,
+                )
+                identity_data = bundle[0][1]
+                classification_data = bundle[1][1]
+                owner_data = bundle[2][1]
+                ledger_data = bundle[3][1]
+                _validate_admission_authority_bindings(
+                    admission_data,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                )
+                if (
+                    head_data["activeOwnerKind"] != owner_data["ownerKind"]
+                    or head_data["activeOwnerKey"] != owner_data["ownerKey"]
+                ):
+                    raise ThreadTransitionConflict(
+                        "actionable thread head conflicts with source owner authority"
+                    )
+                if admission_data["admissionState"] != "settled":
+                    if head_data["activeState"] == "releasing":
+                        raise WakeReleaseConflict(
+                            "releasing thread head lacks settled source authority"
+                        )
+                    if admission_data["admissionState"] != "processing":
+                        raise ThreadTransitionConflict(
+                            "active thread head lacks processing source authority"
+                        )
+                    continue
+                settlement_data = _snapshot_data(
+                    settlement_collection.document(canonical_source_id).get(
+                        transaction=active_transaction
+                    )
+                )
+                if settlement_data is None:
+                    raise SourceSettlementConflict(
+                        "settled source release lacks settlement authority"
+                    )
+                _validate_source_settlement_document(
+                    settlement_data,
+                    canonical_source_id=canonical_source_id,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                    current_aliases=_validated_identity_descriptors(
+                        identity_data,
+                        canonical_source_id=canonical_source_id,
+                    ),
+                )
+                candidates.append(
+                    SettledSourceReleaseCandidate(
+                        canonical_source_id=canonical_source_id,
+                        thread_id=thread_id,
+                    )
+                )
+            candidates.sort(
+                key=lambda candidate: (
+                    candidate.thread_id,
+                    candidate.canonical_source_id,
+                )
+            )
+            return tuple(candidates)
+
+        try:
+            return load_once(transaction)
+        except SourceCoordinatorError:
+            raise
+        except Exception as load_error:
+            raise SourceCoordinatorRetryable(
+                "settled source release authority is unavailable"
+            ) from load_error
+
+    def consume_durable_source_resume_context(
+        self,
+        *,
+        user_id: str,
+        context: DurableSourceResumeContext,
+        consumer=None,
+    ) -> DurableSourceResumeResult:
+        """Claim one durable wake and continue its frozen authority."""
+        _validate_user_id(user_id)
+        if type(context) is not DurableSourceResumeContext or (
+            consumer is not None and not callable(consumer)
+        ):
+            raise SourceCoordinatorConfigError(
+                "eligible source resume dependencies are invalid"
+            )
+        current = next(
+            (
+                candidate
+                for candidate in self.durable_source_resume_contexts(
+                    user_id=user_id
+                )
+                if candidate.canonical_source_id == context.canonical_source_id
+            ),
+            None,
+        )
+        if current is None or current != context:
+            raise WakeClaimConflict(
+                "eligible source resume context changed before claim"
+            )
+        if context.resume_state != "pending":
+            transition = self.claim_or_resume_thread_transition(
+                user_id=user_id,
+                canonical_source_id=context.canonical_source_id,
+                received_at=context.received_at,
+                sent_at=context.sent_at,
+                saved_history_binding=_thaw_json(context.saved_history_binding),
+                index_binding=_thaw_json(context.index_binding),
+            )
+            if transition.disposition != "claimed":
+                raise WakeClaimConflict(
+                    "durable source resume did not claim its authority"
+                )
+        ledger = _thaw_json(context.ledger)
+        work_result = self.consume_source_work_once(
+            user_id=user_id,
+            canonical_source_id=context.canonical_source_id,
+            ledger_hash=ledger["ledgerHash"],
+            consumer=(
+                None
+                if consumer is None
+                else lambda execution_ledger: consumer(context, execution_ledger)
+            ),
+        )
+        if work_result["state"] == "blocked":
+            return DurableSourceResumeResult(
+                canonical_source_id=context.canonical_source_id,
+                thread_id=context.thread_id,
+                state="blocked",
+                settlement=None,
+            )
+        settlement = self.settle_source_markers_if_ready(
+            user_id=user_id,
+            canonical_source_id=context.canonical_source_id,
+            ledger_hash=ledger["ledgerHash"],
+            required_source_alias_key=context.required_source_alias_key,
+        )
+        if context.owner["ownerKind"] != "none":
+            self.release_settled_generation_if_needed(
+                user_id=user_id,
+                thread_id=context.thread_id,
+                canonical_source_id=context.canonical_source_id,
+            )
+        return DurableSourceResumeResult(
+            canonical_source_id=context.canonical_source_id,
+            thread_id=context.thread_id,
+            state="settled",
+            settlement=settlement,
+        )
+
+    def verify_settled_source_dispatch_binding(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        thread_id: str,
+        source_alias_keys: Sequence[str],
+        snapshot_hash: str,
+        selection_hash: str,
+        owner_kind: str,
+        owner_key: str | None,
+        ledger_hash: str,
+        settlement_hash: str,
+        settlement_revision: int,
+        alias_projection_count: int,
+    ) -> bool:
+        """Prove a scanner result is bound to retained exact-source authority."""
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        _validate_document_id(thread_id, field_name="thread id")
+        alias_keys = tuple(source_alias_keys)
+        if (
+            not alias_keys
+            or len(alias_keys) > MAX_SOURCE_ALIASES
+            or alias_keys != tuple(sorted(set(alias_keys)))
+            or any(not _is_sha256(key) for key in alias_keys)
+            or any(
+                not _is_sha256(value)
+                for value in (
+                    snapshot_hash,
+                    selection_hash,
+                    ledger_hash,
+                    settlement_hash,
+                )
+            )
+            or owner_kind not in _TRANSITION_OWNER_KINDS
+            or (owner_kind == "none") != (owner_key is None)
+            or (owner_key is not None and not _is_sha256(owner_key))
+            or type(settlement_revision) is not int
+            or settlement_revision != 1
+            or type(alias_projection_count) is not int
+            or not 1 <= alias_projection_count <= MAX_SOURCE_ALIASES
+        ):
+            raise SourceCoordinatorConfigError(
+                "settled dispatch binding is malformed"
+            )
+        user_ref = self._firestore.collection("users").document(user_id)
+        admission_ref = user_ref.collection(
+            "inboundPendingAdmissions"
+        ).document(canonical_source_id)
+        settlement_ref = user_ref.collection("sourceSettlements").document(
+            canonical_source_id
+        )
+        source_alias_collection = user_ref.collection("sourceAliases")
+        processed_collection = user_ref.collection("processedMessages")
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "settled dispatch verification transaction is unavailable"
+            ) from transaction_error
+
+        @transactional
+        def verify_once(active_transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=active_transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+                expected_thread_id=thread_id,
+            )
+            identity_data = bundle[0][1]
+            classification_data = bundle[1][1]
+            owner_data = bundle[2][1]
+            ledger_data = bundle[3][1]
+            if (
+                classification_data["snapshotImmutableHash"] != snapshot_hash
+                or classification_data["selectionHash"] != selection_hash
+                or owner_data["ownerKind"] != owner_kind
+                or owner_data["ownerKey"] != owner_key
+                or ledger_data["ledgerHash"] != ledger_hash
+            ):
+                raise SourceSettlementConflict(
+                    "scanner authority conflicts with retained source authority"
+                )
+            aliases = _validated_identity_descriptors(
+                identity_data,
+                canonical_source_id=canonical_source_id,
+            )
+            descriptors_by_key = {
+                descriptor["sourceAliasKey"]: descriptor
+                for descriptor in aliases
+            }
+            if (
+                alias_projection_count != len(aliases)
+                or any(key not in descriptors_by_key for key in alias_keys)
+            ):
+                raise SourceSettlementConflict(
+                    "scanner aliases conflict with retained source identity"
+                )
+            admission_data = _snapshot_data(
+                admission_ref.get(transaction=active_transaction)
+            )
+            if admission_data is None:
+                raise SourceSettlementConflict(
+                    "scanner source lacks retained admission authority"
+                )
+            _validate_pending_admission_document(
+                admission_data,
+                canonical_source_id=canonical_source_id,
+                thread_id=thread_id,
+            )
+            _validate_admission_authority_bindings(
+                admission_data,
+                identity_data=identity_data,
+                classification_data=classification_data,
+                owner_data=owner_data,
+                ledger_data=ledger_data,
+            )
+            if admission_data["admissionState"] != "settled":
+                raise SourceSettlementConflict(
+                    "scanner source admission is not settled"
+                )
+            settlement_data = _snapshot_data(
+                settlement_ref.get(transaction=active_transaction)
+            )
+            if settlement_data is None:
+                raise SourceSettlementConflict(
+                    "scanner source lacks retained settlement authority"
+                )
+            _validate_source_settlement_document(
+                settlement_data,
+                canonical_source_id=canonical_source_id,
+                identity_data=identity_data,
+                classification_data=classification_data,
+                owner_data=owner_data,
+                ledger_data=ledger_data,
+                current_aliases=aliases,
+            )
+            if (
+                settlement_data["settlementHash"] != settlement_hash
+                or settlement_data["settlementRevision"]
+                != settlement_revision
+            ):
+                raise SourceSettlementConflict(
+                    "scanner settlement conflicts with retained settlement"
+                )
+            for alias_key in alias_keys:
+                descriptor = descriptors_by_key[alias_key]
+                alias_owner_data = _snapshot_data(
+                    source_alias_collection.document(alias_key).get(
+                        transaction=active_transaction
+                    )
+                )
+                if alias_owner_data is None:
+                    raise SourceSettlementConflict(
+                        "scanner alias lacks retained owner authority"
+                    )
+                _validate_alias_projection(
+                    alias_owner_data,
+                    descriptor=descriptor,
+                    canonical_source_id=canonical_source_id,
+                )
+                processed_data = _snapshot_data(
+                    processed_collection.document(alias_key).get(
+                        transaction=active_transaction
+                    )
+                )
+                if processed_data is None:
+                    raise SourceSettlementConflict(
+                        "scanner alias lacks processed settlement projection"
+                    )
+                _validate_processed_alias_projection(
+                    processed_data,
+                    descriptor=descriptor,
+                    canonical_source_id=canonical_source_id,
+                    settlement_data=settlement_data,
+                )
+            return True
+
+        try:
+            return verify_once(transaction)
+        except SourceCoordinatorError:
+            raise
+        except Exception as verification_error:
+            raise SourceCoordinatorRetryable(
+                "settled dispatch verification is unavailable"
+            ) from verification_error
 
     def claim_source_classification(
         self,
@@ -3754,19 +5771,12 @@ class SourceCoordinator:
             canonical_source_id=canonical_source_id,
         )
 
-        def invoke_verifier():
-            if self._hard_optout_verifier is None:
-                return None
-            try:
-                verified_result = self._hard_optout_verifier(
-                    _freeze_json(deepcopy(input_copy))
-                )
-            except SourceCoordinatorError:
-                raise
-            except Exception as verifier_error:
-                raise SourceCoordinatorAmbiguous(
-                    "hard opt-out verifier failed"
-                ) from verifier_error
+        def validate_verifier_result(
+            verified_result,
+            *,
+            verifier_name: str,
+            hard_optout: bool,
+        ):
             if verified_result is None:
                 return None
             if (
@@ -3782,15 +5792,77 @@ class SourceCoordinator:
                 or not _is_sha256(verified_result.get("evidenceHash"))
             ):
                 raise SourceCoordinatorConfigError(
-                    "hard opt-out verifier returned an untrusted result"
+                    f"{verifier_name} returned an untrusted result"
                 )
-            return _VerifiedHardOptoutEvidence(evidence=verified_result)
+            if hard_optout:
+                if (
+                    verified_result["evidenceKind"]
+                    in _LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
+                ):
+                    raise SourceCoordinatorConfigError(
+                        "hard opt-out verifier returned local-policy evidence"
+                    )
+            elif (
+                verified_result["evidenceKind"]
+                not in _LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
+            ):
+                raise SourceCoordinatorConfigError(
+                    "local source-policy verifier returned unsupported evidence"
+                )
+            return _VerifiedDeterministicEvidence(
+                evidence=verified_result,
+                hard_optout=hard_optout,
+            )
+
+        def invoke_verifier():
+            if self._hard_optout_verifier is not None:
+                try:
+                    verified_result = self._hard_optout_verifier(
+                        _freeze_json(deepcopy(input_copy))
+                    )
+                except SourceCoordinatorError:
+                    raise
+                except Exception as verifier_error:
+                    raise SourceCoordinatorAmbiguous(
+                        "hard opt-out verifier failed"
+                    ) from verifier_error
+                verified = validate_verifier_result(
+                    verified_result,
+                    verifier_name="hard opt-out verifier",
+                    hard_optout=True,
+                )
+                if verified is not None:
+                    return verified
+            if self._local_source_policy_verifier is None:
+                return None
+            try:
+                verified_result = self._local_source_policy_verifier(
+                    _freeze_json(deepcopy(input_copy))
+                )
+            except SourceCoordinatorError:
+                raise
+            except Exception as verifier_error:
+                raise SourceCoordinatorAmbiguous(
+                    "local source-policy verifier failed"
+                ) from verifier_error
+            return validate_verifier_result(
+                verified_result,
+                verifier_name="local source-policy verifier",
+                hard_optout=False,
+            )
 
         def material_from_verified(verified_result):
             deterministic_evidence = _thaw_json(verified_result.evidence)
-            complete_proposal = _deterministic_hard_optout_proposal(
-                deterministic_evidence
-            )
+            if verified_result.hard_optout:
+                complete_proposal = _deterministic_hard_optout_proposal(
+                    deterministic_evidence
+                )
+            else:
+                complete_proposal = {
+                    "schemaVersion": _CLASSIFICATION_SNAPSHOT_SCHEMA_VERSION,
+                    "transitionCandidates": [],
+                    "ordinaryObligations": [],
+                }
             return _build_classification_snapshot_material(
                 canonical_source_id=canonical_source_id,
                 classification_input_hash=classification_input_hash,
@@ -3832,7 +5904,10 @@ class SourceCoordinator:
                     raise ClassificationSnapshotConflict(
                         "deterministic snapshot retry differs from authority"
                     )
-                if self._hard_optout_verifier is None:
+                if (
+                    self._hard_optout_verifier is None
+                    and self._local_source_policy_verifier is None
+                ):
                     raise ClassificationSnapshotConflict(
                         "deterministic evidence verifier is unavailable on retry"
                     )
@@ -4371,7 +6446,11 @@ class SourceCoordinator:
             now = self._current_time()
             expected = _initial_pending_admission_document(immutable, now=now)
             mutations = ((admission_ref, None, expected),)
-            self._stage_document_mutations(transaction, mutations)
+            mutations = self._stage_source_authority_mutations(
+                transaction,
+                user_ref=user_ref,
+                mutations=mutations,
+            )
             return _MultiDocumentTransactionPlan(
                 result=PendingAdmissionResult(
                     canonical_source_id=canonical_source_id,
@@ -4636,7 +6715,11 @@ class SourceCoordinator:
                         if reference not in mutation_refs
                     ),
                 ]
-                self._stage_document_mutations(transaction, mutations)
+                mutations = self._stage_source_authority_mutations(
+                    transaction,
+                    user_ref=user_ref,
+                    mutations=mutations,
+                )
                 return _MultiDocumentTransactionPlan(
                     result=ThreadTransitionResult(
                         canonical_source_id=canonical_source_id,
@@ -4779,7 +6862,11 @@ class SourceCoordinator:
                     if reference not in mutation_refs
                 ),
             ]
-            self._stage_document_mutations(transaction, mutations)
+            mutations = self._stage_source_authority_mutations(
+                transaction,
+                user_ref=user_ref,
+                mutations=mutations,
+            )
             return _MultiDocumentTransactionPlan(
                 result=ThreadTransitionResult(
                     canonical_source_id=canonical_source_id,
@@ -4800,6 +6887,103 @@ class SourceCoordinator:
             prepare,
             authority_name="thread transition claim",
         )
+
+    def claim_or_resume_thread_transition(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        received_at: datetime,
+        sent_at: datetime,
+        saved_history_binding: Mapping[str, Any],
+        index_binding: Mapping[str, Any],
+    ) -> ThreadTransitionResult:
+        """Atomically admit/queue a source, or consume its eligible wake token."""
+        try:
+            return self.claim_or_block_thread_transition(
+                user_id=user_id,
+                canonical_source_id=canonical_source_id,
+                received_at=received_at,
+                sent_at=sent_at,
+                saved_history_binding=saved_history_binding,
+                index_binding=index_binding,
+            )
+        except ThreadTransitionConflict as claim_error:
+            _validate_user_id(user_id)
+            _validate_document_id(
+                canonical_source_id,
+                field_name="canonical source id",
+            )
+            user_ref = self._firestore.collection("users").document(user_id)
+            admission_ref = user_ref.collection(
+                "inboundPendingAdmissions"
+            ).document(canonical_source_id)
+            try:
+                admission_data = _snapshot_data(admission_ref.get())
+                bundle = self._read_source_authority_bundle(
+                    transaction=None,
+                    user_ref=user_ref,
+                    canonical_source_id=canonical_source_id,
+                )
+            except SourceCoordinatorError:
+                raise
+            except Exception as read_error:
+                raise ThreadTransitionConflict(
+                    "eligible wake authority is unreadable"
+                ) from read_error
+            if admission_data is None:
+                raise claim_error
+            thread_id = bundle[0][1]["threadId"]
+            expected_immutable = _pending_admission_immutable_material(
+                canonical_source_id=canonical_source_id,
+                thread_id=thread_id,
+                identity_data=bundle[0][1],
+                classification_data=bundle[1][1],
+                owner_data=bundle[2][1],
+                ledger_data=bundle[3][1],
+                received_at=received_at,
+                sent_at=sent_at,
+                saved_history_binding=saved_history_binding,
+                index_binding=index_binding,
+            )
+            _validate_pending_admission_document(
+                admission_data,
+                canonical_source_id=canonical_source_id,
+                thread_id=thread_id,
+                expected_immutable=expected_immutable,
+            )
+            _validate_admission_authority_bindings(
+                admission_data,
+                identity_data=bundle[0][1],
+                classification_data=bundle[1][1],
+                owner_data=bundle[2][1],
+                ledger_data=bundle[3][1],
+            )
+            if (
+                admission_data["admissionState"] != "blocked"
+                or admission_data["blockedLifecycleState"] != "eligible"
+                or admission_data["wakeState"] != "eligible"
+                or not _is_sha256(admission_data["wakeToken"])
+            ):
+                raise claim_error
+            wake_claim_id = self._allocate_document_token(
+                field_name="wake claim id"
+            )
+            claimed = self.claim_wake_and_rebind_generation(
+                user_id=user_id,
+                thread_id=thread_id,
+                canonical_source_id=canonical_source_id,
+                wake_token=admission_data["wakeToken"],
+                wake_claim_id=wake_claim_id,
+            )
+            return ThreadTransitionResult(
+                canonical_source_id=canonical_source_id,
+                thread_id=thread_id,
+                disposition="claimed",
+                generation=claimed.wake_generation,
+                head_revision=claimed.head_revision,
+                blocker_canonical_source_id=None,
+            )
 
     def release_generation_and_wake_oldest(
         self,
@@ -5004,7 +7188,11 @@ class SourceCoordinator:
                     created_at=head_before["createdAt"],
                 )
                 mutations = ((head_ref, head_before, head_expected),)
-                self._stage_document_mutations(transaction, mutations)
+                mutations = self._stage_source_authority_mutations(
+                    transaction,
+                    user_ref=user_ref,
+                    mutations=mutations,
+                )
                 return _MultiDocumentTransactionPlan(
                     result=WakeReleaseResult(
                         thread_id=thread_id,
@@ -5101,7 +7289,11 @@ class SourceCoordinator:
                     if reference not in mutation_refs
                 ),
             ]
-            self._stage_document_mutations(transaction, mutations)
+            mutations = self._stage_source_authority_mutations(
+                transaction,
+                user_ref=user_ref,
+                mutations=mutations,
+            )
             return _MultiDocumentTransactionPlan(
                 result=WakeReleaseResult(
                     thread_id=thread_id,
@@ -5122,6 +7314,117 @@ class SourceCoordinator:
             prepare,
             authority_name="thread generation release",
         )
+
+    def release_settled_generation_if_needed(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        canonical_source_id: str,
+    ) -> WakeReleaseResult:
+        """Release once, or prove a settled source no longer owns the head."""
+        _validate_user_id(user_id)
+        _validate_document_id(thread_id, field_name="thread id")
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        try:
+            return self.release_generation_and_wake_oldest(
+                user_id=user_id,
+                thread_id=thread_id,
+                canonical_source_id=canonical_source_id,
+            )
+        except WakeReleaseConflict as release_error:
+            user_ref = self._firestore.collection("users").document(user_id)
+            admission_ref = user_ref.collection(
+                "inboundPendingAdmissions"
+            ).document(canonical_source_id)
+            settlement_ref = user_ref.collection("sourceSettlements").document(
+                canonical_source_id
+            )
+            head_ref = user_ref.collection("threadTransitionHeads").document(
+                thread_id
+            )
+            try:
+                bundle = self._read_source_authority_bundle(
+                    transaction=None,
+                    user_ref=user_ref,
+                    canonical_source_id=canonical_source_id,
+                    expected_thread_id=thread_id,
+                )
+                identity_data = bundle[0][1]
+                classification_data = bundle[1][1]
+                owner_data = bundle[2][1]
+                ledger_data = bundle[3][1]
+                admission_data = _snapshot_data(admission_ref.get())
+                settlement_data = _snapshot_data(settlement_ref.get())
+                head_data = _snapshot_data(head_ref.get())
+            except SourceCoordinatorError:
+                raise
+            except Exception as read_error:
+                raise WakeReleaseConflict(
+                    "settled generation release state is unreadable"
+                ) from read_error
+            if admission_data is None or settlement_data is None or head_data is None:
+                raise release_error
+            _validate_pending_admission_document(
+                admission_data,
+                canonical_source_id=canonical_source_id,
+                thread_id=thread_id,
+            )
+            _validate_admission_authority_bindings(
+                admission_data,
+                identity_data=identity_data,
+                classification_data=classification_data,
+                owner_data=owner_data,
+                ledger_data=ledger_data,
+            )
+            _validate_source_settlement_document(
+                settlement_data,
+                canonical_source_id=canonical_source_id,
+                identity_data=identity_data,
+                classification_data=classification_data,
+                owner_data=owner_data,
+                ledger_data=ledger_data,
+                current_aliases=_validated_identity_descriptors(
+                    identity_data,
+                    canonical_source_id=canonical_source_id,
+                ),
+            )
+            _validate_thread_head_document(head_data, thread_id=thread_id)
+            if admission_data["admissionState"] != "settled" or (
+                head_data["activeState"] != "clear"
+                and head_data["activeCanonicalSourceId"]
+                == canonical_source_id
+            ):
+                raise release_error
+            try:
+                head_readback = _snapshot_data(head_ref.get())
+            except Exception as readback_error:
+                raise WakeReleaseConflict(
+                    "settled generation release readback is unavailable"
+                ) from readback_error
+            if head_readback != head_data:
+                raise WakeReleaseConflict(
+                    "settled generation release state changed during readback"
+                )
+            return WakeReleaseResult(
+                thread_id=thread_id,
+                released_canonical_source_id=canonical_source_id,
+                next_canonical_source_id=(
+                    None
+                    if head_data["activeState"] == "clear"
+                    else head_data["activeCanonicalSourceId"]
+                ),
+                wake_generation=(
+                    None
+                    if head_data["activeState"] == "clear"
+                    else head_data["activeGeneration"]
+                ),
+                wake_token=None,
+                head_state=head_data["activeState"],
+            )
 
     def claim_wake_and_rebind_generation(
         self,
@@ -5421,7 +7724,11 @@ class SourceCoordinator:
                     if reference not in mutation_refs
                 ),
             ]
-            self._stage_document_mutations(transaction, mutations)
+            mutations = self._stage_source_authority_mutations(
+                transaction,
+                user_ref=user_ref,
+                mutations=mutations,
+            )
             return _MultiDocumentTransactionPlan(
                 result=WakeClaimResult(
                     thread_id=thread_id,
@@ -5484,6 +7791,7 @@ class SourceCoordinator:
                         ledger_hash=ledger_hash,
                         ledger_revision=ledger_before["revision"],
                         evidence_hash=None,
+                        newly_started=False,
                     ),
                     prerequisites=bundle,
                     mutations=(),
@@ -5512,6 +7820,7 @@ class SourceCoordinator:
                     ledger_hash=ledger_hash,
                     ledger_revision=ledger_expected["revision"],
                     evidence_hash=None,
+                    newly_started=True,
                 ),
                 prerequisites=bundle[:3],
                 mutations=mutations,
@@ -5906,6 +8215,210 @@ class SourceCoordinator:
             authority_name="source work dominance",
         )
 
+    def _current_source_work_ledger(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+    ) -> dict[str, Any]:
+        """Read one validated ledger snapshot for fenced local consumption."""
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        if not _is_sha256(ledger_hash):
+            raise SourceCoordinatorConfigError("source work ledger hash is malformed")
+        user_ref = self._firestore.collection("users").document(user_id)
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "source work ledger read transaction is unavailable"
+            ) from transaction_error
+
+        @transactional
+        def read_once(active_transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=active_transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            ledger_data = bundle[3][1]
+            if ledger_data["ledgerHash"] != ledger_hash:
+                raise SourceWorkLedgerConflict(
+                    "source work ledger hash conflicts with retained authority"
+                )
+            return deepcopy(ledger_data)
+
+        try:
+            return read_once(transaction)
+        except SourceCoordinatorError:
+            raise
+        except Exception as read_error:
+            raise SourceCoordinatorRetryable(
+                "source work ledger snapshot is unavailable"
+            ) from read_error
+
+    def consume_source_work_once(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+        consumer=None,
+    ) -> Mapping[str, Any]:
+        """Admit preserved local work at most once, then resolve its ledger.
+
+        B1's applying state is only a fail-closed local latch. It grants no
+        external-effect authority and ambiguous applying work is never replayed.
+        Transition-only callbacks remain effect-free readiness hooks until B3.
+        """
+        if consumer is not None and not callable(consumer):
+            raise SourceCoordinatorConfigError(
+                "source work consumer must be callable or unavailable"
+            )
+        ledger = self._current_source_work_ledger(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+            ledger_hash=ledger_hash,
+        )
+        if any(entry["state"] == "applying" for entry in ledger["entries"]):
+            return {
+                "state": "blocked",
+                "reason": "execution_outcome_ambiguous",
+            }
+        if all(
+            entry["state"] in {"completed", "delegated", "dominated"}
+            for entry in ledger["entries"]
+        ):
+            return {"state": "completed", "completionRecords": {}}
+
+        if consumer is None:
+            return {
+                "state": "blocked",
+                "reason": "exact-source downstream adapter is unavailable until B4",
+            }
+        preserved = [
+            entry
+            for entry in ledger["entries"]
+            if entry["state"] == "pending"
+            and entry["dominanceOutcome"] == "preserve"
+        ]
+        claimed_keys = []
+        for entry in preserved:
+            claimed = self.record_source_work_applying(
+                user_id=user_id,
+                canonical_source_id=canonical_source_id,
+                ledger_hash=ledger_hash,
+                work_key=entry["workKey"],
+                payload_hash=entry["payloadHash"],
+            )
+            if not claimed.newly_started:
+                return {
+                    "state": "blocked",
+                    "reason": "execution_outcome_ambiguous",
+                }
+            claimed_keys.append(entry["workKey"])
+
+        execution_ledger = self._current_source_work_ledger(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+            ledger_hash=ledger_hash,
+        )
+        applying_keys = {
+            entry["workKey"]
+            for entry in execution_ledger["entries"]
+            if entry["state"] == "applying"
+        }
+        if applying_keys != set(claimed_keys):
+            raise SourceWorkTransitionConflict(
+                "source work applying latch conflicts with claimed work"
+            )
+
+        consumer_result = consumer(execution_ledger)
+        if not isinstance(consumer_result, MappingABC):
+            raise SourceCoordinatorConfigError(
+                "source work consumer returned an invalid result"
+            )
+        consumer_state = consumer_result.get("state")
+        if consumer_state == "blocked":
+            return {
+                "state": "blocked",
+                "reason": (
+                    "execution_outcome_ambiguous"
+                    if claimed_keys
+                    else consumer_result.get("reason", "downstream_consumer_blocked")
+                ),
+            }
+        if consumer_state != "completed":
+            raise SourceCoordinatorConfigError(
+                "source work consumer did not complete or block"
+            )
+        completion_records = consumer_result.get("completionRecords", {})
+        if not isinstance(completion_records, MappingABC):
+            raise SourceCoordinatorConfigError(
+                "source work completion records must be a mapping"
+            )
+        if set(completion_records) != set(claimed_keys):
+            raise SourceCoordinatorConfigError(
+                "source work completion evidence must exactly match claimed work"
+            )
+        for entry in execution_ledger["entries"]:
+            if entry["state"] not in {"pending", "applying"}:
+                continue
+            work_arguments = {
+                "user_id": user_id,
+                "canonical_source_id": canonical_source_id,
+                "ledger_hash": ledger_hash,
+                "work_key": entry["workKey"],
+                "payload_hash": entry["payloadHash"],
+            }
+            if entry["dominanceOutcome"] in {
+                "delegate_owner",
+                "delegate_terminal_policy",
+            }:
+                self.delegate_source_work_entry(**work_arguments)
+            elif entry["dominanceOutcome"] in {
+                "dominated_by_owner",
+                "dominated_no_send",
+            }:
+                self.dominate_source_work_entry_from_selection(**work_arguments)
+            elif entry["dominanceOutcome"] == "preserve":
+                completion_record = completion_records.get(entry["workKey"])
+                if not isinstance(completion_record, MappingABC):
+                    raise SourceCoordinatorConfigError(
+                        "preserved source work lacks completion evidence"
+                    )
+                self.complete_source_work_entry(
+                    **work_arguments,
+                    completion_record=completion_record,
+                )
+            else:
+                raise SourceWorkTransitionConflict(
+                    "source work entry has no executable dominance outcome"
+                )
+
+        final_ledger = self._current_source_work_ledger(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+            ledger_hash=ledger_hash,
+        )
+        if not all(
+            entry["state"] in {"completed", "delegated", "dominated"}
+            for entry in final_ledger["entries"]
+        ):
+            raise SourceWorkTransitionConflict(
+                "source work completion lacks final ledger readback"
+            )
+        return {
+            "state": "completed",
+            "completionRecords": dict(completion_records),
+        }
+
     def settle_source_markers_if_ready(
         self,
         *,
@@ -6007,6 +8520,26 @@ class SourceCoordinator:
                 owner_data=owner_data,
                 ledger_data=ledger_data,
             )
+            blocked_projection_ref = user_ref.collection(
+                "blockedSources"
+            ).document(canonical_source_id)
+            blocked_projection_before = _snapshot_data(
+                blocked_projection_ref.get(transaction=transaction)
+            )
+            if admission_before["currentBlocker"] is None:
+                if blocked_projection_before is not None:
+                    raise SourceSettlementConflict(
+                        "unblocked source retains a blocked projection"
+                    )
+            else:
+                if blocked_projection_before is None:
+                    raise SourceSettlementNotReady(
+                        "blocked source settlement lacks its projection"
+                    )
+                _validate_blocked_projection_document(
+                    blocked_projection_before,
+                    admission=admission_before,
+                )
             head_ref = user_ref.collection("threadTransitionHeads").document(
                 identity_data["threadId"]
             )
@@ -6105,11 +8638,17 @@ class SourceCoordinator:
                     (admission_ref, admission_before),
                     (head_ref, head_before),
                     (settlement_ref, settlement_before),
+                    (blocked_projection_ref, blocked_projection_before),
                     *alias_owner_prerequisites,
                     *deferred_prerequisites,
                     *projection_prerequisites,
                 )
-                self._stage_document_mutations(transaction, mutations)
+                repaired_projection_count = len(mutations)
+                mutations = self._stage_source_authority_mutations(
+                    transaction,
+                    user_ref=user_ref,
+                    mutations=mutations,
+                )
                 return _MultiDocumentTransactionPlan(
                     result=SourceSettlementResult(
                         canonical_source_id=canonical_source_id,
@@ -6118,7 +8657,7 @@ class SourceCoordinator:
                             "settlementRevision"
                         ],
                         alias_projection_count=len(aliases),
-                        repaired_projection_count=len(mutations),
+                        repaired_projection_count=repaired_projection_count,
                     ),
                     prerequisites=prerequisites,
                     mutations=tuple(mutations),
@@ -6174,6 +8713,21 @@ class SourceCoordinator:
                 (settlement_ref, None, settlement_expected),
                 (admission_ref, admission_before, admission_expected),
             ]
+            if blocked_projection_before is not None:
+                blocked_projection_expected = (
+                    _blocked_projection_from_admission(
+                        admission_expected,
+                        now=now,
+                        created_at=blocked_projection_before["createdAt"],
+                    )
+                )
+                mutations.append(
+                    (
+                        blocked_projection_ref,
+                        blocked_projection_before,
+                        blocked_projection_expected,
+                    )
+                )
             for projection_ref, descriptor, _projection_before in processed_readbacks:
                 mutations.append(
                     (
@@ -6193,7 +8747,11 @@ class SourceCoordinator:
                 *alias_owner_prerequisites,
                 *deferred_prerequisites,
             )
-            self._stage_document_mutations(transaction, mutations)
+            mutations = self._stage_source_authority_mutations(
+                transaction,
+                user_ref=user_ref,
+                mutations=mutations,
+            )
             return _MultiDocumentTransactionPlan(
                 result=SourceSettlementResult(
                     canonical_source_id=canonical_source_id,
@@ -6376,12 +8934,25 @@ class SourceCoordinator:
         if len(owners) > 1:
             raise SourceAliasConflict("source aliases have conflicting owners")
 
+        created = not owners
+        sync_ref, sync_before, source_authority_revision = (
+            self._read_source_authority_revision(
+                transaction=transaction,
+                user_ref=user_ref,
+                allow_missing=created,
+            )
+        )
+        if source_authority_revision is None:
+            self._require_empty_source_authority_inventory(
+                transaction=transaction,
+                user_ref=user_ref,
+            )
+
         now = self._now_factory()
         if not _is_aware_datetime(now):
             raise SourceCoordinatorConfigError(
                 "now factory must return an aware datetime"
             )
-        created = not owners
         if created:
             canonical_source_id = self._uuid_factory()
             _validate_document_id(
@@ -6423,11 +8994,25 @@ class SourceCoordinator:
                     created_at=now,
                 )
 
+            sync_expected = deepcopy(sync_before) if sync_before is not None else {}
+            sync_expected.update(
+                {
+                    _SOURCE_AUTHORITY_REVISION_FIELD: (
+                        1
+                        if source_authority_revision is None
+                        else source_authority_revision + 1
+                    ),
+                    "updatedAt": now,
+                }
+            )
+            before_state[sync_ref.path] = sync_before
+
             transaction.create(identity_ref, expected_identity)
             for alias in envelope.aliases:
                 transaction.create(
                     supplied_alias_refs[alias.key], expected_alias_data[alias.key]
                 )
+            transaction.set(sync_ref, sync_expected)
             repaired = False
         else:
             canonical_source_id = next(iter(owners))
@@ -6549,6 +9134,16 @@ class SourceCoordinator:
                 before_state[retained_alias_refs[key].path] = data
 
             if repaired:
+                sync_expected = deepcopy(sync_before)
+                sync_expected.update(
+                    {
+                        _SOURCE_AUTHORITY_REVISION_FIELD: (
+                            source_authority_revision + 1
+                        ),
+                        "updatedAt": now,
+                    }
+                )
+                before_state[sync_ref.path] = sync_before
                 transaction.update(identity_ref, expected_identity)
                 for alias in envelope.aliases:
                     if supplied_alias_data[alias.key] is None:
@@ -6556,10 +9151,14 @@ class SourceCoordinator:
                             supplied_alias_refs[alias.key],
                             expected_alias_data[alias.key],
                         )
+                transaction.set(sync_ref, sync_expected)
 
         expected_state = {identity_ref.path: expected_identity}
         for key, ref in retained_alias_refs.items():
             expected_state[ref.path] = expected_alias_data[key]
+        revision_ref = sync_ref if created or repaired else None
+        if revision_ref is not None:
+            expected_state[sync_ref.path] = sync_expected
 
         return _SourceIdentityTransactionPlan(
             result=SourceIdentityResult(
@@ -6575,6 +9174,7 @@ class SourceCoordinator:
                     (ref.path, ref) for ref in retained_alias_refs.values()
                 )
             ),
+            revision_ref=revision_ref,
             before_state=before_state,
             expected_state=expected_state,
         )
@@ -6585,7 +9185,11 @@ class SourceCoordinator:
         commit_error: Exception,
     ) -> SourceIdentityResult:
         try:
-            refs = (plan.identity_ref, *plan.alias_refs)
+            refs = (
+                plan.identity_ref,
+                *plan.alias_refs,
+                *((plan.revision_ref,) if plan.revision_ref is not None else ()),
+            )
             readback_state = {
                 ref.path: _snapshot_data(ref.get())
                 for ref in sorted(refs, key=lambda item: item.path)
@@ -6603,6 +9207,92 @@ class SourceCoordinator:
         raise SourceCoordinatorAmbiguous(
             "source identity commit outcome is ambiguous"
         ) from commit_error
+
+    def resolve_existing_canonical_source_id(
+        self,
+        *,
+        user_id: str,
+        hydrated_message: Mapping[str, Any],
+        evidence_kind: str,
+        thread_id: str | None,
+    ) -> str | None:
+        """Resolve supplied aliases without attaching any new alias authority."""
+        _validate_user_id(user_id)
+        validated_thread_id = _validate_thread_id(thread_id)
+        envelope = _build_source_admission_envelope(
+            user_id=user_id,
+            hydrated_message=hydrated_message,
+            evidence_kind=evidence_kind,
+        )
+        if not envelope.aliases:
+            raise SourceIdentityMissing("source identity requires a typed alias")
+        user_ref = self._firestore.collection("users").document(user_id)
+        alias_collection = user_ref.collection("sourceAliases")
+        identity_collection = user_ref.collection("sourceIdentities")
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "source identity resolution transaction is unavailable"
+            ) from transaction_error
+
+        @transactional
+        def resolve_once(active_transaction):
+            resolved = []
+            for alias in envelope.aliases:
+                projection_data = _snapshot_data(
+                    alias_collection.document(alias.key).get(
+                        transaction=active_transaction
+                    )
+                )
+                if projection_data is None:
+                    continue
+                canonical_source_id = projection_data.get("canonicalSourceId")
+                _validate_document_id(
+                    canonical_source_id,
+                    field_name="canonical source id",
+                )
+                _validate_alias_projection(
+                    projection_data,
+                    descriptor=_alias_descriptor(alias),
+                    canonical_source_id=canonical_source_id,
+                )
+                resolved.append(canonical_source_id)
+            canonical_ids = set(resolved)
+            if not canonical_ids:
+                return None
+            if len(canonical_ids) != 1:
+                raise SourceAliasConflict(
+                    "supplied source aliases resolve to different identities"
+                )
+            canonical_source_id = next(iter(canonical_ids))
+            identity_data = self._require_source_identity_snapshot(
+                identity_collection.document(canonical_source_id).get(
+                    transaction=active_transaction
+                ),
+                canonical_source_id=canonical_source_id,
+            )
+            stored_thread_id = identity_data["threadId"]
+            if (
+                stored_thread_id is not None
+                and validated_thread_id is not None
+                and stored_thread_id != validated_thread_id
+            ):
+                raise SourceThreadConflict(
+                    "source internal thread binding is immutable"
+                )
+            return canonical_source_id
+
+        try:
+            return resolve_once(transaction)
+        except SourceCoordinatorError:
+            raise
+        except Exception as resolution_error:
+            raise SourceCoordinatorRetryable(
+                "source identity resolution is unavailable"
+            ) from resolution_error
 
     def admit_or_repair_source_identity(
         self,
@@ -6656,6 +9346,116 @@ class SourceCoordinator:
             raise SourceCoordinatorAmbiguous(
                 "source identity transaction failed before commit"
             ) from transaction_error
+
+
+def unsettled_source_admission_ids(
+    firestore_client,
+    *,
+    user_id: str,
+    max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+) -> tuple[str, ...]:
+    """Reviewed read-only adapter for scanner cursor admission auditing."""
+    return SourceCoordinator(
+        firestore_client,
+        uuid_factory=lambda: "read-only-admission-audit",
+        now_factory=lambda: datetime.now(timezone.utc),
+    ).unsettled_source_admission_ids(
+        user_id=user_id,
+        max_records=max_records,
+    )
+
+
+def advance_scan_cursor_if_source_authority_clear(
+    firestore_client,
+    *,
+    user_id: str,
+    last_scan_iso: str,
+    max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+) -> tuple[str, ...]:
+    """Reviewed strict adapter for fenced source cursor advancement."""
+    return SourceCoordinator(
+        firestore_client,
+        uuid_factory=lambda: "read-only-source-cursor-audit",
+        now_factory=lambda: datetime.now(timezone.utc),
+    ).advance_scan_cursor_if_source_authority_clear(
+        user_id=user_id,
+        last_scan_iso=last_scan_iso,
+        max_records=max_records,
+    )
+
+
+def durable_source_resume_contexts(
+    firestore_client,
+    *,
+    user_id: str,
+    max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+) -> tuple[DurableSourceResumeContext, ...]:
+    """Reviewed read-only adapter for provider-independent wake discovery."""
+    return SourceCoordinator(
+        firestore_client,
+        uuid_factory=lambda: "read-only-durable-source-resume",
+        now_factory=lambda: datetime.now(timezone.utc),
+    ).durable_source_resume_contexts(
+        user_id=user_id,
+        max_records=max_records,
+    )
+
+
+def consume_durable_source_resume_context(
+    firestore_client,
+    *,
+    user_id: str,
+    context: DurableSourceResumeContext,
+    consumer=None,
+) -> DurableSourceResumeResult:
+    """Reviewed mutating adapter for provider-independent wake consumption."""
+    return SourceCoordinator(
+        firestore_client,
+        uuid_factory=lambda: str(uuid4()),
+        now_factory=lambda: datetime.now(timezone.utc),
+    ).consume_durable_source_resume_context(
+        user_id=user_id,
+        context=context,
+        consumer=consumer,
+    )
+
+
+def release_settled_source_generations(
+    firestore_client,
+    *,
+    user_id: str,
+    max_records: int = MAX_UNSETTLED_SOURCE_ADMISSIONS,
+) -> tuple[WakeReleaseResult, ...]:
+    """Reviewed mutating adapter for crash-safe settled-head release."""
+    coordinator = SourceCoordinator(
+        firestore_client,
+        uuid_factory=lambda: str(uuid4()),
+        now_factory=lambda: datetime.now(timezone.utc),
+    )
+    candidates = coordinator.settled_source_release_candidates(
+        user_id=user_id,
+        max_records=max_records,
+    )
+    return tuple(
+        coordinator.release_settled_generation_if_needed(
+            user_id=user_id,
+            thread_id=candidate.thread_id,
+            canonical_source_id=candidate.canonical_source_id,
+        )
+        for candidate in candidates
+    )
+
+
+def verify_settled_source_dispatch_binding(
+    firestore_client,
+    **binding,
+) -> bool:
+    """Reviewed read-only adapter for scanner settlement verification."""
+    return SourceCoordinator(
+        firestore_client,
+        uuid_factory=lambda: "read-only-dispatch-verification",
+        now_factory=lambda: datetime.now(timezone.utc),
+    ).verify_settled_source_dispatch_binding(**binding)
 
 
 def settle_source_marker_context_if_ready(

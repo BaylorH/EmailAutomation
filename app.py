@@ -41,6 +41,14 @@ except Exception as _fb_import_err:  # pragma: no cover - env dependent
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE = "msal_token_cache.bin"
+B1_PROCESSED_OWNERSHIP_FIELDS = frozenset(
+    {
+        "canonicalSourceId",
+        "settlementRevision",
+        "settlementHash",
+        "sourceAliasKey",
+    }
+)
 
 # Fix environment variable naming before anything else
 if not os.getenv("AZURE_API_CLIENT_SECRET") and os.getenv("AZURE_CLIENT_SECRET"):
@@ -3261,9 +3269,21 @@ def api_firestore_cleanup():
                 try:
                     pm_ref = _fs.collection("users").document(uid).collection("processedMessages")
                     docs = list(pm_ref.stream())
+                    legacy_docs = []
                     for doc in docs:
+                        doc_data = doc.to_dict()
+                        if not isinstance(doc_data, dict) or any(
+                            field in doc_data
+                            for field in B1_PROCESSED_OWNERSHIP_FIELDS
+                        ):
+                            continue
+                        legacy_docs.append(doc)
+                    for doc in legacy_docs:
                         doc.reference.delete()
-                    user_results["processedMessages"] = f"Deleted {len(docs)} docs"
+                    user_results["processedMessages"] = (
+                        f"Deleted {len(legacy_docs)} legacy docs; "
+                        f"preserved {len(docs) - len(legacy_docs)} B1/ambiguous docs"
+                    )
                 except Exception as e:
                     user_results["processedMessages"] = f"Error: {e}"
 
@@ -3296,29 +3316,10 @@ def api_firestore_cleanup():
 
             # Clear old threads
             if clear_old_threads_days > 0:
-                try:
-                    threads_ref = _fs.collection("users").document(uid).collection("threads")
-                    docs = list(threads_ref.stream())
-                    cutoff = datetime.now() - timedelta(days=clear_old_threads_days)
-                    deleted = 0
-                    for doc in docs:
-                        doc_data = doc.to_dict()
-                        updated_at = doc_data.get("updatedAt") or doc_data.get("createdAt")
-                        if updated_at:
-                            if hasattr(updated_at, 'timestamp'):
-                                doc_time = datetime.fromtimestamp(updated_at.timestamp())
-                            else:
-                                doc_time = datetime.now()
-                            if doc_time < cutoff:
-                                # Also delete messages subcollection
-                                msgs_ref = doc.reference.collection("messages")
-                                for msg in msgs_ref.stream():
-                                    msg.reference.delete()
-                                doc.reference.delete()
-                                deleted += 1
-                    user_results["threads"] = f"Deleted {deleted} old threads (kept {len(docs) - deleted})"
-                except Exception as e:
-                    user_results["threads"] = f"Error: {e}"
+                user_results["threads"] = (
+                    "Legacy old-thread cleanup is disabled until a coordinated "
+                    "writer lock is available"
+                )
 
             results[uid] = user_results
 

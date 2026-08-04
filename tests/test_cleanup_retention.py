@@ -10,6 +10,7 @@ os.environ.setdefault(
 )
 
 import main
+from scripts import production_reset
 
 
 class FakeDocRef:
@@ -145,6 +146,250 @@ def _canonical_processed_projection(processed_at):
 
 
 class CleanupRetentionTests(unittest.TestCase):
+    def test_production_reset_includes_complete_b1_authority_graph(self):
+        self.assertTrue(
+            set(FakeFirestore.B1_AUTHORITY_COLLECTIONS).issubset(
+                production_reset.COLLECTIONS_TO_WIPE
+            )
+        )
+
+    def test_production_reset_dry_run_materializes_bounded_pages(self):
+        stream_state = {
+            "active": False,
+            "interrupted": False,
+            "calls": 0,
+        }
+
+        class DryRunDoc:
+            class Reference:
+                def __init__(self, path, state):
+                    self._path = path
+                    self._state = state
+
+                @property
+                def path(self):
+                    if self._state["active"]:
+                        self._state["interrupted"] = True
+                    return self._path
+
+            def __init__(self, path, state):
+                self.reference = self.Reference(path, state)
+
+        class FullPageCollection:
+            def __init__(self, docs, state, *, start=0, limit=None):
+                self.docs = docs
+                self.state = state
+                self.start = start
+                self._limit = limit
+
+            def order_by(self, field):
+                self.assert_document_order(field)
+                return FullPageCollection(
+                    self.docs,
+                    self.state,
+                    start=self.start,
+                    limit=self._limit,
+                )
+
+            @staticmethod
+            def assert_document_order(field):
+                if field != "__name__":
+                    raise AssertionError(f"unexpected order field: {field}")
+
+            def limit(self, count):
+                return FullPageCollection(
+                    self.docs,
+                    self.state,
+                    start=self.start,
+                    limit=count,
+                )
+
+            def start_after(self, snapshot):
+                return FullPageCollection(
+                    self.docs,
+                    self.state,
+                    start=self.docs.index(snapshot) + 1,
+                    limit=self._limit,
+                )
+
+            def stream(self):
+                end = (
+                    None
+                    if self._limit is None
+                    else self.start + self._limit
+                )
+                selected = self.docs[self.start:end]
+
+                def snapshots():
+                    self.state["calls"] += 1
+                    self.state["active"] = True
+                    self.state["interrupted"] = False
+                    try:
+                        for doc in selected:
+                            if self.state["interrupted"]:
+                                return
+                            yield doc
+                    finally:
+                        self.state["active"] = False
+                        self.state["interrupted"] = False
+
+                return snapshots()
+
+        docs = [
+            DryRunDoc(path, stream_state)
+            for path in ("one", "two", "three")
+        ]
+        collection = FullPageCollection(docs, stream_state)
+
+        deleted = production_reset.delete_collection_batched(
+            object(),
+            collection,
+            batch_size=2,
+            dry_run=True,
+        )
+
+        self.assertEqual(3, deleted)
+        self.assertEqual(2, stream_state["calls"])
+
+    def test_production_reset_traverses_every_nested_parent(self):
+        stream_state = {
+            "active": False,
+            "interrupted": False,
+        }
+
+        class NestedCollection:
+            pass
+
+        class ParentReference:
+            def __init__(self, index):
+                self.index = index
+
+            def collection(self, _name):
+                return NestedCollection()
+
+        class ParentDoc:
+            def __init__(self, index):
+                self.index = index
+                self.reference = ParentReference(index)
+
+        class ParentCollection:
+            def __init__(self, docs, state, *, start=0, limit=None):
+                self.docs = docs
+                self.state = state
+                self.start = start
+                self._limit = limit
+
+            def order_by(self, field):
+                if field != "__name__":
+                    raise AssertionError(f"unexpected order field: {field}")
+                return ParentCollection(
+                    self.docs,
+                    self.state,
+                    start=self.start,
+                    limit=self._limit,
+                )
+
+            def limit(self, count):
+                return ParentCollection(
+                    self.docs,
+                    self.state,
+                    start=self.start,
+                    limit=count,
+                )
+
+            def start_after(self, snapshot):
+                return ParentCollection(
+                    self.docs,
+                    self.state,
+                    start=snapshot.index + 1,
+                    limit=self._limit,
+                )
+
+            def stream(self):
+                end = (
+                    None
+                    if self._limit is None
+                    else self.start + self._limit
+                )
+                selected = self.docs[self.start:end]
+
+                def snapshots():
+                    self.state["active"] = True
+                    self.state["interrupted"] = False
+                    try:
+                        for doc in selected:
+                            if self.state["interrupted"]:
+                                return
+                            yield doc
+                    finally:
+                        self.state["active"] = False
+                        self.state["interrupted"] = False
+
+                return snapshots()
+
+        class UserReference:
+            def __init__(self, parents):
+                self.parents = parents
+
+            def collection(self, name):
+                if name != "threads":
+                    raise AssertionError(f"unexpected collection: {name}")
+                return ParentCollection(self.parents, stream_state)
+
+        class UsersCollection:
+            def __init__(self, parents):
+                self.parents = parents
+
+            def document(self, _user_id):
+                return UserReference(self.parents)
+
+        class ResetFirestore:
+            def __init__(self, parents):
+                self.parents = parents
+
+            def collection(self, name):
+                if name != "users":
+                    raise AssertionError(f"unexpected root collection: {name}")
+                return UsersCollection(self.parents)
+
+        parents = [ParentDoc(index) for index in range(501)]
+        fake_db = ResetFirestore(parents)
+
+        def delete_collection(_db, collection_ref, **_kwargs):
+            if (
+                isinstance(collection_ref, NestedCollection)
+                and stream_state["active"]
+            ):
+                stream_state["interrupted"] = True
+            return 1
+
+        with patch.object(
+            production_reset,
+            "COLLECTIONS_TO_WIPE",
+            ["threads"],
+        ), patch.object(
+            production_reset,
+            "NESTED_COLLECTIONS",
+            {"threads": ["messages"]},
+        ), patch.object(
+            production_reset,
+            "delete_collection_batched",
+            side_effect=delete_collection,
+        ) as delete_collection:
+            stats = production_reset.wipe_user_data(
+                fake_db,
+                "user-1",
+                dry_run=True,
+            )
+
+        nested_calls = [
+            call
+            for call in delete_collection.call_args_list
+            if isinstance(call.args[1], NestedCollection)
+        ]
+        self.assertEqual(501, len(nested_calls))
+        self.assertEqual(501, stats["nested_deleted"])
+
     def test_auto_cleanup_deletes_only_oldest_excess_docs(self):
         fake_fs = FakeFirestore()
 
