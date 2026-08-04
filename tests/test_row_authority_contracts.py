@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -21,7 +22,20 @@ class BoundedRowAuthorityFakeTests(unittest.TestCase):
 
     def test_invalid_write_ceilings_are_rejected(self):
         module = self._load_fakes()
-        for value in (True, False, 0, -1, 1.5, "400", None):
+
+        class IntSubclass(int):
+            pass
+
+        for value in (
+            True,
+            False,
+            0,
+            -1,
+            1.5,
+            "400",
+            None,
+            IntSubclass(400),
+        ):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 module.BoundedFakeFirestore(max_writes_per_commit=value)
 
@@ -40,7 +54,23 @@ class BoundedRowAuthorityFakeTests(unittest.TestCase):
 
     def test_401_writes_fail_before_any_apply(self):
         module = self._load_fakes()
+
+        class FailOnCallBarrier:
+            def wait(self, timeout=5):
+                raise AssertionError(
+                    f"commit barrier was touched with timeout {timeout}"
+                )
+
         store = module.BoundedFakeFirestore(max_writes_per_commit=400)
+        store.collection("seeded").document("existing").create(
+            {"seeded": True}
+        )
+        data_before = deepcopy(store.data)
+        versions_before = dict(store._versions)
+        version_clock_before = store._version_clock
+        store.events.clear()
+        store.before_commit_barrier = FailOnCallBarrier()
+
         transaction = store.transaction()
         for index in range(401):
             transaction.create(
@@ -49,12 +79,13 @@ class BoundedRowAuthorityFakeTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(RuntimeError, "400-write ceiling"):
             transaction.commit()
-        self.assertEqual({}, store.data)
-        self.assertIn(
-            ("commit_refused_write_ceiling", 401, 400),
+        self.assertEqual(data_before, store.data)
+        self.assertEqual(versions_before, store._versions)
+        self.assertEqual(version_clock_before, store._version_clock)
+        self.assertEqual(
+            [("commit_refused_write_ceiling", 401, 400)],
             store.events,
         )
-        self.assertNotIn(("commit_applied", 401), store.events)
 
 
 if __name__ == "__main__":
