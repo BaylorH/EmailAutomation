@@ -8,10 +8,14 @@
 
 **Tech Stack:** Python 3.14, unittest, dataclasses/enums, Firestore transaction interfaces and hermetic fakes, AST-based static inventory tests.
 
-**Plan deliverable:** code
+**Plan deliverable:** both (code and production-readiness findings)
 **Approved spec:** `docs/superpowers/specs/2026-08-02-shared-exact-source-coordinator-design.md`
 **Baseline:** `2b5e785bbc46754de16ca439e463793653e45f84`
 **Safety boundary:** Local/offline only. No credentials, network, Graph, OpenAI, Sheets, Drive, mailbox, campaign, production data, deployment, push, or merge.
+**Execution authorization update (2026-08-04):** A later explicit user
+instruction authorized milestone pushes to the owned GitHub branch. It did not
+authorize production enablement, deployment, provider effects, external
+contact, or bypassing the B2-B4 clearance gates.
 
 ---
 
@@ -59,7 +63,7 @@ all implementation tasks are green.
 - Read: `email_automation/operator_replay.py`
 - Read: `scheduler_runner.py`
 
-- [ ] **Step 1: Write the failing Graph draft caller inventory test**
+- [x] **Step 1: Write the failing Graph draft caller inventory test**
 
 Add a test that parses application Python with `ast`, records the containing
 function for each `_delete_graph_reply_draft` call, and compares the result
@@ -83,7 +87,7 @@ The test must separately assert deferred count `3 + 13 == 16`, M2-owned count
 `5`, total production callers `21`, and exactly one `requests.delete` call
 implementation inside `_delete_graph_reply_draft`.
 
-- [ ] **Step 2: Run the inventory test and verify RED**
+- [x] **Step 2: Run the inventory test and verify RED**
 
 Run:
 
@@ -95,7 +99,7 @@ Run:
 Expected: FAIL with `graph draft delete caller manifest is missing`; no import
 or file-read error is accepted as RED.
 
-- [ ] **Step 3: Add the exact JSON manifest and AST scanner**
+- [x] **Step 3: Add the exact JSON manifest and AST scanner**
 
 The fixture schema is:
 
@@ -118,7 +122,7 @@ Implement an AST visitor that tracks the current `FunctionDef`/
 `_delete_graph_reply_draft`, and separately counts `requests.delete` in the
 helper. Do not count tests, vendored files, wrappers, or string tokens.
 
-- [ ] **Step 4: Add the initial direct-writer inventory test**
+- [x] **Step 4: Add the initial direct-writer inventory test**
 
 Assert the pre-B1 inventory contains these authority writers/readers so later
 tasks must deliberately remove or quarantine them:
@@ -134,7 +138,7 @@ EXPECTED_LEGACY_MARKER_SYMBOLS = {
 The inventory is a baseline assertion, not an allowlist that authorizes those
 writers after enforced adoption.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 Run the command from Step 2. Expected: all inventory tests pass with deferred
 `16`, M2-owned `5`, total `21`.
@@ -154,7 +158,7 @@ git commit -m "test: freeze B1 mutation inventories"
 - Create: `tests/test_source_coordinator.py`
 - Test: `tests/test_source_coordinator_inventory.py`
 
-- [ ] **Step 1: Write failing mode, hash, and alias tests**
+- [x] **Step 1: Write failing mode, hash, and alias tests**
 
 Use `importlib.util.find_spec("email_automation.source_coordinator")` in a test
 helper, assert the spec is not `None`, and return before dynamic import when it
@@ -204,7 +208,7 @@ FORBIDDEN_ROOTS = {"requests", "openai", "googleapiclient"}
 FORBIDDEN_RELATIVE = {"email", "sheets", "sheet_operations", "file_handling", "ai_processing"}
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -218,7 +222,7 @@ Expected: FAIL with `source coordinator module is missing`; a
 `ModuleNotFoundError` is an instrument error and must be corrected before
 implementation.
 
-- [ ] **Step 3: Implement the minimal pure contracts**
+- [x] **Step 3: Implement the minimal pure contracts**
 
 Create these exact types and functions:
 
@@ -261,14 +265,14 @@ separators=(",", ":"), allow_nan=False).encode("utf-8")` and full SHA-256.
 Do not import `requests`, Graph, OpenAI, Sheets, Drive, or application effect
 modules.
 
-- [ ] **Step 4: Verify the prewritten static zero-provider-import gate**
+- [x] **Step 4: Verify the prewritten static zero-provider-import gate**
 
 Run the inventory test alone and confirm the now-present module passes the
 prewritten AST assertions. Firestore types and `SERVER_TIMESTAMP` are allowed;
 network/effect clients are not. Do not add or weaken a test after observing the
 implementation.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 Run:
 
@@ -296,7 +300,7 @@ git commit -m "feat: add B1 coordinator contracts"
 - Modify: `tests/test_source_coordinator.py`
 - Modify: `tests/test_source_coordinator_inventory.py`
 
-- [ ] **Step 1: Build the deterministic transaction fake**
+- [x] **Step 1: Build the deterministic transaction fake**
 
 Implement fake document references, snapshots, transactions, and a client with:
 
@@ -317,7 +321,7 @@ new buffered fake transaction bound to the store. Transactions buffer `create`,
 preconditions atomically, and optionally fail before apply or after full apply.
 the fake must never import production coordinator code.
 
-- [ ] **Step 2: Write identity RED tests**
+- [x] **Step 2: Write identity RED tests**
 
 Test the wished-for interface:
 
@@ -367,7 +371,7 @@ production imports/construction of `_SourceAdmissionEnvelope` and permit calls
 to `admit_or_repair_source_identity` only from the reviewed processing/replay
 adapter functions.
 
-- [ ] **Step 3: Run RED and confirm the missing API is the cause**
+- [x] **Step 3: Run RED and confirm the missing API is the cause**
 
 Run:
 
@@ -381,7 +385,7 @@ Expected: an explicit `hasattr` assertion FAIL stating that
 `SourceCoordinator` or `admit_or_repair_source_identity` is absent. Do not
 accept an `AttributeError` as RED.
 
-- [ ] **Step 4: Implement identity paths and strict readback**
+- [x] **Step 4: Implement identity paths and strict readback**
 
 Add:
 
@@ -421,7 +425,7 @@ as routing evidence, never aliases. Catch commit errors once, perform one
 strict readback, and accept only a fully matching state; otherwise raise typed
 retryable/ambiguous errors. Do not retry the transaction automatically.
 
-- [ ] **Step 5: Run GREEN, invariants, and commit**
+- [x] **Step 5: Run GREEN, invariants, and commit**
 
 Run:
 
@@ -449,7 +453,7 @@ git commit -m "feat: add canonical source identity"
 - Modify: `tests/test_source_coordinator.py`
 - Modify: `tests/test_source_coordinator_inventory.py`
 
-- [ ] **Step 1: Write classification state-machine RED tests**
+- [x] **Step 1: Write classification state-machine RED tests**
 
 Exercise these APIs:
 
@@ -504,7 +508,7 @@ Also add the AST/signature assertion now to
 private verified-evidence type and reject `deterministic_evidence`,
 `owner_kind`, or `winner` parameters on `classify_source_once`.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -517,7 +521,7 @@ Run:
 Expected: explicit `hasattr` assertion failures for the absent classification
 API. Do not accept an `AttributeError` as RED.
 
-- [ ] **Step 3: Implement explicit classification types and transitions**
+- [x] **Step 3: Implement explicit classification types and transitions**
 
 Add immutable result types:
 
@@ -555,7 +559,7 @@ the input/evidence, and atomically writes `not_applicable` plus `snapshot_ready`
 When the verifier is absent or returns no verified result, this API cannot elect
 hard opt-out.
 
-- [ ] **Step 4: Implement the one-call orchestration helper**
+- [x] **Step 4: Implement the one-call orchestration helper**
 
 Implement the pretested `classify_source_once` helper with explicit user ID, canonical source
 ID, lease duration, immutable classification input, and classifier callback
@@ -575,7 +579,7 @@ a reviewed fake, and B4 owns the real adapter. The helper must:
 The prewritten test uses a counter callback and two simulated workers; total
 callback count must be one.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 Run:
 
@@ -602,7 +606,7 @@ git commit -m "feat: freeze authoritative source classification"
 - Modify: `email_automation/source_coordinator.py`
 - Modify: `tests/test_source_coordinator.py`
 
-- [ ] **Step 1: Write deterministic selection and ledger RED tests**
+- [x] **Step 1: Write deterministic selection and ledger RED tests**
 
 Create proposal permutations containing ordinary updates plus combinations of
 hard opt-out, terminal, human-decision, generic reply, new property, and
@@ -635,7 +639,7 @@ ledger = coordinator.create_or_verify_source_work_ledger(
   fail before materialization;
 - differing retry payload/hash cannot replace the owner or ledger.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -647,7 +651,7 @@ Run:
 Expected: explicit `hasattr` assertion failures for missing selection/ledger
 APIs, not import or attribute errors.
 
-- [ ] **Step 3: Implement pure selection normalization**
+- [x] **Step 3: Implement pure selection normalization**
 
 Add `build_selection_snapshot(complete_proposal: Mapping[str, Any]) ->
 Mapping[str, Any]` with deterministic normalization that sorts candidates by
@@ -659,7 +663,7 @@ allowlisted unknown informational work is preserved while unknown
 transition-shaped work blocks.
 It must not accept a caller-provided winner.
 
-- [ ] **Step 4: Persist owner and immutable ledger from the stored snapshot**
+- [x] **Step 4: Persist owner and immutable ledger from the stored snapshot**
 
 Implement `elect_transition_owner_from_snapshot` and
 `create_or_verify_source_work_ledger`. The transaction reads only the retained
@@ -669,7 +673,7 @@ full-hash `workKey` values. Enforce the spec's entry, canonical-byte, and
 transaction-write bounds before mutation. Exact retries are no-ops after strict
 readback; mismatches fail closed.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 Run:
 
@@ -695,7 +699,7 @@ git commit -m "feat: elect source transition owner"
 - Modify: `tests/source_coordinator_fakes.py`
 - Modify: `tests/test_source_coordinator.py`
 
-- [ ] **Step 1: Write two-worker thread-head RED barriers**
+- [x] **Step 1: Write two-worker thread-head RED barriers**
 
 Use deterministic barriers to race two distinct sources on one thread. Assert
 `claim_or_block_thread_transition` leaves exactly one active head; the
@@ -708,7 +712,7 @@ queue-bound cases. Exactly 100 blocked sources are representable for a thread;
 source 101 fails closed with zero partial admission/history/index/projection or
 head writes.
 
-- [ ] **Step 2: Write wake-order and handoff RED tests**
+- [x] **Step 2: Write wake-order and handoff RED tests**
 
 Create three blocked sources with different received/sent/canonical ordering.
 `release_generation_and_wake_oldest` must produce one monotonic wake token
@@ -721,7 +725,7 @@ compare-and-set claim/rebind/next-head creation is a second atomic transaction.
 Both use the durable admission set rather than unread/age-filtered scans and
 strictly read back apply-then-raise outcomes.
 
-- [ ] **Step 3: Write strict settlement RED tests**
+- [x] **Step 3: Write strict settlement RED tests**
 
 `settle_source_markers_if_ready` must reject pending/applying ledger work,
 invalid delegation, partial dominance, absent/malformed identity, unreadable
@@ -739,7 +743,7 @@ Also assert legal ledger transitions and exact completion/delegation evidence;
 Name the partial marker/cursor barrier exactly
 `LedgerTransitionAndSettlementTests.test_marker_partial_commit_blocks_cursor`.
 
-- [ ] **Step 4: Run the new Task 5 tests RED**
+- [x] **Step 4: Run the new Task 5 tests RED**
 
 Run:
 
@@ -753,7 +757,7 @@ Expected: explicit `hasattr` assertion failures naming the first absent head,
 wake, ledger-transition, or settlement API. Import/attribute errors are not an
 accepted RED.
 
-- [ ] **Step 5: Implement minimal head, queue, ledger, and marker APIs**
+- [x] **Step 5: Implement minimal head, queue, ledger, and marker APIs**
 
 Add the exact methods `claim_or_block_thread_transition`,
 `admit_pending_inbound`, `enqueue_blocked_source`,
@@ -776,7 +780,7 @@ atomically creates/verifies `sourceDeferredWork` with matching owner and payload
 hash; dominance is derived only from the stored selection and accepts no caller
 winner. Legal transitions are exactly those in the spec.
 
-- [ ] **Step 6: Run GREEN and commit**
+- [x] **Step 6: Run GREEN and commit**
 
 Run:
 
@@ -806,7 +810,7 @@ git commit -m "feat: add B1 source queue and settlement"
 - Modify: `tests/test_cleanup_retention.py`
 - Create or modify: `tests/test_source_coordinator_integration.py`
 
-- [ ] **Step 1: Write disabled-mode zero-effect RED tests**
+- [x] **Step 1: Write disabled-mode zero-effect RED tests**
 
 Patch coordinator construction to raise if called, unset the environment mode,
 and run representative `has_processed`, `mark_processed`, and scanner entry
@@ -815,7 +819,7 @@ and coordinator construction count is zero. Repeat with an invalid mode value.
 Under `shadow`, assert pure in-memory proposal computation is allowed but every
 coordinator, marker, cursor, domain, and provider write/call counter stays zero.
 
-- [ ] **Step 2: Write enforced strict-marker and retention RED tests**
+- [x] **Step 2: Write enforced strict-marker and retention RED tests**
 
 Under `enforced`, assert direct `messaging.mark_processed` and duplicate
 `scheduler_runner.mark_processed` cannot authorize source completion. They must
@@ -823,7 +827,7 @@ delegate to a coordinator settlement context or raise a typed error. Assert
 `main.auto_cleanup_firestore` never deletes coordinator authority collections
 or B1-owned processed projections.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -835,7 +839,7 @@ Run:
 
 Expected: enforced cases fail because legacy writers remain active.
 
-- [ ] **Step 4: Implement mode-routed compatibility**
+- [x] **Step 4: Implement mode-routed compatibility**
 
 In `messaging.py`, preserve legacy bodies behind `disabled`; in `enforced`,
 require a canonical settlement context and invoke coordinator methods. In
@@ -848,7 +852,7 @@ Change cleanup to skip any B1 authority collection and any processed projection
 carrying `canonicalSourceId`/`settlementRevision`; preserve existing legacy
 retention behavior for records without B1 ownership.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 Run:
 
@@ -881,7 +885,7 @@ git commit -m "feat: gate strict source markers"
 - Modify: `tests/test_compound_nonviable_processing.py`
 - Modify: `tests/test_source_coordinator_integration.py`
 
-- [ ] **Step 1: Write the same-thread source-loss RED**
+- [x] **Step 1: Write the same-thread source-loss RED**
 
 Under enforced mode, scan two ordinary messages in one thread. Assert both have
 canonical identity, classification, and ledger records; the earlier message is
@@ -891,7 +895,7 @@ unprocessed and enumerable.
 Name this regression exactly
 `SourceCoordinatorScannerTests.test_two_same_thread_sources_are_independently_settled`.
 
-- [ ] **Step 2: Write freeze-before-effects RED instrumentation**
+- [x] **Step 2: Write freeze-before-effects RED instrumentation**
 
 Instrument proposal callback and every pre-election forbidden write/effect
 seam: thread
@@ -927,7 +931,7 @@ immutable history/index, pending admission/block projection, classification
 state, and source-bound failure visibility may write. Losing families have zero
 events.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -941,7 +945,7 @@ Run:
 Expected: earlier source is still marked processed and Sheet/event work still
 precedes snapshot authority.
 
-- [ ] **Step 4: Split `process_inbox_message` at the proposal seam**
+- [x] **Step 4: Split `process_inbox_message` at the proposal seam**
 
 Add a small context object:
 
@@ -975,7 +979,7 @@ enforced mode rather than treating them as harmless preparation. Split
 `fetch_and_log_sheet_for_thread` so its read-only input acquisition is distinct
 from logging/mutation; the latter remains behind the barrier.
 
-- [ ] **Step 5: Replace scanner last-message batching**
+- [x] **Step 5: Replace scanner last-message batching**
 
 In enforced mode, admit/process each message oldest-first. If a head blocks a
 source, persist pending/history/index/blocked evidence and continue only as the
@@ -983,7 +987,7 @@ queue contract permits. Remove every enforced path that marks an earlier source
 processed solely because it was saved for history. Stop same-thread advancement
 after the first retryable/ambiguous source failure.
 
-- [ ] **Step 6: Run GREEN, adjacent terminal tests, and commit**
+- [x] **Step 6: Run GREEN, adjacent terminal tests, and commit**
 
 Run:
 
@@ -1020,7 +1024,7 @@ git commit -m "feat: enforce exact-source inbox admission"
 - Modify: `tests/test_source_coordinator.py`
 - Modify: `tests/test_source_coordinator_inventory.py`
 
-- [ ] **Step 1: Write retry/replay ownership RED tests**
+- [x] **Step 1: Write retry/replay ownership RED tests**
 
 Under enforced mode prove failure retry and operator replay:
 
@@ -1048,7 +1052,7 @@ forbidden; `quarantine_retained_terminal_authority` cannot accept evidence/hash
 arguments; and production loader wiring must be the exact
 `_terminal_retry_disposition` adapter.
 
-- [ ] **Step 2: Write pending-response source-binding RED tests**
+- [x] **Step 2: Write pending-response source-binding RED tests**
 
 Create pending work for source A, then attempt source B on the same thread-keyed
 legacy path. Assert B cannot overwrite A, send A's body, or become A's ledger
@@ -1057,7 +1061,7 @@ hashes, and `workKey`. Existing M2 Graph permit behavior remains unchanged.
 Exact enqueue/require/claim/clear operations verify canonical source and
 `workKey`; clearing A cannot delete, settle, or alter B.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run coordinator, operator replay, pending response, and retry test modules.
 Expected: retained-authority API, direct-marker, and thread-key overwrite
@@ -1070,7 +1074,7 @@ assertions fail.
   tests.test_processing_retryability tests.test_source_coordinator_inventory -v
 ```
 
-- [ ] **Step 4: Implement coordinator-routed recovery**
+- [x] **Step 4: Implement coordinator-routed recovery**
 
 Add canonical authority parameters to internal retry/replay calls. Replace
 `_begin_replay_claim`/`_complete_replay_claim` direct processed ownership in
@@ -1114,13 +1118,13 @@ lifecycle to health but does not implement a resolver. Add equivalent
 operator-visible dispositions for legacy marker-only ambiguity and in-progress
 replay quarantine. Do not alter B3 send permits.
 
-- [ ] **Step 5: Verify the prewritten direct-writer inventory**
+- [x] **Step 5: Verify the prewritten direct-writer inventory**
 
 Run the inventory assertions written in Step 1. Fix only the production call
 sites they identify; do not relax the exact disabled-compatibility or trusted
 loader boundaries.
 
-- [ ] **Step 6: Run GREEN and commit**
+- [x] **Step 6: Run GREEN and commit**
 
 Run:
 
@@ -1153,7 +1157,7 @@ git commit -m "feat: route source recovery through B1"
 - Modify: `tests/test_source_coordinator_inventory.py`
 - Modify: `tests/test_source_coordinator_integration.py`
 
-- [ ] **Step 1: Write health RED tests**
+- [x] **Step 1: Write health RED tests**
 
 Add bounded count tests for active/ambiguous classification, blocked sources,
 nonsettled pending admissions, unsettled ledgers, alias conflicts, and marker
@@ -1177,7 +1181,7 @@ Before production health edits, also add the final static closure assertions:
 - no runtime default enables enforced mode; and
 - no B2 `rowBindings`/stable-row owner or B3 general execution claim was added.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run `tests.test_system_health`, coordinator integration health nodes, and
 `tests.test_source_coordinator_inventory`. Expected: B1 health fields are absent
@@ -1191,20 +1195,20 @@ not an accepted RED.
   tests.test_source_coordinator_inventory -v
 ```
 
-- [ ] **Step 3: Implement bounded health projections**
+- [x] **Step 3: Implement bounded health projections**
 
 Use server-filtered queries where the fake/runtime supports them and a hard
 `HEALTH_SCAN_LIMIT = 500`. Count only unresolved B1 states. Never include raw
 aliases, proposal bodies, addresses, recipients, or customer data in health
 payloads/logs.
 
-- [ ] **Step 4: Resolve the prewritten static closure gates**
+- [x] **Step 4: Resolve the prewritten static closure gates**
 
 Run the inventory test alone, fix only concrete production call sites or scoped
 manifests identified by its prewritten assertions, and do not weaken the gates
 to make the implementation pass.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 Run:
 
@@ -1233,7 +1237,7 @@ git commit -m "feat: expose B1 coordinator health"
 - Create: `docs/superpowers/evidence/2026-08-03-shared-exact-source-coordinator-b1.md`
 - Read: approved spec and every changed file
 
-- [ ] **Step 1: Run the complete B1 focused suite**
+- [x] **Step 1: Run the complete B1 focused suite**
 
 Run all new coordinator, inventory, integration, retry, replay, pending,
 retention, and health modules in one import-order command with credentials
@@ -1258,7 +1262,7 @@ env -u GOOGLE_APPLICATION_CREDENTIALS \
   tests.test_system_health -v
 ```
 
-- [ ] **Step 2: Run retained M2 regression suites**
+- [x] **Step 2: Run retained M2 regression suites**
 
 Run the 23-module changed-surface suite used to checkpoint M2, including
 compound terminal, send permits, immutable Graph identity, pending APIs,
@@ -1292,7 +1296,7 @@ completion obligations, retryability, and system health. Expected: exit `0`.
   tests.test_terminal_completion_replay -v
 ```
 
-- [ ] **Step 3: Compile every changed Python file and inspect the diff**
+- [x] **Step 3: Compile every changed Python file and inspect the diff**
 
 Run:
 
@@ -1307,7 +1311,7 @@ git diff --check 2b5e785
 
 Expected: both commands exit `0` with no output.
 
-- [ ] **Step 4: Prove the original source-loss symptom is fixed**
+- [x] **Step 4: Prove the original source-loss symptom is fixed**
 
 Cross-reference the captured Task 7 RED for the exact two-message source-loss
 test, then run these named barriers GREEN on the candidate:
@@ -1323,19 +1327,19 @@ test, then run these named barriers GREEN on the candidate:
 The evidence file records the Task 7 RED assertion text/commit and the Task 10
 GREEN output. Never modify production code merely to manufacture RED.
 
-- [ ] **Step 5: Request independent spec-compliance review**
+- [x] **Step 5: Request independent spec-compliance review**
 
 Give a fresh reviewer only the approved spec, this plan, baseline SHA, head SHA,
 and diff. Resolve every Critical/Important finding, rerun affected tests, and
 request re-review until approved.
 
-- [ ] **Step 6: Request independent code-quality/security review**
+- [x] **Step 6: Request independent code-quality/security review**
 
 After spec approval, give a separate fresh reviewer the same immutable diff and
 test evidence. Resolve every Critical/Important finding and rerun the affected
 and full focused suites. Do not proceed with an open Important issue.
 
-- [ ] **Step 7: Freeze evidence and leave production NO-GO**
+- [x] **Step 7: Freeze evidence and leave production NO-GO**
 
 Record head SHA, sorted changed-file aggregate, commands/counts/durations,
 compile/diff results, review findings, and zero-effect boundary in this plan and
@@ -1352,7 +1356,7 @@ git diff --name-only --diff-filter=ACMR 2b5e785 | LC_ALL=C sort | \
   while IFS= read -r path; do shasum -a 256 "$path"; done | shasum -a 256
 ```
 
-- [ ] **Step 8: Commit the local verification record**
+- [x] **Step 8: Commit the local verification record**
 
 Commit the plan/evidence record only after Steps 1-7 are complete:
 
@@ -1364,6 +1368,32 @@ git commit -m "docs: freeze B1 verification evidence"
 
 The evidence records the verified code head before this documentation-only
 commit; report both SHAs in the final handoff.
+
+## Execution record — 2026-08-04
+
+- Verified code head:
+  `a3fcdf51a9b721b4b61be857476942498a292495`
+- Remote branch readback: exact match on
+  `codex/sitesift-m3-b1-source-authority-20260803`
+- Sorted changed-file aggregate:
+  `018fb05dd4bec033075c7cf9d70bf65aced9abd9f93ee21e79308d9e2b6ec5fe`
+- Complete focused suite: 606/606 in 23.779 seconds under offline
+  containment.
+- Retained M2 suite: 669/669 in 22.101 seconds under offline containment.
+- Source-loss/concurrency barriers: 3/3 in 0.053 seconds.
+- Changed-Python compile and baseline diff check: clean.
+- Independent spec review: APPROVED, no open Critical/Important.
+- Independent code-quality/security review: APPROVED, no open
+  Critical/Important.
+- GitHub Actions query: no workflow run exists for the branch; local gates are
+  the recorded authority.
+- Production status: **NO-GO**. Enforced mode, deployment, campaigns,
+  providers, and production data were not touched. B1 advances the board to
+  B2 only.
+
+Full commands, evidence limitations, resolved findings, and the zero-effect
+boundary are frozen in
+`docs/superpowers/evidence/2026-08-03-shared-exact-source-coordinator-b1.md`.
 
 ## Plan self-review checklist
 
