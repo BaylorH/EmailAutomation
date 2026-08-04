@@ -23,14 +23,19 @@ reconcilable.
   a production-runtime action rather than administrative cleanup. Milestone
   branches may be pushed; `main`, deployment, runtime flags, and campaigns stay
   closed until their explicit gates below.
-- The complete B1 suite is 606/606 and the retained M2 suite is 669/669, but the
-  older campaign-clearance lane is currently 85/88. Its two follow-up failures
-  are stale state expectations and its health failure is a stale Firestore fake
-  query contract. The separate auth-isolation test file is also stale against
-  the now-required Firebase token decorator and is not included in normal test
-  discovery.
-- GitHub has scheduled runtime workflows but no push/PR CI for the release
-  branch. No GitHub Actions run exists for the B1 branch.
+- M0 began with an 85/88 campaign-clearance RED and a separately stale
+  auth-isolation harness. Those remain the initial RED history: the two
+  follow-up failures were stale state expectations, the health failure was a
+  stale Firestore fake query contract, and the auth harness predated the
+  required Firebase token decorator and retained-flow field names. After
+  fixture-only repairs, fresh local controllers pass 95/95, 606/606, and
+  669/669.
+- Credential-free release-branch CI now exists and passed at exact local and
+  remote SHA `6dcb319281ce1c2519fec15c6a3ec6d1bf84e15b`: 95/95, 606/606, and
+  669/669, plus compile and diff checks. The completed run is
+  [30946405294](https://github.com/BaylorH/EmailAutomation/actions/runs/30946405294).
+  This closes only the M0 release-gate baseline; it does not prove deployed
+  behavior or clear production.
 - The prior Jill clearance plan has 35 unchecked steps. Its seven planned
   committed artifacts are absent. Its private evidence ledger exists and must
   be preserved uncommitted and uninspected until the evidence lane is rebased;
@@ -49,7 +54,7 @@ reconcilable.
 | Milestone | State | Product exit gate | GitHub / production action |
 |---|---|---|---|
 | F0 — B1 exact-source authority | COMPLETE | 606 focused + 669 retained, two independent approvals | Code and evidence pushed; production off |
-| M0 — Trustworthy release gates | ACTIVE | Campaign and auth isolation gates green locally and in credential-free CI | Push train branch; no merge/deploy |
+| M0 — Trustworthy release gates | COMPLETE — technical baseline | Campaign and auth isolation gates green locally and in credential-free CI at exact remote SHA | Branch pushed and CI passed; evidence packet is committed only after separate fact/document review; no merge/deploy |
 | M1 — B2 stable row authority | NEXT | One stable row ID and retained row owner across terminal, opt-out, split/late roots, moves, cleanup | Push reviewed milestone; no deploy |
 | M2 — B3 effect authority | BLOCKED by M1 | Every Graph/Sheet/notification/cleanup mutation requires the live execution tuple; ambiguity never replays | Push reviewed milestone; no deploy |
 | M3 — B4 real-path and frontend/rules cutover | BLOCKED by M1-M2 | Real backend and frontend entry paths consume B1-B3; rules emulator and all ordered races pass | Candidate push; controlled disabled deploy only after review |
@@ -84,10 +89,20 @@ from its completion.
    runtime identity, provider receipt, and rollback readback.
 7. Agent-run external contact is prohibited unless the current user turn names
    the exact self-owned recipient. Without that, M5 is a user-launched canary.
+8. GitHub readback found `main` unprotected; no repository setting was changed.
+   Do not push or merge directly to `main`. Before M6, require an explicit
+   protected/check-gated release decision that includes the candidate's
+   successful required checks.
 
 ## M0 — Restore trustworthy release gates
 
-**Deliverable:** code
+**Deliverable:** both (code gate and production-readiness findings)
+
+**Status:** The technical release-gate baseline is complete. The linked evidence
+packet is part of the current documentation commit candidate and is committed
+only after separate fact and documentation review. The milestone's COMPLETE
+state is scoped to the technical gates; it does not self-attest or bypass that
+pre-commit packet review.
 
 - [x] Capture the existing campaign clearance RED: 88 tests, 3 failures.
 - [x] Trace the two follow-up failures to a stale expectation: the current
@@ -105,16 +120,23 @@ from its completion.
   suite, 669-test retained M2 suite, compile, and diff checks under corrected
   offline containment. Provider egress was blackholed and all authoritative
   runs exited 0.
-- [ ] Freeze the full freshly fetched main-to-candidate file/feature/mutation
-  inventory so later gates certify all 118 commits, not only B1.
+- [x] Freeze the full freshly fetched main-to-candidate file/feature/mutation
+  inventory so later gates certify all 118 commits, not only B1. The exact
+  69-file inventory and recertification map are in
+  [`2026-08-04-production-clearance-m0.md`](../evidence/2026-08-04-production-clearance-m0.md).
 - [x] Add credential-free GitHub CI for this release train. It has
   read-only repository permissions, no secrets, empty OpenAI key, an
   unreachable emulator, Python 3.12 matching the production image, and a
   hash-locked `requirements.lock` install. The job defaults outbound mode to
-  `paused`, so the release and B1 gates remain paused. Only the retained M2
-  suite step uses `live`; its provider boundaries are faked and provider egress
-  remains blackholed.
-- [ ] Commit, push, verify remote SHA, observe CI, and stop on any non-pass.
+  `paused`. Full-campaign tests opt into `live` only after every provider
+  boundary is faked and restore `paused` first during teardown. Only the
+  retained M2 suite step is configured `live` at step level; its provider
+  boundaries are faked and provider egress remains blackholed.
+- [x] Commit and push the M0 code milestone, verify exact local/remote SHA
+  `6dcb319281ce1c2519fec15c6a3ec6d1bf84e15b`, and observe successful
+  credential-free CI run
+  [30946405294](https://github.com/BaylorH/EmailAutomation/actions/runs/30946405294).
+  Production remains closed.
 
 ## M1 — B2 stable row authority
 
@@ -280,9 +302,9 @@ repairs work but are transient until their final health write.
 
 ## Immediate execution order
 
-1. Complete and push M0.
-2. Write the exact B2 design and TDD plan from the confirmed audit.
-3. Build B2 in reviewed slices, pushing every milestone.
-4. Continue B3, then B4; do not interleave speculative feature work.
-5. Keep the complaint-corpus lane read-only and sanitized in parallel, then bind
+1. Write the exact B2 design and TDD plan from the confirmed audit; no B2
+   production edit has begun.
+2. Build B2 in reviewed slices, pushing every milestone.
+3. Continue B3, then B4; do not interleave speculative feature work.
+4. Keep the complaint-corpus lane read-only and sanitized in parallel, then bind
    it to the exact B4 candidate before any campaign decision.
