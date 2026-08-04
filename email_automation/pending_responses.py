@@ -5,8 +5,10 @@ Handles retry logic for failed AI-generated response emails.
 Similar to outbox retry, but for responses that fail to send after processing.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import os
 from typing import Optional, Dict, Any, List
 from uuid import uuid4
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
@@ -28,9 +30,12 @@ from .column_config import (
     get_column_config_error,
     response_requests_nonrequestable_fields,
 )
+from .firestore_transactions import run_firestore_transaction
 from .send_permits import (
     GraphSendPermitBlocked,
     PENDING_COMPLETION_OBLIGATION_COLLECTION,
+    PENDING_COMPLETION_EXACT_SOURCE_PROTOCOL,
+    PENDING_COMPLETION_EXACT_SOURCE_VERSION,
     PENDING_GRAPH_SENT_RECHECK_LIMIT,
     _stable_evidence_hash,
     _validate_permit,
@@ -49,17 +54,128 @@ from .send_permits import (
     resolve_graph_send_permit,
     validate_pending_completion_obligation_payload,
 )
+from .source_coordinator import (
+    CoordinatorMode,
+    SourceCoordinatorConflict,
+    SourceCoordinatorRetryable,
+    resolve_source_coordinator_mode,
+)
 
 # Maximum retry attempts before giving up
 MAX_RESPONSE_ATTEMPTS = 5
 PENDING_RESPONSE_SEND_LEASE_SECONDS = 300
 PENDING_COMPLETION_SCAN_LIMIT = 500
+PENDING_RESPONSE_SOURCE_BINDING_COLLECTION = "pendingResponseSourceBindings"
+PENDING_RESPONSE_SOURCE_BINDING_VERSION = 1
+PENDING_RESPONSE_SOURCE_BINDING_KIND = "pending_response_source_binding"
+PENDING_RESPONSE_PROTOCOL_VERSION = 1
+PENDING_RESPONSE_EXACT_SOURCE_PROTOCOL = "b1_exact_source"
+PENDING_RESPONSE_LEGACY_PROTOCOL = "legacy"
+PENDING_RESPONSE_PROTOCOL_FIELD = "pendingProtocol"
+_PENDING_RESPONSE_PROTOCOL_FIELDS = frozenset({"kind", "version"})
+_PENDING_RESPONSE_B1_MARKER_FIELDS = frozenset({
+    PENDING_RESPONSE_PROTOCOL_FIELD,
+    "canonicalSourceId",
+    "workKey",
+    "proposalHash",
+    "selectionHash",
+    "pendingRevision",
+})
+_PENDING_RESPONSE_EXACT_CLAIM_TOKEN_PREFIX = "pending-response-b1-"
+_PENDING_RESPONSE_SOURCE_BINDING_FIELDS = frozenset({
+    "version",
+    "kind",
+    "bindingId",
+    "userId",
+    "threadId",
+    "pendingDocumentId",
+    "sourceGraphMessageId",
+    "pendingEnvelopeHash",
+    "pendingProtocol",
+    "canonicalSourceId",
+    "workKey",
+    "proposalHash",
+    "selectionHash",
+    "immutableHash",
+    "pendingRevision",
+    "claimTokenHash",
+    "claimBindingHash",
+    "createdAt",
+    "updatedAt",
+})
+_PENDING_RESPONSE_SOURCE_BINDING_IMMUTABLE_FIELDS = (
+    "version",
+    "kind",
+    "bindingId",
+    "userId",
+    "threadId",
+    "pendingDocumentId",
+    "sourceGraphMessageId",
+    "pendingEnvelopeHash",
+    "pendingProtocol",
+    "canonicalSourceId",
+    "workKey",
+    "proposalHash",
+    "selectionHash",
+)
 _CLIENT_COMPLETION_INELIGIBLE_STATUSES = frozenset({
     "stopping",
     "stopped",
     "archived",
     "deleted",
 })
+
+
+class PendingResponseConflict(SourceCoordinatorConflict):
+    """The pending document conflicts with the requested B1 source binding."""
+
+    code = "pending_response_conflict"
+
+
+class PendingResponseRetryable(SourceCoordinatorRetryable):
+    """The exact pending operation may be retried after durable state changes."""
+
+    code = "pending_response_retryable"
+
+
+@dataclass(frozen=True)
+class PendingResponseRecord:
+    user_id: str
+    document_id: str
+    thread_id: str
+    canonical_source_id: str
+    work_key: str
+    proposal_hash: str
+    selection_hash: str
+    pending_revision: int
+    data: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PendingResponseClaim:
+    user_id: str
+    document_id: str
+    thread_id: str
+    canonical_source_id: str
+    work_key: str
+    proposal_hash: str
+    selection_hash: str
+    pending_revision: int
+    claim_token: str
+    data: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PendingResponseClearResult:
+    user_id: str
+    document_id: str
+    thread_id: str
+    canonical_source_id: str
+    work_key: str
+    proposal_hash: str
+    selection_hash: str
+    pending_revision: int
+    cleared: bool
 
 
 def resolve_pending_graph_draft_review(
@@ -328,6 +444,644 @@ def _same_pending_response_intent(
     ).strip().lower()
 
 
+def _is_full_hash(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _exact_pending_response_protocol() -> Dict[str, Any]:
+    return {
+        "kind": PENDING_RESPONSE_EXACT_SOURCE_PROTOCOL,
+        "version": PENDING_RESPONSE_PROTOCOL_VERSION,
+    }
+
+
+def _classify_pending_response_protocol(data: Any) -> str:
+    """Classify durable pending work independently of the current rollout mode."""
+    if type(data) is not dict:
+        raise PendingResponseConflict(
+            "pending response persisted protocol record is malformed"
+        )
+    present_markers = _PENDING_RESPONSE_B1_MARKER_FIELDS.intersection(data)
+    if not present_markers:
+        return PENDING_RESPONSE_LEGACY_PROTOCOL
+    if present_markers != _PENDING_RESPONSE_B1_MARKER_FIELDS:
+        raise PendingResponseConflict(
+            "pending response persisted protocol has partial B1 markers"
+        )
+    protocol = data.get(PENDING_RESPONSE_PROTOCOL_FIELD)
+    if (
+        type(protocol) is not dict
+        or set(protocol) != _PENDING_RESPONSE_PROTOCOL_FIELDS
+        or protocol != _exact_pending_response_protocol()
+        or type(data.get("canonicalSourceId")) is not str
+        or not data["canonicalSourceId"]
+        or data["canonicalSourceId"].strip() != data["canonicalSourceId"]
+        or any(
+            not _is_full_hash(data.get(field_name))
+            for field_name in (
+                "workKey",
+                "proposalHash",
+                "selectionHash",
+            )
+        )
+        or type(data.get("pendingRevision")) is not int
+        or data["pendingRevision"] < 1
+    ):
+        raise PendingResponseConflict(
+            "pending response persisted B1 protocol is malformed"
+        )
+    return PENDING_RESPONSE_EXACT_SOURCE_PROTOCOL
+
+
+def _require_pending_binding_arguments(
+    *,
+    user_id: str,
+    thread_id: str,
+    canonical_source_id: str,
+    work_key: str,
+    proposal_hash: Optional[str] = None,
+    selection_hash: Optional[str] = None,
+    expected_revision: Optional[int] = None,
+    require_content_hashes: bool = False,
+) -> None:
+    for label, value in (
+        ("user id", user_id),
+        ("thread id", thread_id),
+        ("canonical source id", canonical_source_id),
+    ):
+        if type(value) is not str or not value or value.strip() != value:
+            raise PendingResponseConflict(
+                f"pending response binding {label} must be an exact non-empty string"
+            )
+    if not _is_full_hash(work_key):
+        raise PendingResponseConflict(
+            "pending response binding work key must be a full hash"
+        )
+    for label, value in (
+        ("proposal hash", proposal_hash),
+        ("selection hash", selection_hash),
+    ):
+        if (
+            require_content_hashes
+            and not _is_full_hash(value)
+        ) or (
+            value is not None and not _is_full_hash(value)
+        ):
+            raise PendingResponseConflict(
+                f"pending response binding {label} must be a full hash"
+            )
+    if expected_revision is not None and (
+        type(expected_revision) is not int or expected_revision < 1
+    ):
+        raise PendingResponseConflict(
+            "pending response binding expected revision must be a positive integer"
+        )
+
+
+def _pending_source_binding_id(pending_envelope_hash_value: str) -> str:
+    if not _is_full_hash(pending_envelope_hash_value):
+        raise PendingResponseConflict(
+            "pending response source binding envelope hash is malformed"
+        )
+    return f"pending-source-{pending_envelope_hash_value}"
+
+
+def _pending_source_binding_ref(user_ref, pending_envelope_hash_value: str):
+    return user_ref.collection(
+        PENDING_RESPONSE_SOURCE_BINDING_COLLECTION
+    ).document(_pending_source_binding_id(pending_envelope_hash_value))
+
+
+def _pending_source_binding_payload(
+    *,
+    user_id: str,
+    pending_document_id: str,
+    data: Dict[str, Any],
+    pending_revision: int,
+    claim_token_hash: Optional[str] = None,
+) -> Dict[str, Any]:
+    if (
+        _classify_pending_response_protocol(data)
+        != PENDING_RESPONSE_EXACT_SOURCE_PROTOCOL
+    ):
+        raise PendingResponseConflict(
+            "pending response source binding requires exact B1 protocol"
+        )
+    envelope_hash = pending_envelope_hash(data)
+    binding_id = _pending_source_binding_id(envelope_hash)
+    immutable = {
+        "version": PENDING_RESPONSE_SOURCE_BINDING_VERSION,
+        "kind": PENDING_RESPONSE_SOURCE_BINDING_KIND,
+        "bindingId": binding_id,
+        "userId": user_id,
+        "threadId": data.get("threadId"),
+        "pendingDocumentId": pending_document_id,
+        "sourceGraphMessageId": data.get("msgId"),
+        "pendingEnvelopeHash": envelope_hash,
+        "pendingProtocol": dict(data[PENDING_RESPONSE_PROTOCOL_FIELD]),
+        "canonicalSourceId": data.get("canonicalSourceId"),
+        "workKey": data.get("workKey"),
+        "proposalHash": data.get("proposalHash"),
+        "selectionHash": data.get("selectionHash"),
+    }
+    payload = {
+        **immutable,
+        "immutableHash": _stable_evidence_hash(immutable),
+        "pendingRevision": pending_revision,
+        "claimTokenHash": claim_token_hash,
+        "claimBindingHash": (
+            _pending_source_claim_binding_hash(
+                _stable_evidence_hash(immutable),
+                pending_revision,
+            )
+            if claim_token_hash is not None
+            else None
+        ),
+        "createdAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    }
+    return _validate_pending_source_binding(
+        payload,
+        expected_user_id=user_id,
+        expected_pending_document_id=pending_document_id,
+        expected_data=data,
+        expected_pending_revision=pending_revision,
+        expected_claim_token_hash=claim_token_hash,
+    )
+
+
+def _pending_source_claim_binding_hash(
+    immutable_hash: str,
+    pending_revision: int,
+) -> str:
+    if (
+        not _is_full_hash(immutable_hash)
+        or type(pending_revision) is not int
+        or pending_revision < 1
+    ):
+        raise PendingResponseConflict(
+            "pending response source claim binding is malformed"
+        )
+    return _stable_evidence_hash({
+        "immutableHash": immutable_hash,
+        "pendingRevision": pending_revision,
+    })
+
+
+def _pending_claim_binding_hash_from_token(claim_token: Any) -> str:
+    if (
+        type(claim_token) is not str
+        or not claim_token.startswith(_PENDING_RESPONSE_EXACT_CLAIM_TOKEN_PREFIX)
+    ):
+        raise PendingResponseConflict(
+            "pending response exact claim token lacks B1 provenance"
+        )
+    suffix = claim_token.removeprefix(
+        _PENDING_RESPONSE_EXACT_CLAIM_TOKEN_PREFIX
+    )
+    binding_hash, separator, nonce = suffix.partition("-")
+    if (
+        not separator
+        or not _is_full_hash(binding_hash)
+        or len(nonce) != 32
+        or any(character not in "0123456789abcdef" for character in nonce)
+    ):
+        raise PendingResponseConflict(
+            "pending response exact claim token provenance is malformed"
+        )
+    return binding_hash
+
+
+def _validate_pending_source_binding(
+    raw: Any,
+    *,
+    expected_user_id: str,
+    expected_pending_document_id: str,
+    expected_data: Dict[str, Any],
+    expected_pending_envelope_hash: Optional[str] = None,
+    expected_pending_revision: Optional[int] = None,
+    expected_claim_token_hash: Any = ...,
+) -> Dict[str, Any]:
+    if type(raw) is not dict or set(raw) != _PENDING_RESPONSE_SOURCE_BINDING_FIELDS:
+        raise PendingResponseConflict(
+            "pending response source binding document schema is malformed"
+        )
+    envelope_hash = (
+        expected_pending_envelope_hash
+        if expected_pending_envelope_hash is not None
+        else pending_envelope_hash(expected_data)
+    )
+    binding_id = _pending_source_binding_id(envelope_hash)
+    if (
+        _classify_pending_response_protocol(expected_data)
+        != PENDING_RESPONSE_EXACT_SOURCE_PROTOCOL
+    ):
+        raise PendingResponseConflict(
+            "pending response source binding expected protocol is not exact B1"
+        )
+    expected_protocol = expected_data[PENDING_RESPONSE_PROTOCOL_FIELD]
+    expected_strings = {
+        "kind": PENDING_RESPONSE_SOURCE_BINDING_KIND,
+        "bindingId": binding_id,
+        "userId": expected_user_id,
+        "threadId": expected_data.get("threadId"),
+        "pendingDocumentId": expected_pending_document_id,
+        "sourceGraphMessageId": expected_data.get("msgId"),
+        "pendingEnvelopeHash": envelope_hash,
+        "canonicalSourceId": expected_data.get("canonicalSourceId"),
+        "workKey": expected_data.get("workKey"),
+        "proposalHash": expected_data.get("proposalHash"),
+        "selectionHash": expected_data.get("selectionHash"),
+    }
+    if (
+        type(raw.get("version")) is not int
+        or raw.get("version") != PENDING_RESPONSE_SOURCE_BINDING_VERSION
+        or raw.get("pendingProtocol") != expected_protocol
+        or type(raw.get("pendingProtocol")) is not dict
+        or any(
+            type(value) is not str
+            or not value
+            or value.strip() != value
+            or raw.get(field) != value
+            for field, value in expected_strings.items()
+        )
+        or any(
+            not _is_full_hash(raw.get(field))
+            for field in (
+                "pendingEnvelopeHash",
+                "workKey",
+                "proposalHash",
+                "selectionHash",
+                "immutableHash",
+            )
+        )
+    ):
+        raise PendingResponseConflict(
+            "pending response source binding changed or immutable identity conflicts"
+        )
+    immutable = {
+        field: raw.get(field)
+        for field in _PENDING_RESPONSE_SOURCE_BINDING_IMMUTABLE_FIELDS
+    }
+    if raw.get("immutableHash") != _stable_evidence_hash(immutable):
+        raise PendingResponseConflict(
+            "pending response source binding immutable hash conflicts"
+        )
+    pending_revision = raw.get("pendingRevision")
+    claim_token_hash = raw.get("claimTokenHash")
+    claim_binding_hash = raw.get("claimBindingHash")
+    if (
+        type(pending_revision) is not int
+        or pending_revision < 1
+        or (
+            claim_token_hash is not None
+            and not _is_full_hash(claim_token_hash)
+        )
+        or "createdAt" not in raw
+        or "updatedAt" not in raw
+    ):
+        raise PendingResponseConflict(
+            "pending response source binding mutable state is malformed"
+        )
+    expected_claim_binding_hash = (
+        _pending_source_claim_binding_hash(
+            raw.get("immutableHash"),
+            pending_revision,
+        )
+        if claim_token_hash is not None
+        else None
+    )
+    if claim_binding_hash != expected_claim_binding_hash:
+        raise PendingResponseConflict(
+            "pending response source claim binding hash conflicts"
+        )
+    if (
+        expected_pending_revision is not None
+        and pending_revision != expected_pending_revision
+    ):
+        raise PendingResponseRetryable(
+            "pending response source binding revision changed"
+        )
+    if (
+        expected_claim_token_hash is not ...
+        and claim_token_hash != expected_claim_token_hash
+    ):
+        raise PendingResponseConflict(
+            "pending response source binding claim conflicts"
+        )
+    return dict(raw)
+
+
+def _pending_record_from_data(
+    *,
+    user_id: str,
+    document_id: str,
+    thread_id: str,
+    canonical_source_id: str,
+    work_key: str,
+    data: Any,
+) -> PendingResponseRecord:
+    if type(data) is not dict:
+        raise PendingResponseConflict("pending response binding record is malformed")
+    if (
+        _classify_pending_response_protocol(data)
+        != PENDING_RESPONSE_EXACT_SOURCE_PROTOCOL
+    ):
+        raise PendingResponseConflict(
+            "pending response binding record is not exact B1 protocol"
+        )
+    if document_id != thread_id or data.get("threadId") != thread_id:
+        raise PendingResponseConflict(
+            "pending response binding thread or document id conflicts"
+        )
+    if data.get("canonicalSourceId") != canonical_source_id:
+        raise PendingResponseConflict(
+            "pending response binding canonical source conflicts"
+        )
+    if data.get("workKey") != work_key:
+        raise PendingResponseConflict("pending response binding work key conflicts")
+    proposal_hash = data.get("proposalHash")
+    selection_hash = data.get("selectionHash")
+    if not _is_full_hash(proposal_hash) or not _is_full_hash(selection_hash):
+        raise PendingResponseConflict(
+            "pending response binding proposal or selection hash is malformed"
+        )
+    pending_revision = data.get("pendingRevision")
+    if type(pending_revision) is not int or pending_revision < 1:
+        raise PendingResponseConflict(
+            "pending response binding revision is malformed"
+        )
+    return PendingResponseRecord(
+        user_id=user_id,
+        document_id=document_id,
+        thread_id=thread_id,
+        canonical_source_id=canonical_source_id,
+        work_key=work_key,
+        proposal_hash=proposal_hash,
+        selection_hash=selection_hash,
+        pending_revision=pending_revision,
+        data=dict(data),
+    )
+
+
+def _pending_record_from_snapshot(
+    *,
+    user_id: str,
+    thread_id: str,
+    canonical_source_id: str,
+    work_key: str,
+    snapshot,
+) -> PendingResponseRecord:
+    try:
+        exists = snapshot.exists
+        data = snapshot.to_dict() if exists else None
+        document_id = snapshot.id if exists else thread_id
+    except Exception as exc:
+        raise PendingResponseRetryable(
+            "pending response exact read is unavailable"
+        ) from exc
+    if not exists:
+        raise PendingResponseRetryable("pending response exact record is absent")
+    return _pending_record_from_data(
+        user_id=user_id,
+        document_id=document_id,
+        thread_id=thread_id,
+        canonical_source_id=canonical_source_id,
+        work_key=work_key,
+        data=data,
+    )
+
+
+def require_pending_response_exact(
+    user_id: str,
+    thread_id: str,
+    canonical_source_id: str,
+    work_key: str,
+) -> PendingResponseRecord:
+    """Read one pending response only through its exact B1 source binding."""
+    if resolve_source_coordinator_mode(os.environ) is CoordinatorMode.SHADOW:
+        raise PendingResponseRetryable(
+            "pending response exact read has no effect in shadow mode"
+        )
+    _require_pending_binding_arguments(
+        user_id=user_id,
+        thread_id=thread_id,
+        canonical_source_id=canonical_source_id,
+        work_key=work_key,
+    )
+    from .clients import _fs
+
+    user_ref = _fs.collection("users").document(user_id)
+    pending_ref = user_ref.collection("pendingResponses").document(thread_id)
+
+    def read_exact(transaction) -> PendingResponseRecord:
+        snapshot = pending_ref.get(transaction=transaction)
+        record = _pending_record_from_snapshot(
+            user_id=user_id,
+            thread_id=thread_id,
+            canonical_source_id=canonical_source_id,
+            work_key=work_key,
+            snapshot=snapshot,
+        )
+        binding_ref = _pending_source_binding_ref(
+            user_ref,
+            pending_envelope_hash(record.data),
+        )
+        binding_snapshot = binding_ref.get(transaction=transaction)
+        if getattr(binding_snapshot, "exists", False) is not True:
+            raise PendingResponseConflict(
+                "pending response source binding is absent"
+            )
+        _validate_pending_source_binding(
+            binding_snapshot.to_dict(),
+            expected_user_id=user_id,
+            expected_pending_document_id=record.document_id,
+            expected_data=record.data,
+            expected_pending_revision=record.pending_revision,
+        )
+        return record
+
+    try:
+        return run_firestore_transaction(_fs, read_exact)
+    except (PendingResponseConflict, PendingResponseRetryable):
+        raise
+    except Exception as exc:
+        raise PendingResponseRetryable(
+            "pending response exact read failed"
+        ) from exc
+
+
+def claim_pending_response_for_send_exact(
+    user_id: str,
+    thread_id: str,
+    canonical_source_id: str,
+    work_key: str,
+    expected_revision: int,
+) -> PendingResponseClaim:
+    """Claim only the exact source/work record at the caller's revision."""
+    if resolve_source_coordinator_mode(os.environ) is CoordinatorMode.SHADOW:
+        raise PendingResponseRetryable(
+            "pending response exact claim has no effect in shadow mode"
+        )
+    _require_pending_binding_arguments(
+        user_id=user_id,
+        thread_id=thread_id,
+        canonical_source_id=canonical_source_id,
+        work_key=work_key,
+        expected_revision=expected_revision,
+    )
+    from .clients import _fs
+
+    user_ref = _fs.collection("users").document(user_id)
+    thread_ref = user_ref.collection("threads").document(thread_id)
+    pending_ref = user_ref.collection("pendingResponses").document(thread_id)
+
+    def claim_exact(transaction) -> PendingResponseClaim:
+        thread_snapshot = thread_ref.get(transaction=transaction)
+        pending_snapshot = pending_ref.get(transaction=transaction)
+        if not thread_snapshot.exists:
+            raise PendingResponseRetryable(
+                "pending response exact claim thread is absent"
+            )
+        record = _pending_record_from_snapshot(
+            user_id=user_id,
+            thread_id=thread_id,
+            canonical_source_id=canonical_source_id,
+            work_key=work_key,
+            snapshot=pending_snapshot,
+        )
+        binding_ref = _pending_source_binding_ref(
+            user_ref,
+            pending_envelope_hash(record.data),
+        )
+        binding_snapshot = binding_ref.get(transaction=transaction)
+        if getattr(binding_snapshot, "exists", False) is not True:
+            raise PendingResponseConflict(
+                "pending response source binding is absent"
+            )
+        source_binding = _validate_pending_source_binding(
+            binding_snapshot.to_dict(),
+            expected_user_id=user_id,
+            expected_pending_document_id=record.document_id,
+            expected_data=record.data,
+            expected_pending_revision=record.pending_revision,
+        )
+        if record.pending_revision != expected_revision:
+            raise PendingResponseRetryable(
+                "pending response exact claim revision changed"
+            )
+        thread_data = thread_snapshot.to_dict()
+        if type(thread_data) is not dict:
+            raise PendingResponseConflict(
+                "pending response exact claim thread is malformed"
+            )
+        pending_client_id = record.data.get("clientId")
+        if pending_client_id not in (None, "") and (
+            type(pending_client_id) is not str
+            or pending_client_id != pending_client_id.strip()
+            or thread_data.get("clientId") != pending_client_id
+        ):
+            raise PendingResponseConflict(
+                "pending response exact claim client conflicts with canonical thread"
+            )
+        if _has_terminal_pending_send_marker(thread_data):
+            raise PendingResponseRetryable(
+                "pending response exact claim is blocked by terminal ownership"
+            )
+        try:
+            assert_pending_claim_allowed(
+                transaction,
+                thread_ref,
+                thread_data=thread_data,
+            )
+        except GraphSendPermitBlocked as exc:
+            raise PendingResponseRetryable(
+                "pending response exact claim is blocked by retained send authority"
+            ) from exc
+
+        now = datetime.now(timezone.utc)
+        current_owner = record.data.get("processingBy")
+        current_lease = record.data.get("processingLeaseUntil")
+        if isinstance(current_lease, datetime):
+            if current_lease.tzinfo is None:
+                current_lease = current_lease.replace(tzinfo=timezone.utc)
+            else:
+                current_lease = current_lease.astimezone(timezone.utc)
+        else:
+            current_lease = None
+        if current_owner and (
+            current_lease is None or current_lease > now
+        ):
+            raise PendingResponseRetryable(
+                "pending response exact claim is already owned"
+            )
+        current_status = record.data.get("status")
+        if current_status not in {"queued", "sending"}:
+            raise PendingResponseConflict(
+                "pending response exact claim status is malformed"
+            )
+        if current_status == "sending" and not current_owner:
+            raise PendingResponseConflict(
+                "pending response exact claim has malformed ownership"
+            )
+
+        pending_revision = expected_revision + 1
+        claim_binding_hash = _pending_source_claim_binding_hash(
+            source_binding["immutableHash"],
+            pending_revision,
+        )
+        claim_token = (
+            f"{_PENDING_RESPONSE_EXACT_CLAIM_TOKEN_PREFIX}"
+            f"{claim_binding_hash}-{uuid4().hex}"
+        )
+        update = {
+            "status": "sending",
+            "processingBy": claim_token,
+            "processingAt": now,
+            "processingLeaseUntil": now + timedelta(
+                seconds=PENDING_RESPONSE_SEND_LEASE_SECONDS
+            ),
+            "pendingRevision": pending_revision,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        claim_token_hash = hashlib.sha256(
+            claim_token.encode("utf-8")
+        ).hexdigest()
+        transaction.update(pending_ref, update)
+        transaction.update(binding_ref, {
+            "pendingRevision": pending_revision,
+            "claimTokenHash": claim_token_hash,
+            "claimBindingHash": claim_binding_hash,
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+        claimed_data = {**record.data, **update}
+        return PendingResponseClaim(
+            user_id=user_id,
+            document_id=record.document_id,
+            thread_id=thread_id,
+            canonical_source_id=canonical_source_id,
+            work_key=work_key,
+            proposal_hash=record.proposal_hash,
+            selection_hash=record.selection_hash,
+            pending_revision=pending_revision,
+            claim_token=claim_token,
+            data=claimed_data,
+        )
+
+    try:
+        return run_firestore_transaction(_fs, claim_exact)
+    except (PendingResponseConflict, PendingResponseRetryable):
+        raise
+    except Exception as exc:
+        raise PendingResponseRetryable(
+            "pending response exact claim failed"
+        ) from exc
+
+
 def _has_terminal_pending_send_marker(thread_data: Dict[str, Any]) -> bool:
     """Fail closed on any durable marker that may own terminal reply work."""
     return has_terminal_send_marker(thread_data)
@@ -339,6 +1093,11 @@ def _claim_pending_response_for_send(
     loaded_data: Dict[str, Any],
 ) -> Optional[str]:
     """CAS the pending doc only when no terminal saga currently owns the thread."""
+    persisted_protocol = _classify_pending_response_protocol(loaded_data)
+    if persisted_protocol != PENDING_RESPONSE_LEGACY_PROTOCOL:
+        raise PendingResponseConflict(
+            "legacy pending response claim cannot process exact B1 work"
+        )
     from .clients import _fs
 
     thread_id = str((loaded_data or {}).get("threadId") or "").strip()
@@ -347,14 +1106,19 @@ def _claim_pending_response_for_send(
     user_ref = _fs.collection("users").document(user_id)
     thread_ref = user_ref.collection("threads").document(thread_id)
     pending_ref = user_ref.collection("pendingResponses").document(doc.id)
-    transaction = _fs.transaction()
-    try:
+
+    def claim_legacy(transaction) -> Optional[str]:
         thread_snapshot = thread_ref.get(transaction=transaction)
         pending_snapshot = pending_ref.get(transaction=transaction)
         if not thread_snapshot.exists or not pending_snapshot.exists:
             return None
         thread_data = thread_snapshot.to_dict() or {}
         current_data = pending_snapshot.to_dict() or {}
+        current_protocol = _classify_pending_response_protocol(current_data)
+        if current_protocol != PENDING_RESPONSE_LEGACY_PROTOCOL:
+            raise PendingResponseConflict(
+                "legacy pending response claim cannot adopt exact B1 work"
+            )
         if _has_terminal_pending_send_marker(thread_data):
             return None
         try:
@@ -396,8 +1160,12 @@ def _claim_pending_response_for_send(
             ),
             "updatedAt": SERVER_TIMESTAMP,
         })
-        transaction.commit()
         return claim_token
+
+    try:
+        return run_firestore_transaction(_fs, claim_legacy)
+    except PendingResponseConflict:
+        raise
     except Exception as exc:
         raise RuntimeError(f"pending response send claim failed: {exc}") from exc
 
@@ -422,6 +1190,73 @@ def _final_pending_response_send_fence(
     user_ref = _fs.collection("users").document(user_id)
     thread_ref = user_ref.collection("threads").document(thread_id)
     pending_ref = user_ref.collection("pendingResponses").document(doc.id)
+    source_protocol = _classify_pending_response_protocol(loaded_data)
+    require_exact_source_binding = (
+        source_protocol == PENDING_RESPONSE_EXACT_SOURCE_PROTOCOL
+    )
+    exact_claim_validator = None
+    if require_exact_source_binding:
+        def exact_claim_validator(
+            transaction,
+            current_data: Dict[str, Any],
+            current_claim_token: str,
+        ) -> None:
+            canonical_source_id = (current_data or {}).get(
+                "canonicalSourceId"
+            )
+            work_key = (current_data or {}).get("workKey")
+            pending_revision = (current_data or {}).get("pendingRevision")
+            _require_pending_binding_arguments(
+                user_id=user_id,
+                thread_id=(current_data or {}).get("threadId"),
+                canonical_source_id=canonical_source_id,
+                work_key=work_key,
+                proposal_hash=(current_data or {}).get("proposalHash"),
+                selection_hash=(current_data or {}).get("selectionHash"),
+                expected_revision=pending_revision,
+                require_content_hashes=True,
+            )
+            record = _pending_record_from_data(
+                user_id=user_id,
+                document_id=str(getattr(pending_ref, "id", None) or ""),
+                thread_id=(current_data or {}).get("threadId"),
+                canonical_source_id=canonical_source_id,
+                work_key=work_key,
+                data=current_data,
+            )
+            if record.data.get("status") != "sending":
+                raise PendingResponseConflict(
+                    "pending response exact permit claim status is malformed"
+                )
+            binding_ref = _pending_source_binding_ref(
+                user_ref,
+                pending_envelope_hash(record.data),
+            )
+            binding_snapshot = binding_ref.get(transaction=transaction)
+            if getattr(binding_snapshot, "exists", False) is not True:
+                raise PendingResponseConflict(
+                    "pending response exact permit source binding is absent"
+                )
+            claim_token_hash = hashlib.sha256(
+                current_claim_token.encode("utf-8")
+            ).hexdigest()
+            source_binding = _validate_pending_source_binding(
+                binding_snapshot.to_dict(),
+                expected_user_id=user_id,
+                expected_pending_document_id=record.document_id,
+                expected_data=record.data,
+                expected_pending_revision=record.pending_revision,
+                expected_claim_token_hash=claim_token_hash,
+            )
+            if (
+                _pending_claim_binding_hash_from_token(
+                    current_claim_token
+                )
+                != source_binding.get("claimBindingHash")
+            ):
+                raise PendingResponseConflict(
+                    "pending response exact permit claim binding conflicts"
+                )
     try:
         return issue_pending_graph_send_permit(
             _fs,
@@ -429,6 +1264,8 @@ def _final_pending_response_send_fence(
             pending_ref,
             loaded_data,
             claim_token,
+            require_exact_client_binding=require_exact_source_binding,
+            exact_claim_validator=exact_claim_validator,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -595,6 +1432,9 @@ def _pending_completion_side_document(
             permit_immutable_hash=permit_immutable_hash,
             sent_evidence=sent_evidence,
             complete_client_after_reply=bool(client_id),
+            source_authority_protocol=(
+                _classify_pending_response_protocol(data)
+            ),
         )
     )
     obligation_ref = user_ref.collection(
@@ -1099,12 +1939,39 @@ def record_sent_unindexed_response(
     source_context: str = "autoResponse",
     original_doc_id: Optional[str] = None,
     sent_match: Optional[Dict[str, Any]] = None,
+    canonical_source_id: Optional[str] = None,
+    work_key: Optional[str] = None,
+    proposal_hash: Optional[str] = None,
+    selection_hash: Optional[str] = None,
 ) -> None:
     """Record a reply that Graph accepted but the worker could not index.
 
     The email may already be in the sender mailbox, so this must be visible to
     operators without re-queuing the same body for another send attempt.
     """
+    source_binding = {}
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.SHADOW:
+        raise PendingResponseRetryable(
+            "sent-unindexed reconciliation has no effect in shadow mode"
+        )
+    if mode is CoordinatorMode.ENFORCED:
+        _require_pending_binding_arguments(
+            user_id=user_id,
+            thread_id=thread_id,
+            canonical_source_id=canonical_source_id,
+            work_key=work_key,
+            proposal_hash=proposal_hash,
+            selection_hash=selection_hash,
+            require_content_hashes=True,
+        )
+        source_binding = {
+            "canonicalSourceId": canonical_source_id,
+            "workKey": work_key,
+            "proposalHash": proposal_hash,
+            "selectionHash": selection_hash,
+        }
+
     from .clients import _fs
 
     payload = {
@@ -1121,6 +1988,7 @@ def record_sent_unindexed_response(
         "movedAt": SERVER_TIMESTAMP,
         "createdAt": SERVER_TIMESTAMP,
         "updatedAt": SERVER_TIMESTAMP,
+        **source_binding,
     }
     if original_doc_id:
         payload["originalDocId"] = original_doc_id
@@ -1147,16 +2015,16 @@ def queue_pending_response(
     subject: Optional[str] = None,
     conversation_id: Optional[str] = None,
     last_send_attempt_at: Optional[Any] = None,
-) -> str:
+    canonical_source_id: Optional[str] = None,
+    work_key: Optional[str] = None,
+    proposal_hash: Optional[str] = None,
+    selection_hash: Optional[str] = None,
+) -> Any:
     """
     Queue a failed response for later retry.
 
     Returns the document ID of the queued response.
     """
-    from .clients import _fs
-
-    pending_ref = _fs.collection("users").document(user_id).collection("pendingResponses")
-
     doc_data = {
         "threadId": thread_id,
         "msgId": msg_id,
@@ -1175,23 +2043,197 @@ def queue_pending_response(
     if last_send_attempt_at:
         doc_data["lastSendAttemptAt"] = last_send_attempt_at
 
-    # Use thread_id as doc ID to prevent duplicates
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.DISABLED:
+        from .clients import _fs
+
+        pending_ref = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("pendingResponses")
+        )
+
+        # Use thread_id as doc ID to prevent duplicates
+        doc_ref = pending_ref.document(thread_id)
+
+        def enqueue_legacy(transaction) -> str:
+            write_data = dict(doc_data)
+            existing = doc_ref.get(transaction=transaction)
+            if existing.exists:
+                existing_data = existing.to_dict()
+                persisted_protocol = _classify_pending_response_protocol(
+                    existing_data
+                )
+                if persisted_protocol != PENDING_RESPONSE_LEGACY_PROTOCOL:
+                    raise PendingResponseConflict(
+                        "legacy pending response enqueue cannot overwrite exact B1 work"
+                    )
+                write_data["attempts"] = existing_data.get("attempts", 0) + 1
+                write_data["createdAt"] = existing_data.get("createdAt")
+                transaction.set(doc_ref, write_data)
+                return (
+                    f"📝 Updated pending response for thread {thread_id[:30]}... "
+                    f"(attempt {write_data['attempts']})"
+                )
+
+            transaction.set(doc_ref, write_data)
+            return f"📝 Queued pending response for thread {thread_id[:30]}..."
+
+        success_message = run_firestore_transaction(_fs, enqueue_legacy)
+        print(success_message)
+        return doc_ref.id
+
+    if mode is CoordinatorMode.SHADOW:
+        raise PendingResponseRetryable(
+            "pending response enqueue has no effect in shadow mode"
+        )
+
+    _require_pending_binding_arguments(
+        user_id=user_id,
+        thread_id=thread_id,
+        canonical_source_id=canonical_source_id,
+        work_key=work_key,
+        proposal_hash=proposal_hash,
+        selection_hash=selection_hash,
+        require_content_hashes=True,
+    )
+    from .clients import _fs
+
+    user_ref = _fs.collection("users").document(user_id)
+    pending_ref = user_ref.collection("pendingResponses")
     doc_ref = pending_ref.document(thread_id)
 
-    # Check if already exists
-    existing = doc_ref.get()
-    if existing.exists:
-        # Update existing entry
-        existing_data = existing.to_dict()
-        doc_data["attempts"] = existing_data.get("attempts", 0) + 1
-        doc_data["createdAt"] = existing_data.get("createdAt")  # Preserve original
-        doc_ref.set(doc_data)
-        print(f"📝 Updated pending response for thread {thread_id[:30]}... (attempt {doc_data['attempts']})")
-    else:
-        doc_ref.set(doc_data)
-        print(f"📝 Queued pending response for thread {thread_id[:30]}...")
+    def enqueue_exact(transaction) -> tuple[PendingResponseRecord, str]:
+        existing = doc_ref.get(transaction=transaction)
+        if existing.exists:
+            current = _pending_record_from_snapshot(
+                user_id=user_id,
+                thread_id=thread_id,
+                canonical_source_id=canonical_source_id,
+                work_key=work_key,
+                snapshot=existing,
+            )
+            if (
+                current.proposal_hash != proposal_hash
+                or current.selection_hash != selection_hash
+            ):
+                raise PendingResponseConflict(
+                    "pending response binding proposal or selection hash conflicts"
+                )
+            if (
+                not _same_pending_response_intent(current.data, doc_data)
+                or current.data.get("subject") != doc_data.get("subject")
+            ):
+                raise PendingResponseConflict(
+                    "pending response exact retry envelope conflicts"
+                )
+            if current.data.get("status") != "queued":
+                raise PendingResponseRetryable(
+                    "pending response exact retry is not in queued state"
+                )
+            if current.data.get("processingBy"):
+                raise PendingResponseRetryable(
+                    "pending response exact retry is already being processed"
+                )
+            attempts = current.data.get("attempts", 0)
+            if type(attempts) is not int or attempts < 0:
+                raise PendingResponseConflict(
+                    "pending response exact retry attempts are malformed"
+                )
+            envelope_hash = pending_envelope_hash(current.data)
+            binding_ref = _pending_source_binding_ref(
+                user_ref,
+                envelope_hash,
+            )
+            binding_snapshot = binding_ref.get(transaction=transaction)
+            if getattr(binding_snapshot, "exists", False) is not True:
+                raise PendingResponseConflict(
+                    "pending response source binding is absent"
+                )
+            _validate_pending_source_binding(
+                binding_snapshot.to_dict(),
+                expected_user_id=user_id,
+                expected_pending_document_id=thread_id,
+                expected_data=current.data,
+                expected_pending_revision=current.pending_revision,
+            )
+            next_revision = current.pending_revision + 1
+            update = {
+                "attempts": attempts + 1,
+                "lastError": error,
+                "pendingRevision": next_revision,
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+            if last_send_attempt_at:
+                update["lastSendAttemptAt"] = last_send_attempt_at
+            transaction.update(doc_ref, update)
+            transaction.update(binding_ref, {
+                "pendingRevision": next_revision,
+                "claimTokenHash": None,
+                "claimBindingHash": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+            effective = {**current.data, **update}
+            queued = _pending_record_from_data(
+                user_id=user_id,
+                document_id=thread_id,
+                thread_id=thread_id,
+                canonical_source_id=canonical_source_id,
+                work_key=work_key,
+                data=effective,
+            )
+            return queued, (
+                f"📝 Updated exact pending response for thread {thread_id[:30]}... "
+                f"(attempt {effective['attempts']})"
+            )
 
-    return doc_ref.id
+        exact_data = {
+            **doc_data,
+            PENDING_RESPONSE_PROTOCOL_FIELD: _exact_pending_response_protocol(),
+            "status": "queued",
+            "canonicalSourceId": canonical_source_id,
+            "workKey": work_key,
+            "proposalHash": proposal_hash,
+            "selectionHash": selection_hash,
+            "pendingRevision": 1,
+        }
+        envelope_hash = pending_envelope_hash(exact_data)
+        binding_ref = _pending_source_binding_ref(user_ref, envelope_hash)
+        binding_snapshot = binding_ref.get(transaction=transaction)
+        if getattr(binding_snapshot, "exists", False) is True:
+            raise PendingResponseConflict(
+                "pending response source binding already exists without its issuer"
+            )
+        binding_payload = _pending_source_binding_payload(
+            user_id=user_id,
+            pending_document_id=thread_id,
+            data=exact_data,
+            pending_revision=1,
+        )
+        transaction.set(doc_ref, exact_data)
+        transaction.set(binding_ref, binding_payload)
+        queued = _pending_record_from_data(
+            user_id=user_id,
+            document_id=thread_id,
+            thread_id=thread_id,
+            canonical_source_id=canonical_source_id,
+            work_key=work_key,
+            data=exact_data,
+        )
+        return queued, (
+            f"📝 Queued exact pending response for thread {thread_id[:30]}..."
+        )
+
+    try:
+        queued, success_message = run_firestore_transaction(_fs, enqueue_exact)
+        print(success_message)
+        return queued
+    except (PendingResponseConflict, PendingResponseRetryable):
+        raise
+    except Exception as exc:
+        raise PendingResponseRetryable(
+            "pending response exact enqueue failed"
+        ) from exc
 
 
 def get_pending_responses(user_id: str, *, apply_send_gates: bool = True) -> list:
@@ -1319,6 +2361,20 @@ def _pending_completion_linkage(
     pending_ref = user_ref.collection("pendingResponses").document(
         immutable["pendingDocumentId"]
     )
+    require_source_binding = (
+        immutable.get("version")
+        == PENDING_COMPLETION_EXACT_SOURCE_VERSION
+        and immutable.get("sourceAuthorityProtocol")
+        == PENDING_COMPLETION_EXACT_SOURCE_PROTOCOL
+    )
+    source_binding_ref = (
+        _pending_source_binding_ref(
+            user_ref,
+            immutable["pendingEnvelopeHash"],
+        )
+        if require_source_binding
+        else None
+    )
     client_ref = None
     if immutable["completeClientAfterReply"]:
         client_ref = user_ref.collection("clients").document(
@@ -1327,6 +2383,11 @@ def _pending_completion_linkage(
     thread_snapshot = thread_ref.get(transaction=transaction)
     permit_snapshot = permit_ref.get(transaction=transaction)
     pending_snapshot = pending_ref.get(transaction=transaction)
+    source_binding_snapshot = (
+        source_binding_ref.get(transaction=transaction)
+        if source_binding_ref is not None
+        else None
+    )
     client_snapshot = (
         client_ref.get(transaction=transaction)
         if client_ref is not None
@@ -1337,6 +2398,10 @@ def _pending_completion_linkage(
         or getattr(permit_snapshot, "exists", False) is not True
         or getattr(pending_snapshot, "exists", False) is True
         or (
+            require_source_binding
+            and getattr(source_binding_snapshot, "exists", False) is not True
+        )
+        or (
             client_snapshot is not None
             and getattr(client_snapshot, "exists", False) is not True
         )
@@ -1345,6 +2410,41 @@ def _pending_completion_linkage(
             "pending completion obligation exact local evidence is missing"
         )
     permit = _validate_permit(permit_snapshot.to_dict() or {})
+    source_binding = None
+    permit_issuer_owner = str(permit.get("issuerOwner") or "")
+    if (
+        not require_source_binding
+        and permit_issuer_owner.startswith(
+            _PENDING_RESPONSE_EXACT_CLAIM_TOKEN_PREFIX
+        )
+    ):
+        raise GraphSendPermitBlocked(
+            "legacy pending completion obligation cannot downgrade an exact-source permit"
+        )
+    retained_claim_binding_hash = None
+    if require_source_binding:
+        raw_source_binding = source_binding_snapshot.to_dict() or {}
+        source_binding = _validate_pending_source_binding(
+            raw_source_binding,
+            expected_user_id=user_id,
+            expected_pending_document_id=immutable["pendingDocumentId"],
+            expected_data={
+                "threadId": immutable["threadId"],
+                "msgId": immutable["sourceGraphMessageId"],
+                "pendingProtocol": raw_source_binding.get(
+                    "pendingProtocol"
+                ),
+                "canonicalSourceId": raw_source_binding.get("canonicalSourceId"),
+                "workKey": raw_source_binding.get("workKey"),
+                "proposalHash": raw_source_binding.get("proposalHash"),
+                "selectionHash": raw_source_binding.get("selectionHash"),
+                "pendingRevision": raw_source_binding.get("pendingRevision"),
+            },
+            expected_pending_envelope_hash=immutable["pendingEnvelopeHash"],
+        )
+        retained_claim_binding_hash = _pending_claim_binding_hash_from_token(
+            permit_issuer_owner
+        )
     thread_data = thread_snapshot.to_dict() or {}
     expected_pending_path = (
         f"{user_path}/pendingResponses/{immutable['pendingDocumentId']}"
@@ -1370,6 +2470,18 @@ def _pending_completion_linkage(
         != immutable["sourceGraphMessageId"]
         or permit.get("envelopeHash")
         != immutable["pendingEnvelopeHash"]
+        or (
+            require_source_binding
+            and (
+                not permit_issuer_owner.strip()
+                or retained_claim_binding_hash
+                != source_binding.get("claimBindingHash")
+                or source_binding.get("claimTokenHash")
+                != hashlib.sha256(
+                    permit_issuer_owner.encode("utf-8")
+                ).hexdigest()
+            )
+        )
         or _stable_evidence_hash(
             permit.get("terminalSentEvidence") or {}
         )
@@ -1396,6 +2508,8 @@ def _pending_completion_linkage(
         "obligationRef": obligation_ref,
         "threadRef": thread_ref,
         "permitRef": permit_ref,
+        "sourceBindingRef": source_binding_ref,
+        "sourceBinding": source_binding,
         "clientRef": client_ref,
         "clientStatus": str(client_data.get("status") or "").strip().lower(),
     }
@@ -1418,46 +2532,48 @@ def _settle_pending_completion_obligation(
             "pending completion settlement outcome is invalid"
         )
     user_ref = _fs.collection("users").document(user_id)
-    transaction = _fs.transaction()
     obligation_ref = getattr(obligation_snapshot, "reference", None)
     if obligation_ref is None:
         obligation_ref = obligation_snapshot
-    current_snapshot = obligation_ref.get(transaction=transaction)
-    if getattr(current_snapshot, "exists", False) is not True:
-        raise GraphSendPermitBlocked(
-            "pending completion obligation disappeared before settlement"
-        )
-    linkage = _pending_completion_linkage(
-        user_id,
-        user_ref,
-        current_snapshot,
-        transaction=transaction,
-    )
-    current = linkage["obligation"]
-    completion_required = linkage["immutable"][
-        "completeClientAfterReply"
-    ]
-    if (
-        completion_required
-        and outcome not in {"client_completed", "client_ineligible"}
-    ) or (completion_required is False and outcome != "not_required"):
-        raise GraphSendPermitBlocked(
-            "pending completion settlement outcome conflicts with binding"
-        )
-    if current.get("status") == "settled":
-        if current.get("completionOutcome") != outcome:
+
+    def settle_completion(transaction) -> None:
+        current_snapshot = obligation_ref.get(transaction=transaction)
+        if getattr(current_snapshot, "exists", False) is not True:
             raise GraphSendPermitBlocked(
-                "pending completion settlement outcome drifted"
+                "pending completion obligation disappeared before settlement"
             )
-        return
-    now = datetime.now(timezone.utc)
-    transaction.update(obligation_ref, {
-        "status": "settled",
-        "completionOutcome": outcome,
-        "settledAt": now,
-        "updatedAt": now,
-    })
-    transaction.commit()
+        linkage = _pending_completion_linkage(
+            user_id,
+            user_ref,
+            current_snapshot,
+            transaction=transaction,
+        )
+        current = linkage["obligation"]
+        completion_required = linkage["immutable"][
+            "completeClientAfterReply"
+        ]
+        if (
+            completion_required
+            and outcome not in {"client_completed", "client_ineligible"}
+        ) or (completion_required is False and outcome != "not_required"):
+            raise GraphSendPermitBlocked(
+                "pending completion settlement outcome conflicts with binding"
+            )
+        if current.get("status") == "settled":
+            if current.get("completionOutcome") != outcome:
+                raise GraphSendPermitBlocked(
+                    "pending completion settlement outcome drifted"
+                )
+            return
+        now = datetime.now(timezone.utc)
+        transaction.update(obligation_ref, {
+            "status": "settled",
+            "completionOutcome": outcome,
+            "settledAt": now,
+            "updatedAt": now,
+        })
+
+    run_firestore_transaction(_fs, settle_completion)
 
 
 def _replay_pending_completion_obligation(
@@ -1625,6 +2741,10 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
     """
     from . import processing as processing_module
 
+    source_mode = resolve_source_coordinator_mode(os.environ)
+    if source_mode is CoordinatorMode.SHADOW:
+        return []
+
     send_reply_in_thread = processing_module.send_reply_in_thread
     reset_reply_send_outcome = getattr(
         processing_module,
@@ -1637,14 +2757,27 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
         lambda: None,
     )
 
-    operation_states: List[Dict[str, Any]] = []
-
-    operation_states.extend(_process_pending_completion_obligations(
-        user_id,
-        processing_module,
-    ))
-
     pending = get_pending_responses(user_id, apply_send_gates=False)
+    disabled_protocol_errors = {}
+    if source_mode is CoordinatorMode.DISABLED:
+        for item in pending:
+            data = item["data"]
+            try:
+                persisted_protocol = _classify_pending_response_protocol(data)
+                if persisted_protocol != PENDING_RESPONSE_LEGACY_PROTOCOL:
+                    raise PendingResponseConflict(
+                        "disabled legacy pending processing cannot process exact "
+                        "B1 protocol work"
+                    )
+            except PendingResponseConflict as protocol_error:
+                disabled_protocol_errors[id(item["doc"])] = protocol_error
+
+    operation_states: List[Dict[str, Any]] = []
+    if not disabled_protocol_errors:
+        operation_states.extend(_process_pending_completion_obligations(
+            user_id,
+            processing_module,
+        ))
 
     if not pending:
         return operation_states
@@ -1665,12 +2798,81 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
 
         print(f"  → Retrying response to {recipient} (attempt {attempts + 1}/{MAX_RESPONSE_ATTEMPTS})")
 
-        try:
-            pending_send_claim = _claim_pending_response_for_send(
-                user_id,
-                doc,
-                data,
+        disabled_protocol_error = disabled_protocol_errors.get(id(doc))
+        if disabled_protocol_error is not None:
+            operation_states.append(
+                _pending_response_operation_state(
+                    "error",
+                    recipient=recipient,
+                    error=disabled_protocol_error,
+                )
             )
+            continue
+
+        try:
+            if source_mode is CoordinatorMode.DISABLED:
+                pending_send_claim = _claim_pending_response_for_send(
+                    user_id,
+                    doc,
+                    data,
+                )
+            else:
+                canonical_source_id = data.get("canonicalSourceId")
+                work_key = data.get("workKey")
+                pending_revision = data.get("pendingRevision")
+                _require_pending_binding_arguments(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    canonical_source_id=canonical_source_id,
+                    work_key=work_key,
+                    proposal_hash=data.get("proposalHash"),
+                    selection_hash=data.get("selectionHash"),
+                    expected_revision=pending_revision,
+                )
+                required = require_pending_response_exact(
+                    user_id,
+                    thread_id,
+                    canonical_source_id,
+                    work_key,
+                )
+                if (
+                    getattr(doc, "id", None) != required.document_id
+                    or required.pending_revision != pending_revision
+                    or required.proposal_hash != data.get("proposalHash")
+                    or required.selection_hash != data.get("selectionHash")
+                    or not _same_pending_response_intent(required.data, data)
+                ):
+                    raise PendingResponseConflict(
+                        "pending response binding changed after queue scan"
+                    )
+                try:
+                    exact_claim = claim_pending_response_for_send_exact(
+                        user_id,
+                        thread_id,
+                        canonical_source_id,
+                        work_key,
+                        required.pending_revision,
+                    )
+                except PendingResponseRetryable:
+                    if _reconcile_expired_pending_permit(
+                        user_id,
+                        headers,
+                        doc,
+                        data,
+                    ):
+                        print(
+                            "    🧾 Reconciled expired retained Graph permit "
+                            "without issuing another send"
+                        )
+                        continue
+                    raise
+                pending_send_claim = exact_claim.claim_token
+                data = dict(exact_claim.data)
+                thread_id = data.get("threadId")
+                msg_id = data.get("msgId")
+                recipient = data.get("recipient")
+                response_body = data.get("responseBody")
+                attempts = data.get("attempts", 0)
             if not pending_send_claim:
                 if _reconcile_expired_pending_permit(
                     user_id,
@@ -2099,17 +3301,110 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
     return operation_states
 
 
+def clear_pending_response_exact(
+    user_id: str,
+    thread_id: str,
+    canonical_source_id: str,
+    work_key: str,
+    expected_revision: int,
+) -> PendingResponseClearResult:
+    """Delete only the exact B1-bound pending record at its current revision."""
+    if resolve_source_coordinator_mode(os.environ) is CoordinatorMode.SHADOW:
+        raise PendingResponseRetryable(
+            "pending response exact clear has no effect in shadow mode"
+        )
+    _require_pending_binding_arguments(
+        user_id=user_id,
+        thread_id=thread_id,
+        canonical_source_id=canonical_source_id,
+        work_key=work_key,
+        expected_revision=expected_revision,
+    )
+    from .clients import _fs
+
+    user_ref = _fs.collection("users").document(user_id)
+    pending_ref = user_ref.collection("pendingResponses").document(thread_id)
+
+    def clear_exact(transaction) -> PendingResponseClearResult:
+        snapshot = pending_ref.get(transaction=transaction)
+        record = _pending_record_from_snapshot(
+            user_id=user_id,
+            thread_id=thread_id,
+            canonical_source_id=canonical_source_id,
+            work_key=work_key,
+            snapshot=snapshot,
+        )
+        binding_ref = _pending_source_binding_ref(
+            user_ref,
+            pending_envelope_hash(record.data),
+        )
+        binding_snapshot = binding_ref.get(transaction=transaction)
+        if getattr(binding_snapshot, "exists", False) is not True:
+            raise PendingResponseConflict(
+                "pending response source binding is absent"
+            )
+        _validate_pending_source_binding(
+            binding_snapshot.to_dict(),
+            expected_user_id=user_id,
+            expected_pending_document_id=record.document_id,
+            expected_data=record.data,
+            expected_pending_revision=record.pending_revision,
+        )
+        if record.pending_revision != expected_revision:
+            raise PendingResponseRetryable(
+                "pending response exact clear revision changed"
+            )
+        if record.data.get("status") != "queued" or record.data.get("processingBy"):
+            raise PendingResponseRetryable(
+                "pending response exact clear requires an unclaimed queued record"
+            )
+        transaction.delete(pending_ref)
+        transaction.delete(binding_ref)
+        return PendingResponseClearResult(
+            user_id=user_id,
+            document_id=record.document_id,
+            thread_id=thread_id,
+            canonical_source_id=canonical_source_id,
+            work_key=work_key,
+            proposal_hash=record.proposal_hash,
+            selection_hash=record.selection_hash,
+            pending_revision=expected_revision,
+            cleared=True,
+        )
+
+    try:
+        return run_firestore_transaction(_fs, clear_exact)
+    except (PendingResponseConflict, PendingResponseRetryable):
+        raise
+    except Exception as exc:
+        raise PendingResponseRetryable(
+            "pending response exact clear failed"
+        ) from exc
+
+
 def clear_pending_response(user_id: str, thread_id: str) -> bool:
     """
     Remove a pending response (called after successful manual send or when no longer needed).
     """
+    if resolve_source_coordinator_mode(os.environ) is not CoordinatorMode.DISABLED:
+        raise PendingResponseConflict(
+            "legacy thread-only pending clear is unavailable outside disabled mode"
+        )
+
     from .clients import _fs
 
     doc_ref = _fs.collection("users").document(user_id).collection("pendingResponses").document(thread_id)
-    doc = doc_ref.get()
 
-    if doc.exists:
-        doc_ref.delete()
+    def clear_legacy(transaction) -> bool:
+        doc = doc_ref.get(transaction=transaction)
+        if not doc.exists:
+            return False
+        persisted_protocol = _classify_pending_response_protocol(doc.to_dict())
+        if persisted_protocol != PENDING_RESPONSE_LEGACY_PROTOCOL:
+            raise PendingResponseConflict(
+                "legacy thread-only pending clear cannot delete exact B1 work"
+            )
+        transaction.delete(doc_ref)
         return True
 
-    return False
+    return run_firestore_transaction(_fs, clear_legacy)

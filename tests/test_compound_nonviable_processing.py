@@ -4986,9 +4986,16 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                     )
                     if current_status == target_status:
                         self.assertEqual(current, updated)
+                        # The supported Firestore runner closes this
+                        # read/validate no-op with an empty commit. It must
+                        # never enqueue a document write.
                         self.assertEqual(
-                            write_count_before,
+                            write_count_before + 1,
                             len(firestore.transaction_write_counts),
+                        )
+                        self.assertEqual(
+                            0,
+                            firestore.transaction_write_counts[-1],
                         )
                         self.assertEqual(
                             review_before,
@@ -5718,9 +5725,15 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 **review_fields,
             )
             self.assertEqual(needs_review, replayed)
+            # The supported Firestore runner closes this read/validate no-op
+            # with an empty commit; the persisted attempt/review stay exact.
             self.assertEqual(
-                write_count_before_replay,
+                write_count_before_replay + 1,
                 len(firestore.transaction_write_counts),
+            )
+            self.assertEqual(
+                0,
+                firestore.transaction_write_counts[-1],
             )
             self.assertEqual(
                 first_review,
@@ -7711,6 +7724,48 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             )
         self.assertEqual(saga, roots[current_id]._data["terminalSaga"])
         self.assertIsNone(roots[sibling_id]._data.get("terminalSaga"))
+        self.assertEqual(shift_before, roots[shift_id]._data)
+        self.assertEqual([2], firestore.transaction_write_counts)
+
+    def test_terminal_stage_ambiguous_commit_returns_exact_readback_winner(self):
+        (
+            current_id,
+            sibling_id,
+            shift_id,
+            roots,
+            firestore,
+            saga,
+        ) = self._terminal_staging_plan_fixture("ambiguous-commit")
+        shift_before = copy.deepcopy(roots[shift_id]._data)
+        firestore.transaction_commit_behaviors_by_field = {
+            "terminalSagaKey": [{
+                "error": RuntimeError("staging acknowledgement was lost"),
+                "applyBeforeError": True,
+            }],
+        }
+
+        with patch.object(processing, "_fs", firestore):
+            result = processing._stage_terminal_saga(
+                "user-1",
+                "client-1",
+                current_id,
+                saga,
+            )
+
+        self.assertIsNotNone(result)
+        staged, owner = result
+        self.assertEqual(saga, staged)
+        self.assertIsInstance(owner, processing.TerminalSagaExecution)
+        self.assertEqual(
+            owner.owner,
+            roots[saga["finalizationPlan"]["claimThreadId"]]
+            ._data["terminalSagaClaim"]["owner"],
+        )
+        self.assertEqual(saga, roots[current_id]._data["terminalSaga"])
+        self.assertEqual(
+            saga["sagaKey"],
+            roots[sibling_id]._data["terminalSagaKey"],
+        )
         self.assertEqual(shift_before, roots[shift_id]._data)
         self.assertEqual([2], firestore.transaction_write_counts)
 

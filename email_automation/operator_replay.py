@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
@@ -13,6 +14,16 @@ from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .campaign_safety import get_client_automation_decision
 from .sent_mail_guard import coerce_utc_datetime, sent_after_from_retry_data
+from .source_coordinator import (
+    CoordinatorMode,
+    SourceCoordinatorAmbiguous,
+    SourceCoordinatorConflict,
+    SourceCoordinatorError,
+    normalize_source_alias,
+    resolve_source_coordinator_mode,
+    source_alias_key,
+    verify_settled_source_dispatch_binding,
+)
 from .utils import (
     b64url_id,
     exponential_backoff_request,
@@ -528,6 +539,181 @@ def _complete_replay_claim(
     batch.commit()
 
 
+def _legacy_replay_marker_disposition(
+    fs_client,
+    request: ReplayRequest,
+) -> str | None:
+    """Strictly classify exact pre-B1 replay markers without trusting them."""
+    markers = []
+    for message_id in (request.graph_message_id, request.internet_message_id):
+        try:
+            snapshot = _processed_ref(
+                fs_client,
+                request.uid,
+                message_id,
+            ).get()
+        except Exception as exc:
+            raise ReplayRefused(
+                "Exact legacy replay marker authority is unreadable"
+            ) from exc
+        if snapshot.exists is False:
+            continue
+        if snapshot.exists is not True:
+            raise ReplayRefused(
+                "Exact legacy replay marker existence is ambiguous"
+            )
+        marker = snapshot.to_dict()
+        if not isinstance(marker, dict):
+            raise ReplayRefused("Exact legacy replay marker is malformed")
+        markers.append(marker)
+    if not markers:
+        return None
+    if any(
+        _clean(marker.get("status")) == "operator_replay_in_progress"
+        for marker in markers
+    ):
+        return "legacy_replay_claim_quarantined"
+    return "legacy_marker_only_ambiguous"
+
+
+def _complete_b1_replay_failure(
+    fs_client,
+    request: ReplayRequest,
+    failure_ref,
+    attempt_id: str,
+    failure: Dict[str, Any],
+    canonical_source_id: str,
+) -> None:
+    """Archive only source-bound failure visibility after B1 settlement."""
+    batch = fs_client.batch()
+    history_ref = (
+        _user_ref(fs_client, request.uid)
+        .collection("processingFailureHistory")
+        .document(failure_ref.id)
+    )
+    resolved_failure = dict(failure)
+    resolved_failure.update(
+        {
+            "status": "replayed",
+            "retryable": False,
+            "recoveryStatus": "replayed_b1",
+            "replayAttemptId": attempt_id,
+            "canonicalSourceId": canonical_source_id,
+            "sourceFailureId": failure_ref.id,
+            "resolvedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+    )
+    batch.set(history_ref, resolved_failure, merge=False)
+    batch.delete(failure_ref)
+    batch.commit()
+
+
+def _mark_b1_replay_settlement_unverified(
+    failure_ref,
+    *,
+    attempt_id: str,
+    canonical_source_id: str,
+    error_class: str,
+) -> None:
+    """Retain a fail-closed operator record after an uncertain B1 readback."""
+    failure_ref.set(
+        {
+            "recoveryStatus": "operator_replay_settlement_unverified",
+            "retryable": False,
+            "replayAttemptId": attempt_id,
+            "canonicalSourceId": canonical_source_id,
+            "replaySettlementVerified": False,
+            "replayErrorClass": error_class,
+            "updatedAt": SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+
+def _verify_b1_replay_settlement(
+    fs_client,
+    request: ReplayRequest,
+    process_result: Any,
+    canonical_source_id: str,
+) -> bool:
+    authority = getattr(process_result, "authority", None)
+    settlement = getattr(process_result, "settlement", None)
+    source_alias_keys = getattr(process_result, "source_alias_keys", ())
+    expected_source_alias_keys = tuple(
+        sorted(
+            {
+                source_alias_key(
+                    request.uid,
+                    normalize_source_alias("graph", request.graph_message_id),
+                ),
+                source_alias_key(
+                    request.uid,
+                    normalize_source_alias(
+                        "internet_message_id",
+                        request.internet_message_id,
+                    ),
+                ),
+            }
+        )
+    )
+    try:
+        exact_source_alias_keys = tuple(source_alias_keys)
+    except TypeError:
+        return False
+    if (
+        getattr(process_result, "mode", None) is not CoordinatorMode.ENFORCED
+        or getattr(process_result, "state", None) != "settled"
+        or getattr(authority, "canonical_source_id", None)
+        != canonical_source_id
+        or getattr(settlement, "canonical_source_id", None)
+        != canonical_source_id
+        or exact_source_alias_keys != expected_source_alias_keys
+    ):
+        return False
+    return verify_settled_source_dispatch_binding(
+        fs_client,
+        user_id=request.uid,
+        canonical_source_id=canonical_source_id,
+        thread_id=request.thread_id,
+        source_alias_keys=expected_source_alias_keys,
+        snapshot_hash=authority.snapshot_hash,
+        selection_hash=authority.selection_hash,
+        owner_kind=authority.owner_kind,
+        owner_key=authority.owner_key,
+        ledger_hash=authority.ledger_hash,
+        settlement_hash=settlement.settlement_hash,
+        settlement_revision=settlement.settlement_revision,
+        alias_projection_count=settlement.alias_projection_count,
+    )
+
+
+def _b1_replay_result(
+    *,
+    status: str,
+    request: ReplayRequest,
+    message: Dict[str, Any],
+    failure_id: str,
+    decision,
+    thread_status: str,
+) -> ReplayResult:
+    return ReplayResult(
+        status=status,
+        applied=False,
+        uid=request.uid,
+        client_id=request.client_id,
+        thread_id=request.thread_id,
+        graph_message_id=request.graph_message_id,
+        internet_message_id=request.internet_message_id,
+        sender=_normalize_email(request.sender),
+        operator_recipient=_normalize_email(request.operator_recipient),
+        conversation_id=_clean(message.get("conversationId")),
+        failure_id=failure_id,
+        client_status=_clean(decision.client_data.get("status")).lower(),
+        thread_status=thread_status,
+    )
+
+
 def replay_exact_message(
     request: ReplayRequest,
     headers: Dict[str, str],
@@ -548,6 +734,8 @@ def replay_exact_message(
     ] = None,
     lease_runner: Optional[Callable[..., bool]] = None,
     scheduler_lease_runner: Optional[Callable[..., bool]] = None,
+    source_coordinator=None,
+    verify_source_settlement: Optional[Callable[..., bool]] = None,
 ) -> ReplayResult:
     """Preflight and optionally process exactly one failed inbox message.
 
@@ -555,6 +743,11 @@ def replay_exact_message(
     per-user lease so state cannot change between identity checks and replay.
     """
     validate_approved_lane(request)
+    source_mode = resolve_source_coordinator_mode(os.environ)
+    if source_mode is CoordinatorMode.SHADOW and apply:
+        raise ReplayRefused(
+            "Operator replay is shadowed and cannot apply provider or domain effects"
+        )
     authorization = _clean((headers or {}).get("Authorization"))
     if not authorization.startswith("Bearer ") or len(authorization) <= len("Bearer "):
         raise ReplayRefused("Graph authorization headers are unavailable")
@@ -591,9 +784,10 @@ def replay_exact_message(
         scheduler_lease_runner = scheduler_lease_runner or run_with_scheduler_lease
 
     result: Optional[ReplayResult] = None
+    active_source_coordinator = source_coordinator
 
     def _under_lease() -> None:
-        nonlocal result
+        nonlocal active_source_coordinator, result
 
         thread_ref = (
             _user_ref(fs_client, request.uid)
@@ -618,13 +812,15 @@ def replay_exact_message(
             "processing failure for the RFC internet message ID",
         )
         _validate_failure(request, failure)
+        failure_id = failure_ref.id
 
-        for label, message_id in (
-            ("Graph", request.graph_message_id),
-            ("RFC", request.internet_message_id),
-        ):
-            if _processed_ref(fs_client, request.uid, message_id).get().exists:
-                raise ReplayRefused(f"Exact {label} message is already processed")
+        if source_mode is not CoordinatorMode.ENFORCED:
+            for label, message_id in (
+                ("Graph", request.graph_message_id),
+                ("RFC", request.internet_message_id),
+            ):
+                if _processed_ref(fs_client, request.uid, message_id).get().exists:
+                    raise ReplayRefused(f"Exact {label} message is already processed")
 
         message = fetch_message(headers, request.graph_message_id)
         _validate_graph_identity(request, message)
@@ -632,6 +828,124 @@ def replay_exact_message(
             fs_client, request, thread, message
         )
         _validate_reply_header_indexes(fs_client, request, message)
+
+        existing_source_id = None
+        canonical_source_id = None
+        marker_disposition = None
+
+        if source_mode is CoordinatorMode.ENFORCED:
+            if active_source_coordinator is None:
+                from .processing import build_source_coordinator
+
+                active_source_coordinator = build_source_coordinator(fs_client)
+            try:
+                existing_source_id = (
+                    active_source_coordinator.resolve_existing_canonical_source_id(
+                        user_id=request.uid,
+                        hydrated_message=message,
+                        evidence_kind="operator_replay",
+                        thread_id=request.thread_id,
+                    )
+                )
+            except SourceCoordinatorError as exc:
+                raise ReplayRefused(
+                    "Exact canonical source authority refused replay"
+                ) from exc
+            marker_disposition = _legacy_replay_marker_disposition(
+                fs_client,
+                request,
+            )
+            if not apply and marker_disposition is not None:
+                result = _b1_replay_result(
+                    status=marker_disposition,
+                    request=request,
+                    message=message,
+                    failure_id=failure_id,
+                    decision=decision,
+                    thread_status=thread_status,
+                )
+                return
+            if apply and marker_disposition == "legacy_replay_claim_quarantined":
+                result = _b1_replay_result(
+                    status=marker_disposition,
+                    request=request,
+                    message=message,
+                    failure_id=failure_id,
+                    decision=decision,
+                    thread_status=thread_status,
+                )
+                return
+            if apply:
+                try:
+                    identity = (
+                        active_source_coordinator.admit_or_repair_source_identity(
+                            user_id=request.uid,
+                            hydrated_message=message,
+                            evidence_kind="operator_replay",
+                            thread_id=request.thread_id,
+                        )
+                    )
+                except SourceCoordinatorError as exc:
+                    raise ReplayRefused(
+                        "Exact canonical source admission refused replay"
+                    ) from exc
+                canonical_source_id = identity.canonical_source_id
+                if (
+                    existing_source_id is not None
+                    and existing_source_id != canonical_source_id
+                ):
+                    raise ReplayRefused(
+                        "Exact canonical source changed during replay admission"
+                    )
+                try:
+                    retained_disposition = (
+                        active_source_coordinator.quarantine_retained_terminal_authority(
+                            user_id=request.uid,
+                            canonical_source_id=canonical_source_id,
+                            thread_id=request.thread_id,
+                            graph_message_id=request.graph_message_id,
+                            internet_message_id=request.internet_message_id,
+                        )
+                    )
+                except SourceCoordinatorError as exc:
+                    raise ReplayRefused(
+                        "Exact retained terminal authority refused replay"
+                    ) from exc
+                if (
+                    retained_disposition.canonical_source_id
+                    != canonical_source_id
+                ):
+                    raise ReplayRefused(
+                        "Retained terminal authority changed canonical source"
+                    )
+                retained_state = retained_disposition.state
+                if retained_state == "legacy_terminal_authority_retained":
+                    result = _b1_replay_result(
+                        status=retained_state,
+                        request=request,
+                        message=message,
+                        failure_id=failure_id,
+                        decision=decision,
+                        thread_status=thread_status,
+                    )
+                    return
+                if retained_state not in {
+                    "migrated_b1",
+                    "no_retained_terminal_authority",
+                }:
+                    raise ReplayRefused(
+                        "Retained terminal authority returned an invalid disposition"
+                    )
+            if apply and marker_disposition == "legacy_marker_only_ambiguous":
+                result = _b1_replay_result(
+                    status=marker_disposition,
+                    request=request,
+                    message=message,
+                    failure_id=failure_id,
+                    decision=decision,
+                    thread_status=thread_status,
+                )
+                return
 
         existing_artifact = find_existing_artifact(
             request.uid,
@@ -687,21 +1001,33 @@ def replay_exact_message(
                 "Sent Items shows a newer recipient continuation outside the exact thread"
             )
 
-        failure_id = failure_ref.id
         if apply:
-            attempt_id, attempt_started_at = _begin_replay_claim(
-                fs_client,
-                request,
-                failure_ref,
-            )
+            if source_mode is CoordinatorMode.ENFORCED:
+                attempt_id = uuid4().hex
+                attempt_started_at = datetime.now(timezone.utc)
+            else:
+                attempt_id, attempt_started_at = _begin_replay_claim(
+                    fs_client,
+                    request,
+                    failure_ref,
+                )
+            process_kwargs = {
+                "allow_outbound_reply": False,
+                "operator_replay_attempt_id": attempt_id,
+            }
+            if source_mode is CoordinatorMode.ENFORCED:
+                process_kwargs["expected_canonical_source_id"] = (
+                    canonical_source_id
+                )
             try:
-                process_message(
+                process_result = process_message(
                     request.uid,
                     headers,
                     message,
-                    allow_outbound_reply=False,
-                    operator_replay_attempt_id=attempt_id,
+                    **process_kwargs,
                 )
+            except (SourceCoordinatorConflict, SourceCoordinatorAmbiguous):
+                raise
             except Exception as exc:
                 failure_ref.set(
                     {
@@ -712,6 +1038,37 @@ def replay_exact_message(
                     merge=True,
                 )
                 raise
+            if source_mode is CoordinatorMode.ENFORCED:
+                settlement_verifier = (
+                    verify_source_settlement or _verify_b1_replay_settlement
+                )
+                try:
+                    settlement_verified = settlement_verifier(
+                        fs_client,
+                        request,
+                        process_result,
+                        canonical_source_id,
+                    )
+                except Exception as exc:
+                    _mark_b1_replay_settlement_unverified(
+                        failure_ref,
+                        attempt_id=attempt_id,
+                        canonical_source_id=canonical_source_id,
+                        error_class=type(exc).__name__,
+                    )
+                    raise ReplayRefused(
+                        "Canonical replay settlement readback is unavailable"
+                    ) from exc
+                if settlement_verified is not True:
+                    _mark_b1_replay_settlement_unverified(
+                        failure_ref,
+                        attempt_id=attempt_id,
+                        canonical_source_id=canonical_source_id,
+                        error_class="SettlementVerificationFailed",
+                    )
+                    raise ReplayRefused(
+                        "Canonical replay did not produce an exact B1 settlement"
+                    )
             try:
                 post_process_artifact = find_existing_artifact(
                     request.uid,
@@ -779,13 +1136,23 @@ def replay_exact_message(
                 raise ReplayRefused(
                     "Durable degraded-asset replay postcondition was not satisfied"
                 )
-            _complete_replay_claim(
-                fs_client,
-                request,
-                failure_ref,
-                attempt_id,
-                failure,
-            )
+            if source_mode is CoordinatorMode.ENFORCED:
+                _complete_b1_replay_failure(
+                    fs_client,
+                    request,
+                    failure_ref,
+                    attempt_id,
+                    failure,
+                    canonical_source_id,
+                )
+            else:
+                _complete_replay_claim(
+                    fs_client,
+                    request,
+                    failure_ref,
+                    attempt_id,
+                    failure,
+                )
 
         result = ReplayResult(
             status="applied" if apply else "verified",

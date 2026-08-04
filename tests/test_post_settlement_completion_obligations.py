@@ -72,7 +72,13 @@ class _CompletionCrash(BaseException):
 
 
 class PendingCompletionObligationSchemaTests(unittest.TestCase):
-    def _build(self, *, client_id, complete_client_after_reply):
+    def _build(
+        self,
+        *,
+        client_id,
+        complete_client_after_reply,
+        source_authority_protocol="legacy",
+    ):
         return send_permits.pending_completion_obligation_payload(
             user_id="uid-completion-schema",
             client_id=client_id,
@@ -84,6 +90,35 @@ class PendingCompletionObligationSchemaTests(unittest.TestCase):
             permit_immutable_hash="b" * 64,
             sent_evidence={"sentMessageId": "sent-completion-schema"},
             complete_client_after_reply=complete_client_after_reply,
+            source_authority_protocol=source_authority_protocol,
+        )
+
+    def test_builder_persists_versioned_exact_source_protocol(self):
+        _legacy_id, legacy = self._build(
+            client_id="client-completion-schema",
+            complete_client_after_reply=True,
+        )
+        exact_id, exact = self._build(
+            client_id="client-completion-schema",
+            complete_client_after_reply=True,
+            source_authority_protocol="b1_exact_source",
+        )
+
+        self.assertEqual(1, legacy["version"])
+        self.assertNotIn("sourceAuthorityProtocol", legacy["immutable"])
+        self.assertEqual(2, exact["version"])
+        self.assertEqual(2, exact["immutable"]["version"])
+        self.assertEqual(
+            "b1_exact_source",
+            exact["immutable"]["sourceAuthorityProtocol"],
+        )
+        self.assertEqual(
+            exact,
+            send_permits.validate_pending_completion_obligation_payload(
+                exact,
+                document_id=exact_id,
+                expected_user_id="uid-completion-schema",
+            ),
         )
 
     def test_builder_rejects_client_binding_when_completion_is_not_required(self):
@@ -499,6 +534,64 @@ class PendingSuccessCompletionObligationTests(unittest.TestCase):
         self.assertEqual("owed", first_payload["status"])
         self.assertTrue(first_payload["immutable"]["completeClientAfterReply"])
 
+    def test_exact_pending_success_stamps_immutable_b1_protocol(self):
+        data = {
+            **self._pending_data("exact-protocol"),
+            "status": "sending",
+            "canonicalSourceId": "source-exact-protocol",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 2,
+            "pendingProtocol": {
+                "kind": "b1_exact_source",
+                "version": 1,
+            },
+        }
+        pending_doc = FakeDoc(data["threadId"], copy.deepcopy(data))
+        fake_fs = self._firestore(pending_doc)
+        capability = types.SimpleNamespace(
+            permit_id="graph-send-exact-protocol",
+            immutable_hash="a" * 64,
+            envelope_hash=send_permits.pending_envelope_hash(data),
+            issuer_ref=pending_doc.reference,
+        )
+        evidence = {
+            "sentMessageId": "draft-exact-protocol",
+            "permitId": capability.permit_id,
+        }
+        settle = MagicMock(return_value=True)
+        refs = (
+            fake_fs,
+            fake_fs,
+            fake_fs.collections["threads"].document(data["threadId"]),
+            pending_doc.reference,
+        )
+        with patch.object(
+            pending_responses,
+            "_pending_claim_refs",
+            return_value=refs,
+        ), patch.object(
+            pending_responses,
+            "cas_pending_claim_transition",
+            new=settle,
+        ):
+            pending_responses._cas_pending_success(
+                self.USER_ID,
+                pending_doc,
+                data,
+                "pending-response-b1-owner",
+                capability,
+                evidence,
+            )
+
+        _ref, payload = settle.call_args.kwargs["side_documents"][0]
+        self.assertEqual(2, payload["version"])
+        self.assertEqual(
+            "b1_exact_source",
+            payload["immutable"]["sourceAuthorityProtocol"],
+        )
+
     def test_false_exception_and_crash_after_success_leave_settled_permit_and_owed_tombstone(self):
         cases = (
             ("false", False, None),
@@ -619,6 +712,39 @@ class PendingSuccessCompletionObligationTests(unittest.TestCase):
         heuristic.assert_not_called()
         continuation.assert_not_called()
         self.assertEqual(permit_before, send_permits.read_permit(capability))
+
+    def test_legacy_v1_obligation_replays_after_enforced_rollout(self):
+        fake_fs, pending_doc, _data, capability, _evidence, obligation = (
+            self._seed_manual_obligation("legacy-rollout")
+        )
+        self.assertEqual(1, obligation.to_dict()["version"])
+        self.assertNotIn(
+            "sourceAuthorityProtocol",
+            obligation.to_dict()["immutable"],
+        )
+        permit_before = copy.deepcopy(send_permits.read_permit(capability))
+
+        with patch.dict(
+            "os.environ",
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            states, send, exact, heuristic, continuation = self._process(
+                fake_fs,
+                completion_effect=True,
+            )
+
+        self._last_state(states, "healthy")
+        self.assertEqual("settled", obligation.to_dict()["status"])
+        self.assertEqual(
+            "client_completed",
+            obligation.to_dict()["completionOutcome"],
+        )
+        self.assertTrue(pending_doc.reference.deleted)
+        self.assertEqual(permit_before, send_permits.read_permit(capability))
+        send.assert_not_called()
+        exact.assert_not_called()
+        heuristic.assert_not_called()
+        continuation.assert_not_called()
 
     def test_completed_and_ineligible_clients_settle_without_duplicate_completion(self):
         for status in ("completed", "stopping", "stopped", "archived", "deleted"):

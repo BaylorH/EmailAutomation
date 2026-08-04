@@ -28,8 +28,12 @@ DRAFT_DELETE_EMAIL_PATH = "email_automation/email.py"
 SOURCE_ADMISSION_METHOD = "admit_or_repair_source_identity"
 SOURCE_ADMISSION_PRIVATE_ENVELOPE = "_SourceAdmissionEnvelope"
 SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE = "_VerifiedHardOptoutEvidence"
+SOURCE_RETAINED_TERMINAL_PRIVATE_EVIDENCE = (
+    "_VerifiedRetainedTerminalEvidence"
+)
 SOURCE_CLASSIFICATION_PRIVATE_NAMES = {
     SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE,
+    SOURCE_RETAINED_TERMINAL_PRIVATE_EVIDENCE,
 }
 SOURCE_CLASSIFICATION_VERIFIER_NAME = "hard_optout_verifier"
 SOURCE_CLASSIFICATION_ORCHESTRATOR = "classify_source_once"
@@ -44,6 +48,10 @@ SOURCE_ADMISSION_ALLOWED_CALLABLE_SCOPES = {
         ("replay_exact_message", "_under_lease"),
     ),
 }
+SOURCE_COORDINATOR_FACTORY_CALLABLE_SCOPE = (
+    "email_automation/processing.py",
+    ("build_source_coordinator",),
+)
 
 EXPECTED_DRAFT_DELETE_MANIFEST = {
     "schemaVersion": 1,
@@ -654,6 +662,18 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
             and isinstance(parent.target, ast.Name)
         )
 
+    def _reviewed_factory_constructor_return(self, node):
+        parent = self._parents.get(id(node))
+        return (
+            isinstance(parent, ast.Return)
+            and parent.value is node
+            and (
+                self.relative_path,
+                self._current_callable_scope(),
+            )
+            == SOURCE_COORDINATOR_FACTORY_CALLABLE_SCOPE
+        )
+
     def _bind_assignment_target(self, target, *, protected_instance=False):
         if isinstance(target, ast.Name):
             if (
@@ -938,9 +958,18 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
 
         if self._constructor_name_is_protected(node.func):
             self._allowed_constructor_refs.add(id(node.func))
-            if not self._reviewed_callable():
+            reviewed_factory_return = (
+                self._reviewed_factory_constructor_return(node)
+            )
+            if not (
+                self._reviewed_callable()
+                or reviewed_factory_return
+            ):
                 self._record(node, "SourceCoordinator construction is outside a reviewed adapter")
-            if not self._simple_constructor_assignment(node):
+            if not (
+                self._simple_constructor_assignment(node)
+                or reviewed_factory_return
+            ):
                 self._record(node, "SourceCoordinator result propagation is unreviewed")
             if any(keyword.arg is None for keyword in node.keywords):
                 self._record(node, "SourceCoordinator constructor expansion is unreviewed")
@@ -1807,6 +1836,22 @@ class InventoryContractTests(unittest.TestCase):
                 "constructor = namespace[prefix + 'OptoutEvidence']\n"
                 "value = constructor({})"
             ),
+            "retained evidence direct import": (
+                "from email_automation.source_coordinator import "
+                "_VerifiedRetainedTerminalEvidence\n"
+                "value = object.__new__(_VerifiedRetainedTerminalEvidence)"
+            ),
+            "retained evidence module attribute": (
+                "import email_automation.source_coordinator as coordinator\n"
+                "value = coordinator._VerifiedRetainedTerminalEvidence"
+            ),
+            "retained evidence fragmented lookup": (
+                "name = '_VerifiedRetained' + 'TerminalEvidence'\n"
+                "value = getattr(coordinator, name)"
+            ),
+            "retained evidence spoofed definition": (
+                "class _VerifiedRetainedTerminalEvidence: pass"
+            ),
         }
         for case, source in mutations.items():
             with self.subTest(case=case):
@@ -2399,6 +2444,51 @@ class InventoryContractTests(unittest.TestCase):
             ),
         )
 
+    def test_classification_gate_allows_only_exact_production_factory_return(self):
+        factory = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "def build_source_coordinator(fs_client) -> 'SourceCoordinator':\n"
+            "    return SourceCoordinator("
+            "fs_client, uuid_factory=make_id, now_factory=now)"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                factory,
+                "email_automation/processing.py",
+            ),
+        )
+
+        mutations = {
+            "wrong path": (
+                factory,
+                "email_automation/unreviewed.py",
+            ),
+            "wrong function": (
+                factory.replace(
+                    "build_source_coordinator",
+                    "alternate_source_coordinator_factory",
+                ),
+                "email_automation/processing.py",
+            ),
+            "nested factory": (
+                "from email_automation.source_coordinator import SourceCoordinator\n"
+                "def wrapper():\n"
+                "    def build_source_coordinator(fs_client):\n"
+                "        return SourceCoordinator("
+                "fs_client, uuid_factory=make_id, now_factory=now)",
+                "email_automation/processing.py",
+            ),
+        }
+        for case, (source, relative_path) in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        relative_path,
+                    )
+                )
+
     def test_source_admission_gate_rejects_private_envelope_mutations(self):
         mutations = {
             "direct import": (
@@ -2788,6 +2878,83 @@ class InventoryContractTests(unittest.TestCase):
                     calls = called_names(top_level_function(tree, name))
                     self.assertIn("_processed_ref", calls)
                     self.assertIn(required_effect, calls)
+
+    def test_operator_replay_legacy_claim_writers_are_disabled_only(self):
+        tree = _parse_module(Path("email_automation/operator_replay.py"))
+        replay_functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "replay_exact_message"
+        ]
+        self.assertEqual(1, len(replay_functions))
+        replay_function = replay_functions[0]
+
+        def call_name(node):
+            if isinstance(node.func, ast.Name):
+                return node.func.id
+            if isinstance(node.func, ast.Attribute):
+                return node.func.attr
+            return None
+
+        def is_enforced_test(node):
+            return (
+                isinstance(node, ast.Compare)
+                and isinstance(node.left, ast.Name)
+                and node.left.id == "source_mode"
+                and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.Is)
+                and len(node.comparators) == 1
+                and isinstance(node.comparators[0], ast.Attribute)
+                and isinstance(node.comparators[0].value, ast.Name)
+                and node.comparators[0].value.id == "CoordinatorMode"
+                and node.comparators[0].attr == "ENFORCED"
+            )
+
+        calls = [
+            node
+            for node in ast.walk(replay_function)
+            if isinstance(node, ast.Call)
+            and call_name(node)
+            in {"_begin_replay_claim", "_complete_replay_claim"}
+        ]
+        self.assertEqual(2, len(calls))
+        enforced_branches = [
+            node
+            for node in ast.walk(replay_function)
+            if isinstance(node, ast.If) and is_enforced_test(node.test)
+        ]
+        self.assertGreaterEqual(len(enforced_branches), 2)
+        for legacy_call in calls:
+            self.assertTrue(
+                any(
+                    legacy_call in {
+                        descendant
+                        for statement in branch.orelse
+                        for descendant in ast.walk(statement)
+                    }
+                    for branch in enforced_branches
+                ),
+                f"{call_name(legacy_call)} escaped the disabled-only branch",
+            )
+            self.assertFalse(
+                any(
+                    legacy_call in {
+                        descendant
+                        for statement in branch.body
+                        for descendant in ast.walk(statement)
+                    }
+                    for branch in enforced_branches
+                )
+            )
+
+        replay_calls = {
+            call_name(node)
+            for node in ast.walk(replay_function)
+            if isinstance(node, ast.Call)
+        }
+        self.assertIn("resolve_source_coordinator_mode", replay_calls)
+        self.assertIn("admit_or_repair_source_identity", replay_calls)
 
     def test_legacy_inventory_only_accepts_top_level_definitions(self):
         sources = {

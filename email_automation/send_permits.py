@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from google.cloud.firestore import SERVER_TIMESTAMP
 
+from .firestore_transactions import run_firestore_transaction
 from .sent_mail_guard import (
     GRAPH_EXACT_SENT_ATTACHMENT_LIMIT,
     canonical_graph_body_hash,
@@ -35,9 +36,12 @@ PENDING_COMPLETION_OBLIGATION_COLLECTION = (
     "pendingResponseCompletionObligations"
 )
 PENDING_COMPLETION_OBLIGATION_VERSION = 1
+PENDING_COMPLETION_EXACT_SOURCE_VERSION = 2
 PENDING_COMPLETION_OBLIGATION_KIND = (
     "pending_response_client_completion"
 )
+PENDING_COMPLETION_LEGACY_PROTOCOL = "legacy"
+PENDING_COMPLETION_EXACT_SOURCE_PROTOCOL = "b1_exact_source"
 GRAPH_SEND_POST_PREPARATION_HISTORY_RESERVE = (
     PENDING_GRAPH_SENT_RECHECK_LIMIT + 8
 )
@@ -300,7 +304,7 @@ def _stable_evidence_hash(payload: Dict[str, Any]) -> str:
     }))
 
 
-_PENDING_COMPLETION_IMMUTABLE_FIELDS = frozenset({
+_PENDING_COMPLETION_LEGACY_IMMUTABLE_FIELDS = frozenset({
     "version",
     "kind",
     "userId",
@@ -313,6 +317,10 @@ _PENDING_COMPLETION_IMMUTABLE_FIELDS = frozenset({
     "permitImmutableHash",
     "sentEvidenceHash",
     "completeClientAfterReply",
+})
+_PENDING_COMPLETION_EXACT_SOURCE_IMMUTABLE_FIELDS = frozenset({
+    *_PENDING_COMPLETION_LEGACY_IMMUTABLE_FIELDS,
+    "sourceAuthorityProtocol",
 })
 _PENDING_COMPLETION_DOCUMENT_FIELDS = frozenset({
     "version",
@@ -344,10 +352,22 @@ def pending_completion_obligation_payload(
     permit_immutable_hash: str,
     sent_evidence: Dict[str, Any],
     complete_client_after_reply: bool,
+    source_authority_protocol: str = PENDING_COMPLETION_LEGACY_PROTOCOL,
 ) -> tuple[str, Dict[str, Any]]:
     """Build one deterministic local-completion tombstone."""
+    if source_authority_protocol == PENDING_COMPLETION_LEGACY_PROTOCOL:
+        version = PENDING_COMPLETION_OBLIGATION_VERSION
+    elif (
+        source_authority_protocol
+        == PENDING_COMPLETION_EXACT_SOURCE_PROTOCOL
+    ):
+        version = PENDING_COMPLETION_EXACT_SOURCE_VERSION
+    else:
+        raise GraphSendPermitBlocked(
+            "pending completion obligation source authority protocol is invalid"
+        )
     immutable = {
-        "version": PENDING_COMPLETION_OBLIGATION_VERSION,
+        "version": version,
         "kind": PENDING_COMPLETION_OBLIGATION_KIND,
         "userId": str(user_id or "").strip(),
         "clientId": str(client_id or "").strip(),
@@ -362,10 +382,12 @@ def pending_completion_obligation_payload(
         "sentEvidenceHash": _stable_evidence_hash(sent_evidence),
         "completeClientAfterReply": complete_client_after_reply,
     }
+    if version == PENDING_COMPLETION_EXACT_SOURCE_VERSION:
+        immutable["sourceAuthorityProtocol"] = source_authority_protocol
     immutable_hash = _hash(immutable)
     obligation_id = f"pending-completion-{immutable_hash}"
     payload = {
-        "version": PENDING_COMPLETION_OBLIGATION_VERSION,
+        "version": version,
         "obligationId": obligation_id,
         "immutable": immutable,
         "immutableHash": immutable_hash,
@@ -400,11 +422,18 @@ def validate_pending_completion_obligation_payload(
     expected_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Validate an owed completion obligation or its retained settlement."""
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if version == PENDING_COMPLETION_OBLIGATION_VERSION:
+        immutable_fields = _PENDING_COMPLETION_LEGACY_IMMUTABLE_FIELDS
+    elif version == PENDING_COMPLETION_EXACT_SOURCE_VERSION:
+        immutable_fields = _PENDING_COMPLETION_EXACT_SOURCE_IMMUTABLE_FIELDS
+    else:
+        immutable_fields = None
     if (
         not isinstance(payload, dict)
         or set(payload) != _PENDING_COMPLETION_DOCUMENT_FIELDS
         or type(payload.get("version")) is not int
-        or payload.get("version") != PENDING_COMPLETION_OBLIGATION_VERSION
+        or immutable_fields is None
     ):
         raise GraphSendPermitBlocked(
             "pending completion obligation document schema is malformed"
@@ -412,13 +441,17 @@ def validate_pending_completion_obligation_payload(
     immutable = payload.get("immutable")
     if (
         not isinstance(immutable, dict)
-        or set(immutable) != _PENDING_COMPLETION_IMMUTABLE_FIELDS
+        or set(immutable) != immutable_fields
         or type(immutable.get("version")) is not int
-        or immutable.get("version")
-        != PENDING_COMPLETION_OBLIGATION_VERSION
+        or immutable.get("version") != version
         or type(immutable.get("kind")) is not str
         or immutable.get("kind") != PENDING_COMPLETION_OBLIGATION_KIND
         or type(immutable.get("completeClientAfterReply")) is not bool
+        or (
+            version == PENDING_COMPLETION_EXACT_SOURCE_VERSION
+            and immutable.get("sourceAuthorityProtocol")
+            != PENDING_COMPLETION_EXACT_SOURCE_PROTOCOL
+        )
     ):
         raise GraphSendPermitBlocked(
             "pending completion obligation immutable schema is malformed"
@@ -1352,7 +1385,7 @@ def _prepared_envelope(
 
 
 def pending_envelope(data: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    envelope = {
         "threadId": (data or {}).get("threadId"),
         "msgId": (data or {}).get("msgId"),
         "recipient": str((data or {}).get("recipient") or "").strip().lower(),
@@ -1360,6 +1393,9 @@ def pending_envelope(data: Dict[str, Any]) -> Dict[str, Any]:
         "conversationId": (data or {}).get("conversationId"),
         "responseBodyHash": _body_hash((data or {}).get("responseBody")),
     }
+    if "pendingProtocol" in (data or {}):
+        envelope["pendingProtocol"] = (data or {}).get("pendingProtocol")
+    return envelope
 
 
 def pending_envelope_hash(data: Dict[str, Any]) -> str:
@@ -2596,119 +2632,186 @@ def issue_pending_graph_send_permit(
     pending_ref,
     loaded_data: Dict[str, Any],
     claim_token: str,
+    *,
+    require_exact_client_binding: bool = False,
+    exact_claim_validator=None,
 ) -> Optional[GraphSendCapability]:
     """Linearize a pending worker against terminal staging."""
-    transaction = firestore_client.transaction()
-    now = datetime.now(timezone.utc)
-    thread_snapshot = thread_ref.get(transaction=transaction)
-    pending_snapshot = pending_ref.get(transaction=transaction)
-    if not thread_snapshot.exists or not pending_snapshot.exists:
-        return None
-    thread_data = thread_snapshot.to_dict() or {}
-    pending_data = pending_snapshot.to_dict() or {}
-    canonical_thread_id = getattr(thread_ref, "id", None)
-    loaded_thread_id = (loaded_data or {}).get("threadId")
-    if (
-        not isinstance(canonical_thread_id, str)
-        or not canonical_thread_id
-        or not isinstance(loaded_thread_id, str)
-        or loaded_thread_id != canonical_thread_id
-    ):
-        raise GraphSendPermitBlocked(
-            "pending Graph permit source threadId does not match its canonical "
-            "thread issuer"
+    prepared: Dict[str, Any] = {}
+
+    def validate_exact_claim(
+        issue_transaction,
+        current_pending_data: Dict[str, Any],
+    ) -> None:
+        if require_exact_client_binding is not True:
+            return
+        if not callable(exact_claim_validator):
+            raise GraphSendPermitBlocked(
+                "exact pending Graph permit requires an atomic source binding "
+                "validator"
+            )
+        try:
+            exact_claim_validator(
+                issue_transaction,
+                current_pending_data,
+                claim_token,
+            )
+        except GraphSendPermitBlocked:
+            raise
+        except Exception as exc:
+            raise GraphSendPermitBlocked(
+                "exact pending Graph permit source binding validation failed: "
+                f"{exc}"
+            ) from exc
+
+    def enqueue_issue_writes(issue_transaction) -> None:
+        permit_ref = prepared["permit_ref"]
+        permit = prepared["permit"]
+        issue_transaction.set(permit_ref, permit)
+        issue_transaction.update(thread_ref, prepared["thread_patch"])
+        issue_transaction.update(pending_ref, prepared["pending_patch"])
+
+    def prepare_issue(transaction):
+        now = datetime.now(timezone.utc)
+        thread_snapshot = thread_ref.get(transaction=transaction)
+        pending_snapshot = pending_ref.get(transaction=transaction)
+        if not thread_snapshot.exists or not pending_snapshot.exists:
+            return None
+        thread_data = thread_snapshot.to_dict() or {}
+        pending_data = pending_snapshot.to_dict() or {}
+        canonical_thread_id = getattr(thread_ref, "id", None)
+        loaded_thread_id = (loaded_data or {}).get("threadId")
+        if (
+            not isinstance(canonical_thread_id, str)
+            or not canonical_thread_id
+            or not isinstance(loaded_thread_id, str)
+            or loaded_thread_id != canonical_thread_id
+        ):
+            raise GraphSendPermitBlocked(
+                "pending Graph permit source threadId does not match its canonical "
+                "thread issuer"
+            )
+        pending_client_id = (loaded_data or {}).get("clientId")
+        if require_exact_client_binding is True and pending_client_id not in (
+            None,
+            "",
+        ) and (
+            type(pending_client_id) is not str
+            or pending_client_id != pending_client_id.strip()
+            or thread_data.get("clientId") != pending_client_id
+        ):
+            raise GraphSendPermitBlocked(
+                "pending Graph permit client conflicts with its canonical thread"
+            )
+        issuer_document_id, issuer_document_path = _issuer_document_identity(
+            pending_ref,
+            issuer_kind="pending_response",
         )
-    issuer_document_id, issuer_document_path = _issuer_document_identity(
-        pending_ref,
-        issuer_kind="pending_response",
-    )
-    _require_canonical_ref_path(
-        pending_ref,
-        _pending_response_path(thread_ref, issuer_document_id),
-        label="pending permit issuer reference",
-    )
-    envelope_hash = _validate_pending_claim(
-        pending_data,
-        loaded_data,
-        claim_token,
-        now=now,
-    )
-    if has_terminal_send_marker(thread_data):
-        transaction.update(pending_ref, {
-            "status": "queued",
-            "processingBy": None,
-            "processingAt": None,
-            "processingLeaseUntil": None,
+        _require_canonical_ref_path(
+            pending_ref,
+            _pending_response_path(thread_ref, issuer_document_id),
+            label="pending permit issuer reference",
+        )
+        envelope_hash = _validate_pending_claim(
+            pending_data,
+            loaded_data,
+            claim_token,
+            now=now,
+        )
+        validate_exact_claim(transaction, pending_data)
+        if has_terminal_send_marker(thread_data):
+            transaction.update(pending_ref, {
+                "status": "queued",
+                "processingBy": None,
+                "processingAt": None,
+                "processingLeaseUntil": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+            return None
+
+        _prior_ref, prior = _active_permit(
+            transaction,
+            thread_ref,
+            thread_data,
+        )
+        if graph_send_permit_blocks_new_send(prior):
+            raise GraphSendPermitBlocked(
+                "prior active Graph send permit is unresolved or awaits operator "
+                "draft review; no new permit is allowed"
+            )
+
+        permit_id = f"graph-send-{uuid4().hex}"
+        plaintext_capability = uuid4().hex
+        permit = _new_permit(
+            permit_id=permit_id,
+            issuer_kind="pending_response",
+            issuer_owner=claim_token,
+            issuer_fence=None,
+            issuer_document_id=issuer_document_id,
+            issuer_document_path=issuer_document_path,
+            thread_id=canonical_thread_id,
+            client_id=(loaded_data or {}).get("clientId"),
+            source_graph_message_id=(loaded_data or {}).get("msgId"),
+            conversation_id=(loaded_data or {}).get("conversationId"),
+            recipient=(loaded_data or {}).get("recipient"),
+            body_hash=_body_hash((loaded_data or {}).get("responseBody")),
+            envelope_hash=envelope_hash,
+            capability_hash=hashlib.sha256(
+                plaintext_capability.encode("utf-8")
+            ).hexdigest(),
+            now=now,
+        )
+        permit_ref = thread_ref.collection("graphSendPermits").document(
+            permit_id
+        )
+        expected_pointer = _pointer(permit)
+        thread_patch = {
+            "activeGraphSendPermit": expected_pointer,
             "updatedAt": SERVER_TIMESTAMP,
-        })
-        transaction.commit()
-        return None
-
-    _prior_ref, prior = _active_permit(transaction, thread_ref, thread_data)
-    if graph_send_permit_blocks_new_send(prior):
-        raise GraphSendPermitBlocked(
-            "prior active Graph send permit is unresolved or awaits operator "
-            "draft review; no new permit is allowed"
+        }
+        pending_patch = {
+            "graphSendPermitId": permit_id,
+            "graphSendPermitHash": permit["immutableHash"],
+            "processingLeaseUntil": permit["leaseUntil"],
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        capability = GraphSendCapability(
+            permit_id=permit_id,
+            immutable_hash=permit["immutableHash"],
+            issuer_kind="pending_response",
+            issuer_owner=claim_token,
+            issuer_fence=None,
+            envelope_hash=envelope_hash,
+            capability=plaintext_capability,
+            firestore_client=firestore_client,
+            thread_ref=thread_ref,
+            permit_ref=permit_ref,
+            issuer_ref=pending_ref,
         )
-
-    permit_id = f"graph-send-{uuid4().hex}"
-    plaintext_capability = uuid4().hex
-    permit = _new_permit(
-        permit_id=permit_id,
-        issuer_kind="pending_response",
-        issuer_owner=claim_token,
-        issuer_fence=None,
-        issuer_document_id=issuer_document_id,
-        issuer_document_path=issuer_document_path,
-        thread_id=canonical_thread_id,
-        client_id=(loaded_data or {}).get("clientId"),
-        source_graph_message_id=(loaded_data or {}).get("msgId"),
-        conversation_id=(loaded_data or {}).get("conversationId"),
-        recipient=(loaded_data or {}).get("recipient"),
-        body_hash=_body_hash((loaded_data or {}).get("responseBody")),
-        envelope_hash=envelope_hash,
-        capability_hash=hashlib.sha256(
-            plaintext_capability.encode("utf-8")
-        ).hexdigest(),
-        now=now,
-    )
-    permit_ref = thread_ref.collection("graphSendPermits").document(permit_id)
-    expected_pointer = _pointer(permit)
-    thread_patch = {
-        "activeGraphSendPermit": _pointer(permit),
-        "updatedAt": SERVER_TIMESTAMP,
-    }
-    pending_patch = {
-        "graphSendPermitId": permit_id,
-        "graphSendPermitHash": permit["immutableHash"],
-        "processingLeaseUntil": permit["leaseUntil"],
-        "updatedAt": SERVER_TIMESTAMP,
-    }
-    capability = GraphSendCapability(
-        permit_id=permit_id,
-        immutable_hash=permit["immutableHash"],
-        issuer_kind="pending_response",
-        issuer_owner=claim_token,
-        issuer_fence=None,
-        envelope_hash=envelope_hash,
-        capability=plaintext_capability,
-        firestore_client=firestore_client,
-        thread_ref=thread_ref,
-        permit_ref=permit_ref,
-        issuer_ref=pending_ref,
-    )
-    original_thread_data = dict(thread_data)
-    original_pending_data = dict(pending_data)
-    expected_thread_data = {
-        **original_thread_data,
-        "activeGraphSendPermit": expected_pointer,
-    }
-    expected_pending_data = {
-        **original_pending_data,
-        "graphSendPermitId": permit_id,
-        "graphSendPermitHash": permit["immutableHash"],
-        "processingLeaseUntil": permit["leaseUntil"],
-    }
+        original_thread_data = dict(thread_data)
+        original_pending_data = dict(pending_data)
+        prepared.update({
+            "permit": permit,
+            "permit_ref": permit_ref,
+            "thread_patch": thread_patch,
+            "pending_patch": pending_patch,
+            "capability": capability,
+            "expected_pointer": expected_pointer,
+            "original_thread_data": original_thread_data,
+            "original_pending_data": original_pending_data,
+            "expected_thread_data": {
+                **original_thread_data,
+                "activeGraphSendPermit": expected_pointer,
+            },
+            "expected_pending_data": {
+                **original_pending_data,
+                "graphSendPermitId": permit_id,
+                "graphSendPermitHash": permit["immutableHash"],
+                "processingLeaseUntil": permit["leaseUntil"],
+            },
+        })
+        enqueue_issue_writes(transaction)
+        return capability
 
     def classify_issue_readback(
         thread_readback,
@@ -2733,8 +2836,8 @@ def issue_pending_graph_send_permit(
             return "drift"
         if (
             permit_exists is False
-            and raw_thread == original_thread_data
-            and raw_pending == original_pending_data
+            and raw_thread == prepared["original_thread_data"]
+            and raw_pending == prepared["original_pending_data"]
         ):
             return "source"
         if permit_exists is not True:
@@ -2745,68 +2848,112 @@ def issue_pending_graph_send_permit(
         except GraphSendPermitError:
             return "drift"
         if (
-            readback_permit == permit
+            readback_permit == prepared["permit"]
             and _terminal_thread_commit_comparable(raw_thread)
-            == _terminal_thread_commit_comparable(expected_thread_data)
+            == _terminal_thread_commit_comparable(
+                prepared["expected_thread_data"]
+            )
             and _pending_settlement_commit_comparable(raw_pending)
-            == _pending_settlement_commit_comparable(expected_pending_data)
-            and raw_thread.get("activeGraphSendPermit") == expected_pointer
-            and raw_pending.get("graphSendPermitId") == permit_id
+            == _pending_settlement_commit_comparable(
+                prepared["expected_pending_data"]
+            )
+            and raw_thread.get("activeGraphSendPermit")
+            == prepared["expected_pointer"]
+            and raw_pending.get("graphSendPermitId")
+            == prepared["permit"]["permitId"]
             and raw_pending.get("graphSendPermitHash")
-            == permit["immutableHash"]
+            == prepared["permit"]["immutableHash"]
             and raw_pending.get("processingLeaseUntil")
-            == permit["leaseUntil"]
+            == prepared["permit"]["leaseUntil"]
         ):
             return "target"
         return "drift"
 
     def issue_readback_state() -> str:
-        readback_transaction = firestore_client.transaction()
-        return classify_issue_readback(
-            thread_ref.get(transaction=readback_transaction),
-            pending_ref.get(transaction=readback_transaction),
-            permit_ref.get(transaction=readback_transaction),
+        return run_firestore_transaction(
+            firestore_client,
+            lambda readback_transaction: classify_issue_readback(
+                thread_ref.get(transaction=readback_transaction),
+                pending_ref.get(transaction=readback_transaction),
+                prepared["permit_ref"].get(
+                    transaction=readback_transaction
+                ),
+            ),
+            max_attempts=1,
+            read_only=True,
         )
 
-    def enqueue_issue_writes(issue_transaction) -> None:
-        issue_transaction.set(permit_ref, permit)
-        issue_transaction.update(thread_ref, thread_patch)
-        issue_transaction.update(pending_ref, pending_patch)
-
-    def enqueue_exact_issue_retry():
-        retry_transaction = firestore_client.transaction()
+    def retry_issue(retry_transaction):
         retry_state = classify_issue_readback(
             thread_ref.get(transaction=retry_transaction),
             pending_ref.get(transaction=retry_transaction),
-            permit_ref.get(transaction=retry_transaction),
+            prepared["permit_ref"].get(transaction=retry_transaction),
         )
         if retry_state != "source":
             raise GraphSendPermitError(
                 "pending Graph permit issuance retry lost its exact source"
             )
+        validate_exact_claim(
+            retry_transaction,
+            prepared["original_pending_data"],
+        )
         enqueue_issue_writes(retry_transaction)
-        return retry_transaction
+        return prepared["capability"]
 
-    enqueue_issue_writes(transaction)
-    _commit_exact_orphaned_draft_settlement(
-        transaction,
-        readback_state=issue_readback_state,
-        enqueue_retry=enqueue_exact_issue_retry,
-        operation="pending Graph permit issuance",
-    )
-    return capability
+    try:
+        return run_firestore_transaction(
+            firestore_client,
+            prepare_issue,
+            max_attempts=1,
+        )
+    except Exception as first_error:
+        if not prepared:
+            raise
+        state = issue_readback_state()
+        if state == "target":
+            return prepared["capability"]
+        if state != "source":
+            raise GraphSendPermitError(
+                "pending Graph permit issuance commit outcome drifted from "
+                "exact source/target"
+            ) from first_error
+        try:
+            run_firestore_transaction(
+                firestore_client,
+                retry_issue,
+                max_attempts=1,
+            )
+        except Exception as retry_error:
+            retry_state = issue_readback_state()
+            if retry_state == "target":
+                return prepared["capability"]
+            if retry_state == "source":
+                raise GraphSendPermitLocalRetryable(
+                    "pending Graph permit issuance did not commit after one "
+                    "exact retry"
+                ) from retry_error
+            raise GraphSendPermitError(
+                "pending Graph permit issuance retry outcome drifted from "
+                "exact source/target"
+            ) from retry_error
+        if issue_readback_state() != "target":
+            raise GraphSendPermitLocalRetryable(
+                "pending Graph permit issuance exact retry returned without "
+                "its full target"
+            ) from first_error
+        return prepared["capability"]
 
 
-def issue_terminal_graph_send_permit(
+def _prepare_terminal_graph_send_permit_transaction(
+    transaction,
     firestore_client,
     thread_ref,
     claim_ref,
     saga: Dict[str, Any],
     issuer_owner: str,
     issuer_fence: int,
-) -> GraphSendCapability:
+) -> Dict[str, Any]:
     """Issue a terminal acknowledgement permit under the saga owner/fence."""
-    transaction = firestore_client.transaction()
     now = datetime.now(timezone.utc)
     same_claim_root = _same_document_ref(claim_ref, thread_ref)
     thread_snapshot = thread_ref.get(transaction=transaction)
@@ -2930,67 +3077,132 @@ def issue_terminal_graph_send_permit(
     original_claim_data = dict(claim_data)
     original_claim = dict(claim)
 
-    try:
-        transaction.commit()
-    except Exception as commit_error:
-        try:
-            permit_readback = permit_ref.get()
-            thread_readback = thread_ref.get()
-            claim_readback = (
-                thread_readback if same_claim_root else claim_ref.get()
-            )
-            permit_exists = getattr(permit_readback, "exists", None)
-            thread_exists = getattr(thread_readback, "exists", None)
-            claim_exists = getattr(claim_readback, "exists", None)
-            readback_permit = None
-            if permit_exists is True:
-                raw_permit = permit_readback.to_dict()
-                if not isinstance(raw_permit, dict):
-                    raise GraphSendPermitError(
-                        "terminal Graph permit issuance readback is malformed"
-                    )
-                readback_permit = _validate_permit(raw_permit)
-            readback_thread_data = (
-                thread_readback.to_dict() if thread_exists is True else None
-            )
-            readback_claim_data = (
-                claim_readback.to_dict() if claim_exists is True else None
-            )
-            if (
-                thread_exists is True
-                and not isinstance(readback_thread_data, dict)
-            ) or (
-                claim_exists is True
-                and not isinstance(readback_claim_data, dict)
-            ):
-                raise GraphSendPermitError(
-                    "terminal Graph permit issuance root readback is malformed"
-                )
-        except Exception as readback_error:
-            raise GraphSendPermitError(
-                "terminal Graph permit issuance commit outcome is ambiguous; "
-                "exact readback was unavailable"
-            ) from readback_error
+    return {
+        "capability": capability,
+        "permit": permit,
+        "permit_ref": permit_ref,
+        "same_claim_root": same_claim_root,
+        "original_thread_data": original_thread_data,
+        "original_claim_data": original_claim_data,
+        "original_claim": original_claim,
+        "expected_pointer": expected_pointer,
+        "expected_attempt": expected_attempt,
+        "issuer_document_id": issuer_document_id,
+        "issuer_document_path": issuer_document_path,
+    }
 
+
+def issue_terminal_graph_send_permit(
+    firestore_client,
+    thread_ref,
+    claim_ref,
+    saga: Dict[str, Any],
+    issuer_owner: str,
+    issuer_fence: int,
+) -> GraphSendCapability:
+    """Issue terminal authority through one supported Firestore transaction."""
+    plan: Dict[str, Any] = {}
+
+    def prepare_issue(transaction):
+        prepared = _prepare_terminal_graph_send_permit_transaction(
+            transaction,
+            firestore_client,
+            thread_ref,
+            claim_ref,
+            saga,
+            issuer_owner,
+            issuer_fence,
+        )
+        plan.update(prepared)
+        return prepared["capability"]
+
+    try:
+        return run_firestore_transaction(
+            firestore_client,
+            prepare_issue,
+            max_attempts=1,
+        )
+    except Exception as commit_error:
+        if not plan:
+            raise
+
+        def read_issue_state(transaction):
+            try:
+                permit_readback = plan["permit_ref"].get(
+                    transaction=transaction
+                )
+                thread_readback = thread_ref.get(transaction=transaction)
+                claim_readback = (
+                    thread_readback
+                    if plan["same_claim_root"]
+                    else claim_ref.get(transaction=transaction)
+                )
+                permit_exists = getattr(permit_readback, "exists", None)
+                thread_exists = getattr(thread_readback, "exists", None)
+                claim_exists = getattr(claim_readback, "exists", None)
+                readback_permit = None
+                if permit_exists is True:
+                    raw_permit = permit_readback.to_dict()
+                    if not isinstance(raw_permit, dict):
+                        raise GraphSendPermitError(
+                            "terminal Graph permit issuance readback is malformed"
+                        )
+                    readback_permit = _validate_permit(raw_permit)
+                readback_thread_data = (
+                    thread_readback.to_dict()
+                    if thread_exists is True
+                    else None
+                )
+                readback_claim_data = (
+                    claim_readback.to_dict()
+                    if claim_exists is True
+                    else None
+                )
+                if (
+                    thread_exists is True
+                    and not isinstance(readback_thread_data, dict)
+                ) or (
+                    claim_exists is True
+                    and not isinstance(readback_claim_data, dict)
+                ):
+                    raise GraphSendPermitError(
+                        "terminal Graph permit issuance root readback is malformed"
+                    )
+                return {
+                    "permit_exists": permit_exists,
+                    "thread_exists": thread_exists,
+                    "claim_exists": claim_exists,
+                    "permit": readback_permit,
+                    "thread": readback_thread_data,
+                    "claim_data": readback_claim_data,
+                }
+            except Exception as readback_error:
+                raise GraphSendPermitError(
+                    "terminal Graph permit issuance commit outcome is ambiguous; "
+                    "exact readback was unavailable"
+                ) from readback_error
+
+        readback = run_firestore_transaction(
+            firestore_client,
+            read_issue_state,
+            max_attempts=1,
+            read_only=True,
+        )
+        readback_thread_data = readback["thread"]
+        readback_claim_data = readback["claim_data"]
         expected_thread_data = {
-            **original_thread_data,
-            "activeGraphSendPermit": expected_pointer,
-            "terminalReplyAttempt": expected_attempt,
+            **plan["original_thread_data"],
+            "activeGraphSendPermit": plan["expected_pointer"],
+            "terminalReplyAttempt": plan["expected_attempt"],
         }
         comparable_thread_data = (
-            {
-                key: value
-                for key, value in readback_thread_data.items()
-                if key != "updatedAt"
-            }
+            _terminal_thread_commit_comparable(readback_thread_data)
             if isinstance(readback_thread_data, dict)
             else None
         )
-        comparable_expected_thread_data = {
-            key: value
-            for key, value in expected_thread_data.items()
-            if key != "updatedAt"
-        }
+        comparable_expected_thread_data = (
+            _terminal_thread_commit_comparable(expected_thread_data)
+        )
         readback_claim = (
             readback_claim_data.get("terminalSagaClaim")
             if isinstance(readback_claim_data, dict)
@@ -3002,25 +3214,26 @@ def issue_terminal_graph_send_permit(
             else None
         )
         separate_claim_root_unchanged = (
-            same_claim_root or readback_claim_data == original_claim_data
+            plan["same_claim_root"]
+            or readback_claim_data == plan["original_claim_data"]
         )
         applied_exactly = (
-            permit_exists is True
-            and thread_exists is True
-            and claim_exists is True
-            and readback_permit == permit
+            readback["permit_exists"] is True
+            and readback["thread_exists"] is True
+            and readback["claim_exists"] is True
+            and readback["permit"] == plan["permit"]
             and comparable_thread_data == comparable_expected_thread_data
             and "updatedAt" in readback_thread_data
             and readback_thread_data.get("activeGraphSendPermit")
-            == expected_pointer
+            == plan["expected_pointer"]
             and readback_thread_data.get("terminalReplyAttempt")
-            == expected_attempt
-            and readback_claim == original_claim
+            == plan["expected_attempt"]
+            and readback_claim == plan["original_claim"]
             and separate_claim_root_unchanged
-            and readback_permit.get("issuerDocumentId")
-            == issuer_document_id
-            and readback_permit.get("issuerDocumentPath")
-            == issuer_document_path
+            and readback["permit"].get("issuerDocumentId")
+            == plan["issuer_document_id"]
+            and readback["permit"].get("issuerDocumentPath")
+            == plan["issuer_document_path"]
             and readback_claim.get("sagaKey") == saga.get("sagaKey")
             and readback_claim.get("immutableHash")
             == saga.get("immutableHash")
@@ -3030,26 +3243,29 @@ def issue_terminal_graph_send_permit(
             and claim_lease_until > datetime.now(timezone.utc)
         )
         if applied_exactly:
-            return capability
+            return plan["capability"]
 
         definitely_not_applied = (
-            permit_exists is False
-            and thread_exists is True
-            and claim_exists is True
-            and readback_thread_data == original_thread_data
+            readback["permit_exists"] is False
+            and readback["thread_exists"] is True
+            and readback["claim_exists"] is True
+            and readback_thread_data == plan["original_thread_data"]
             and (
-                same_claim_root
-                or readback_claim_data == original_claim_data
+                plan["same_claim_root"]
+                or readback_claim_data == plan["original_claim_data"]
             )
             and (
                 ("activeGraphSendPermit" in readback_thread_data)
-                == ("activeGraphSendPermit" in original_thread_data)
+                == (
+                    "activeGraphSendPermit"
+                    in plan["original_thread_data"]
+                )
             )
             and readback_thread_data.get("activeGraphSendPermit")
-            == original_thread_data.get("activeGraphSendPermit")
+            == plan["original_thread_data"].get("activeGraphSendPermit")
             and readback_thread_data.get("terminalReplyAttempt")
-            == original_thread_data.get("terminalReplyAttempt")
-            and readback_claim == original_claim
+            == plan["original_thread_data"].get("terminalReplyAttempt")
+            and readback_claim == plan["original_claim"]
         )
         if definitely_not_applied:
             raise GraphSendPermitError(
@@ -3060,8 +3276,6 @@ def issue_terminal_graph_send_permit(
             "terminal Graph permit issuance commit outcome is ambiguous; "
             "exact readback did not match either atomic outcome"
         ) from commit_error
-
-    return capability
 
 
 def _read_exact_capability_permit(
@@ -3475,81 +3689,130 @@ def _read_exact_local_transition_state(
     target_permit: Dict[str, Any],
     operation: str,
 ):
-    transaction = capability.firestore_client.transaction()
-    now = datetime.now(timezone.utc)
-    try:
-        readback = _read_exact_capability_permit(transaction, capability)
-        _validate_capability_issuer(
-            transaction,
-            capability,
-            now=now,
-            require_active_lease=True,
-        )
-    except Exception as readback_error:
+    def read_state(transaction):
+        now = datetime.now(timezone.utc)
+        try:
+            readback = _read_exact_capability_permit(
+                transaction,
+                capability,
+            )
+            _validate_capability_issuer(
+                transaction,
+                capability,
+                now=now,
+                require_active_lease=True,
+            )
+        except Exception as readback_error:
+            raise GraphSendPermitError(
+                f"{operation} commit outcome is ambiguous; exact readback is malformed"
+            ) from readback_error
+        if _local_transition_comparable(
+            readback
+        ) == _local_transition_comparable(target_permit):
+            return "target", readback, now
+        if readback == source_permit:
+            return "source", readback, now
         raise GraphSendPermitError(
-            f"{operation} commit outcome is ambiguous; exact readback is malformed"
-        ) from readback_error
-    if _local_transition_comparable(readback) == _local_transition_comparable(
-        target_permit
-    ):
-        return "target", transaction, readback, now
-    if readback == source_permit:
-        return "source", transaction, readback, now
-    raise GraphSendPermitError(
-        f"{operation} commit outcome is ambiguous; exact readback drifted"
+            f"{operation} commit outcome is ambiguous; exact readback drifted"
+        )
+
+    return run_firestore_transaction(
+        capability.firestore_client,
+        read_state,
+        max_attempts=1,
+        read_only=True,
     )
 
 
 def _commit_exact_local_transition(
     capability: GraphSendCapability,
-    transaction,
-    source_permit: Dict[str, Any],
-    state_patch: Dict[str, Any],
+    prepare_transition,
     *,
     operation: str,
-    timeout_seconds: Optional[float] = None,
 ):
     """Commit one local pre-provider transition with bounded exact recovery."""
-    target_permit = {**source_permit, **dict(state_patch)}
-    transaction.update(capability.permit_ref, state_patch)
+    plan: Dict[str, Any] = {}
+
+    def apply_transition(transaction):
+        source_permit, state_patch, timeout_seconds = prepare_transition(
+            transaction
+        )
+        target_permit = {**source_permit, **dict(state_patch)}
+        plan.update({
+            "source_permit": source_permit,
+            "state_patch": state_patch,
+            "target_permit": target_permit,
+            "timeout_seconds": timeout_seconds,
+        })
+        if state_patch:
+            transaction.update(capability.permit_ref, state_patch)
+        return target_permit, timeout_seconds
 
     def recovered_result(readback: Dict[str, Any], now: datetime):
-        recovered_timeout = timeout_seconds
-        if timeout_seconds is not None:
+        recovered_timeout = plan["timeout_seconds"]
+        if recovered_timeout is not None:
             recovered_timeout = _remaining_provider_seconds(
                 readback,
                 now,
-                maximum=float(timeout_seconds),
+                maximum=float(recovered_timeout),
             )
         return readback, recovered_timeout
 
     try:
-        transaction.commit()
-        return target_permit, timeout_seconds
+        return run_firestore_transaction(
+            capability.firestore_client,
+            apply_transition,
+            max_attempts=1,
+        )
     except Exception as first_error:
-        state, retry_transaction, readback, readback_at = (
+        if not plan:
+            raise
+        state, readback, readback_at = (
             _read_exact_local_transition_state(
                 capability,
-                source_permit=source_permit,
-                target_permit=target_permit,
+                source_permit=plan["source_permit"],
+                target_permit=plan["target_permit"],
                 operation=operation,
             )
         )
         if state == "target":
             return recovered_result(readback, readback_at)
 
-        retry_transaction.update(
-            capability.permit_ref,
-            state_patch,
-        )
+        def retry_transition(retry_transaction):
+            retry_now = datetime.now(timezone.utc)
+            retry_source = _read_exact_capability_permit(
+                retry_transaction,
+                capability,
+            )
+            _validate_capability_issuer(
+                retry_transaction,
+                capability,
+                now=retry_now,
+                require_active_lease=True,
+            )
+            if retry_source != plan["source_permit"]:
+                raise GraphSendPermitError(
+                    f"{operation} exact retry lost its source permit"
+                )
+            state_patch = plan["state_patch"]
+            if state_patch:
+                retry_transaction.update(
+                    capability.permit_ref,
+                    state_patch,
+                )
+
         try:
-            retry_transaction.commit()
+            run_firestore_transaction(
+                capability.firestore_client,
+                retry_transition,
+                max_attempts=1,
+            )
         except Exception as retry_error:
-            retry_state, _transaction, retry_readback, retry_readback_at = (
+            retry_state, retry_readback, retry_readback_at = (
                 _read_exact_local_transition_state(
                     capability,
-                    source_permit=source_permit,
-                    target_permit=target_permit,
+                    source_permit=plan["source_permit"],
+                    target_permit=plan["target_permit"],
                     operation=operation,
                 )
             )
@@ -3560,11 +3823,11 @@ def _commit_exact_local_transition(
                 "the unchanged local source state remains retryable"
             ) from retry_error
 
-        retry_state, _transaction, retry_readback, retry_readback_at = (
+        retry_state, retry_readback, retry_readback_at = (
             _read_exact_local_transition_state(
                 capability,
-                source_permit=source_permit,
-                target_permit=target_permit,
+                source_permit=plan["source_permit"],
+                target_permit=plan["target_permit"],
                 operation=operation,
             )
         )
@@ -3577,43 +3840,61 @@ def _commit_exact_local_transition(
 
 
 def _commit_exact_orphaned_draft_settlement(
-    transaction,
+    firestore_client,
     *,
+    first_error: Exception,
     readback_state,
     enqueue_retry,
     operation: str,
 ) -> None:
     """Recover one atomic orphan review commit without replaying provider work."""
-    try:
-        transaction.commit()
+    state = run_firestore_transaction(
+        firestore_client,
+        readback_state,
+        max_attempts=1,
+        read_only=True,
+    )
+    if state == "target":
         return
-    except Exception as first_error:
-        state = readback_state()
-        if state == "target":
-            return
-        if state != "source":
-            raise GraphSendPermitError(
-                f"{operation} commit outcome drifted from exact source/target"
-            ) from first_error
+    if state != "source":
+        raise GraphSendPermitError(
+            f"{operation} commit outcome drifted from exact source/target"
+        ) from first_error
 
-        retry_transaction = enqueue_retry()
-        try:
-            retry_transaction.commit()
-        except Exception as retry_error:
-            retry_state = readback_state()
-            if retry_state == "target":
-                return
-            if retry_state == "source":
-                raise GraphSendPermitLocalRetryable(
-                    f"{operation} did not commit after one exact retry"
-                ) from retry_error
-            raise GraphSendPermitError(
-                f"{operation} retry outcome drifted from exact source/target"
-            ) from retry_error
-        if readback_state() != "target":
+    try:
+        run_firestore_transaction(
+            firestore_client,
+            enqueue_retry,
+            max_attempts=1,
+        )
+    except Exception as retry_error:
+        retry_state = run_firestore_transaction(
+            firestore_client,
+            readback_state,
+            max_attempts=1,
+            read_only=True,
+        )
+        if retry_state == "target":
+            return
+        if retry_state == "source":
             raise GraphSendPermitLocalRetryable(
-                f"{operation} exact retry returned without its full target"
-            ) from first_error
+                f"{operation} did not commit after one exact retry"
+            ) from retry_error
+        raise GraphSendPermitError(
+            f"{operation} retry outcome drifted from exact source/target"
+        ) from retry_error
+    if (
+        run_firestore_transaction(
+            firestore_client,
+            readback_state,
+            max_attempts=1,
+            read_only=True,
+        )
+        != "target"
+    ):
+        raise GraphSendPermitLocalRetryable(
+            f"{operation} exact retry returned without its full target"
+        ) from first_error
 
 
 def _terminal_thread_commit_comparable(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -3690,66 +3971,66 @@ def begin_graph_draft_creation(
         raise GraphSendPermitBlocked(
             "Graph draft attachment plan exceeds the retained history bound"
         )
-    transaction = capability.firestore_client.transaction()
-    now = datetime.now(timezone.utc)
-    permit = _read_exact_capability_permit(transaction, capability)
-    _validate_capability_issuer(
-        transaction,
-        capability,
-        now=now,
-        require_active_lease=True,
-    )
-    preparation = permit.get("draftPreparation")
-    if permit.get("status") != "issued" or preparation is not None:
-        state = (preparation or {}).get("state")
-        raise GraphSendPermitBlocked(
-            "Graph draft creation is one-use; current state is "
-            f"{state or permit.get('status')}"
+    def prepare_transition(transaction):
+        now = datetime.now(timezone.utc)
+        permit = _read_exact_capability_permit(transaction, capability)
+        _validate_capability_issuer(
+            transaction,
+            capability,
+            now=now,
+            require_active_lease=True,
         )
-    source_id = str(source_graph_message_id or "").strip()
-    if source_id != permit.get("sourceGraphMessageId"):
-        raise GraphSendPermitBlocked(
-            "Graph draft creation source message drifted from permit"
+        preparation = permit.get("draftPreparation")
+        if permit.get("status") != "issued" or preparation is not None:
+            state = (preparation or {}).get("state")
+            raise GraphSendPermitBlocked(
+                "Graph draft creation is one-use; current state is "
+                f"{state or permit.get('status')}"
+            )
+        source_id = str(source_graph_message_id or "").strip()
+        if source_id != permit.get("sourceGraphMessageId"):
+            raise GraphSendPermitBlocked(
+                "Graph draft creation source message drifted from permit"
+            )
+        timeout = _remaining_provider_seconds(permit, now)
+        history = permit.get("stateHistory") or []
+        future_entries = (
+            _required_graph_send_history_entries(planned_attachment_count) - 1
         )
-    timeout = _remaining_provider_seconds(permit, now)
-    history = permit.get("stateHistory") or []
-    future_entries = (
-        _required_graph_send_history_entries(planned_attachment_count) - 1
-    )
-    if len(history) + future_entries > _PERMIT_STATE_HISTORY_LIMIT:
-        raise GraphSendPermitBlocked(
-            "Graph send permit has insufficient retained transition history"
+        if len(history) + future_entries > _PERMIT_STATE_HISTORY_LIMIT:
+            raise GraphSendPermitBlocked(
+                "Graph send permit has insufficient retained transition history"
+            )
+        request = {
+            "version": GRAPH_DRAFT_PREPARATION_VERSION,
+            "state": "create_request_started",
+            "sourceGraphMessageId": source_id,
+            "createRequestStartedAt": now,
+            "plannedAttachmentCount": planned_attachment_count,
+        }
+        request["createRequestHash"] = _hash(request)
+        permit_patch = {
+            "draftPreparation": request,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        state_patch = _stateful_permit_patch(
+            permit,
+            permit_patch,
+            event="draft_create_requested",
+            now=now,
         )
-    request = {
-        "version": GRAPH_DRAFT_PREPARATION_VERSION,
-        "state": "create_request_started",
-        "sourceGraphMessageId": source_id,
-        "createRequestStartedAt": now,
-        "plannedAttachmentCount": planned_attachment_count,
-    }
-    request["createRequestHash"] = _hash(request)
-    permit_patch = {
-        "draftPreparation": request,
-        "updatedAt": SERVER_TIMESTAMP,
-    }
-    state_patch = _stateful_permit_patch(
-        permit,
-        permit_patch,
-        event="draft_create_requested",
-        now=now,
-    )
+        return permit, state_patch, timeout
+
     _target, recovered_timeout = _commit_exact_local_transition(
         capability,
-        transaction,
-        permit,
-        state_patch,
+        prepare_transition,
         operation="Graph draft-create request",
-        timeout_seconds=timeout,
     )
     return recovered_timeout
 
 
-def complete_graph_draft_creation(
+def _complete_graph_draft_creation_in_transaction(
+    transaction,
     capability: GraphSendCapability,
     *,
     outcome: str,
@@ -3773,7 +4054,6 @@ def complete_graph_draft_creation(
             evidence,
             draft_id=normalized_draft_id,
         )
-    transaction = capability.firestore_client.transaction()
     now = datetime.now(timezone.utc)
     permit = _read_exact_capability_permit(transaction, capability)
     _validate_capability_issuer(
@@ -3838,8 +4118,27 @@ def complete_graph_draft_creation(
             now=now,
         ),
     )
-    transaction.commit()
     return {**permit, **permit_patch}
+
+
+def complete_graph_draft_creation(
+    capability: GraphSendCapability,
+    *,
+    outcome: str,
+    draft_id: Optional[str] = None,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return run_firestore_transaction(
+        capability.firestore_client,
+        lambda transaction: _complete_graph_draft_creation_in_transaction(
+            transaction,
+            capability,
+            outcome=outcome,
+            draft_id=draft_id,
+            evidence=evidence,
+        ),
+        max_attempts=1,
+    )
 
 
 def begin_graph_draft_patch(
@@ -3854,69 +4153,70 @@ def begin_graph_draft_patch(
     attachments,
 ) -> Dict[str, Any]:
     """Freeze the later-bound prepared envelope before the one-use PATCH."""
-    transaction = capability.firestore_client.transaction()
-    now = datetime.now(timezone.utc)
-    permit = _read_exact_capability_permit(transaction, capability)
-    _validate_capability_issuer(
-        transaction,
-        capability,
-        now=now,
-        require_active_lease=True,
-    )
-    preparation = dict(permit.get("draftPreparation") or {})
-    if (
-        permit.get("status") != "issued"
-        or preparation.get("state") != "draft_created"
-    ):
-        raise GraphSendPermitBlocked(
-            "Graph draft patch is one-use and draft creation is not settled"
+    def prepare_transition(transaction):
+        now = datetime.now(timezone.utc)
+        permit = _read_exact_capability_permit(transaction, capability)
+        _validate_capability_issuer(
+            transaction,
+            capability,
+            now=now,
+            require_active_lease=True,
         )
-    attachment_count = validate_graph_draft_attachment_plan(attachments)
-    if attachment_count != preparation.get("plannedAttachmentCount"):
-        raise GraphSendPermitBlocked(
-            "Graph draft attachment plan drifted from the pre-create plan"
+        preparation = dict(permit.get("draftPreparation") or {})
+        if (
+            permit.get("status") != "issued"
+            or preparation.get("state") != "draft_created"
+        ):
+            raise GraphSendPermitBlocked(
+                "Graph draft patch is one-use and draft creation is not settled"
+            )
+        attachment_count = validate_graph_draft_attachment_plan(attachments)
+        if attachment_count != preparation.get("plannedAttachmentCount"):
+            raise GraphSendPermitBlocked(
+                "Graph draft attachment plan drifted from the pre-create plan"
+            )
+        envelope = _prepared_envelope(
+            capability,
+            source_graph_message_id=source_graph_message_id,
+            draft_id=draft_id,
+            subject=subject,
+            html_body=html_body,
+            to_recipients=to_recipients,
+            cc_recipients=cc_recipients,
+            attachments=attachments,
         )
-    envelope = _prepared_envelope(
-        capability,
-        source_graph_message_id=source_graph_message_id,
-        draft_id=draft_id,
-        subject=subject,
-        html_body=html_body,
-        to_recipients=to_recipients,
-        cc_recipients=cc_recipients,
-        attachments=attachments,
-    )
-    if (
-        envelope.get("sourceGraphMessageId") != permit.get("sourceGraphMessageId")
-        or envelope.get("draftId") != preparation.get("draftId")
-    ):
-        raise GraphSendPermitBlocked(
-            "Graph draft prepared envelope drifted from created draft/source"
+        if (
+            envelope.get("sourceGraphMessageId")
+            != permit.get("sourceGraphMessageId")
+            or envelope.get("draftId") != preparation.get("draftId")
+        ):
+            raise GraphSendPermitBlocked(
+                "Graph draft prepared envelope drifted from created draft/source"
+            )
+        timeout = _remaining_provider_seconds(permit, now)
+        permit_patch = {
+            "draftPreparation": {
+                **preparation,
+                "state": "patch_request_started",
+                "patchRequestStartedAt": now,
+            },
+            "preparedEnvelope": envelope,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        state_patch = _stateful_permit_patch(
+            permit,
+            permit_patch,
+            event="draft_patch_requested",
+            now=now,
         )
-    timeout = _remaining_provider_seconds(permit, now)
-    permit_patch = {
-        "draftPreparation": {
-            **preparation,
-            "state": "patch_request_started",
-            "patchRequestStartedAt": now,
-        },
-        "preparedEnvelope": envelope,
-        "updatedAt": SERVER_TIMESTAMP,
-    }
-    state_patch = _stateful_permit_patch(
-        permit,
-        permit_patch,
-        event="draft_patch_requested",
-        now=now,
-    )
-    _target, recovered_timeout = _commit_exact_local_transition(
+        return permit, state_patch, timeout
+
+    target, recovered_timeout = _commit_exact_local_transition(
         capability,
-        transaction,
-        permit,
-        state_patch,
+        prepare_transition,
         operation="Graph draft-patch request",
-        timeout_seconds=timeout,
     )
+    envelope = dict(target.get("preparedEnvelope") or {})
     return {
         "preparedEnvelopeHash": envelope["preparedEnvelopeHash"],
         "subject": envelope["subject"],
@@ -3924,7 +4224,8 @@ def begin_graph_draft_patch(
     }
 
 
-def complete_graph_draft_patch(
+def _complete_graph_draft_patch_in_transaction(
+    transaction,
     capability: GraphSendCapability,
     *,
     prepared_envelope_hash: str,
@@ -3933,7 +4234,6 @@ def complete_graph_draft_patch(
 ) -> Dict[str, Any]:
     if outcome not in {"applied", "needs_reconciliation"}:
         raise ValueError(f"unsupported Graph draft-patch outcome: {outcome}")
-    transaction = capability.firestore_client.transaction()
     now = datetime.now(timezone.utc)
     permit = _read_exact_capability_permit(transaction, capability)
     _validate_capability_issuer(
@@ -3999,8 +4299,27 @@ def complete_graph_draft_patch(
             now=now,
         ),
     )
-    transaction.commit()
     return {**permit, **permit_patch}
+
+
+def complete_graph_draft_patch(
+    capability: GraphSendCapability,
+    *,
+    prepared_envelope_hash: str,
+    outcome: str,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return run_firestore_transaction(
+        capability.firestore_client,
+        lambda transaction: _complete_graph_draft_patch_in_transaction(
+            transaction,
+            capability,
+            prepared_envelope_hash=prepared_envelope_hash,
+            outcome=outcome,
+            evidence=evidence,
+        ),
+        max_attempts=1,
+    )
 
 
 def begin_graph_draft_attachment(
@@ -4010,60 +4329,65 @@ def begin_graph_draft_attachment(
     attachment_index: int,
     attachment: Dict[str, Any],
 ) -> Dict[str, Any]:
-    transaction = capability.firestore_client.transaction()
-    now = datetime.now(timezone.utc)
-    permit = _read_exact_capability_permit(transaction, capability)
-    _validate_capability_issuer(
-        transaction,
-        capability,
-        now=now,
-        require_active_lease=True,
-    )
-    preparation = dict(permit.get("draftPreparation") or {})
-    envelope = dict(permit.get("preparedEnvelope") or {})
-    plan = list(envelope.get("attachments") or [])
-    outcomes = list(preparation.get("attachmentOutcomes") or [])
-    if (
-        permit.get("status") != "issued"
-        or preparation.get("state") not in {"patch_applied", "attachment_applied"}
-        or envelope.get("preparedEnvelopeHash") != prepared_envelope_hash
-        or attachment_index != len(outcomes)
-        or attachment_index >= len(plan)
-        or _attachment_projection(attachment, attachment_index)["attachmentHash"]
-        != plan[attachment_index].get("attachmentHash")
-    ):
-        raise GraphSendPermitBlocked(
-            "Graph draft attachment operation drifted or was already consumed"
+    def prepare_transition(transaction):
+        now = datetime.now(timezone.utc)
+        permit = _read_exact_capability_permit(transaction, capability)
+        _validate_capability_issuer(
+            transaction,
+            capability,
+            now=now,
+            require_active_lease=True,
         )
-    timeout = _remaining_provider_seconds(permit, now)
-    active = {
-        "index": attachment_index,
-        "attachmentHash": plan[attachment_index]["attachmentHash"],
-        "requestStartedAt": now,
-    }
-    active["requestHash"] = _hash(active)
-    permit_patch = {
-        "draftPreparation": {
-            **preparation,
-            "state": "attachment_request_started",
-            "activeAttachment": active,
-        },
-        "updatedAt": SERVER_TIMESTAMP,
-    }
-    state_patch = _stateful_permit_patch(
-        permit,
-        permit_patch,
-        event=f"draft_attachment_{attachment_index}_requested",
-        now=now,
-    )
-    _target, recovered_timeout = _commit_exact_local_transition(
+        preparation = dict(permit.get("draftPreparation") or {})
+        envelope = dict(permit.get("preparedEnvelope") or {})
+        plan = list(envelope.get("attachments") or [])
+        outcomes = list(preparation.get("attachmentOutcomes") or [])
+        if (
+            permit.get("status") != "issued"
+            or preparation.get("state")
+            not in {"patch_applied", "attachment_applied"}
+            or envelope.get("preparedEnvelopeHash") != prepared_envelope_hash
+            or attachment_index != len(outcomes)
+            or attachment_index >= len(plan)
+            or _attachment_projection(
+                attachment,
+                attachment_index,
+            )["attachmentHash"]
+            != plan[attachment_index].get("attachmentHash")
+        ):
+            raise GraphSendPermitBlocked(
+                "Graph draft attachment operation drifted or was already consumed"
+            )
+        timeout = _remaining_provider_seconds(permit, now)
+        active = {
+            "index": attachment_index,
+            "attachmentHash": plan[attachment_index]["attachmentHash"],
+            "requestStartedAt": now,
+        }
+        active["requestHash"] = _hash(active)
+        permit_patch = {
+            "draftPreparation": {
+                **preparation,
+                "state": "attachment_request_started",
+                "activeAttachment": active,
+            },
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        state_patch = _stateful_permit_patch(
+            permit,
+            permit_patch,
+            event=f"draft_attachment_{attachment_index}_requested",
+            now=now,
+        )
+        return permit, state_patch, timeout
+
+    target, recovered_timeout = _commit_exact_local_transition(
         capability,
-        transaction,
-        permit,
-        state_patch,
+        prepare_transition,
         operation=f"Graph draft attachment {attachment_index} request",
-        timeout_seconds=timeout,
     )
+    envelope = dict(target.get("preparedEnvelope") or {})
+    plan = list(envelope.get("attachments") or [])
     return {
         "timeoutSeconds": recovered_timeout,
         "draftId": envelope.get("draftId"),
@@ -4072,7 +4396,8 @@ def begin_graph_draft_attachment(
     }
 
 
-def complete_graph_draft_attachment(
+def _complete_graph_draft_attachment_in_transaction(
+    transaction,
     capability: GraphSendCapability,
     *,
     prepared_envelope_hash: str,
@@ -4082,7 +4407,6 @@ def complete_graph_draft_attachment(
 ) -> Dict[str, Any]:
     if outcome not in {"applied", "needs_reconciliation"}:
         raise ValueError(f"unsupported Graph attachment outcome: {outcome}")
-    transaction = capability.firestore_client.transaction()
     now = datetime.now(timezone.utc)
     permit = _read_exact_capability_permit(transaction, capability)
     _validate_capability_issuer(
@@ -4166,7 +4490,6 @@ def complete_graph_draft_attachment(
                 now=now,
             ),
         )
-        transaction.commit()
         return permit
     outcomes.append({
         "index": attachment_index,
@@ -4194,8 +4517,29 @@ def complete_graph_draft_attachment(
             now=now,
         ),
     )
-    transaction.commit()
     return permit
+
+
+def complete_graph_draft_attachment(
+    capability: GraphSendCapability,
+    *,
+    prepared_envelope_hash: str,
+    attachment_index: int,
+    outcome: str,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return run_firestore_transaction(
+        capability.firestore_client,
+        lambda transaction: _complete_graph_draft_attachment_in_transaction(
+            transaction,
+            capability,
+            prepared_envelope_hash=prepared_envelope_hash,
+            attachment_index=attachment_index,
+            outcome=outcome,
+            evidence=evidence,
+        ),
+        max_attempts=1,
+    )
 
 
 def finalize_graph_draft_preparation(
@@ -4203,61 +4547,68 @@ def finalize_graph_draft_preparation(
     *,
     prepared_envelope_hash: str,
 ) -> Dict[str, Any]:
-    transaction = capability.firestore_client.transaction()
-    now = datetime.now(timezone.utc)
-    permit = _read_exact_capability_permit(transaction, capability)
-    _validate_capability_issuer(
-        transaction,
-        capability,
-        now=now,
-        require_active_lease=True,
-    )
-    preparation = dict(permit.get("draftPreparation") or {})
-    envelope = dict(permit.get("preparedEnvelope") or {})
-    if preparation.get("state") == "prepared":
-        if envelope.get("preparedEnvelopeHash") == prepared_envelope_hash:
-            return envelope
-        raise GraphSendPermitBlocked(
-            "Graph prepared envelope was already frozen with another hash"
+    prepared_result: Dict[str, Any] = {}
+
+    def prepare_transition(transaction):
+        now = datetime.now(timezone.utc)
+        permit = _read_exact_capability_permit(transaction, capability)
+        _validate_capability_issuer(
+            transaction,
+            capability,
+            now=now,
+            require_active_lease=True,
         )
-    plan = list(envelope.get("attachments") or [])
-    outcomes = list(preparation.get("attachmentOutcomes") or [])
-    if (
-        permit.get("status") != "issued"
-        or preparation.get("state") not in {"patch_applied", "attachment_applied"}
-        or envelope.get("preparedEnvelopeHash") != prepared_envelope_hash
-        or len(outcomes) != len(plan)
-        or any(
-            outcome.get("index") != index
-            or outcome.get("attachmentHash") != plan[index].get("attachmentHash")
-            or outcome.get("outcome") != "applied"
-            for index, outcome in enumerate(outcomes)
+        preparation = dict(permit.get("draftPreparation") or {})
+        envelope = dict(permit.get("preparedEnvelope") or {})
+        if preparation.get("state") == "prepared":
+            if envelope.get("preparedEnvelopeHash") == prepared_envelope_hash:
+                prepared_result["envelope"] = envelope
+                return permit, {}, None
+            raise GraphSendPermitBlocked(
+                "Graph prepared envelope was already frozen with another hash"
+            )
+        plan = list(envelope.get("attachments") or [])
+        outcomes = list(preparation.get("attachmentOutcomes") or [])
+        if (
+            permit.get("status") != "issued"
+            or preparation.get("state")
+            not in {"patch_applied", "attachment_applied"}
+            or envelope.get("preparedEnvelopeHash") != prepared_envelope_hash
+            or len(outcomes) != len(plan)
+            or any(
+                outcome.get("index") != index
+                or outcome.get("attachmentHash")
+                != plan[index].get("attachmentHash")
+                or outcome.get("outcome") != "applied"
+                for index, outcome in enumerate(outcomes)
+            )
+        ):
+            raise GraphSendPermitBlocked(
+                "Graph draft cannot become prepared before every one-use operation settles"
+            )
+        permit_patch = {
+            "draftPreparation": {
+                **preparation,
+                "state": "prepared",
+                "preparedAt": now,
+            },
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        state_patch = _stateful_permit_patch(
+            permit,
+            permit_patch,
+            event="draft_prepared",
+            now=now,
         )
-    ):
-        raise GraphSendPermitBlocked(
-            "Graph draft cannot become prepared before every one-use operation settles"
-        )
-    permit_patch = {
-        "draftPreparation": {
-            **preparation,
-            "state": "prepared",
-            "preparedAt": now,
-        },
-        "updatedAt": SERVER_TIMESTAMP,
-    }
-    state_patch = _stateful_permit_patch(
-        permit,
-        permit_patch,
-        event="draft_prepared",
-        now=now,
-    )
+        return permit, state_patch, None
+
     target, _timeout = _commit_exact_local_transition(
         capability,
-        transaction,
-        permit,
-        state_patch,
+        prepare_transition,
         operation="Graph draft preparation finalize",
     )
+    if "envelope" in prepared_result:
+        return prepared_result["envelope"]
     return dict(target.get("preparedEnvelope") or {})
 
 
@@ -4273,62 +4624,61 @@ def consume_graph_send_capability(
     attachments,
 ) -> float:
     """Commit the one-use request_started transition immediately before /send."""
-    transaction = capability.firestore_client.transaction()
-    now = datetime.now(timezone.utc)
-    permit = _read_exact_capability_permit(transaction, capability)
-    if permit.get("status") != "issued":
-        raise GraphSendPermitBlocked(
-            f"Graph send one-use permit is {permit.get('status')}; expected issued"
+    def prepare_transition(transaction):
+        now = datetime.now(timezone.utc)
+        permit = _read_exact_capability_permit(transaction, capability)
+        if permit.get("status") != "issued":
+            raise GraphSendPermitBlocked(
+                f"Graph send one-use permit is {permit.get('status')}; expected issued"
+            )
+        _validate_capability_issuer(
+            transaction,
+            capability,
+            now=now,
+            require_active_lease=True,
         )
-    _validate_capability_issuer(
-        transaction,
-        capability,
-        now=now,
-        require_active_lease=True,
-    )
-    preparation = dict(permit.get("draftPreparation") or {})
-    persisted_envelope = dict(permit.get("preparedEnvelope") or {})
-    actual_envelope = _prepared_envelope(
-        capability,
-        source_graph_message_id=source_graph_message_id,
-        draft_id=draft_id,
-        subject=subject,
-        html_body=html_body,
-        to_recipients=to_recipients,
-        cc_recipients=cc_recipients,
-        attachments=attachments,
-    )
-    if (
-        preparation.get("state") != "prepared"
-        or persisted_envelope.get("preparedEnvelopeHash")
-        != actual_envelope.get("preparedEnvelopeHash")
-        or persisted_envelope != actual_envelope
-    ):
-        raise GraphSendPermitBlocked(
-            "Graph send prepared envelope drifted before request_started"
+        preparation = dict(permit.get("draftPreparation") or {})
+        persisted_envelope = dict(permit.get("preparedEnvelope") or {})
+        actual_envelope = _prepared_envelope(
+            capability,
+            source_graph_message_id=source_graph_message_id,
+            draft_id=draft_id,
+            subject=subject,
+            html_body=html_body,
+            to_recipients=to_recipients,
+            cc_recipients=cc_recipients,
+            attachments=attachments,
         )
-    remaining = _remaining_provider_seconds(permit, now)
-    permit_patch = {
-        "status": "request_started",
-        "requestStartedAt": now,
-        "sendPreparedEnvelopeHash": actual_envelope["preparedEnvelopeHash"],
-        "capabilityConsumedAt": now,
-        "providerTimeoutSeconds": remaining,
-        "updatedAt": SERVER_TIMESTAMP,
-    }
-    state_patch = _stateful_permit_patch(
-        permit,
-        permit_patch,
-        event="send_request_started",
-        now=now,
-    )
+        if (
+            preparation.get("state") != "prepared"
+            or persisted_envelope.get("preparedEnvelopeHash")
+            != actual_envelope.get("preparedEnvelopeHash")
+            or persisted_envelope != actual_envelope
+        ):
+            raise GraphSendPermitBlocked(
+                "Graph send prepared envelope drifted before request_started"
+            )
+        remaining = _remaining_provider_seconds(permit, now)
+        permit_patch = {
+            "status": "request_started",
+            "requestStartedAt": now,
+            "sendPreparedEnvelopeHash": actual_envelope["preparedEnvelopeHash"],
+            "capabilityConsumedAt": now,
+            "providerTimeoutSeconds": remaining,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        state_patch = _stateful_permit_patch(
+            permit,
+            permit_patch,
+            event="send_request_started",
+            now=now,
+        )
+        return permit, state_patch, remaining
+
     _target, recovered_timeout = _commit_exact_local_transition(
         capability,
-        transaction,
-        permit,
-        state_patch,
+        prepare_transition,
         operation="Graph send request",
-        timeout_seconds=remaining,
     )
     return recovered_timeout
 
@@ -4810,7 +5160,8 @@ def _require_fresh_sent_lookup(
         )
 
 
-def resolve_graph_send_permit(
+def _resolve_graph_send_permit_in_transaction(
+    transaction,
     capability: GraphSendCapability,
     status: str,
     *,
@@ -4828,7 +5179,6 @@ def resolve_graph_send_permit(
         "reconciled_sent",
     }:
         raise ValueError(f"unsupported Graph send permit resolution: {status}")
-    transaction = capability.firestore_client.transaction()
     now = datetime.now(timezone.utc)
     permit = _read_exact_capability_permit(transaction, capability)
     _validate_capability_issuer(
@@ -4881,8 +5231,25 @@ def resolve_graph_send_permit(
             now=now,
         ),
     )
-    transaction.commit()
     return updated
+
+
+def resolve_graph_send_permit(
+    capability: GraphSendCapability,
+    status: str,
+    *,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return run_firestore_transaction(
+        capability.firestore_client,
+        lambda transaction: _resolve_graph_send_permit_in_transaction(
+            transaction,
+            capability,
+            status,
+            evidence=evidence,
+        ),
+        max_attempts=1,
+    )
 
 
 def _validate_terminal_claim_identity(
@@ -5039,6 +5406,8 @@ def cas_terminal_reply_transition(
     pending_upsert=None,
     pending_delete_ref=None,
     side_documents=(),
+    _transaction=None,
+    _recovery_plan=None,
 ) -> bool:
     """Settle a terminal permit and its exact reply transition atomically.
 
@@ -5122,7 +5491,48 @@ def cas_terminal_reply_transition(
         )
     )
 
-    transaction = firestore_client.transaction()
+    if _transaction is None:
+        recovery_plan: Dict[str, Any] = {}
+
+        def settle_terminal_reply(transaction):
+            return cas_terminal_reply_transition(
+                firestore_client,
+                thread_ref,
+                claim_ref,
+                saga,
+                issuer_owner,
+                issuer_fence,
+                expected_attempt_status=expected_attempt_status,
+                thread_patch=thread_patch,
+                permit_settlement=permit_settlement,
+                capability=capability,
+                sent_evidence=sent_evidence,
+                pending_upsert=pending_upsert,
+                pending_delete_ref=pending_delete_ref,
+                side_documents=side_documents,
+                _transaction=transaction,
+                _recovery_plan=recovery_plan,
+            )
+
+        try:
+            return run_firestore_transaction(
+                firestore_client,
+                settle_terminal_reply,
+                max_attempts=1,
+            )
+        except Exception as first_error:
+            if not recovery_plan:
+                raise
+            _commit_exact_orphaned_draft_settlement(
+                firestore_client,
+                first_error=first_error,
+                readback_state=recovery_plan["readback_state"],
+                enqueue_retry=recovery_plan["enqueue_retry"],
+                operation=recovery_plan["operation"],
+            )
+            return bool(recovery_plan["result"])
+
+    transaction = _transaction
     deferred_sets = []
     deferred_deletes = []
     now = datetime.now(timezone.utc)
@@ -5669,8 +6079,7 @@ def cas_terminal_reply_transition(
             else None
         )
 
-        def capabilityless_readback_state():
-            read_transaction = firestore_client.transaction()
+        def capabilityless_readback_state(read_transaction):
             read_thread_snapshot = thread_ref.get(
                 transaction=read_transaction
             )
@@ -5787,8 +6196,7 @@ def cas_terminal_reply_transition(
                 "capability-less terminal settlement readback drifted"
             )
 
-        def enqueue_capabilityless_retry():
-            retry_transaction = firestore_client.transaction()
+        def enqueue_capabilityless_retry(retry_transaction):
             retry_thread_snapshot = thread_ref.get(
                 transaction=retry_transaction
             )
@@ -5874,16 +6282,16 @@ def cas_terminal_reply_transition(
                     settlement_state_patch,
                 )
             retry_transaction.update(thread_ref, dict(thread_patch))
-            return retry_transaction
-
-        _commit_exact_orphaned_draft_settlement(
-            transaction,
-            readback_state=capabilityless_readback_state,
-            enqueue_retry=enqueue_capabilityless_retry,
-            operation="capability-less terminal pre-send settlement",
-        )
-    else:
-        transaction.commit()
+        if _recovery_plan is None:
+            raise RuntimeError(
+                "terminal settlement exact-recovery plan is unavailable"
+            )
+        _recovery_plan.update({
+            "result": True,
+            "readback_state": capabilityless_readback_state,
+            "enqueue_retry": enqueue_capabilityless_retry,
+            "operation": "capability-less terminal pre-send settlement",
+        })
     return True
 
 
@@ -5924,14 +6332,14 @@ def assert_terminal_reply_permit_settled(
         )
 
 
-def read_active_terminal_reply_permit(
+def _read_active_terminal_reply_permit_in_transaction(
+    transaction,
     firestore_client,
     thread_ref,
     attempt: Dict[str, Any],
     saga: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Read one retained terminal permit bound to the exact current saga."""
-    transaction = firestore_client.transaction()
     thread_snapshot = thread_ref.get(transaction=transaction)
     if not thread_snapshot.exists:
         raise GraphSendPermitBlocked("terminal reply permit thread root is missing")
@@ -5992,6 +6400,26 @@ def read_active_terminal_reply_permit(
     return permit
 
 
+def read_active_terminal_reply_permit(
+    firestore_client,
+    thread_ref,
+    attempt: Dict[str, Any],
+    saga: Dict[str, Any],
+) -> Dict[str, Any]:
+    return run_firestore_transaction(
+        firestore_client,
+        lambda transaction: _read_active_terminal_reply_permit_in_transaction(
+            transaction,
+            firestore_client,
+            thread_ref,
+            attempt,
+            saga,
+        ),
+        max_attempts=1,
+        read_only=True,
+    )
+
+
 def reconcile_pending_graph_send_permit(
     firestore_client,
     thread_ref,
@@ -6003,6 +6431,8 @@ def reconcile_pending_graph_send_permit(
     evidence_document=None,
     operator_audit_document=None,
     completion_document=None,
+    _transaction=None,
+    _recovery_plan=None,
 ) -> bool:
     """Reconcile an expired pending issuer without recovering its secret.
 
@@ -6032,6 +6462,42 @@ def reconcile_pending_graph_send_permit(
             "pending completion obligation is only valid for exact-Sent "
             "settlement"
         )
+    if _transaction is None:
+        recovery_plan: Dict[str, Any] = {}
+
+        def reconcile_pending_permit(transaction):
+            return reconcile_pending_graph_send_permit(
+                firestore_client,
+                thread_ref,
+                pending_ref,
+                loaded_data,
+                outcome=outcome,
+                sent_evidence=sent_evidence,
+                evidence_document=evidence_document,
+                operator_audit_document=operator_audit_document,
+                completion_document=completion_document,
+                _transaction=transaction,
+                _recovery_plan=recovery_plan,
+            )
+
+        try:
+            return run_firestore_transaction(
+                firestore_client,
+                reconcile_pending_permit,
+                max_attempts=1,
+            )
+        except Exception as first_error:
+            if not recovery_plan:
+                raise
+            _commit_exact_orphaned_draft_settlement(
+                firestore_client,
+                first_error=first_error,
+                readback_state=recovery_plan["readback_state"],
+                enqueue_retry=recovery_plan["enqueue_retry"],
+                operation=recovery_plan["operation"],
+            )
+            return bool(recovery_plan["result"])
+
     evidence_ref, raw_evidence_payload = evidence_document
     completion_ref = None
     raw_completion_payload: Dict[str, Any] = {}
@@ -6049,7 +6515,7 @@ def reconcile_pending_graph_send_permit(
             raise GraphSendPermitBlocked(
                 "operator exact-Sent settlement requires an audit reference"
             )
-    transaction = firestore_client.transaction()
+    transaction = _transaction
     now = datetime.now(timezone.utc)
     thread_snapshot = thread_ref.get(transaction=transaction)
     pending_snapshot = pending_ref.get(transaction=transaction)
@@ -6678,8 +7144,7 @@ def reconcile_pending_graph_send_permit(
             else {**current, **dict(pending_exit_patch or {})}
         )
 
-        def capabilityless_readback_state():
-            read_transaction = firestore_client.transaction()
+        def capabilityless_readback_state(read_transaction):
             read_thread_snapshot = thread_ref.get(
                 transaction=read_transaction
             )
@@ -6740,8 +7205,7 @@ def reconcile_pending_graph_send_permit(
                 "capability-less pending settlement readback drifted"
             )
 
-        def enqueue_capabilityless_retry():
-            retry_transaction = firestore_client.transaction()
+        def enqueue_capabilityless_retry(retry_transaction):
             retry_thread_snapshot = thread_ref.get(
                 transaction=retry_transaction
             )
@@ -6788,16 +7252,16 @@ def reconcile_pending_graph_send_permit(
                     permit_ref,
                     settlement_state_patch,
                 )
-            return retry_transaction
-
-        _commit_exact_orphaned_draft_settlement(
-            transaction,
-            readback_state=capabilityless_readback_state,
-            enqueue_retry=enqueue_capabilityless_retry,
-            operation="capability-less pending pre-send settlement",
-        )
-    else:
-        transaction.commit()
+        if _recovery_plan is None:
+            raise RuntimeError(
+                "pending settlement exact-recovery plan is unavailable"
+            )
+        _recovery_plan.update({
+            "result": True,
+            "readback_state": capabilityless_readback_state,
+            "enqueue_retry": enqueue_capabilityless_retry,
+            "operation": "capability-less pending pre-send settlement",
+        })
     return True
 
 
@@ -6814,6 +7278,8 @@ def operator_resolve_pending_graph_draft_review(
     operator_reason: str,
     settlement_id: str,
     audit_ref,
+    _transaction=None,
+    _recovery_plan=None,
 ) -> bool:
     """Resolve one retained draft only after an authenticated local attestation.
 
@@ -6867,7 +7333,47 @@ def operator_resolve_pending_graph_draft_review(
             "draft review settlement audit id is not exact"
         )
 
-    transaction = firestore_client.transaction()
+    if _transaction is None:
+        recovery_plan: Dict[str, Any] = {}
+
+        def resolve_draft_review(transaction):
+            return operator_resolve_pending_graph_draft_review(
+                firestore_client,
+                thread_ref,
+                expected_permit_id=expected_permit_id,
+                expected_permit_hash=expected_permit_hash,
+                expected_review_evidence_hash=(
+                    expected_review_evidence_hash
+                ),
+                review_ref=review_ref,
+                action=action,
+                operator_id=operator_id,
+                operator_reason=operator_reason,
+                settlement_id=settlement_id,
+                audit_ref=audit_ref,
+                _transaction=transaction,
+                _recovery_plan=recovery_plan,
+            )
+
+        try:
+            return run_firestore_transaction(
+                firestore_client,
+                resolve_draft_review,
+                max_attempts=1,
+            )
+        except Exception as first_error:
+            if not recovery_plan:
+                raise
+            _commit_exact_orphaned_draft_settlement(
+                firestore_client,
+                first_error=first_error,
+                readback_state=recovery_plan["readback_state"],
+                enqueue_retry=recovery_plan["enqueue_retry"],
+                operation=recovery_plan["operation"],
+            )
+            return bool(recovery_plan["result"])
+
+    transaction = _transaction
     now = datetime.now(timezone.utc)
     thread_snapshot = thread_ref.get(transaction=transaction)
     review_snapshot = review_ref.get(transaction=transaction)
@@ -7046,11 +7552,10 @@ def operator_resolve_pending_graph_draft_review(
             "operator draft review resolution readback drifted"
         )
 
-    def readback_state() -> str:
-        return exact_resolution_state(firestore_client.transaction())
+    def readback_state(read_transaction) -> str:
+        return exact_resolution_state(read_transaction)
 
-    def enqueue_retry():
-        retry_transaction = firestore_client.transaction()
+    def enqueue_retry(retry_transaction):
         if exact_resolution_state(retry_transaction) != "source":
             raise GraphSendPermitError(
                 "operator draft review resolution retry source drifted"
@@ -7058,17 +7563,20 @@ def operator_resolve_pending_graph_draft_review(
         retry_transaction.set(audit_ref, audit_payload)
         retry_transaction.set(review_ref, resolved_review)
         retry_transaction.update(permit_ref, state_patch)
-        return retry_transaction
 
     transaction.set(audit_ref, audit_payload)
     transaction.set(review_ref, resolved_review)
     transaction.update(permit_ref, state_patch)
-    _commit_exact_orphaned_draft_settlement(
-        transaction,
-        readback_state=readback_state,
-        enqueue_retry=enqueue_retry,
-        operation="operator draft review resolution",
-    )
+    if _recovery_plan is None:
+        raise RuntimeError(
+            "operator draft resolution exact-recovery plan is unavailable"
+        )
+    _recovery_plan.update({
+        "result": True,
+        "readback_state": readback_state,
+        "enqueue_retry": enqueue_retry,
+        "operation": "operator draft review resolution",
+    })
     return True
 
 
@@ -7088,6 +7596,7 @@ def operator_settle_pending_graph_send_review(
     settlement_id: str,
     audit_ref,
     sent_lookup_completed_at: Any,
+    _transaction=None,
 ) -> bool:
     """Atomically retire one exact ambiguous send without claiming sent/unsent.
 
@@ -7143,7 +7652,32 @@ def operator_settle_pending_graph_send_review(
             "operator settlement audit id is not the exact settlement id"
         )
 
-    transaction = firestore_client.transaction()
+    if _transaction is None:
+        return run_firestore_transaction(
+            firestore_client,
+            lambda transaction: operator_settle_pending_graph_send_review(
+                firestore_client,
+                thread_ref,
+                pending_ref,
+                loaded_data,
+                expected_permit_id=expected_permit_id,
+                expected_permit_hash=expected_permit_hash,
+                expected_reconciliation_evidence_hash=(
+                    expected_reconciliation_evidence_hash
+                ),
+                reconciliation_evidence_ref=reconciliation_evidence_ref,
+                action=action,
+                operator_id=operator_id,
+                operator_reason=operator_reason,
+                settlement_id=settlement_id,
+                audit_ref=audit_ref,
+                sent_lookup_completed_at=sent_lookup_completed_at,
+                _transaction=transaction,
+            ),
+            max_attempts=1,
+        )
+
+    transaction = _transaction
     now = datetime.now(timezone.utc)
     thread_snapshot = thread_ref.get(transaction=transaction)
     pending_snapshot = pending_ref.get(transaction=transaction)
@@ -7309,11 +7843,11 @@ def operator_settle_pending_graph_send_review(
             now=now,
         ),
     )
-    transaction.commit()
     return True
 
 
-def read_pending_graph_send_operator_settlement_replay(
+def _read_pending_graph_send_operator_settlement_replay_in_transaction(
+    transaction,
     firestore_client,
     user_ref,
     audit_ref,
@@ -7339,7 +7873,6 @@ def read_pending_graph_send_operator_settlement_replay(
         ),
         label="operator settlement replay audit reference",
     )
-    transaction = firestore_client.transaction()
     audit_snapshot = audit_ref.get(transaction=transaction)
     if not audit_snapshot.exists:
         return None
@@ -7456,7 +7989,45 @@ def read_pending_graph_send_operator_settlement_replay(
     return expected_status
 
 
-def read_expired_pending_graph_send_permit(
+def read_pending_graph_send_operator_settlement_replay(
+    firestore_client,
+    user_ref,
+    audit_ref,
+    *,
+    pending_document_id: str,
+    expected_permit_id: str,
+    expected_permit_hash: str,
+    expected_reconciliation_evidence_hash: str,
+    operator_id: str,
+    operator_reason: str,
+    settlement_id: str,
+) -> Optional[str]:
+    return run_firestore_transaction(
+        firestore_client,
+        lambda transaction: (
+            _read_pending_graph_send_operator_settlement_replay_in_transaction(
+                transaction,
+                firestore_client,
+                user_ref,
+                audit_ref,
+                pending_document_id=pending_document_id,
+                expected_permit_id=expected_permit_id,
+                expected_permit_hash=expected_permit_hash,
+                expected_reconciliation_evidence_hash=(
+                    expected_reconciliation_evidence_hash
+                ),
+                operator_id=operator_id,
+                operator_reason=operator_reason,
+                settlement_id=settlement_id,
+            )
+        ),
+        max_attempts=1,
+        read_only=True,
+    )
+
+
+def _read_expired_pending_graph_send_permit_in_transaction(
+    transaction,
     firestore_client,
     thread_ref,
     pending_ref,
@@ -7471,7 +8042,6 @@ def read_expired_pending_graph_send_permit(
         ),
         label="expired pending issuer reference",
     )
-    transaction = firestore_client.transaction()
     now = datetime.now(timezone.utc)
     thread_snapshot = thread_ref.get(transaction=transaction)
     pending_snapshot = pending_ref.get(transaction=transaction)
@@ -7550,6 +8120,66 @@ def read_expired_pending_graph_send_permit(
     return permit
 
 
+def read_expired_pending_graph_send_permit(
+    firestore_client,
+    thread_ref,
+    pending_ref,
+    loaded_data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    return run_firestore_transaction(
+        firestore_client,
+        lambda transaction: _read_expired_pending_graph_send_permit_in_transaction(
+            transaction,
+            firestore_client,
+            thread_ref,
+            pending_ref,
+            loaded_data,
+        ),
+        max_attempts=1,
+        read_only=True,
+    )
+
+
+def _pending_completion_source_authority_protocol(
+    current: Dict[str, Any],
+) -> str:
+    """Derive completion provenance from the persisted pending issuer."""
+    exact_fields = frozenset({
+        "pendingProtocol",
+        "canonicalSourceId",
+        "workKey",
+        "proposalHash",
+        "selectionHash",
+        "pendingRevision",
+    })
+    present_fields = exact_fields.intersection(current or {})
+    if not present_fields:
+        return PENDING_COMPLETION_LEGACY_PROTOCOL
+    protocol = (current or {}).get("pendingProtocol")
+    if (
+        present_fields != exact_fields
+        or type(protocol) is not dict
+        or protocol != {
+            "kind": PENDING_COMPLETION_EXACT_SOURCE_PROTOCOL,
+            "version": 1,
+        }
+        or type(current.get("canonicalSourceId")) is not str
+        or not current["canonicalSourceId"]
+        or current["canonicalSourceId"] != current["canonicalSourceId"].strip()
+        or any(
+            type(current.get(field_name)) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", current[field_name]) is None
+            for field_name in ("workKey", "proposalHash", "selectionHash")
+        )
+        or type(current.get("pendingRevision")) is not int
+        or current["pendingRevision"] < 1
+    ):
+        raise GraphSendPermitBlocked(
+            "pending completion issuer has malformed source authority protocol"
+        )
+    return PENDING_COMPLETION_EXACT_SOURCE_PROTOCOL
+
+
 def _validate_pending_completion_side_document(
     thread_ref,
     pending_ref,
@@ -7588,6 +8218,9 @@ def _validate_pending_completion_side_document(
         permit_immutable_hash=str(permit.get("immutableHash") or ""),
         sent_evidence=exact_sent_evidence,
         complete_client_after_reply=bool(canonical_client_id),
+        source_authority_protocol=(
+            _pending_completion_source_authority_protocol(current)
+        ),
     )
     canonical_current_strings = {
         field_name: str(current.get(field_name) or "")
@@ -7628,7 +8261,8 @@ def _validate_pending_completion_side_document(
     return completion_ref, payload
 
 
-def cas_pending_claim_transition(
+def _cas_pending_claim_transition_in_transaction(
+    transaction,
     firestore_client,
     thread_ref,
     pending_ref,
@@ -7646,7 +8280,6 @@ def cas_pending_claim_transition(
     if bool(pending_patch) == bool(delete_pending):
         raise ValueError("pending CAS requires exactly one update or delete action")
     side_documents = tuple(side_documents)
-    transaction = firestore_client.transaction()
     now = datetime.now(timezone.utc)
     thread_snapshot = thread_ref.get(transaction=transaction)
     pending_snapshot = pending_ref.get(transaction=transaction)
@@ -8006,8 +8639,47 @@ def cas_pending_claim_transition(
         transaction.delete(pending_ref)
     else:
         transaction.update(pending_ref, dict(pending_patch or {}))
-    transaction.commit()
     return True
+
+
+def cas_pending_claim_transition(
+    firestore_client,
+    thread_ref,
+    pending_ref,
+    loaded_data: Dict[str, Any],
+    claim_token: str,
+    *,
+    pending_patch: Optional[Dict[str, Any]] = None,
+    delete_pending: bool = False,
+    side_documents=(),
+    capability: Optional[GraphSendCapability] = None,
+    permit_settlement: Optional[str] = None,
+    sent_evidence: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Run one exact pending-claim exit in an active Firestore transaction."""
+    side_documents = tuple(side_documents)
+
+    def settle_pending(transaction):
+        return _cas_pending_claim_transition_in_transaction(
+            transaction,
+            firestore_client,
+            thread_ref,
+            pending_ref,
+            loaded_data,
+            claim_token,
+            pending_patch=pending_patch,
+            delete_pending=delete_pending,
+            side_documents=side_documents,
+            capability=capability,
+            permit_settlement=permit_settlement,
+            sent_evidence=sent_evidence,
+        )
+
+    return run_firestore_transaction(
+        firestore_client,
+        settle_pending,
+        max_attempts=1,
+    )
 
 
 def read_permit(capability: GraphSendCapability) -> Dict[str, Any]:

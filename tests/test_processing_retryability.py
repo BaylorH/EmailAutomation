@@ -1,6 +1,7 @@
 import unittest
 import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import quote
 from unittest.mock import MagicMock, patch
 
@@ -13,7 +14,7 @@ os.environ.setdefault(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
-from email_automation import ai_processing, processing
+from email_automation import ai_processing, processing, source_coordinator
 from email_automation.campaign_safety import CampaignAutomationDecision
 
 
@@ -643,6 +644,247 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertEqual("campaign_stopped", outcome)
         queue_pending.assert_not_called()
         reconcile.assert_not_called()
+
+    def test_enforced_no_write_suppressions_do_not_require_pending_binding(self):
+        cases = (
+            (
+                "campaign terminal",
+                {
+                    "outcome": "blocked_campaign_terminal",
+                    "error": "client_stopped_by_user",
+                    "sent_but_unindexed": False,
+                    "campaign_suppression_kind": "terminal",
+                },
+                "campaign_stopped",
+            ),
+            (
+                "recipient optout",
+                {
+                    "outcome": "suppressed_recipient_optout",
+                    "error": "recipient opted out",
+                    "sent_but_unindexed": False,
+                },
+                "recipient_suppressed",
+            ),
+        )
+
+        for label, send_outcome, expected in cases:
+            with self.subTest(label=label):
+                processing._reset_reply_send_outcome()
+                processing._set_reply_send_outcome(**send_outcome)
+                with patch.dict(
+                    os.environ,
+                    {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+                ), patch.object(
+                    processing,
+                    "queue_pending_response",
+                ) as queue_pending, patch.object(
+                    processing,
+                    "record_sent_unindexed_response",
+                ) as reconcile:
+                    outcome = processing._queue_response_retry_or_reconciliation(
+                        "uid-1",
+                        "thread-1",
+                        "message-1",
+                        "bp21harrison@gmail.com",
+                        "Thanks for the update.",
+                        "client-1",
+                    )
+
+                self.assertEqual(expected, outcome)
+                queue_pending.assert_not_called()
+                reconcile.assert_not_called()
+
+    def test_enforced_response_retry_forwards_exact_pending_work_binding(self):
+        processing._set_reply_send_outcome(
+            outcome="send_failed",
+            error="definitely not sent",
+        )
+        binding = {
+            "canonical_source_id": "source-1",
+            "work_key": "a" * 64,
+            "proposal_hash": "b" * 64,
+            "selection_hash": "c" * 64,
+        }
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "queue_pending_response",
+        ) as queue_pending:
+            outcome = processing._queue_response_retry_or_reconciliation(
+                "uid-1",
+                "thread-1",
+                "graph-1",
+                "broker@example.test",
+                "Thanks for the update.",
+                "client-1",
+                **binding,
+            )
+
+        self.assertEqual("queued_retry", outcome)
+        queue_pending.assert_called_once()
+        for key, value in binding.items():
+            self.assertEqual(value, queue_pending.call_args.kwargs[key])
+
+    def test_enforced_response_retry_missing_pending_binding_fails_before_queue(self):
+        processing._set_reply_send_outcome(
+            outcome="send_failed",
+            error="definitely not sent",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "queue_pending_response",
+        ) as queue_pending, self.assertRaisesRegex(
+            source_coordinator.SourceCoordinatorConfigError,
+            "pending response source binding",
+        ):
+            processing._queue_response_retry_or_reconciliation(
+                "uid-1",
+                "thread-1",
+                "graph-1",
+                "broker@example.test",
+                "Thanks for the update.",
+                "client-1",
+            )
+
+        queue_pending.assert_not_called()
+
+    def test_enforced_sent_unindexed_requires_binding_before_reconciliation_write(self):
+        processing._set_reply_send_outcome(
+            outcome="sent_but_unindexed",
+            error="Graph accepted but Sent indexing failed",
+            sent_but_unindexed=True,
+        )
+        malformed_bindings = (
+            {},
+            {
+                "canonical_source_id": "source-1",
+                "work_key": "a" * 64,
+                "proposal_hash": "not-a-hash",
+                "selection_hash": "c" * 64,
+            },
+        )
+
+        for binding in malformed_bindings:
+            with self.subTest(binding=binding), patch.dict(
+                os.environ,
+                {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+            ), patch.object(
+                processing,
+                "record_sent_unindexed_response",
+            ) as reconcile, patch.object(
+                processing,
+                "queue_pending_response",
+            ) as queue_pending, self.assertRaisesRegex(
+                source_coordinator.SourceCoordinatorConfigError,
+                "pending response source binding",
+            ):
+                processing._queue_response_retry_or_reconciliation(
+                    "uid-1",
+                    "thread-1",
+                    "graph-1",
+                    "broker@example.test",
+                    "Thanks for the update.",
+                    "client-1",
+                    **binding,
+                )
+
+            reconcile.assert_not_called()
+            queue_pending.assert_not_called()
+
+    def test_enforced_sent_unindexed_persists_exact_pending_work_binding(self):
+        processing._set_reply_send_outcome(
+            outcome="sent_but_unindexed",
+            error="Graph accepted but Sent indexing failed",
+            sent_but_unindexed=True,
+        )
+        binding = {
+            "canonical_source_id": "source-1",
+            "work_key": "a" * 64,
+            "proposal_hash": "b" * 64,
+            "selection_hash": "c" * 64,
+        }
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "record_sent_unindexed_response",
+        ) as reconcile, patch.object(
+            processing,
+            "queue_pending_response",
+        ) as queue_pending:
+            outcome = processing._queue_response_retry_or_reconciliation(
+                "uid-1",
+                "thread-1",
+                "graph-1",
+                "broker@example.test",
+                "Thanks for the update.",
+                "client-1",
+                **binding,
+            )
+
+        self.assertEqual("sent_unindexed", outcome)
+        reconcile.assert_called_once()
+        queue_pending.assert_not_called()
+        for key, value in binding.items():
+            self.assertEqual(value, reconcile.call_args.kwargs[key])
+
+    def test_enforced_terminal_queue_forwards_exact_pending_work_binding(self):
+        binding = {
+            "canonical_source_id": "source-1",
+            "work_key": "a" * 64,
+            "proposal_hash": "b" * 64,
+            "selection_hash": "c" * 64,
+        }
+        saga = {
+            "sourceGraphMessageId": "graph-1",
+            "sourceConversationId": "conversation-1",
+        }
+        attempt = {"conversationId": "conversation-1"}
+        owner = processing.TerminalSagaExecution(
+            owner="worker-1",
+            fencing_token=1,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "_exact_terminal_pending_response",
+            side_effect=[None, {}],
+        ), patch.object(
+            processing,
+            "_fenced_terminal_thread_update",
+        ), patch.object(
+            processing,
+            "queue_pending_response",
+        ) as queue_pending:
+            processing._ensure_terminal_reply_queue(
+                "uid-1",
+                "client-1",
+                "thread-1",
+                "broker@example.test",
+                "Thanks for the update.",
+                saga,
+                attempt,
+                owner,
+                error="definitely not sent",
+                **binding,
+            )
+
+        queue_pending.assert_called_once()
+        for key, value in binding.items():
+            self.assertEqual(value, queue_pending.call_args.kwargs[key])
 
     def test_processing_entry_resets_prior_source_reply_outcome(self):
         processing._set_reply_send_outcome(
@@ -2930,6 +3172,785 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertFalse(update_payload["retryable"])
         self.assertEqual("blocked_retry_guard_unreadable", update_payload["recoveryStatus"])
         self.assertIn("Could not verify duplicate-send guard", update_payload["lastRetryError"])
+
+    def test_build_source_coordinator_binds_terminal_loader_to_factory_client(self):
+        retained = {
+            "kind": "settled",
+            "saga": None,
+            "settlement": {"sourceMessageKey": "<source@example.test>"},
+            "exactSourceConfirmed": True,
+        }
+        constructed = MagicMock()
+        factory_client = object()
+        foreign_global_client = object()
+        transaction = object()
+
+        with patch.object(
+            processing,
+            "_fs",
+            foreign_global_client,
+        ), patch.object(
+            processing,
+            "_terminal_retry_disposition",
+            return_value=retained,
+        ) as terminal_disposition, patch.object(
+            processing,
+            "SourceCoordinator",
+            return_value=constructed,
+        ) as coordinator_type:
+            result = processing.build_source_coordinator(factory_client)
+            loader = coordinator_type.call_args.kwargs[
+                "retained_terminal_authority_loader"
+            ]
+            try:
+                loaded = loader(
+                    "uid-1",
+                    "thread-1",
+                    graph_message_id="graph-1",
+                    internet_message_id="<source@example.test>",
+                    transaction=transaction,
+                )
+            except TypeError as exc:
+                self.fail(
+                    "retained terminal loader must accept its coordinator "
+                    f"transaction: {exc}"
+                )
+            self.assertIs(
+                retained,
+                loaded,
+            )
+
+        self.assertIs(constructed, result)
+        terminal_disposition.assert_called_once_with(
+            "uid-1",
+            "thread-1",
+            graph_message_id="graph-1",
+            internet_message_id="<source@example.test>",
+            firestore_client=factory_client,
+            transaction=transaction,
+        )
+
+    def test_strict_legacy_source_marker_detector_separates_replay_claims(self):
+        fake_fs = _FailureFirestore()
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        fake_fs.documents[
+            (
+                "users",
+                "uid-1",
+                "processedMessages",
+                processing.b64url_id(graph_message_id),
+            )
+        ] = {"processedAt": "legacy"}
+        fake_fs.documents[
+            (
+                "users",
+                "uid-1",
+                "processedMessages",
+                processing.b64url_id(internet_message_id),
+            )
+        ] = {
+            "status": "operator_replay_in_progress",
+            "replayAttemptId": "attempt-1",
+        }
+        fake_fs.documents[("users", "uid-1", "threads", "thread-1")] = {
+            "handledEvents": {},
+        }
+
+        with patch.object(processing, "_fs", fake_fs):
+            disposition = processing._strict_legacy_source_marker_disposition(
+                "uid-1",
+                "thread-1",
+                graph_message_id=graph_message_id,
+                internet_message_id=internet_message_id,
+            )
+
+        self.assertEqual("legacy_replay_claim_quarantined", disposition)
+        self.assertEqual([], fake_fs.deleted_paths)
+
+    def test_enforced_retry_conflicting_aliases_stop_before_all_effects(self):
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        failure_doc, fake_fs = self._enforced_retry_failure(
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+        )
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.side_effect = (
+            source_coordinator.SourceAliasConflict("conflicting aliases")
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "_fs",
+            fake_fs,
+        ), patch.object(
+            processing,
+            "build_source_coordinator",
+            return_value=coordinator,
+            create=True,
+        ), patch.object(
+            processing,
+            "_terminal_retry_disposition",
+            side_effect=_ordinary_terminal_retry_disposition_for_test,
+        ), patch.object(
+            processing,
+            "_fetch_graph_message_for_processing_failure",
+        ) as fetch_message, patch.object(
+            processing,
+            "process_inbox_message",
+        ) as process_message, patch.object(
+            processing,
+            "has_processed",
+        ) as has_processed, patch.object(
+            processing,
+            "mark_processed",
+        ) as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(1, result["checked"])
+        self.assertEqual(0, result["succeeded"])
+        fetch_message.assert_not_called()
+        process_message.assert_not_called()
+        has_processed.assert_not_called()
+        mark_processed.assert_not_called()
+        self.campaign_decision.assert_not_called()
+        failure_doc.reference.set.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
+
+    def test_enforced_retry_marker_only_source_stays_visible_without_effects(self):
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        failure_doc, fake_fs = self._enforced_retry_failure(
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+        )
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = None
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "_fs",
+            fake_fs,
+        ), patch.object(
+            processing,
+            "build_source_coordinator",
+            return_value=coordinator,
+            create=True,
+        ), patch.object(
+            processing,
+            "_strict_legacy_source_marker_disposition",
+            return_value="legacy_marker_only_ambiguous",
+            create=True,
+        ), patch.object(
+            processing,
+            "_terminal_retry_disposition",
+            side_effect=_ordinary_terminal_retry_disposition_for_test,
+        ), patch.object(
+            processing,
+            "_fetch_graph_message_for_processing_failure",
+        ) as fetch_message, patch.object(
+            processing,
+            "process_inbox_message",
+        ) as process_message, patch.object(
+            processing,
+            "has_processed",
+        ) as has_processed, patch.object(
+            processing,
+            "mark_processed",
+        ) as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(1, result["checked"])
+        self.assertEqual(1, result["skipped"])
+        fetch_message.assert_not_called()
+        process_message.assert_not_called()
+        has_processed.assert_not_called()
+        mark_processed.assert_not_called()
+        self.campaign_decision.assert_not_called()
+        failure_doc.reference.set.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
+
+    def test_enforced_retry_retains_exact_terminal_authority_without_graph(self):
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        failure_doc, fake_fs = self._enforced_retry_failure(
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+        )
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = "source-1"
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            SimpleNamespace(
+                canonical_source_id="source-1",
+                state="legacy_terminal_authority_retained",
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "_fs",
+            fake_fs,
+        ), patch.object(
+            processing,
+            "build_source_coordinator",
+            return_value=coordinator,
+            create=True,
+        ), patch.object(
+            processing,
+            "_strict_legacy_source_marker_disposition",
+            return_value="none",
+            create=True,
+        ), patch.object(
+            processing,
+            "_terminal_retry_disposition",
+            side_effect=_ordinary_terminal_retry_disposition_for_test,
+        ), patch.object(
+            processing,
+            "_fetch_graph_message_for_processing_failure",
+        ) as fetch_message, patch.object(
+            processing,
+            "process_inbox_message",
+        ) as process_message, patch.object(
+            processing,
+            "has_processed",
+        ) as has_processed, patch.object(
+            processing,
+            "mark_processed",
+        ) as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(1, result["skipped"])
+        coordinator.quarantine_retained_terminal_authority.assert_called_once_with(
+            user_id="uid-1",
+            canonical_source_id="source-1",
+            thread_id="thread-1",
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+        )
+        fetch_message.assert_not_called()
+        process_message.assert_not_called()
+        has_processed.assert_not_called()
+        mark_processed.assert_not_called()
+        self.campaign_decision.assert_not_called()
+        failure_doc.reference.set.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
+
+    def test_enforced_retry_reuses_canonical_source_and_only_clears_after_settlement(self):
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        failure_doc, fake_fs = self._enforced_retry_failure(
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+        )
+        graph_message = {
+            "id": graph_message_id,
+            "internetMessageId": internet_message_id,
+            "conversationId": "conversation-1",
+        }
+        resolved_identity = {
+            "processingFailureSchemaVersion": processing.PROCESSING_FAILURE_SCHEMA_VERSION,
+            "sourceMessageKey": internet_message_id,
+            "graphMessageId": graph_message_id,
+            "internetMessageId": internet_message_id,
+        }
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.side_effect = [
+            "source-1",
+            "source-1",
+        ]
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            SimpleNamespace(
+                canonical_source_id="source-1",
+                state="no_retained_terminal_authority",
+            )
+        )
+        authority = processing.SourceProcessingAuthority(
+            canonical_source_id="source-1",
+            snapshot_hash="a" * 64,
+            selection_hash="b" * 64,
+            owner_kind="none",
+            owner_key=None,
+            ledger_hash="c" * 64,
+        )
+        settlement = source_coordinator.SourceSettlementResult(
+            canonical_source_id="source-1",
+            settlement_hash="d" * 64,
+            settlement_revision=1,
+            alias_projection_count=2,
+            repaired_projection_count=0,
+        )
+        process_result = processing.SourceProcessingDisposition(
+            mode=source_coordinator.CoordinatorMode.ENFORCED,
+            state="settled",
+            authority=authority,
+            settlement=settlement,
+            thread_id="thread-1",
+            source_alias_keys=processing._source_alias_keys_for_message(
+                "uid-1",
+                graph_message,
+            ),
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "_fs",
+            fake_fs,
+        ), patch.object(
+            processing,
+            "build_source_coordinator",
+            return_value=coordinator,
+            create=True,
+        ), patch.object(
+            processing,
+            "_strict_legacy_source_marker_disposition",
+            return_value="none",
+            create=True,
+        ), patch.object(
+            processing,
+            "_terminal_retry_disposition",
+            side_effect=_ordinary_terminal_retry_disposition_for_test,
+        ), patch.object(
+            processing,
+            "_fetch_graph_message_for_processing_failure",
+            return_value=(graph_message, resolved_identity),
+        ) as fetch_message, patch.object(
+            processing,
+            "process_inbox_message",
+            return_value=process_result,
+        ) as process_message, patch.object(
+            processing,
+            "verify_settled_source_dispatch_binding",
+            return_value=True,
+        ) as verify_settlement, patch.object(
+            processing,
+            "has_processed",
+        ) as has_processed, patch.object(
+            processing,
+            "mark_processed",
+        ) as mark_processed:
+            self.campaign_decision.reset_mock()
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 1, "succeeded": 1, "failed": 0, "skipped": 0},
+            result,
+        )
+        fetch_message.assert_called_once_with(
+            {"Authorization": "Bearer fake"},
+            failure_doc.to_dict.return_value,
+        )
+        process_message.assert_called_once_with(
+            "uid-1",
+            {"Authorization": "Bearer fake"},
+            graph_message,
+            expected_canonical_source_id="source-1",
+        )
+        verify_settlement.assert_called_once()
+        has_processed.assert_not_called()
+        mark_processed.assert_not_called()
+        self.campaign_decision.assert_not_called()
+        failure_doc.reference.set.assert_not_called()
+        failure_doc.reference.delete.assert_called_once_with()
+
+    def test_enforced_retry_attempted_unsettled_results_are_failed_and_bounded(self):
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        graph_message = {
+            "id": graph_message_id,
+            "internetMessageId": internet_message_id,
+            "conversationId": "conversation-1",
+        }
+        source_alias_keys = processing._source_alias_keys_for_message(
+            "uid-1",
+            graph_message,
+        )
+
+        def authority(canonical_source_id):
+            return processing.SourceProcessingAuthority(
+                canonical_source_id=canonical_source_id,
+                snapshot_hash="a" * 64,
+                selection_hash="b" * 64,
+                owner_kind="none",
+                owner_key=None,
+                ledger_hash="c" * 64,
+            )
+
+        def settlement(canonical_source_id):
+            return source_coordinator.SourceSettlementResult(
+                canonical_source_id=canonical_source_id,
+                settlement_hash="d" * 64,
+                settlement_revision=1,
+                alias_projection_count=2,
+                repaired_projection_count=0,
+            )
+
+        valid_result = processing.SourceProcessingDisposition(
+            mode=source_coordinator.CoordinatorMode.ENFORCED,
+            state="settled",
+            authority=authority("source-1"),
+            settlement=settlement("source-1"),
+            thread_id="thread-1",
+            source_alias_keys=source_alias_keys,
+        )
+        cases = {
+            "none": (None, True, False),
+            "blocked": (
+                processing.SourceProcessingDisposition(
+                    mode=source_coordinator.CoordinatorMode.ENFORCED,
+                    state="blocked",
+                    authority=authority("source-1"),
+                    thread_id="thread-1",
+                    source_alias_keys=source_alias_keys,
+                ),
+                True,
+                False,
+            ),
+            "wrong canonical binding": (
+                processing.SourceProcessingDisposition(
+                    mode=source_coordinator.CoordinatorMode.ENFORCED,
+                    state="settled",
+                    authority=authority("source-2"),
+                    settlement=settlement("source-2"),
+                    thread_id="thread-1",
+                    source_alias_keys=source_alias_keys,
+                ),
+                True,
+                False,
+            ),
+            "settlement readback false": (valid_result, False, True),
+        }
+
+        for label, (
+            process_result,
+            settlement_readback,
+            expect_readback,
+        ) in cases.items():
+            with self.subTest(label=label):
+                failure_doc, fake_fs = self._enforced_retry_failure(
+                    graph_message_id=graph_message_id,
+                    internet_message_id=internet_message_id,
+                )
+                coordinator = MagicMock()
+                coordinator.resolve_existing_canonical_source_id.side_effect = [
+                    "source-1",
+                    "source-1",
+                ]
+                coordinator.quarantine_retained_terminal_authority.return_value = (
+                    SimpleNamespace(
+                        canonical_source_id="source-1",
+                        state="no_retained_terminal_authority",
+                    )
+                )
+
+                with patch.dict(
+                    os.environ,
+                    {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+                ), patch.object(
+                    processing,
+                    "_fs",
+                    fake_fs,
+                ), patch.object(
+                    processing,
+                    "build_source_coordinator",
+                    return_value=coordinator,
+                    create=True,
+                ), patch.object(
+                    processing,
+                    "_strict_legacy_source_marker_disposition",
+                    return_value="none",
+                    create=True,
+                ), patch.object(
+                    processing,
+                    "_fetch_graph_message_for_processing_failure",
+                    return_value=(graph_message, {}),
+                ), patch.object(
+                    processing,
+                    "process_inbox_message",
+                    return_value=process_result,
+                ), patch.object(
+                    processing,
+                    "verify_settled_source_dispatch_binding",
+                    return_value=settlement_readback,
+                ) as verify_settlement:
+                    result = processing.retry_processing_failures(
+                        "uid-1",
+                        {"Authorization": "Bearer fake"},
+                        max_attempts=1,
+                    )
+
+                self.assertEqual(
+                    {
+                        "checked": 1,
+                        "retried": 1,
+                        "succeeded": 0,
+                        "failed": 1,
+                        "skipped": 0,
+                    },
+                    result,
+                )
+                failure_doc.reference.delete.assert_not_called()
+                failure_doc.reference.set.assert_called_once()
+                update_payload = failure_doc.reference.set.call_args.args[0]
+                self.assertEqual(1, update_payload["processingAttempts"])
+                self.assertFalse(update_payload["retryable"])
+                self.assertIn(
+                    "verified canonical settlement",
+                    update_payload["lastRetryError"],
+                )
+                if expect_readback:
+                    verify_settlement.assert_called_once()
+                else:
+                    verify_settlement.assert_not_called()
+
+    def test_enforced_retry_process_authority_errors_are_durably_bounded(self):
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        graph_message = {
+            "id": graph_message_id,
+            "internetMessageId": internet_message_id,
+            "conversationId": "conversation-1",
+        }
+        error_cases = (
+            source_coordinator.SourceAliasConflict(
+                "aliases changed after processing started"
+            ),
+            source_coordinator.SourceCoordinatorAmbiguous(
+                "settlement readback became ambiguous"
+            ),
+        )
+
+        for process_error in error_cases:
+            with self.subTest(error=type(process_error).__name__):
+                failure_doc, fake_fs = self._enforced_retry_failure(
+                    graph_message_id=graph_message_id,
+                    internet_message_id=internet_message_id,
+                )
+                coordinator = MagicMock()
+                coordinator.resolve_existing_canonical_source_id.side_effect = [
+                    "source-1",
+                    "source-1",
+                ]
+                coordinator.quarantine_retained_terminal_authority.return_value = (
+                    SimpleNamespace(
+                        canonical_source_id="source-1",
+                        state="no_retained_terminal_authority",
+                    )
+                )
+
+                with patch.dict(
+                    os.environ,
+                    {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+                ), patch.object(
+                    processing,
+                    "_fs",
+                    fake_fs,
+                ), patch.object(
+                    processing,
+                    "build_source_coordinator",
+                    return_value=coordinator,
+                    create=True,
+                ), patch.object(
+                    processing,
+                    "_strict_legacy_source_marker_disposition",
+                    return_value="none",
+                    create=True,
+                ), patch.object(
+                    processing,
+                    "_fetch_graph_message_for_processing_failure",
+                    return_value=(graph_message, {}),
+                ), patch.object(
+                    processing,
+                    "process_inbox_message",
+                    side_effect=process_error,
+                ) as process_message:
+                    first = processing.retry_processing_failures(
+                        "uid-1",
+                        {"Authorization": "Bearer fake"},
+                        max_attempts=1,
+                    )
+                    update = failure_doc.reference.set.call_args.args[0]
+                    failure_doc.to_dict.return_value = {
+                        **failure_doc.to_dict.return_value,
+                        **update,
+                    }
+                    second = processing.retry_processing_failures(
+                        "uid-1",
+                        {"Authorization": "Bearer fake"},
+                        max_attempts=1,
+                    )
+
+                self.assertEqual(1, first["retried"])
+                self.assertEqual(1, first["failed"])
+                self.assertEqual(1, second["skipped"])
+                self.assertEqual(1, process_message.call_count)
+                self.assertEqual(1, update["processingAttempts"])
+                self.assertFalse(update["retryable"])
+                self.assertIn(str(process_error), update["lastRetryError"])
+
+    def test_enforced_retry_refuses_hydrated_alias_drift_before_processing(self):
+        graph_message_id = "graph-1"
+        internet_message_id = "<source@example.test>"
+        failure_doc, fake_fs = self._enforced_retry_failure(
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+        )
+        graph_message = {
+            "id": graph_message_id,
+            "internetMessageId": internet_message_id,
+        }
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.side_effect = [
+            "source-1",
+            "source-2",
+        ]
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            SimpleNamespace(
+                canonical_source_id="source-1",
+                state="no_retained_terminal_authority",
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "_fs",
+            fake_fs,
+        ), patch.object(
+            processing,
+            "build_source_coordinator",
+            return_value=coordinator,
+            create=True,
+        ), patch.object(
+            processing,
+            "_strict_legacy_source_marker_disposition",
+            return_value="none",
+            create=True,
+        ), patch.object(
+            processing,
+            "_terminal_retry_disposition",
+            side_effect=_ordinary_terminal_retry_disposition_for_test,
+        ), patch.object(
+            processing,
+            "_fetch_graph_message_for_processing_failure",
+            return_value=(
+                graph_message,
+                {
+                    "processingFailureSchemaVersion": processing.PROCESSING_FAILURE_SCHEMA_VERSION,
+                    "sourceMessageKey": internet_message_id,
+                    "graphMessageId": graph_message_id,
+                    "internetMessageId": internet_message_id,
+                },
+            ),
+        ), patch.object(
+            processing,
+            "process_inbox_message",
+        ) as process_message, patch.object(
+            processing,
+            "mark_processed",
+        ) as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(1, result["failed"])
+        process_message.assert_not_called()
+        mark_processed.assert_not_called()
+        self.campaign_decision.assert_not_called()
+        failure_doc.reference.set.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
+
+    def test_enforced_operator_attempt_skips_legacy_claim_reads(self):
+        coordinator = MagicMock()
+        message = {
+            "id": "graph-1",
+            "internetMessageId": "<source@example.test>",
+        }
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            processing,
+            "SourceCoordinator",
+            return_value=coordinator,
+        ), patch.object(
+            processing,
+            "build_source_coordinator",
+            return_value=coordinator,
+            create=True,
+        ), patch.object(
+            processing,
+            "_validate_operator_replay_claims",
+        ) as validate_claims, patch.object(
+            processing,
+            "exponential_backoff_request",
+            side_effect=source_coordinator.SourceCoordinatorRetryable(
+                "stop after claim boundary"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                source_coordinator.SourceCoordinatorRetryable,
+                "stop after claim boundary",
+            ):
+                processing.process_inbox_message(
+                    "uid-1",
+                    {"Authorization": "Bearer fake"},
+                    message,
+                    allow_outbound_reply=False,
+                    operator_replay_attempt_id="attempt-1",
+                )
+
+        validate_claims.assert_not_called()
+
+    @staticmethod
+    def _enforced_retry_failure(*, graph_message_id, internet_message_id):
+        failure_doc = MagicMock()
+        failure_doc.id = "failure-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": internet_message_id,
+            "sourceMessageKey": internet_message_id,
+            "graphMessageId": graph_message_id,
+            "internetMessageId": internet_message_id,
+            "retryable": True,
+            "processingAttempts": 0,
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = (
+            failures_collection
+        )
+        return failure_doc, fake_fs
 
     def test_new_property_duplicate_check_fails_open_on_sheet_read_error(self):
         class FailingSheets:

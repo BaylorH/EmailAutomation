@@ -91,6 +91,14 @@ _CLASSIFICATION_REQUEST_KEY_KIND = "source-model-request-v1"
 _CLASSIFICATION_SNAPSHOT_HASH_KIND = "source-classification-snapshot-v1"
 _CLASSIFICATION_SELECTION_HASH_KIND = "source-selection-v1"
 _CANDIDATE_TAXONOMY_VERSION = "source-candidate-taxonomy-v1"
+_RETAINED_TERMINAL_BINDING_HASH_KIND = "retained-terminal-binding-v1"
+_RETAINED_TERMINAL_RECORD_HASH_KIND = "retained-terminal-record-v1"
+_RETAINED_TERMINAL_CLASSIFICATION_FIELDS = {
+    "retainedTerminalKind",
+    "retainedTerminalImmutableHash",
+    "retainedTerminalRecordHash",
+    "retainedTerminalBindingHash",
+}
 _CLASSIFICATION_FIELDS = {
     "schemaVersion",
     "canonicalSourceId",
@@ -115,6 +123,7 @@ _CLASSIFICATION_FIELDS = {
     "deterministicEvidence",
     "deterministicEvidenceHash",
     "snapshotPersistedAt",
+    *_RETAINED_TERMINAL_CLASSIFICATION_FIELDS,
     "createdAt",
     "updatedAt",
 }
@@ -475,6 +484,10 @@ class ClassificationSnapshotTooLarge(SourceCoordinatorConfigError):
     code = "classification_snapshot_too_large"
 
 
+class RetainedTerminalAuthorityConflict(SourceCoordinatorConflict):
+    code = "legacy_terminal_authority_conflict"
+
+
 class TransitionOwnerConflict(SourceCoordinatorConflict):
     code = "source_transition_owner_conflict"
 
@@ -564,6 +577,15 @@ class ClassificationSnapshot:
     selection_snapshot: Mapping[str, Any]
     selection_hash: str
     snapshot_immutable_hash: str
+
+
+@dataclass(frozen=True)
+class RetainedTerminalAuthorityDisposition:
+    canonical_source_id: str
+    state: str
+    terminal_kind: str | None
+    evidence_hash: str | None
+    created: bool
 
 
 @dataclass(frozen=True)
@@ -787,6 +809,20 @@ class _VerifiedDeterministicEvidence:
         object.__setattr__(self, "hard_optout", hard_optout)
 
 
+@dataclass(frozen=True, init=False)
+class _VerifiedRetainedTerminalEvidence:
+    terminal_kind: str
+    immutable_hash: str
+    record_hash: str
+    binding_hash: str
+    aliases: Sequence[SourceAlias]
+
+    def __init__(self):
+        raise TypeError(
+            "retained terminal evidence is constructed only by SourceCoordinator"
+        )
+
+
 @dataclass(frozen=True)
 class _ClassificationTransactionPlan:
     result: Any
@@ -804,7 +840,7 @@ class _AuthorityCreatePlan:
     prerequisites: Sequence[tuple[Any, Mapping[str, Any]]]
     target_ref: Any
     before_data: Mapping[str, Any] | None
-    expected_data: Mapping[str, Any]
+    expected_data: Mapping[str, Any] | None
     ambiguous_error_type: type[SourceCoordinatorError] = SourceCoordinatorAmbiguous
 
 
@@ -2851,6 +2887,285 @@ def _empty_classification_snapshot_fields() -> dict[str, Any]:
     return {field: None for field in _CLASSIFICATION_SNAPSHOT_FIELDS}
 
 
+def _empty_retained_terminal_classification_fields() -> dict[str, Any]:
+    return {field: None for field in _RETAINED_TERMINAL_CLASSIFICATION_FIELDS}
+
+
+def _retained_terminal_hash_value(
+    value: Any,
+    *,
+    active_containers: set[int],
+) -> list[Any]:
+    if value is None:
+        return ["null"]
+    if type(value) is bool:
+        return ["bool", value]
+    if type(value) is int:
+        return ["int", value]
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise SourceCoordinatorConfigError(
+                "retained terminal record contains a non-finite number"
+            )
+        return ["float", value]
+    if type(value) is str:
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SourceCoordinatorConfigError(
+                "retained terminal record contains invalid UTF-8"
+            ) from exc
+        return ["string", value]
+    if _is_aware_datetime(value):
+        timestamp = _canonical_datetime_token(
+            value,
+            field_name="retained terminal timestamp",
+        )
+        nanosecond = getattr(value, "nanosecond", None)
+        if type(nanosecond) is not int:
+            nanosecond = None
+        return ["datetime", timestamp, nanosecond]
+    if type(value) not in {dict, list}:
+        raise SourceCoordinatorConfigError(
+            "retained terminal record contains an unsupported value"
+        )
+
+    container_id = id(value)
+    if container_id in active_containers:
+        raise SourceCoordinatorConfigError(
+            "retained terminal record contains a cycle"
+        )
+    active_containers.add(container_id)
+    try:
+        if type(value) is list:
+            return [
+                "list",
+                [
+                    _retained_terminal_hash_value(
+                        item,
+                        active_containers=active_containers,
+                    )
+                    for item in value
+                ],
+            ]
+        if any(type(key) is not str for key in value):
+            raise SourceCoordinatorConfigError(
+                "retained terminal record keys must be strings"
+            )
+        items = []
+        for key in sorted(value):
+            items.append(
+                [
+                    key,
+                    _retained_terminal_hash_value(
+                        value[key],
+                        active_containers=active_containers,
+                    ),
+                ]
+            )
+        return ["mapping", items]
+    except (RecursionError, TypeError) as exc:
+        raise SourceCoordinatorConfigError(
+            "retained terminal record cannot be canonically hashed"
+        ) from exc
+    finally:
+        active_containers.remove(container_id)
+
+
+def _retained_terminal_record_hash(record: dict[str, Any]) -> str:
+    return canonical_json_hash(
+        {
+            "hashKind": _RETAINED_TERMINAL_RECORD_HASH_KIND,
+            "record": _retained_terminal_hash_value(
+                record,
+                active_containers=set(),
+            ),
+        }
+    )
+
+
+def _verified_retained_terminal_evidence_from_loader(
+    loader_result: Any,
+    *,
+    user_id: str,
+    canonical_source_id: str,
+    thread_id: str,
+    thread_client_id: Any,
+    supplied_aliases: Sequence[SourceAlias],
+    identity_descriptors: Sequence[Mapping[str, str]],
+) -> _VerifiedRetainedTerminalEvidence | None:
+    required_fields = {
+        "kind",
+        "saga",
+        "settlement",
+        "exactSourceConfirmed",
+    }
+    if (
+        type(loader_result) is not dict
+        or any(type(key) is not str for key in loader_result)
+        or set(loader_result) != required_fields
+    ):
+        raise SourceCoordinatorConfigError(
+            "retained terminal authority loader returned a malformed disposition"
+        )
+    kind = loader_result.get("kind")
+    if type(kind) is not str or kind not in {"ordinary", "active", "settled"}:
+        raise SourceCoordinatorConfigError(
+            "retained terminal authority loader returned an unsupported kind"
+        )
+    exact_source_confirmed = loader_result.get("exactSourceConfirmed")
+    saga = loader_result.get("saga")
+    settlement = loader_result.get("settlement")
+    if kind == "ordinary":
+        if (
+            exact_source_confirmed is not False
+            or saga is not None
+            or settlement is not None
+        ):
+            raise SourceCoordinatorConfigError(
+                "ordinary retained terminal disposition is malformed"
+            )
+        return None
+    if exact_source_confirmed is not True:
+        raise SourceCoordinatorConfigError(
+            "retained terminal authority is not exact-source confirmed"
+        )
+    record = saga if kind == "active" else settlement
+    other_record = settlement if kind == "active" else saga
+    if type(record) is not dict or other_record is not None:
+        raise SourceCoordinatorConfigError(
+            "retained terminal authority selected record is malformed"
+        )
+    _validate_document_id(
+        thread_client_id,
+        field_name="retained terminal thread client id",
+    )
+    if kind == "active":
+        record_client_id = record.get("clientId")
+    else:
+        saga_snapshot = record.get("sagaSnapshot")
+        if type(saga_snapshot) is not dict:
+            raise SourceCoordinatorConfigError(
+                "settled retained terminal authority saga snapshot is malformed"
+            )
+        record_client_id = saga_snapshot.get("clientId")
+    _validate_document_id(
+        record_client_id,
+        field_name="retained terminal record client id",
+    )
+    if record_client_id != thread_client_id:
+        raise RetainedTerminalAuthorityConflict(
+            "retained terminal authority conflicts with thread client binding"
+        )
+    record_hash = _retained_terminal_record_hash(record)
+
+    record_aliases = []
+    raw_aliases = {}
+    for field_name, alias_type in (
+        ("sourceGraphMessageId", "graph"),
+        ("sourceInternetMessageId", "internet_message_id"),
+    ):
+        raw_value = record.get(field_name)
+        if raw_value is None:
+            continue
+        if type(raw_value) is not str or not raw_value.strip():
+            raise SourceCoordinatorConfigError(
+                "retained terminal authority has a malformed typed source alias"
+            )
+        normalized = normalize_source_alias(alias_type, raw_value)
+        alias = SourceAlias(
+            alias_type=alias_type,
+            value=normalized.value,
+            key=source_alias_key(user_id, normalized),
+        )
+        record_aliases.append(alias)
+        raw_aliases[alias_type] = raw_value.strip()
+    if not record_aliases:
+        raise SourceCoordinatorConfigError(
+            "retained terminal authority lacks a typed source alias"
+        )
+
+    supplied_by_type = {alias.alias_type: alias for alias in supplied_aliases}
+    record_by_type = {alias.alias_type: alias for alias in record_aliases}
+    if any(
+        record_by_type.get(alias_type) != alias
+        for alias_type, alias in supplied_by_type.items()
+    ):
+        raise RetainedTerminalAuthorityConflict(
+            "retained terminal authority conflicts with supplied source aliases"
+        )
+    descriptors_by_key = {
+        descriptor["sourceAliasKey"]: dict(descriptor)
+        for descriptor in identity_descriptors
+    }
+    for alias in record_aliases:
+        if descriptors_by_key.get(alias.key) != _alias_descriptor(alias):
+            raise RetainedTerminalAuthorityConflict(
+                "retained terminal authority conflicts with source identity"
+            )
+
+    source_message_key = record.get("sourceMessageKey")
+    if type(source_message_key) is not str or not source_message_key.strip():
+        raise SourceCoordinatorConfigError(
+            "retained terminal authority source-message key is malformed"
+        )
+    source_message_key = source_message_key.strip()
+    expected_source_message_key = raw_aliases.get(
+        "internet_message_id",
+        raw_aliases.get("graph"),
+    )
+    if source_message_key != expected_source_message_key:
+        raise RetainedTerminalAuthorityConflict(
+            "retained terminal source-message key conflicts with typed aliases"
+        )
+
+    saga_key = record.get("sagaKey")
+    if kind == "active" and (
+        type(saga_key) is not str or not saga_key.strip()
+    ):
+        raise SourceCoordinatorConfigError(
+            "active retained terminal authority lacks a saga key"
+        )
+    if saga_key is not None and (
+        type(saga_key) is not str or not saga_key.strip()
+    ):
+        raise SourceCoordinatorConfigError(
+            "retained terminal authority saga key is malformed"
+        )
+    saga_key = saga_key.strip() if type(saga_key) is str else None
+
+    immutable_field = "immutableHash" if kind == "active" else "projectionHash"
+    immutable_hash = record.get(immutable_field)
+    if not _is_sha256(immutable_hash):
+        raise SourceCoordinatorConfigError(
+            "retained terminal immutable authority hash is malformed"
+        )
+    sorted_aliases = tuple(sorted(record_aliases, key=lambda alias: alias.key))
+    binding_hash = canonical_json_hash(
+        {
+            "hashKind": _RETAINED_TERMINAL_BINDING_HASH_KIND,
+            "schemaVersion": 1,
+            "canonicalSourceId": canonical_source_id,
+            "threadId": thread_id,
+            "terminalKind": kind,
+            "sourceAliases": [
+                _alias_descriptor(alias) for alias in sorted_aliases
+            ],
+            "sourceMessageKey": source_message_key,
+            "sagaKey": saga_key,
+            "immutableAuthorityHash": immutable_hash,
+            "validatedRecordHash": record_hash,
+        }
+    )
+    verified = object.__new__(_VerifiedRetainedTerminalEvidence)
+    object.__setattr__(verified, "terminal_kind", kind)
+    object.__setattr__(verified, "immutable_hash", immutable_hash)
+    object.__setattr__(verified, "record_hash", record_hash)
+    object.__setattr__(verified, "binding_hash", binding_hash)
+    object.__setattr__(verified, "aliases", sorted_aliases)
+    return verified
+
+
 def _classification_claim_from_data(data: Mapping[str, Any]) -> ClassificationClaim:
     return ClassificationClaim(
         canonical_source_id=data["canonicalSourceId"],
@@ -2924,6 +3239,35 @@ def _validate_classification_document(
     state = data.get("classificationState")
     model_state = data.get("modelRequestState")
     snapshot_values = {field: data.get(field) for field in _CLASSIFICATION_SNAPSHOT_FIELDS}
+    retained_terminal_values = {
+        field: data.get(field)
+        for field in _RETAINED_TERMINAL_CLASSIFICATION_FIELDS
+    }
+    if state == "legacy_terminal_quarantined":
+        if (
+            model_state != "not_applicable"
+            or data.get("classificationInputHash") is not None
+            or data.get("modelRequestKey") is not None
+            or data.get("requestStartFence") is not None
+            or any(value is not None for value in snapshot_values.values())
+            or data.get("retainedTerminalKind") not in {"active", "settled"}
+            or any(
+                not _is_sha256(data.get(field))
+                for field in (
+                    "retainedTerminalImmutableHash",
+                    "retainedTerminalRecordHash",
+                    "retainedTerminalBindingHash",
+                )
+            )
+        ):
+            raise SourceCoordinatorAmbiguous(
+                "retained terminal classification quarantine is malformed"
+            )
+        return
+    if any(value is not None for value in retained_terminal_values.values()):
+        raise SourceCoordinatorAmbiguous(
+            "classification retains unsupported terminal authority"
+        )
     if state == "claimed":
         if (
             model_state != "not_started"
@@ -3180,6 +3524,7 @@ class SourceCoordinator:
         now_factory,
         hard_optout_verifier=None,
         local_source_policy_verifier=None,
+        retained_terminal_authority_loader=None,
     ):
         if (
             firestore_client is None
@@ -3193,6 +3538,10 @@ class SourceCoordinator:
                 local_source_policy_verifier is not None
                 and not callable(local_source_policy_verifier)
             )
+            or (
+                retained_terminal_authority_loader is not None
+                and not callable(retained_terminal_authority_loader)
+            )
         ):
             raise SourceCoordinatorConfigError(
                 "source coordinator dependencies are invalid"
@@ -3202,6 +3551,9 @@ class SourceCoordinator:
         self._now_factory = now_factory
         self._hard_optout_verifier = hard_optout_verifier
         self._local_source_policy_verifier = local_source_policy_verifier
+        self._retained_terminal_authority_loader = (
+            retained_terminal_authority_loader
+        )
 
     def _classification_refs(self, *, user_id: str, canonical_source_id: str):
         user_ref = self._firestore.collection("users").document(user_id)
@@ -5299,6 +5651,313 @@ class SourceCoordinator:
                 "settled dispatch verification is unavailable"
             ) from verification_error
 
+    def quarantine_retained_terminal_authority(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        thread_id: str,
+        graph_message_id: str | None,
+        internet_message_id: str | None,
+    ) -> RetainedTerminalAuthorityDisposition:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        validated_thread_id = _validate_thread_id(thread_id)
+        if validated_thread_id is None:
+            raise SourceCoordinatorConfigError(
+                "retained terminal quarantine requires an exact thread id"
+            )
+        supplied_aliases = []
+        for alias_type, value in (
+            ("graph", graph_message_id),
+            ("internet_message_id", internet_message_id),
+        ):
+            if value is None:
+                continue
+            normalized = normalize_source_alias(alias_type, value)
+            supplied_aliases.append(
+                SourceAlias(
+                    alias_type=normalized.alias_type,
+                    value=normalized.value,
+                    key=source_alias_key(user_id, normalized),
+                )
+            )
+        if not supplied_aliases:
+            raise SourceIdentityMissing(
+                "retained terminal quarantine requires a typed source alias"
+            )
+        supplied_aliases = tuple(
+            sorted(supplied_aliases, key=lambda alias: alias.key)
+        )
+        if self._retained_terminal_authority_loader is None:
+            raise SourceCoordinatorConfigError(
+                "retained terminal authority loader is unavailable"
+            )
+
+        user_ref = self._firestore.collection("users").document(user_id)
+        thread_ref = user_ref.collection("threads").document(validated_thread_id)
+        identity_ref = user_ref.collection("sourceIdentities").document(
+            canonical_source_id
+        )
+        alias_collection = user_ref.collection("sourceAliases")
+        classification_ref = user_ref.collection("sourceClassifications").document(
+            canonical_source_id
+        )
+
+        def disposition(
+            *,
+            state: str,
+            terminal_kind: str | None,
+            evidence_hash: str | None,
+            created: bool,
+        ) -> RetainedTerminalAuthorityDisposition:
+            return RetainedTerminalAuthorityDisposition(
+                canonical_source_id=canonical_source_id,
+                state=state,
+                terminal_kind=terminal_kind,
+                evidence_hash=evidence_hash,
+                created=created,
+            )
+
+        def prepare(transaction):
+            identity_data = self._require_source_identity_snapshot(
+                identity_ref.get(transaction=transaction),
+                canonical_source_id=canonical_source_id,
+            )
+            identity_descriptors = _validated_identity_descriptors(
+                identity_data,
+                canonical_source_id=canonical_source_id,
+            )
+            if identity_data["threadId"] != validated_thread_id:
+                raise SourceThreadConflict(
+                    "retained terminal thread conflicts with source identity"
+                )
+            descriptors_by_key = {
+                descriptor["sourceAliasKey"]: descriptor
+                for descriptor in identity_descriptors
+            }
+            alias_prerequisites = {}
+            for alias in supplied_aliases:
+                descriptor = _alias_descriptor(alias)
+                if descriptors_by_key.get(alias.key) != descriptor:
+                    raise SourceAliasConflict(
+                        "supplied source alias conflicts with canonical identity"
+                    )
+                alias_ref = alias_collection.document(alias.key)
+                alias_data = _snapshot_data(
+                    alias_ref.get(transaction=transaction)
+                )
+                if alias_data is None:
+                    raise SourceAliasConflict(
+                        "supplied source alias projection is missing"
+                    )
+                _validate_alias_projection(
+                    alias_data,
+                    descriptor=descriptor,
+                    canonical_source_id=canonical_source_id,
+                )
+                alias_prerequisites[alias.key] = (alias_ref, alias_data)
+
+            before = _snapshot_data(
+                classification_ref.get(transaction=transaction)
+            )
+            if before is not None:
+                _validate_classification_document(
+                    before,
+                    canonical_source_id=canonical_source_id,
+                )
+                state = before["classificationState"]
+                if state == "snapshot_ready":
+                    return _AuthorityCreatePlan(
+                        result=disposition(
+                            state="migrated_b1",
+                            terminal_kind=None,
+                            evidence_hash=None,
+                            created=False,
+                        ),
+                        prerequisites=(
+                            (identity_ref, deepcopy(identity_data)),
+                            *(
+                                (reference, deepcopy(data))
+                                for reference, data in (
+                                    alias_prerequisites[key]
+                                    for key in sorted(alias_prerequisites)
+                                )
+                            ),
+                        ),
+                        target_ref=classification_ref,
+                        before_data=before,
+                        expected_data=before,
+                        ambiguous_error_type=RetainedTerminalAuthorityConflict,
+                    )
+                if state not in {"claimed", "legacy_terminal_quarantined"}:
+                    raise RetainedTerminalAuthorityConflict(
+                        "classification authority blocks retained terminal quarantine"
+                    )
+
+            thread_data = _snapshot_data(
+                thread_ref.get(transaction=transaction)
+            )
+            if thread_data is None:
+                raise SourceCoordinatorRetryable(
+                    "retained terminal authority thread is unavailable"
+                )
+            authority_prerequisites = (
+                (identity_ref, deepcopy(identity_data)),
+                (thread_ref, deepcopy(thread_data)),
+                *(
+                    (reference, deepcopy(data))
+                    for reference, data in (
+                        alias_prerequisites[key]
+                        for key in sorted(alias_prerequisites)
+                    )
+                ),
+            )
+            try:
+                loader_result = self._retained_terminal_authority_loader(
+                    user_id,
+                    validated_thread_id,
+                    graph_message_id=graph_message_id,
+                    internet_message_id=internet_message_id,
+                    transaction=transaction,
+                )
+            except SourceCoordinatorError:
+                raise
+            except Exception as loader_error:
+                raise SourceCoordinatorRetryable(
+                    "retained terminal authority lookup is unavailable"
+                ) from loader_error
+            verified = _verified_retained_terminal_evidence_from_loader(
+                loader_result,
+                user_id=user_id,
+                canonical_source_id=canonical_source_id,
+                thread_id=validated_thread_id,
+                thread_client_id=thread_data.get("clientId"),
+                supplied_aliases=supplied_aliases,
+                identity_descriptors=identity_descriptors,
+            )
+            if verified is None:
+                if (
+                    before is not None
+                    and before["classificationState"]
+                    == "legacy_terminal_quarantined"
+                ):
+                    raise RetainedTerminalAuthorityConflict(
+                        "retained terminal evidence disappeared after quarantine"
+                    )
+                return _AuthorityCreatePlan(
+                    result=disposition(
+                        state="no_retained_terminal_authority",
+                        terminal_kind=None,
+                        evidence_hash=None,
+                        created=False,
+                    ),
+                    prerequisites=authority_prerequisites,
+                    target_ref=classification_ref,
+                    before_data=before,
+                    expected_data=before,
+                    ambiguous_error_type=RetainedTerminalAuthorityConflict,
+                )
+
+            for alias in verified.aliases:
+                if alias.key in alias_prerequisites:
+                    continue
+                alias_ref = alias_collection.document(alias.key)
+                alias_data = _snapshot_data(
+                    alias_ref.get(transaction=transaction)
+                )
+                if alias_data is None:
+                    raise SourceAliasConflict(
+                        "retained terminal alias projection is missing"
+                    )
+                _validate_alias_projection(
+                    alias_data,
+                    descriptor=_alias_descriptor(alias),
+                    canonical_source_id=canonical_source_id,
+                )
+                alias_prerequisites[alias.key] = (alias_ref, alias_data)
+
+            authority_prerequisites = (
+                (identity_ref, deepcopy(identity_data)),
+                (thread_ref, deepcopy(thread_data)),
+                *(
+                    (reference, deepcopy(data))
+                    for reference, data in (
+                        alias_prerequisites[key]
+                        for key in sorted(alias_prerequisites)
+                    )
+                ),
+            )
+
+            result = disposition(
+                state="legacy_terminal_authority_retained",
+                terminal_kind=verified.terminal_kind,
+                evidence_hash=verified.binding_hash,
+                created=before is None,
+            )
+            retained_fields = {
+                "retainedTerminalKind": verified.terminal_kind,
+                "retainedTerminalImmutableHash": verified.immutable_hash,
+                "retainedTerminalRecordHash": verified.record_hash,
+                "retainedTerminalBindingHash": verified.binding_hash,
+            }
+            if (
+                before is not None
+                and before["classificationState"] != "legacy_terminal_quarantined"
+            ):
+                raise RetainedTerminalAuthorityConflict(
+                    "classification claim conflicts with retained terminal authority"
+                )
+            if before is not None:
+                if any(
+                    before[field] != value
+                    for field, value in retained_fields.items()
+                ):
+                    raise RetainedTerminalAuthorityConflict(
+                        "retained terminal evidence conflicts with quarantine"
+                    )
+                expected = before
+            else:
+                now = self._current_time()
+                expected = {
+                    "schemaVersion": _CLASSIFICATION_SCHEMA_VERSION,
+                    "canonicalSourceId": canonical_source_id,
+                    "classificationState": "legacy_terminal_quarantined",
+                    "classificationEpoch": 1,
+                    "classificationClaimId": "legacy-terminal-quarantine",
+                    "leaseExpiresAt": now,
+                    "classificationInputSchemaVersion": _CLASSIFICATION_INPUT_SCHEMA_VERSION,
+                    "classificationInputHash": None,
+                    "modelRequestKey": None,
+                    "modelRequestState": "not_applicable",
+                    "requestStartFence": None,
+                    **_empty_classification_snapshot_fields(),
+                    **retained_fields,
+                    "createdAt": now,
+                    "updatedAt": now,
+                }
+                _validate_classification_document(
+                    expected,
+                    canonical_source_id=canonical_source_id,
+                )
+                transaction.create(classification_ref, expected)
+            return _AuthorityCreatePlan(
+                result=result,
+                prerequisites=authority_prerequisites,
+                target_ref=classification_ref,
+                before_data=before,
+                expected_data=expected,
+                ambiguous_error_type=RetainedTerminalAuthorityConflict,
+            )
+
+        return self._run_authority_create_transaction(
+            prepare,
+            authority_name="retained terminal classification quarantine",
+        )
+
     def claim_source_classification(
         self,
         *,
@@ -5344,6 +6003,10 @@ class SourceCoordinator:
                     canonical_source_id=canonical_source_id,
                 )
                 state = before["classificationState"]
+                if state == "legacy_terminal_quarantined":
+                    raise RetainedTerminalAuthorityConflict(
+                        "retained terminal authority forbids fresh classification"
+                    )
                 if state == "snapshot_ready":
                     raise ClassificationSnapshotConflict(
                         "classification snapshot is already frozen"
@@ -5402,6 +6065,7 @@ class SourceCoordinator:
                 "modelRequestState": "not_started",
                 "requestStartFence": None,
                 **_empty_classification_snapshot_fields(),
+                **_empty_retained_terminal_classification_fields(),
                 "createdAt": created_at,
                 "updatedAt": now,
             }
@@ -5516,6 +6180,14 @@ class SourceCoordinator:
                     )
                 raise ClassificationSnapshotConflict(
                     "classification snapshot is already frozen"
+                )
+            if state == "legacy_terminal_quarantined":
+                raise RetainedTerminalAuthorityConflict(
+                    "retained terminal authority forbids request start"
+                )
+            if state != "claimed":
+                raise ClassificationClaimConflict(
+                    "classification claim is not startable"
                 )
             now = self._current_time()
             if before["leaseExpiresAt"] <= now:
@@ -6013,6 +6685,10 @@ class SourceCoordinator:
                     "classification input conflicts with retained authority"
                 )
             return _classification_snapshot_from_data(data)
+        if state == "legacy_terminal_quarantined":
+            raise RetainedTerminalAuthorityConflict(
+                "retained terminal authority is quarantined outside B1 classification"
+            )
         if state in {
             "request_started",
             "classification_request_ambiguous",

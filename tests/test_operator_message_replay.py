@@ -19,7 +19,7 @@ os.environ.setdefault(
     ),
 )
 
-from email_automation import operator_replay, processing
+from email_automation import operator_replay, processing, source_coordinator
 from email_automation.utils import b64url_id, normalize_message_id
 
 
@@ -240,10 +240,15 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.find_continuation = MagicMock(return_value=None)
         self.find_recipient_continuation = MagicMock(return_value=None)
         self.verify_postcondition = MagicMock(return_value=True)
+        self.verify_source_settlement = MagicMock(return_value=True)
         self.lease_runner = MagicMock(side_effect=_lease_runs)
         self.scheduler_lease_runner = MagicMock(side_effect=_scheduler_lease_runs)
 
-    def replay(self, request=None, *, apply=False):
+    def replay(self, request=None, *, apply=False, source_coordinator_instance=None):
+        kwargs = {}
+        if source_coordinator_instance is not None:
+            kwargs["source_coordinator"] = source_coordinator_instance
+            kwargs["verify_source_settlement"] = self.verify_source_settlement
         return operator_replay.replay_exact_message(
             request or _request(),
             {"Authorization": "Bearer test-token"},
@@ -257,12 +262,88 @@ class OperatorReplayContractTests(unittest.TestCase):
             verify_postcondition=self.verify_postcondition,
             lease_runner=self.lease_runner,
             scheduler_lease_runner=self.scheduler_lease_runner,
+            **kwargs,
         )
 
     def assert_refused(self, request=None, message=None):
         with self.assertRaisesRegex(operator_replay.ReplayRefused, message or ".+"):
             self.replay(request)
         self.process_message.assert_not_called()
+
+    def _enforced_apply_coordinator(
+        self,
+        *,
+        existing_source_id="source-b1",
+        retained_state="no_retained_terminal_authority",
+    ):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = (
+            existing_source_id
+        )
+        coordinator.admit_or_repair_source_identity.return_value = SimpleNamespace(
+            canonical_source_id="source-b1",
+        )
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            source_coordinator.RetainedTerminalAuthorityDisposition(
+                canonical_source_id="source-b1",
+                state=retained_state,
+                terminal_kind=(
+                    "settled"
+                    if retained_state == "legacy_terminal_authority_retained"
+                    else None
+                ),
+                evidence_hash=(
+                    "a" * 64
+                    if retained_state == "legacy_terminal_authority_retained"
+                    else None
+                ),
+                created=retained_state == "legacy_terminal_authority_retained",
+            )
+        )
+        return coordinator
+
+    def _settled_b1_process_result(self, source_alias_keys):
+        return processing.SourceProcessingDisposition(
+            mode=source_coordinator.CoordinatorMode.ENFORCED,
+            state="settled",
+            authority=processing.SourceProcessingAuthority(
+                canonical_source_id="source-b1",
+                snapshot_hash="a" * 64,
+                selection_hash="b" * 64,
+                owner_kind="none",
+                owner_key=None,
+                ledger_hash="c" * 64,
+            ),
+            settlement=source_coordinator.SourceSettlementResult(
+                canonical_source_id="source-b1",
+                settlement_hash="d" * 64,
+                settlement_revision=1,
+                alias_projection_count=2,
+                repaired_projection_count=0,
+            ),
+            source_alias_keys=source_alias_keys,
+        )
+
+    def _exact_request_source_alias_keys(self):
+        request = _request()
+        return tuple(
+            sorted(
+                {
+                    source_coordinator.source_alias_key(
+                        request.uid,
+                        source_coordinator.normalize_source_alias(
+                            "graph", request.graph_message_id
+                        ),
+                    ),
+                    source_coordinator.source_alias_key(
+                        request.uid,
+                        source_coordinator.normalize_source_alias(
+                            "internet_message_id", request.internet_message_id
+                        ),
+                    ),
+                }
+            )
+        )
 
     def test_dry_run_fetches_and_verifies_one_exact_message_without_processing(self):
         result = self.replay()
@@ -475,6 +556,587 @@ class OperatorReplayContractTests(unittest.TestCase):
                 self.fs = fs
                 self.assert_refused(message="processed")
                 self.process_message.reset_mock()
+
+    def test_b1_settlement_refuses_a_missing_exact_request_alias(self):
+        exact_alias_keys = self._exact_request_source_alias_keys()
+        process_result = self._settled_b1_process_result(exact_alias_keys[:1])
+
+        with patch.object(
+            operator_replay,
+            "verify_settled_source_dispatch_binding",
+            return_value=True,
+        ) as retained_verifier:
+            verified = operator_replay._verify_b1_replay_settlement(
+                self.fs,
+                _request(),
+                process_result,
+                "source-b1",
+            )
+
+        self.assertFalse(verified)
+        retained_verifier.assert_not_called()
+
+    def test_b1_settlement_refuses_a_substituted_request_alias(self):
+        exact_alias_keys = self._exact_request_source_alias_keys()
+        process_result = self._settled_b1_process_result(
+            tuple(sorted((exact_alias_keys[0], "0" * 64)))
+        )
+
+        with patch.object(
+            operator_replay,
+            "verify_settled_source_dispatch_binding",
+            return_value=True,
+        ) as retained_verifier:
+            verified = operator_replay._verify_b1_replay_settlement(
+                self.fs,
+                _request(),
+                process_result,
+                "source-b1",
+            )
+
+        self.assertFalse(verified)
+        retained_verifier.assert_not_called()
+
+    def test_b1_settlement_verifies_both_exact_request_aliases(self):
+        exact_alias_keys = self._exact_request_source_alias_keys()
+        process_result = self._settled_b1_process_result(exact_alias_keys)
+
+        with patch.object(
+            operator_replay,
+            "verify_settled_source_dispatch_binding",
+            return_value=True,
+        ) as retained_verifier:
+            verified = operator_replay._verify_b1_replay_settlement(
+                self.fs,
+                _request(),
+                process_result,
+                "source-b1",
+            )
+
+        self.assertTrue(verified)
+        self.assertEqual(
+            exact_alias_keys,
+            retained_verifier.call_args.kwargs["source_alias_keys"],
+        )
+
+    def test_enforced_apply_uses_b1_admission_without_legacy_claim_writers(self):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = None
+        coordinator.admit_or_repair_source_identity.return_value = SimpleNamespace(
+            canonical_source_id="source-b1",
+        )
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            source_coordinator.RetainedTerminalAuthorityDisposition(
+                canonical_source_id="source-b1",
+                state="no_retained_terminal_authority",
+                terminal_kind=None,
+                evidence_hash=None,
+                created=False,
+            )
+        )
+        self.process_message.return_value = processing.SourceProcessingDisposition(
+            mode=source_coordinator.CoordinatorMode.ENFORCED,
+            state="settled",
+            authority=processing.SourceProcessingAuthority(
+                canonical_source_id="source-b1",
+                snapshot_hash="a" * 64,
+                selection_hash="b" * 64,
+                owner_kind="none",
+                owner_key=None,
+                ledger_hash="c" * 64,
+            ),
+            settlement=source_coordinator.SourceSettlementResult(
+                canonical_source_id="source-b1",
+                settlement_hash="d" * 64,
+                settlement_revision=1,
+                alias_projection_count=2,
+                repaired_projection_count=0,
+            ),
+            source_alias_keys=("e" * 64, "f" * 64),
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), patch.object(
+            operator_replay,
+            "_begin_replay_claim",
+            side_effect=AssertionError("legacy replay claim called"),
+        ), patch.object(
+            operator_replay,
+            "_complete_replay_claim",
+            side_effect=AssertionError("legacy replay completion called"),
+        ):
+            result = self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertTrue(result.applied)
+        self.assertEqual("applied", result.status)
+        coordinator.admit_or_repair_source_identity.assert_called_once_with(
+            user_id=BAYLOR_UID,
+            hydrated_message=self.fetch_message.return_value,
+            evidence_kind="operator_replay",
+            thread_id=THREAD_ID,
+        )
+        coordinator.quarantine_retained_terminal_authority.assert_called_once_with(
+            user_id=BAYLOR_UID,
+            canonical_source_id="source-b1",
+            thread_id=THREAD_ID,
+            graph_message_id=GRAPH_MESSAGE_ID,
+            internet_message_id=INTERNET_MESSAGE_ID,
+        )
+        self.process_message.assert_called_once_with(
+            BAYLOR_UID,
+            {"Authorization": "Bearer test-token"},
+            self.fetch_message.return_value,
+            allow_outbound_reply=False,
+            operator_replay_attempt_id=ANY,
+            expected_canonical_source_id="source-b1",
+        )
+        processed_paths = [
+            path
+            for path in self.fs.data
+            if len(path) >= 3 and path[-2] == "processedMessages"
+        ]
+        self.assertEqual([], processed_paths)
+
+    def test_enforced_retained_terminal_authority_is_visible_with_zero_domain_effects(self):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = "source-b1"
+        coordinator.admit_or_repair_source_identity.return_value = SimpleNamespace(
+            canonical_source_id="source-b1",
+        )
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            source_coordinator.RetainedTerminalAuthorityDisposition(
+                canonical_source_id="source-b1",
+                state="legacy_terminal_authority_retained",
+                terminal_kind="settled",
+                evidence_hash="a" * 64,
+                created=True,
+            )
+        )
+        data_before = deepcopy(self.fs.data)
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            result = self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertEqual("legacy_terminal_authority_retained", result.status)
+        coordinator.quarantine_retained_terminal_authority.assert_called_once_with(
+            user_id=BAYLOR_UID,
+            canonical_source_id="source-b1",
+            thread_id=THREAD_ID,
+            graph_message_id=GRAPH_MESSAGE_ID,
+            internet_message_id=INTERNET_MESSAGE_ID,
+        )
+        self.process_message.assert_not_called()
+        self.verify_source_settlement.assert_not_called()
+        self.verify_postcondition.assert_not_called()
+        self.assertEqual(data_before, self.fs.data)
+        self.assertFalse(
+            any(
+                event[0] in {"set", "delete", "batch_commit"}
+                for event in self.fs.events
+            )
+        )
+
+    def test_enforced_retained_terminal_authority_outranks_legacy_marker_only(self):
+        marker_path = (
+            "users",
+            BAYLOR_UID,
+            "processedMessages",
+            b64url_id(GRAPH_MESSAGE_ID),
+        )
+        self.fs.data[marker_path] = {"status": "processed"}
+        coordinator = self._enforced_apply_coordinator(
+            retained_state="legacy_terminal_authority_retained"
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            result = self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertEqual("legacy_terminal_authority_retained", result.status)
+        coordinator.quarantine_retained_terminal_authority.assert_called_once()
+        self.process_message.assert_not_called()
+        self.assertEqual({"status": "processed"}, self.fs.data[marker_path])
+
+    def test_enforced_migrated_b1_terminal_disposition_continues_processing(self):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = "source-b1"
+        coordinator.admit_or_repair_source_identity.return_value = SimpleNamespace(
+            canonical_source_id="source-b1",
+        )
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            source_coordinator.RetainedTerminalAuthorityDisposition(
+                canonical_source_id="source-b1",
+                state="migrated_b1",
+                terminal_kind=None,
+                evidence_hash=None,
+                created=False,
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            result = self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertTrue(result.applied)
+        self.assertEqual("applied", result.status)
+        self.process_message.assert_called_once()
+        self.verify_source_settlement.assert_called_once()
+
+    def test_enforced_legacy_marker_only_is_visible_and_has_zero_domain_effects(self):
+        marker_path = (
+            "users",
+            BAYLOR_UID,
+            "processedMessages",
+            b64url_id(GRAPH_MESSAGE_ID),
+        )
+        self.fs.data[marker_path] = {"status": "processed"}
+        coordinator = self._enforced_apply_coordinator(existing_source_id=None)
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            result = self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertEqual("legacy_marker_only_ambiguous", result.status)
+        self.process_message.assert_not_called()
+        coordinator.admit_or_repair_source_identity.assert_called_once()
+        coordinator.quarantine_retained_terminal_authority.assert_called_once()
+        self.assertEqual({"status": "processed"}, self.fs.data[marker_path])
+
+    def test_enforced_in_progress_legacy_claim_is_quarantined(self):
+        for message_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
+            self.fs.data[
+                (
+                    "users",
+                    BAYLOR_UID,
+                    "processedMessages",
+                    b64url_id(message_id),
+                )
+            ] = {
+                "status": "operator_replay_in_progress",
+                "replayAttemptId": "legacy-attempt",
+            }
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = None
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            result = self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertEqual("legacy_replay_claim_quarantined", result.status)
+        self.process_message.assert_not_called()
+        coordinator.admit_or_repair_source_identity.assert_not_called()
+
+    def test_enforced_alias_conflict_has_zero_writes_and_zero_domain_effects(self):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.side_effect = (
+            source_coordinator.SourceAliasConflict("conflicting exact aliases")
+        )
+        self.find_existing_artifact.return_value = {
+            "guardUnreadable": True,
+            "guardError": "must not outrank alias conflict",
+        }
+        data_before = deepcopy(self.fs.data)
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self.assertRaisesRegex(
+            operator_replay.ReplayRefused,
+            "canonical source",
+        ):
+            self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.process_message.assert_not_called()
+        self.find_existing_artifact.assert_not_called()
+        self.assertEqual(data_before, self.fs.data)
+        self.assertFalse(
+            any(
+                event[0] in {"set", "delete", "batch_commit"}
+                for event in self.fs.events
+            )
+        )
+
+    def test_enforced_dry_run_never_creates_b1_or_legacy_authority(self):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = None
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            result = self.replay(
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertEqual("verified", result.status)
+        coordinator.resolve_existing_canonical_source_id.assert_called_once_with(
+            user_id=BAYLOR_UID,
+            hydrated_message=self.fetch_message.return_value,
+            evidence_kind="operator_replay",
+            thread_id=THREAD_ID,
+        )
+        coordinator.admit_or_repair_source_identity.assert_not_called()
+        coordinator.quarantine_retained_terminal_authority.assert_not_called()
+        self.process_message.assert_not_called()
+
+    def test_enforced_dry_run_refuses_alias_conflict_without_writes(self):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.side_effect = (
+            source_coordinator.SourceAliasConflict("conflicting exact aliases")
+        )
+        data_before = deepcopy(self.fs.data)
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self.assertRaisesRegex(
+            operator_replay.ReplayRefused,
+            "canonical source",
+        ):
+            self.replay(source_coordinator_instance=coordinator)
+
+        self.assertEqual(data_before, self.fs.data)
+        coordinator.admit_or_repair_source_identity.assert_not_called()
+        coordinator.quarantine_retained_terminal_authority.assert_not_called()
+        self.find_existing_artifact.assert_not_called()
+        self.process_message.assert_not_called()
+        self.assertFalse(
+            any(
+                event[0] in {"set", "delete", "batch_commit"}
+                for event in self.fs.events
+            )
+        )
+
+    def test_enforced_dry_run_reports_legacy_marker_disposition_without_writes(self):
+        marker_path = (
+            "users",
+            BAYLOR_UID,
+            "processedMessages",
+            b64url_id(GRAPH_MESSAGE_ID),
+        )
+        self.fs.data[marker_path] = {"status": "processed"}
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = None
+        data_before = deepcopy(self.fs.data)
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ):
+            result = self.replay(source_coordinator_instance=coordinator)
+
+        self.assertFalse(result.applied)
+        self.assertEqual("legacy_marker_only_ambiguous", result.status)
+        self.assertEqual(data_before, self.fs.data)
+        coordinator.admit_or_repair_source_identity.assert_not_called()
+        coordinator.quarantine_retained_terminal_authority.assert_not_called()
+        self.process_message.assert_not_called()
+
+    def test_enforced_apply_requires_exact_b1_settlement_before_completion(self):
+        coordinator = MagicMock()
+        coordinator.resolve_existing_canonical_source_id.return_value = "source-b1"
+        coordinator.admit_or_repair_source_identity.return_value = SimpleNamespace(
+            canonical_source_id="source-b1",
+        )
+        coordinator.quarantine_retained_terminal_authority.return_value = (
+            source_coordinator.RetainedTerminalAuthorityDisposition(
+                canonical_source_id="source-b1",
+                state="no_retained_terminal_authority",
+                terminal_kind=None,
+                evidence_hash=None,
+                created=False,
+            )
+        )
+        self.process_message.return_value = processing.SourceProcessingDisposition(
+            mode=source_coordinator.CoordinatorMode.ENFORCED,
+            state="blocked",
+            authority=processing.SourceProcessingAuthority(
+                canonical_source_id="source-b1",
+                snapshot_hash="a" * 64,
+                selection_hash="b" * 64,
+                owner_kind="human",
+                owner_key="needs_review",
+                ledger_hash="c" * 64,
+            ),
+        )
+        self.verify_source_settlement.return_value = False
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self.assertRaisesRegex(
+            operator_replay.ReplayRefused,
+            "exact B1 settlement",
+        ):
+            self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.assertIn(failure_path, self.fs.data)
+        failure = self.fs.data[failure_path]
+        self.assertEqual(
+            "operator_replay_settlement_unverified",
+            failure["recoveryStatus"],
+        )
+        self.assertFalse(failure["retryable"])
+        self.assertEqual(
+            self.process_message.call_args.kwargs["operator_replay_attempt_id"],
+            failure["replayAttemptId"],
+        )
+        self.assertEqual("source-b1", failure["canonicalSourceId"])
+        self.assertIs(False, failure["replaySettlementVerified"])
+        self.assertEqual(
+            "SettlementVerificationFailed",
+            failure["replayErrorClass"],
+        )
+        self.assertFalse(
+            any(
+                len(path) >= 3 and path[-2] == "processedMessages"
+                for path in self.fs.data
+            )
+        )
+
+    def test_enforced_settlement_verifier_exception_is_persisted_before_refusal(self):
+        coordinator = self._enforced_apply_coordinator()
+        self.verify_source_settlement.side_effect = RuntimeError(
+            "settlement readback unavailable"
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self.assertRaisesRegex(
+            operator_replay.ReplayRefused,
+            "settlement readback",
+        ):
+            self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        failure = self.fs.data[failure_path]
+        self.assertEqual(
+            "operator_replay_settlement_unverified",
+            failure["recoveryStatus"],
+        )
+        self.assertFalse(failure["retryable"])
+        self.assertEqual(
+            self.process_message.call_args.kwargs["operator_replay_attempt_id"],
+            failure["replayAttemptId"],
+        )
+        self.assertEqual("source-b1", failure["canonicalSourceId"])
+        self.assertIs(False, failure["replaySettlementVerified"])
+        self.assertEqual("RuntimeError", failure["replayErrorClass"])
+
+    def test_enforced_process_alias_drift_does_not_mutate_failure(self):
+        coordinator = self._enforced_apply_coordinator()
+        self.process_message.side_effect = source_coordinator.SourceAliasConflict(
+            "source alias drifted during processing"
+        )
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        failure_before = deepcopy(self.fs.data[failure_path])
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self.assertRaisesRegex(
+            source_coordinator.SourceAliasConflict,
+            "alias drifted",
+        ):
+            self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertEqual(failure_before, self.fs.data[failure_path])
+        self.verify_source_settlement.assert_not_called()
+
+    def test_enforced_process_ambiguous_authority_does_not_mutate_failure(self):
+        coordinator = self._enforced_apply_coordinator()
+        self.process_message.side_effect = (
+            source_coordinator.SourceCoordinatorAmbiguous(
+                "source authority became ambiguous"
+            )
+        )
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        failure_before = deepcopy(self.fs.data[failure_path])
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self.assertRaisesRegex(
+            source_coordinator.SourceCoordinatorAmbiguous,
+            "became ambiguous",
+        ):
+            self.replay(
+                apply=True,
+                source_coordinator_instance=coordinator,
+            )
+
+        self.assertEqual(failure_before, self.fs.data[failure_path])
+        self.verify_source_settlement.assert_not_called()
 
     def test_refuses_terminal_client_or_thread_state(self):
         client_path = ("users", BAYLOR_UID, "clients", CLIENT_ID)

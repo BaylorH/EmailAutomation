@@ -219,6 +219,8 @@ class _Firestore:
 
 class _CommitOutcomeTransaction(_Transaction):
     def commit(self):
+        if not self.writes:
+            return super().commit()
         self.firestore.commit_attempts += 1
         commit_payloads = getattr(self.firestore, "commit_payloads", None)
         if isinstance(commit_payloads, list):
@@ -5093,6 +5095,42 @@ class SendPermitTests(unittest.TestCase):
         self.assertEqual({}, permit_collection.docs)
         self.assertEqual(0, firestore.commit_attempts)
 
+    def test_exact_pending_permit_requires_atomic_source_validator(self):
+        firestore = _CommitOutcomeFirestore()
+        thread_ref = _DocRef(
+            {"clientId": "client-1"},
+            doc_id="thread-exact-validator-required",
+        )
+        token = "pending-owner-exact-validator-required"
+        loaded = _pending_data(thread_ref.id, token=token)
+        pending_ref = _DocRef(
+            loaded,
+            doc_id="pending-exact-validator-required",
+        )
+        original_thread = copy.deepcopy(thread_ref.data)
+        original_pending = copy.deepcopy(pending_ref.data)
+
+        with self.assertRaisesRegex(
+            send_permits.GraphSendPermitBlocked,
+            "validator|source binding",
+        ):
+            send_permits.issue_pending_graph_send_permit(
+                firestore,
+                thread_ref,
+                pending_ref,
+                dict(loaded),
+                token,
+                require_exact_client_binding=True,
+            )
+
+        self.assertEqual(original_thread, thread_ref.data)
+        self.assertEqual(original_pending, pending_ref.data)
+        self.assertEqual(
+            {},
+            thread_ref.collection("graphSendPermits").docs,
+        )
+        self.assertEqual(0, firestore.commit_attempts)
+
     def test_pending_caller_cannot_capabilitylessly_release_linked_permit(self):
         rooted = _RootedFirestore()
         thread_ref = _DocRef(
@@ -7274,8 +7312,16 @@ class SendPermitTests(unittest.TestCase):
                     state_patch = node.args[3] if len(node.args) > 3 else None
                     exact_helper_calls.append((
                         node.lineno,
-                        isinstance(state_patch, ast.Name)
-                        and state_patch.id in stateful_patch_names,
+                        (
+                            isinstance(state_patch, ast.Name)
+                            and state_patch.id in stateful_patch_names
+                        )
+                        or (
+                            len(node.args) == 2
+                            and isinstance(node.args[1], ast.Name)
+                            and node.args[1].id == "prepare_transition"
+                            and "state_patch" in stateful_patch_names
+                        ),
                     ))
                 if (
                     isinstance(node, ast.Call)

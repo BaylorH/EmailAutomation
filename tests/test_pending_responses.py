@@ -1,10 +1,14 @@
+import ast
+import hashlib
 import os
 import sys
 import types
 import unittest
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Event
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +22,19 @@ with patch("google.cloud.firestore.Client", return_value=types.SimpleNamespace()
     from email_automation import pending_responses, processing, send_permits
     from email_automation.campaign_safety import CampaignAutomationDecision
     from email_automation.column_config import get_default_column_config
+
+
+EXACT_PENDING_PROTOCOL = {
+    "kind": "b1_exact_source",
+    "version": 1,
+}
+
+
+def exact_pending_data(data):
+    return {
+        **data,
+        "pendingProtocol": dict(EXACT_PENDING_PROTOCOL),
+    }
 
 
 class FakeDocRef:
@@ -46,8 +63,16 @@ class FakeDocRef:
             return self._doc
         return types.SimpleNamespace(exists=False, to_dict=lambda: {})
 
-    def set(self, data):
+    def set(self, data, merge=False):
         self.set_calls.append(data)
+        if self._doc is None:
+            self._doc = FakeDoc(self.id, {})
+            self._doc.reference = self
+        if merge:
+            self._doc._data.update(data)
+        else:
+            self._doc._data = dict(data)
+        self._doc.exists = True
 
     def collection(self, name):
         return self.subcollections.setdefault(name, FakeCollection())
@@ -146,6 +171,27 @@ class FakeFirestore:
                 FakeDoc(thread_id, {}) for thread_id in sorted(thread_ids)
             ]),
         }
+        exact_bindings = []
+        for doc in pending_docs:
+            data = dict(getattr(doc, "_data", {}) or {})
+            try:
+                protocol = pending_responses._classify_pending_response_protocol(
+                    data
+                )
+            except pending_responses.PendingResponseConflict:
+                continue
+            if protocol != "b1_exact_source":
+                continue
+            payload = pending_responses._pending_source_binding_payload(
+                user_id="uid-1",
+                pending_document_id=doc.id,
+                data=data,
+                pending_revision=data["pendingRevision"],
+            )
+            exact_bindings.append(FakeDoc(payload["bindingId"], payload))
+        self.collections[
+            pending_responses.PENDING_RESPONSE_SOURCE_BINDING_COLLECTION
+        ] = FakeCollection(exact_bindings)
 
     def collection(self, name):
         return self
@@ -171,17 +217,19 @@ class FakeTransaction:
         return types.SimpleNamespace(exists=False, to_dict=lambda: {})
 
     def update(self, document_ref, data):
-        self._updates.append((document_ref, data))
+        self._updates.append(("update", document_ref, data))
 
     def set(self, document_ref, data):
-        self._updates.append((document_ref, data))
+        self._updates.append(("set", document_ref, data))
 
     def delete(self, document_ref):
         self._deletes.append(document_ref)
 
     def commit(self):
-        for document_ref, data in self._updates:
-            if document_ref._doc is not None:
+        for operation, document_ref, data in self._updates:
+            if operation == "set":
+                document_ref.set(data)
+            elif document_ref._doc is not None:
                 document_ref.update(data)
             else:
                 document_ref._doc = FakeDoc(document_ref.id, dict(data))
@@ -391,6 +439,8 @@ class PendingResponsesTests(unittest.TestCase):
 
         self.assertTrue(pending_doc.reference.deleted)
         self.assertEqual("healthy", states[0]["status"])
+        self.assertEqual(2, len(states))
+        self.assertEqual("healthy", states[1]["status"])
         mark_client_completed.assert_called_once_with("uid-1", "client-1")
 
     def test_failed_send_without_local_outcome_keeps_current_retry(self):
@@ -1664,6 +1714,1676 @@ class PendingResponsesTests(unittest.TestCase):
         dead_letter = self._dead_letter_payloads(fake_fs)[-1]
         self.assertEqual(dead_letter["source"], "pendingResponses")
         self.assertIn("Sent Items retry guard could not verify prior send", dead_letter["failureReason"])
+
+    def test_enforced_enqueue_rejects_same_thread_source_overwrite(self):
+        fake_fs = FakeFirestore([])
+        source_a = "source-A"
+        work_a = "1" * 64
+        proposal_a = "2" * 64
+        selection_a = "3" * 64
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            queued = pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-shared",
+                "message-A",
+                "broker@example.com",
+                "Source A body",
+                "client-1",
+                error="definitely unsent",
+                canonical_source_id=source_a,
+                work_key=work_a,
+                proposal_hash=proposal_a,
+                selection_hash=selection_a,
+            )
+            before = dict(
+                fake_fs.collections["pendingResponses"]
+                .document("thread-shared")
+                .get()
+                .to_dict()
+            )
+
+            with self.assertRaises(pending_responses.PendingResponseConflict):
+                pending_responses.queue_pending_response(
+                    "uid-1",
+                    "thread-shared",
+                    "message-B",
+                    "broker@example.com",
+                    "Source B body",
+                    "client-1",
+                    error="definitely unsent",
+                    canonical_source_id="source-B",
+                    work_key="4" * 64,
+                    proposal_hash="5" * 64,
+                    selection_hash="6" * 64,
+                )
+
+        after = (
+            fake_fs.collections["pendingResponses"]
+            .document("thread-shared")
+            .get()
+            .to_dict()
+        )
+        self.assertIsInstance(queued, pending_responses.PendingResponseRecord)
+        self.assertEqual(source_a, queued.canonical_source_id)
+        self.assertEqual(1, queued.pending_revision)
+        self.assertEqual(before, after)
+        self.assertEqual("Source A body", after["responseBody"])
+        self.assertEqual(source_a, after["canonicalSourceId"])
+        self.assertEqual(work_a, after["workKey"])
+        envelope_hash = send_permits.pending_envelope_hash(after)
+        source_binding = (
+            fake_fs.collections["pendingResponseSourceBindings"]
+            .document(f"pending-source-{envelope_hash}")
+            .get()
+        )
+        self.assertTrue(source_binding.exists)
+        self.assertEqual(
+            source_a,
+            source_binding.to_dict()["canonicalSourceId"],
+        )
+
+    def test_enforced_enqueue_requires_both_hashes_before_firestore_access(self):
+        exact = {
+            "canonical_source_id": "source-A",
+            "work_key": "1" * 64,
+            "proposal_hash": "2" * 64,
+            "selection_hash": "3" * 64,
+        }
+
+        for omitted in ("proposal_hash", "selection_hash"):
+            with self.subTest(omitted=omitted):
+                fake_fs = MagicMock(name=f"firestore_without_{omitted}")
+                arguments = {**exact}
+                arguments.pop(omitted)
+                with patch.dict(
+                    os.environ,
+                    {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+                ), self._mock_clients_module(fake_fs), self.assertRaises(
+                    pending_responses.PendingResponseConflict
+                ):
+                    pending_responses.queue_pending_response(
+                        "uid-1",
+                        "thread-A",
+                        "message-A",
+                        "broker@example.com",
+                        "Source A body",
+                        "client-1",
+                        error="definitely unsent",
+                        **arguments,
+                    )
+
+                fake_fs.collection.assert_not_called()
+
+    def test_enforced_sent_unindexed_record_requires_and_persists_binding(self):
+        binding = {
+            "canonical_source_id": "source-A",
+            "work_key": "1" * 64,
+            "proposal_hash": "2" * 64,
+            "selection_hash": "3" * 64,
+        }
+        inaccessible_fs = MagicMock(name="unbound_reconciliation_firestore")
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(inaccessible_fs), self.assertRaises(
+            pending_responses.PendingResponseConflict
+        ):
+            pending_responses.record_sent_unindexed_response(
+                "uid-1",
+                "thread-A",
+                "message-A",
+                "broker@example.com",
+                "Source A body",
+                "client-1",
+                "Sent indexing failed",
+            )
+        inaccessible_fs.collection.assert_not_called()
+
+        fake_fs = FakeFirestore([])
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            pending_responses.record_sent_unindexed_response(
+                "uid-1",
+                "thread-A",
+                "message-A",
+                "broker@example.com",
+                "Source A body",
+                "client-1",
+                "Sent indexing failed",
+                **binding,
+            )
+
+        payload = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertEqual("source-A", payload["canonicalSourceId"])
+        self.assertEqual("1" * 64, payload["workKey"])
+        self.assertEqual("2" * 64, payload["proposalHash"])
+        self.assertEqual("3" * 64, payload["selectionHash"])
+
+    def test_enforced_exact_source_retry_validates_every_binding(self):
+        fake_fs = FakeFirestore([])
+        exact = {
+            "canonical_source_id": "source-A",
+            "work_key": "1" * 64,
+            "proposal_hash": "2" * 64,
+            "selection_hash": "3" * 64,
+        }
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            first = pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-A",
+                "message-A",
+                "broker@example.com",
+                "Source A body",
+                "client-1",
+                error="first failure",
+                **exact,
+            )
+            retried = pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-A",
+                "message-A",
+                "broker@example.com",
+                "Source A body",
+                "client-1",
+                error="second failure",
+                **exact,
+            )
+
+            self.assertEqual(1, first.pending_revision)
+            self.assertEqual(2, retried.pending_revision)
+            self.assertEqual(2, retried.data["attempts"])
+            self.assertEqual("second failure", retried.data["lastError"])
+
+            for field, replacement in (
+                ("canonical_source_id", "source-B"),
+                ("work_key", "4" * 64),
+                ("proposal_hash", "5" * 64),
+                ("selection_hash", "6" * 64),
+            ):
+                with self.subTest(field=field):
+                    drifted = {**exact, field: replacement}
+                    with self.assertRaises(
+                        pending_responses.PendingResponseConflict
+                    ):
+                        pending_responses.queue_pending_response(
+                            "uid-1",
+                            "thread-A",
+                            "message-A",
+                            "broker@example.com",
+                            "Source A body",
+                            "client-1",
+                            error="drifted retry",
+                            **drifted,
+                        )
+
+        stored = (
+            fake_fs.collections["pendingResponses"]
+            .document("thread-A")
+            .get()
+            .to_dict()
+        )
+        self.assertEqual(2, stored["pendingRevision"])
+        self.assertEqual("second failure", stored["lastError"])
+        binding_id = (
+            f"pending-source-{send_permits.pending_envelope_hash(stored)}"
+        )
+        binding = (
+            fake_fs.collections["pendingResponseSourceBindings"]
+            .document(binding_id)
+            .get()
+            .to_dict()
+        )
+        self.assertEqual(2, binding["pendingRevision"])
+        self.assertIsNone(binding["claimTokenHash"])
+
+    def test_require_pending_response_exact_is_typed_and_fails_closed(self):
+        exact_doc = FakeDoc("thread-A", exact_pending_data({
+            "threadId": "thread-A",
+            "msgId": "message-A",
+            "recipient": "broker@example.com",
+            "responseBody": "Source A body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "canonicalSourceId": "source-A",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 7,
+        }))
+        malformed_doc = FakeDoc("thread-malformed", {
+            "threadId": "thread-malformed",
+            "canonicalSourceId": "source-malformed",
+            "workKey": "4" * 64,
+            "proposalHash": "5" * 64,
+            "pendingRevision": 1,
+        })
+        fake_fs = FakeFirestore([exact_doc, malformed_doc])
+
+        with self._mock_clients_module(fake_fs):
+            record = pending_responses.require_pending_response_exact(
+                "uid-1", "thread-A", "source-A", "1" * 64
+            )
+            self.assertIsInstance(record, pending_responses.PendingResponseRecord)
+            self.assertEqual(7, record.pending_revision)
+            self.assertEqual("2" * 64, record.proposal_hash)
+            self.assertEqual("3" * 64, record.selection_hash)
+
+            for source_id, work_key in (
+                ("source-B", "1" * 64),
+                ("source-A", "9" * 64),
+            ):
+                with self.subTest(source_id=source_id, work_key=work_key):
+                    with self.assertRaises(
+                        pending_responses.PendingResponseConflict
+                    ):
+                        pending_responses.require_pending_response_exact(
+                            "uid-1", "thread-A", source_id, work_key
+                        )
+
+            with self.assertRaises(pending_responses.PendingResponseConflict):
+                pending_responses.require_pending_response_exact(
+                    "uid-1",
+                    "thread-malformed",
+                    "source-malformed",
+                    "4" * 64,
+                )
+            with self.assertRaises(pending_responses.PendingResponseRetryable):
+                pending_responses.require_pending_response_exact(
+                    "uid-1", "thread-missing", "source-A", "1" * 64
+                )
+
+    def test_exact_claim_requires_revision_and_returns_bound_claim(self):
+        pending_doc = FakeDoc("thread-A", exact_pending_data({
+            "threadId": "thread-A",
+            "msgId": "message-A",
+            "recipient": "broker@example.com",
+            "responseBody": "Source A body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "canonicalSourceId": "source-A",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 4,
+            "status": "queued",
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+        fake_fs.collections["threads"].document("thread-A").get()._data[
+            "clientId"
+        ] = "client-1"
+
+        with self._mock_clients_module(fake_fs):
+            with self.assertRaises(pending_responses.PendingResponseConflict):
+                pending_responses.claim_pending_response_for_send_exact(
+                    "uid-1", "thread-A", "source-B", "9" * 64, 4
+                )
+            self.assertEqual([], pending_doc.reference.update_calls)
+
+            with self.assertRaises(pending_responses.PendingResponseRetryable):
+                pending_responses.claim_pending_response_for_send_exact(
+                    "uid-1", "thread-A", "source-A", "1" * 64, 3
+                )
+            self.assertEqual([], pending_doc.reference.update_calls)
+
+            claim = pending_responses.claim_pending_response_for_send_exact(
+                "uid-1", "thread-A", "source-A", "1" * 64, 4
+            )
+
+        self.assertIsInstance(claim, pending_responses.PendingResponseClaim)
+        self.assertEqual("source-A", claim.canonical_source_id)
+        self.assertEqual("1" * 64, claim.work_key)
+        self.assertEqual(5, claim.pending_revision)
+        self.assertTrue(claim.claim_token.startswith("pending-response-"))
+        self.assertEqual("sending", pending_doc.to_dict()["status"])
+        self.assertEqual(claim.claim_token, pending_doc.to_dict()["processingBy"])
+        self.assertEqual(5, pending_doc.to_dict()["pendingRevision"])
+        binding_id = (
+            "pending-source-"
+            f"{send_permits.pending_envelope_hash(pending_doc.to_dict())}"
+        )
+        binding = (
+            fake_fs.collections["pendingResponseSourceBindings"]
+            .document(binding_id)
+            .get()
+            .to_dict()
+        )
+        self.assertEqual(5, binding["pendingRevision"])
+        self.assertEqual(
+            hashlib.sha256(claim.claim_token.encode("utf-8")).hexdigest(),
+            binding["claimTokenHash"],
+        )
+
+    def test_enforced_worker_rejects_cross_client_pending_before_any_effect(self):
+        pending_doc = FakeDoc("thread-client-A", exact_pending_data({
+            "threadId": "thread-client-A",
+            "msgId": "message-A",
+            "recipient": "broker@example.com",
+            "responseBody": "Source A body",
+            "clientId": "client-B",
+            "attempts": 0,
+            "canonicalSourceId": "source-A",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 1,
+            "status": "queued",
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+        fake_fs.collections["threads"].document("thread-client-A").get()._data[
+            "clientId"
+        ] = "client-A"
+        binding_id = (
+            "pending-source-"
+            f"{send_permits.pending_envelope_hash(pending_doc.to_dict())}"
+        )
+        binding_doc = (
+            fake_fs.collections["pendingResponseSourceBindings"]
+            .document(binding_id)
+            .get()
+        )
+        pending_before = dict(pending_doc.to_dict())
+        binding_before = dict(binding_doc.to_dict())
+        self.campaign_decision.reset_mock()
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs), patch.object(
+            pending_responses,
+            "_reconcile_expired_pending_permit",
+        ) as reconcile_expired, patch.object(
+            pending_responses,
+            "_final_pending_response_send_fence",
+        ) as final_fence, patch.object(
+            processing,
+            "send_reply_in_thread",
+        ) as graph_send:
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual(1, len(states))
+        self.assertEqual("error", states[0]["status"])
+        self.assertIn("client", states[0]["error"])
+        self.assertEqual(pending_before, pending_doc.to_dict())
+        self.assertEqual([], pending_doc.reference.update_calls)
+        self.assertEqual(binding_before, binding_doc.to_dict())
+        self.assertEqual([], binding_doc.reference.update_calls)
+        self.campaign_decision.assert_not_called()
+        reconcile_expired.assert_not_called()
+        final_fence.assert_not_called()
+        graph_send.assert_not_called()
+
+    def test_exact_claim_preserves_clientless_pending_behavior(self):
+        pending_doc = FakeDoc("thread-clientless", exact_pending_data({
+            "threadId": "thread-clientless",
+            "msgId": "message-clientless",
+            "recipient": "broker@example.com",
+            "responseBody": "Clientless response body",
+            "clientId": None,
+            "attempts": 0,
+            "canonicalSourceId": "source-clientless",
+            "workKey": "4" * 64,
+            "proposalHash": "5" * 64,
+            "selectionHash": "6" * 64,
+            "pendingRevision": 1,
+            "status": "queued",
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            claim = pending_responses.claim_pending_response_for_send_exact(
+                "uid-1",
+                "thread-clientless",
+                "source-clientless",
+                "4" * 64,
+                1,
+            )
+            capability = pending_responses._final_pending_response_send_fence(
+                "uid-1",
+                pending_doc,
+                claim.data,
+                claim.claim_token,
+            )
+
+        self.assertIsNone(claim.data["clientId"])
+        self.assertEqual("sending", claim.data["status"])
+        self.assertEqual(claim.claim_token, claim.data["processingBy"])
+        self.assertIsNotNone(capability)
+
+    def test_exact_final_permit_rejects_client_rebind_after_claim(self):
+        pending_doc = FakeDoc("thread-client-rebind", exact_pending_data({
+            "threadId": "thread-client-rebind",
+            "msgId": "message-client-rebind",
+            "recipient": "broker@example.com",
+            "responseBody": "Client-bound response body",
+            "clientId": "client-A",
+            "attempts": 0,
+            "canonicalSourceId": "source-client-rebind",
+            "workKey": "7" * 64,
+            "proposalHash": "8" * 64,
+            "selectionHash": "9" * 64,
+            "pendingRevision": 1,
+            "status": "queued",
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+        thread_doc = (
+            fake_fs.collections["threads"]
+            .document("thread-client-rebind")
+            .get()
+        )
+        thread_doc._data["clientId"] = "client-A"
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            claim = pending_responses.claim_pending_response_for_send_exact(
+                "uid-1",
+                "thread-client-rebind",
+                "source-client-rebind",
+                "7" * 64,
+                1,
+            )
+            binding_id = (
+                "pending-source-"
+                f"{send_permits.pending_envelope_hash(claim.data)}"
+            )
+            binding_doc = (
+                fake_fs.collections["pendingResponseSourceBindings"]
+                .document(binding_id)
+                .get()
+            )
+            pending_after_claim = dict(pending_doc.to_dict())
+            binding_after_claim = dict(binding_doc.to_dict())
+            pending_update_count = len(pending_doc.reference.update_calls)
+            binding_update_count = len(binding_doc.reference.update_calls)
+
+            thread_doc._data["clientId"] = "client-B"
+            with self.assertRaisesRegex(RuntimeError, "client"):
+                pending_responses._final_pending_response_send_fence(
+                    "uid-1",
+                    pending_doc,
+                    claim.data,
+                    claim.claim_token,
+                )
+
+        self.assertEqual(pending_after_claim, pending_doc.to_dict())
+        self.assertEqual(
+            pending_update_count,
+            len(pending_doc.reference.update_calls),
+        )
+        self.assertEqual(binding_after_claim, binding_doc.to_dict())
+        self.assertEqual(
+            binding_update_count,
+            len(binding_doc.reference.update_calls),
+        )
+        self.assertNotIn("activeGraphSendPermit", thread_doc.to_dict())
+        self.assertEqual(
+            [],
+            thread_doc.reference.collection("graphSendPermits").stream(),
+        )
+
+    def test_exact_final_permit_rejects_deleted_binding_after_claim(self):
+        pending_doc = FakeDoc("thread-binding-deleted", exact_pending_data({
+            "threadId": "thread-binding-deleted",
+            "msgId": "message-binding-deleted",
+            "recipient": "broker@example.com",
+            "responseBody": "Exact source response body",
+            "clientId": "client-A",
+            "attempts": 0,
+            "canonicalSourceId": "source-binding-deleted",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 1,
+            "status": "queued",
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+        thread_doc = (
+            fake_fs.collections["threads"]
+            .document("thread-binding-deleted")
+            .get()
+        )
+        thread_doc._data["clientId"] = "client-A"
+        provider_effect = MagicMock(name="graph_provider_effect")
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            claim = pending_responses.claim_pending_response_for_send_exact(
+                "uid-1",
+                "thread-binding-deleted",
+                "source-binding-deleted",
+                "1" * 64,
+                1,
+            )
+            binding_id = (
+                "pending-source-"
+                f"{send_permits.pending_envelope_hash(claim.data)}"
+            )
+            binding_doc = (
+                fake_fs.collections["pendingResponseSourceBindings"]
+                .document(binding_id)
+                .get()
+            )
+            binding_doc.exists = False
+            pending_before_fence = dict(pending_doc.to_dict())
+            thread_before_fence = dict(thread_doc.to_dict())
+            pending_update_count = len(pending_doc.reference.update_calls)
+            thread_update_count = len(thread_doc.reference.update_calls)
+
+            with patch.dict(
+                os.environ,
+                {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+            ), self.assertRaisesRegex(RuntimeError, "source binding"):
+                capability = pending_responses._final_pending_response_send_fence(
+                    "uid-1",
+                    pending_doc,
+                    claim.data,
+                    claim.claim_token,
+                )
+                provider_effect(capability)
+
+        provider_effect.assert_not_called()
+        self.assertEqual(pending_before_fence, pending_doc.to_dict())
+        self.assertEqual(
+            pending_update_count,
+            len(pending_doc.reference.update_calls),
+        )
+        self.assertEqual(thread_before_fence, thread_doc.to_dict())
+        self.assertEqual(
+            thread_update_count,
+            len(thread_doc.reference.update_calls),
+        )
+        self.assertFalse(binding_doc.exists)
+        self.assertEqual(
+            [],
+            thread_doc.reference.collection("graphSendPermits").stream(),
+        )
+
+    def test_exact_final_permit_rejects_recomputed_binding_drift_after_claim(self):
+        pending_doc = FakeDoc("thread-binding-drift", exact_pending_data({
+            "threadId": "thread-binding-drift",
+            "msgId": "message-binding-drift",
+            "recipient": "broker@example.com",
+            "responseBody": "Exact source response body",
+            "clientId": "client-A",
+            "attempts": 0,
+            "canonicalSourceId": "source-A",
+            "workKey": "4" * 64,
+            "proposalHash": "5" * 64,
+            "selectionHash": "6" * 64,
+            "pendingRevision": 1,
+            "status": "queued",
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+        thread_doc = (
+            fake_fs.collections["threads"]
+            .document("thread-binding-drift")
+            .get()
+        )
+        thread_doc._data["clientId"] = "client-A"
+        provider_effect = MagicMock(name="graph_provider_effect")
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            claim = pending_responses.claim_pending_response_for_send_exact(
+                "uid-1",
+                "thread-binding-drift",
+                "source-A",
+                "4" * 64,
+                1,
+            )
+            binding_id = (
+                "pending-source-"
+                f"{send_permits.pending_envelope_hash(claim.data)}"
+            )
+            binding_doc = (
+                fake_fs.collections["pendingResponseSourceBindings"]
+                .document(binding_id)
+                .get()
+            )
+            drift = {
+                "canonicalSourceId": "source-B",
+                "workKey": "7" * 64,
+                "proposalHash": "8" * 64,
+                "selectionHash": "9" * 64,
+            }
+            pending_doc._data.update(drift)
+            binding_doc._data.update(drift)
+            immutable = {
+                field: binding_doc._data[field]
+                for field in pending_responses._PENDING_RESPONSE_SOURCE_BINDING_IMMUTABLE_FIELDS
+            }
+            binding_doc._data["immutableHash"] = (
+                send_permits._stable_evidence_hash(immutable)
+            )
+            binding_doc._data["claimBindingHash"] = (
+                send_permits._stable_evidence_hash({
+                    "immutableHash": binding_doc._data["immutableHash"],
+                    "pendingRevision": binding_doc._data["pendingRevision"],
+                })
+            )
+            pending_before_fence = dict(pending_doc.to_dict())
+            binding_before_fence = dict(binding_doc.to_dict())
+            thread_before_fence = dict(thread_doc.to_dict())
+            pending_update_count = len(pending_doc.reference.update_calls)
+            binding_update_count = len(binding_doc.reference.update_calls)
+            thread_update_count = len(thread_doc.reference.update_calls)
+
+            with self.assertRaisesRegex(RuntimeError, "claim binding"):
+                capability = pending_responses._final_pending_response_send_fence(
+                    "uid-1",
+                    pending_doc,
+                    claim.data,
+                    claim.claim_token,
+                )
+                provider_effect(capability)
+
+        provider_effect.assert_not_called()
+        self.assertEqual(pending_before_fence, pending_doc.to_dict())
+        self.assertEqual(
+            pending_update_count,
+            len(pending_doc.reference.update_calls),
+        )
+        self.assertEqual(binding_before_fence, binding_doc.to_dict())
+        self.assertEqual(
+            binding_update_count,
+            len(binding_doc.reference.update_calls),
+        )
+        self.assertEqual(thread_before_fence, thread_doc.to_dict())
+        self.assertEqual(
+            thread_update_count,
+            len(thread_doc.reference.update_calls),
+        )
+        self.assertEqual(
+            [],
+            thread_doc.reference.collection("graphSendPermits").stream(),
+        )
+
+    def test_exact_clear_never_deletes_different_source_or_revision(self):
+        pending_doc = FakeDoc("thread-shared", exact_pending_data({
+            "threadId": "thread-shared",
+            "msgId": "message-B",
+            "recipient": "broker@example.com",
+            "responseBody": "Source B body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "canonicalSourceId": "source-B",
+            "workKey": "4" * 64,
+            "proposalHash": "5" * 64,
+            "selectionHash": "6" * 64,
+            "pendingRevision": 9,
+            "status": "queued",
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+
+        with self._mock_clients_module(fake_fs):
+            with self.assertRaises(pending_responses.PendingResponseConflict):
+                pending_responses.clear_pending_response_exact(
+                    "uid-1", "thread-shared", "source-A", "1" * 64, 9
+                )
+            self.assertTrue(pending_doc.exists)
+            self.assertFalse(pending_doc.reference.deleted)
+
+            with self.assertRaises(pending_responses.PendingResponseRetryable):
+                pending_responses.clear_pending_response_exact(
+                    "uid-1", "thread-shared", "source-B", "4" * 64, 8
+                )
+            self.assertTrue(pending_doc.exists)
+            self.assertFalse(pending_doc.reference.deleted)
+
+            result = pending_responses.clear_pending_response_exact(
+                "uid-1", "thread-shared", "source-B", "4" * 64, 9
+            )
+
+        self.assertIsInstance(result, pending_responses.PendingResponseClearResult)
+        self.assertTrue(result.cleared)
+        self.assertEqual("source-B", result.canonical_source_id)
+        self.assertEqual("4" * 64, result.work_key)
+        self.assertEqual(9, result.pending_revision)
+        self.assertFalse(pending_doc.exists)
+        binding_id = (
+            "pending-source-"
+            f"{send_permits.pending_envelope_hash(pending_doc.to_dict())}"
+        )
+        self.assertFalse(
+            fake_fs.collections["pendingResponseSourceBindings"]
+            .document(binding_id)
+            .get()
+            .exists
+        )
+
+    def test_enforced_legacy_clear_raises_before_firestore_access(self):
+        fake_fs = MagicMock(name="firestore")
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            with self.assertRaises(pending_responses.PendingResponseConflict):
+                pending_responses.clear_pending_response(
+                    "uid-1", "thread-A"
+                )
+
+        fake_fs.collection.assert_not_called()
+
+    def test_disabled_queue_and_thread_clear_preserve_legacy_contract(self):
+        fake_fs = FakeFirestore([])
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(fake_fs):
+            document_id = pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-legacy",
+                "message-legacy",
+                "broker@example.com",
+                "Legacy body",
+                "client-1",
+                error="legacy failure",
+            )
+            stored = (
+                fake_fs.collections["pendingResponses"]
+                .document("thread-legacy")
+                .get()
+                .to_dict()
+            )
+            cleared = pending_responses.clear_pending_response(
+                "uid-1", "thread-legacy"
+            )
+
+        self.assertEqual("thread-legacy", document_id)
+        self.assertNotIn("canonicalSourceId", stored)
+        self.assertTrue(cleared)
+        self.assertFalse(
+            fake_fs.collections["pendingResponses"]
+            .document("thread-legacy")
+            .get()
+            .exists
+        )
+
+    def test_persisted_pending_protocol_classifier_is_strict_and_reusable(self):
+        classifier = getattr(
+            pending_responses,
+            "_classify_pending_response_protocol",
+            None,
+        )
+        self.assertTrue(callable(classifier))
+        legacy = {
+            "threadId": "thread-legacy",
+            "msgId": "message-legacy",
+            "recipient": "broker@example.com",
+            "responseBody": "Legacy body",
+            "attempts": 1,
+        }
+        exact = exact_pending_data({
+            **legacy,
+            "canonicalSourceId": "source-A",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 1,
+        })
+        self.assertEqual("legacy", classifier(legacy))
+        self.assertEqual("b1_exact_source", classifier(exact))
+        for malformed in (
+            {**legacy, "canonicalSourceId": "source-A"},
+            {**legacy, "pendingProtocol": dict(EXACT_PENDING_PROTOCOL)},
+            {**exact, "pendingProtocol": {"kind": "wrong", "version": 1}},
+        ):
+            with self.subTest(record=malformed), self.assertRaises(
+                pending_responses.PendingResponseConflict
+            ):
+                classifier(malformed)
+
+    def test_disabled_queue_cannot_overwrite_exact_pending_or_orphan_binding(self):
+        fake_fs = FakeFirestore([])
+        exact_arguments = {
+            "canonical_source_id": "source-A",
+            "work_key": "1" * 64,
+            "proposal_hash": "2" * 64,
+            "selection_hash": "3" * 64,
+        }
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-rollback",
+                "message-A",
+                "broker@example.com",
+                "Source A body",
+                "client-1",
+                error="source A failed",
+                **exact_arguments,
+            )
+
+        pending_doc = (
+            fake_fs.collections["pendingResponses"]
+            .document("thread-rollback")
+            .get()
+        )
+        pending_before = deepcopy(pending_doc.to_dict())
+        envelope_hash = send_permits.pending_envelope_hash(pending_before)
+        binding_doc = (
+            fake_fs.collections["pendingResponseSourceBindings"]
+            .document(f"pending-source-{envelope_hash}")
+            .get()
+        )
+        binding_before = deepcopy(binding_doc.to_dict())
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(fake_fs), self.assertRaises(
+            pending_responses.PendingResponseConflict
+        ):
+            pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-rollback",
+                "message-legacy",
+                "broker@example.com",
+                "Legacy rollback body",
+                "client-1",
+                error="legacy rollback",
+            )
+
+        self.assertEqual(EXACT_PENDING_PROTOCOL, pending_before["pendingProtocol"])
+        self.assertEqual(pending_before, pending_doc.to_dict())
+        self.assertEqual("source-A", pending_doc.to_dict()["canonicalSourceId"])
+        self.assertTrue(binding_doc.exists)
+        self.assertEqual(binding_before, binding_doc.to_dict())
+        self.assertEqual(
+            EXACT_PENDING_PROTOCOL,
+            binding_doc.to_dict()["pendingProtocol"],
+        )
+        drifted_protocol = {
+            **pending_before,
+            "pendingProtocol": {"kind": "different", "version": 1},
+        }
+        self.assertNotEqual(
+            envelope_hash,
+            send_permits.pending_envelope_hash(drifted_protocol),
+        )
+
+    def test_disabled_legacy_mutations_abort_if_exact_work_wins_after_read(self):
+        class AbortAfterExactCommit(FakeTransaction):
+            def __init__(self, target_ref, exact_data):
+                super().__init__()
+                self._target_ref = target_ref
+                self._exact_data = deepcopy(exact_data)
+
+            def commit(self):
+                exact_doc = FakeDoc(
+                    self._target_ref.id,
+                    deepcopy(self._exact_data),
+                )
+                exact_doc.reference = self._target_ref
+                self._target_ref._doc = exact_doc
+                raise RuntimeError("ABORTED: document changed after transaction read")
+
+        exact = exact_pending_data({
+            "threadId": "thread-mixed-race",
+            "msgId": "message-exact",
+            "recipient": "broker@example.com",
+            "responseBody": "Exact source body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "status": "queued",
+            "canonicalSourceId": "source-A",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 1,
+        })
+
+        enqueue_fs = FakeFirestore([])
+        enqueue_ref = enqueue_fs.collections["pendingResponses"].document(
+            "thread-mixed-race"
+        )
+        enqueue_fs.transaction = lambda: AbortAfterExactCommit(
+            enqueue_ref,
+            exact,
+        )
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(enqueue_fs), self.assertRaisesRegex(
+            RuntimeError,
+            "ABORTED",
+        ):
+            pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-mixed-race",
+                "message-legacy",
+                "broker@example.com",
+                "Legacy body",
+                "client-1",
+            )
+        self.assertEqual(exact, enqueue_ref.get().to_dict())
+
+        legacy = {
+            "threadId": "thread-mixed-race",
+            "msgId": "message-legacy",
+            "recipient": "broker@example.com",
+            "responseBody": "Legacy body",
+            "clientId": "client-1",
+            "attempts": 1,
+        }
+        clear_doc = FakeDoc("thread-mixed-race", legacy)
+        clear_fs = FakeFirestore([clear_doc])
+        clear_ref = clear_doc.reference
+        clear_fs.transaction = lambda: AbortAfterExactCommit(
+            clear_ref,
+            exact,
+        )
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(clear_fs), self.assertRaisesRegex(
+            RuntimeError,
+            "ABORTED",
+        ):
+            pending_responses.clear_pending_response(
+                "uid-1",
+                "thread-mixed-race",
+            )
+        self.assertTrue(clear_ref.get().exists)
+        self.assertEqual(exact, clear_ref.get().to_dict())
+
+    def test_disabled_clear_activates_real_firestore_transaction_before_read(self):
+        from google.auth.credentials import AnonymousCredentials
+        from google.cloud import firestore
+        from google.cloud.firestore_v1.types import firestore as firestore_types
+
+        real_fs = firestore.Client(
+            project="pending-transaction-regression",
+            credentials=AnonymousCredentials(),
+        )
+        firestore_api = MagicMock(name="firestore_api")
+        firestore_api.begin_transaction.return_value = types.SimpleNamespace(
+            transaction=b"pending-transaction-id",
+        )
+        firestore_api.batch_get_documents.return_value = iter((
+            firestore_types.BatchGetDocumentsResponse(
+                missing=(
+                    "projects/pending-transaction-regression/databases/"
+                    "(default)/documents/users/uid-real-transaction/"
+                    "pendingResponses/thread-real-transaction"
+                ),
+            ),
+        ))
+        firestore_api.commit.return_value = types.SimpleNamespace(
+            write_results=(),
+            commit_time=None,
+        )
+        real_fs._firestore_api_internal = firestore_api
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(real_fs):
+            cleared = pending_responses.clear_pending_response(
+                "uid-real-transaction",
+                "thread-real-transaction",
+            )
+
+        self.assertFalse(cleared)
+        firestore_api.begin_transaction.assert_called_once()
+        firestore_api.batch_get_documents.assert_called_once()
+        read_request = firestore_api.batch_get_documents.call_args.kwargs[
+            "request"
+        ]
+        self.assertEqual(
+            b"pending-transaction-id",
+            read_request["transaction"],
+        )
+        firestore_api.commit.assert_called_once()
+
+    def test_pending_response_has_no_manual_firestore_transaction_lifecycle(self):
+        source_path = Path(pending_responses.__file__)
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        unsupported = [
+            (node.lineno, node.func.attr)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"transaction", "commit"}
+        ]
+
+        self.assertEqual([], unsupported)
+
+    def test_disabled_queue_fails_closed_on_partial_or_malformed_b1_markers(self):
+        base = {
+            "threadId": "thread-partial",
+            "msgId": "message-partial",
+            "recipient": "broker@example.com",
+            "responseBody": "Original body",
+            "clientId": "client-1",
+            "attempts": 1,
+        }
+        cases = {
+            "source marker only": {"canonicalSourceId": "source-A"},
+            "protocol only": {"pendingProtocol": dict(EXACT_PENDING_PROTOCOL)},
+            "full markers without protocol": {
+                "canonicalSourceId": "source-A",
+                "workKey": "1" * 64,
+                "proposalHash": "2" * 64,
+                "selectionHash": "3" * 64,
+                "pendingRevision": 1,
+            },
+            "malformed protocol": exact_pending_data({
+                "canonicalSourceId": "source-A",
+                "workKey": "1" * 64,
+                "proposalHash": "2" * 64,
+                "selectionHash": "3" * 64,
+                "pendingRevision": 1,
+            }) | {"pendingProtocol": {"kind": "b1_exact_source", "version": 2}},
+        }
+
+        for label, markers in cases.items():
+            with self.subTest(case=label):
+                pending_doc = FakeDoc(
+                    "thread-partial",
+                    {**base, **markers},
+                )
+                fake_fs = FakeFirestore([pending_doc])
+                before = deepcopy(pending_doc.to_dict())
+                with patch.dict(
+                    os.environ,
+                    {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+                ), self._mock_clients_module(fake_fs), self.assertRaises(
+                    pending_responses.PendingResponseConflict
+                ):
+                    pending_responses.queue_pending_response(
+                        "uid-1",
+                        "thread-partial",
+                        "message-replacement",
+                        "broker@example.com",
+                        "Replacement body",
+                        "client-1",
+                    )
+
+                self.assertEqual(before, pending_doc.to_dict())
+                self.assertEqual([], pending_doc.reference.set_calls)
+
+    def test_disabled_legacy_clear_refuses_exact_partial_and_malformed_records(self):
+        base = {
+            "threadId": "thread-clear",
+            "msgId": "message-clear",
+            "recipient": "broker@example.com",
+            "responseBody": "Retained body",
+            "clientId": "client-1",
+            "attempts": 1,
+        }
+        cases = {
+            "exact": exact_pending_data({
+                **base,
+                "canonicalSourceId": "source-A",
+                "workKey": "1" * 64,
+                "proposalHash": "2" * 64,
+                "selectionHash": "3" * 64,
+                "pendingRevision": 1,
+            }),
+            "partial": {**base, "canonicalSourceId": "source-A"},
+            "malformed": {
+                **base,
+                "pendingProtocol": {"kind": "b1_exact_source", "version": 99},
+                "canonicalSourceId": "source-A",
+                "workKey": "1" * 64,
+                "proposalHash": "2" * 64,
+                "selectionHash": "3" * 64,
+                "pendingRevision": 1,
+            },
+        }
+
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                pending_doc = FakeDoc("thread-clear", data)
+                fake_fs = FakeFirestore([pending_doc])
+                before = deepcopy(pending_doc.to_dict())
+                binding_before = {
+                    doc.id: deepcopy(doc.to_dict())
+                    for doc in fake_fs.collections[
+                        "pendingResponseSourceBindings"
+                    ].stream()
+                }
+                with patch.dict(
+                    os.environ,
+                    {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+                ), self._mock_clients_module(fake_fs), self.assertRaises(
+                    pending_responses.PendingResponseConflict
+                ):
+                    pending_responses.clear_pending_response(
+                        "uid-1",
+                        "thread-clear",
+                    )
+
+                self.assertTrue(pending_doc.exists)
+                self.assertFalse(pending_doc.reference.deleted)
+                self.assertEqual(before, pending_doc.to_dict())
+                self.assertEqual(
+                    binding_before,
+                    {
+                        doc.id: deepcopy(doc.to_dict())
+                        for doc in fake_fs.collections[
+                            "pendingResponseSourceBindings"
+                        ].stream()
+                    },
+                )
+
+    def test_disabled_processing_has_zero_effects_on_exact_or_malformed_records(self):
+        base = {
+            "threadId": "thread-rollback-worker",
+            "msgId": "message-A",
+            "recipient": "broker@example.com",
+            "responseBody": "Retained body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "status": "queued",
+        }
+        cases = {
+            "exact": exact_pending_data({
+                **base,
+                "canonicalSourceId": "source-A",
+                "workKey": "1" * 64,
+                "proposalHash": "2" * 64,
+                "selectionHash": "3" * 64,
+                "pendingRevision": 1,
+            }),
+            "partial": {**base, "canonicalSourceId": "source-A"},
+            "full markers without protocol": {
+                **base,
+                "canonicalSourceId": "source-A",
+                "workKey": "1" * 64,
+                "proposalHash": "2" * 64,
+                "selectionHash": "3" * 64,
+                "pendingRevision": 1,
+            },
+            "malformed protocol": {
+                **base,
+                "pendingProtocol": {"kind": "wrong", "version": 1},
+                "canonicalSourceId": "source-A",
+                "workKey": "1" * 64,
+                "proposalHash": "2" * 64,
+                "selectionHash": "3" * 64,
+                "pendingRevision": 1,
+            },
+        }
+
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                pending_doc = FakeDoc("thread-rollback-worker", data)
+                fake_fs = FakeFirestore([pending_doc])
+                before = deepcopy(pending_doc.to_dict())
+                self.campaign_decision.reset_mock()
+                with patch.dict(
+                    os.environ,
+                    {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+                ), self._mock_clients_module(fake_fs), patch.object(
+                    pending_responses,
+                    "_process_pending_completion_obligations",
+                    return_value=[],
+                ) as completion_reconciliation, patch.object(
+                    pending_responses,
+                    "_claim_pending_response_for_send",
+                    return_value=None,
+                ) as legacy_claim, patch.object(
+                    pending_responses,
+                    "_reconcile_expired_pending_permit",
+                    return_value=False,
+                ) as permit_reconciliation, patch.object(
+                    pending_responses,
+                    "_final_pending_response_send_fence",
+                ) as permit_issue, patch.object(
+                    pending_responses,
+                    "find_matching_sent_message_for_retry",
+                ) as provider_read, patch.object(
+                    pending_responses,
+                    "_cas_pending_update",
+                ) as pending_update, patch.object(
+                    pending_responses,
+                    "_cas_pending_dead_letter",
+                ) as pending_delete, patch.object(
+                    processing,
+                    "send_reply_in_thread",
+                ) as provider_send:
+                    states = pending_responses.process_pending_responses(
+                        "uid-1",
+                        {"Authorization": "Bearer token"},
+                    )
+
+                self.assertEqual(1, len(states))
+                self.assertEqual("error", states[0]["status"])
+                self.assertIn("protocol", states[0]["error"])
+                completion_reconciliation.assert_not_called()
+                legacy_claim.assert_not_called()
+                self.campaign_decision.assert_not_called()
+                permit_reconciliation.assert_not_called()
+                permit_issue.assert_not_called()
+                provider_read.assert_not_called()
+                provider_send.assert_not_called()
+                pending_update.assert_not_called()
+                pending_delete.assert_not_called()
+                self.assertEqual(before, pending_doc.to_dict())
+                self.assertEqual([], pending_doc.reference.update_calls)
+                self.assertFalse(pending_doc.reference.deleted)
+
+    def test_disabled_processing_preserves_true_legacy_path(self):
+        pending_doc = FakeDoc("thread-legacy-worker", {
+            "threadId": "thread-legacy-worker",
+            "msgId": "message-legacy",
+            "recipient": "broker@example.com",
+            "responseBody": "Legacy body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "status": "queued",
+        })
+        fake_fs = FakeFirestore([pending_doc])
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(fake_fs), patch.object(
+            pending_responses,
+            "_process_pending_completion_obligations",
+            return_value=[],
+        ) as completion_reconciliation, patch.object(
+            pending_responses,
+            "_claim_pending_response_for_send",
+            return_value=None,
+        ) as legacy_claim, patch.object(
+            pending_responses,
+            "_reconcile_expired_pending_permit",
+            return_value=False,
+        ) as permit_reconciliation:
+            states = pending_responses.process_pending_responses(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+            )
+
+        self.assertEqual([], states)
+        completion_reconciliation.assert_called_once()
+        legacy_claim.assert_called_once_with(
+            "uid-1",
+            pending_doc,
+            pending_doc.to_dict(),
+        )
+        permit_reconciliation.assert_called_once()
+
+    def test_disabled_legacy_claim_rechecks_current_persisted_protocol(self):
+        legacy_loaded = {
+            "threadId": "thread-protocol-race",
+            "msgId": "message-A",
+            "recipient": "broker@example.com",
+            "responseBody": "Same envelope body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "status": "queued",
+        }
+        exact_current = exact_pending_data({
+            **legacy_loaded,
+            "canonicalSourceId": "source-A",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 1,
+        })
+        pending_doc = FakeDoc("thread-protocol-race", exact_current)
+        fake_fs = FakeFirestore([pending_doc])
+        before = deepcopy(pending_doc.to_dict())
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(fake_fs), self.assertRaises(
+            pending_responses.PendingResponseConflict
+        ):
+            pending_responses._claim_pending_response_for_send(
+                "uid-1",
+                pending_doc,
+                legacy_loaded,
+            )
+
+        self.assertEqual(before, pending_doc.to_dict())
+        self.assertEqual([], pending_doc.reference.update_calls)
+
+    def test_enforced_malformed_pending_binding_blocks_provider_work(self):
+        pending_doc = FakeDoc("thread-legacy", {
+            "threadId": "thread-legacy",
+            "msgId": "message-legacy",
+            "recipient": "broker@example.com",
+            "responseBody": "Legacy unbound body",
+            "clientId": "client-1",
+            "attempts": 1,
+        })
+        fake_fs = FakeFirestore([pending_doc])
+        self.campaign_decision.reset_mock()
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs), patch.object(
+            processing, "send_reply_in_thread"
+        ) as graph_send, patch.object(
+            pending_responses, "find_matching_sent_message_for_retry"
+        ) as sent_lookup, patch.object(
+            pending_responses, "_final_pending_response_send_fence"
+        ) as final_fence:
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual(1, len(states))
+        self.assertEqual("error", states[0]["status"])
+        self.assertIn("binding", states[0]["error"])
+        self.campaign_decision.assert_not_called()
+        sent_lookup.assert_not_called()
+        final_fence.assert_not_called()
+        graph_send.assert_not_called()
+        self.assertEqual([], pending_doc.reference.update_calls)
+
+    def test_enforced_hash_drift_after_scan_blocks_before_claim_or_provider(self):
+        class HashDriftDoc(FakeDoc):
+            def __init__(self, doc_id, scanned, current):
+                super().__init__(doc_id, scanned)
+                self._scanned = dict(scanned)
+                self._current = dict(current)
+                self.read_count = 0
+
+            def to_dict(self):
+                self.read_count += 1
+                if self.read_count == 1:
+                    return dict(self._scanned)
+                return dict(self._current)
+
+        scanned = exact_pending_data({
+            "threadId": "thread-hash-drift",
+            "msgId": "message-A",
+            "recipient": "broker@example.com",
+            "responseBody": "Source A body",
+            "clientId": "client-1",
+            "attempts": 0,
+            "status": "queued",
+            "canonicalSourceId": "source-A",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 4,
+        })
+        pending_doc = HashDriftDoc(
+            "thread-hash-drift",
+            scanned,
+            {**scanned, "proposalHash": "4" * 64},
+        )
+        fake_fs = FakeFirestore([pending_doc])
+        pending_doc.read_count = 0
+        self.campaign_decision.reset_mock()
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs), patch.object(
+            processing, "send_reply_in_thread"
+        ) as graph_send:
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual(1, len(states))
+        self.assertIn("binding changed", states[0]["error"])
+        self.assertEqual([], pending_doc.reference.update_calls)
+        self.campaign_decision.assert_not_called()
+        graph_send.assert_not_called()
+
+    def test_enforced_exact_retry_preserves_graph_send_permit_path(self):
+        pending_doc = FakeDoc("thread-exact-send", exact_pending_data({
+            "threadId": "thread-exact-send",
+            "msgId": "message-exact-send",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi Ryan,\n\nThank you for the exact update.",
+            "clientId": "client-1",
+            "attempts": 0,
+            "status": "queued",
+            "canonicalSourceId": "source-exact-send",
+            "workKey": "1" * 64,
+            "proposalHash": "2" * 64,
+            "selectionHash": "3" * 64,
+            "pendingRevision": 1,
+        }))
+        fake_fs = FakeFirestore([pending_doc])
+        fake_fs.collections["threads"].document("thread-exact-send").get()._data[
+            "clientId"
+        ] = "client-1"
+        fake_fs.collections["clients"] = FakeCollection([
+            FakeDoc("client-1", {"status": "live"}),
+        ])
+
+        def accepted_send(**kwargs):
+            exact_sent_evidence = self._prepare_and_accept_capability(
+                kwargs["graph_send_capability"]
+            )
+            processing._set_reply_send_outcome(
+                outcome="sent_indexed",
+                exact_sent_evidence=exact_sent_evidence,
+            )
+            return True
+
+        source_b_attempt = {
+            "canonical_source_id": "source-B",
+            "work_key": "4" * 64,
+            "proposal_hash": "5" * 64,
+            "selection_hash": "6" * 64,
+        }
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs), self.assertRaises(
+            pending_responses.PendingResponseConflict
+        ):
+            pending_responses.queue_pending_response(
+                "uid-1",
+                "thread-exact-send",
+                "message-B",
+                "bp21harrison@gmail.com",
+                "Source B must never replace A.",
+                "client-1",
+                error="source B retry",
+                **source_b_attempt,
+            )
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs), patch.object(
+            processing, "send_reply_in_thread", side_effect=accepted_send
+        ) as graph_send, patch.object(
+            processing, "_maybe_mark_client_completed", return_value=True
+        ):
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertTrue(pending_doc.reference.deleted)
+        self.assertEqual("healthy", states[0]["status"])
+        self.assertEqual(
+            "Hi Ryan,\n\nThank you for the exact update.",
+            graph_send.call_args.kwargs["body"],
+        )
+        obligations = fake_fs.collections[
+            send_permits.PENDING_COMPLETION_OBLIGATION_COLLECTION
+        ].stream()
+        self.assertEqual(1, len(obligations))
+        self.assertEqual(2, obligations[0].to_dict()["version"])
+        self.assertEqual(
+            "b1_exact_source",
+            obligations[0].to_dict()["immutable"][
+                "sourceAuthorityProtocol"
+            ],
+        )
+        envelope_hash = obligations[0].to_dict()["immutable"][
+            "pendingEnvelopeHash"
+        ]
+        binding = (
+            fake_fs.collections["pendingResponseSourceBindings"]
+            .document(f"pending-source-{envelope_hash}")
+            .get()
+        )
+        self.assertTrue(binding.exists)
+        binding_data = binding.to_dict()
+        self.assertEqual("source-exact-send", binding_data["canonicalSourceId"])
+        self.assertEqual("1" * 64, binding_data["workKey"])
+        self.assertEqual("2" * 64, binding_data["proposalHash"])
+        self.assertEqual("3" * 64, binding_data["selectionHash"])
+        self.assertEqual(2, binding_data["pendingRevision"])
+        self.assertRegex(binding_data["claimTokenHash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(binding_data["claimBindingHash"], r"^[0-9a-f]{64}$")
+        self.assertNotEqual("source-B", binding_data["canonicalSourceId"])
+
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "enforced"},
+        ), self._mock_clients_module(fake_fs):
+            linkage = pending_responses._pending_completion_linkage(
+                "uid-1",
+                fake_fs.collection("users").document("uid-1"),
+                obligations[0],
+            )
+        self.assertEqual(
+            "source-exact-send",
+            linkage["sourceBinding"]["canonicalSourceId"],
+        )
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(fake_fs):
+            rollback_linkage = pending_responses._pending_completion_linkage(
+                "uid-1",
+                fake_fs.collection("users").document("uid-1"),
+                obligations[0],
+            )
+        self.assertEqual(
+            "source-exact-send",
+            rollback_linkage["sourceBinding"]["canonicalSourceId"],
+        )
+        downgraded = deepcopy(obligations[0].to_dict())
+        downgraded["version"] = 1
+        downgraded["immutable"]["version"] = 1
+        downgraded["immutable"].pop("sourceAuthorityProtocol")
+        downgraded_hash = send_permits._hash(downgraded["immutable"])
+        downgraded_id = f"pending-completion-{downgraded_hash}"
+        downgraded["obligationId"] = downgraded_id
+        downgraded["immutableHash"] = downgraded_hash
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(fake_fs), self.assertRaisesRegex(
+            send_permits.GraphSendPermitBlocked,
+            "cannot downgrade",
+        ):
+            pending_responses._pending_completion_linkage(
+                "uid-1",
+                fake_fs.collection("users").document("uid-1"),
+                FakeDoc(downgraded_id, downgraded),
+            )
+
+        binding._data.update({
+            "canonicalSourceId": "source-B",
+            "workKey": "4" * 64,
+            "proposalHash": "5" * 64,
+            "selectionHash": "6" * 64,
+            "pendingRevision": 999,
+        })
+        immutable = {
+            field: binding._data[field]
+            for field in pending_responses._PENDING_RESPONSE_SOURCE_BINDING_IMMUTABLE_FIELDS
+        }
+        binding._data["immutableHash"] = send_permits._stable_evidence_hash(
+            immutable
+        )
+        binding._data["claimBindingHash"] = send_permits._stable_evidence_hash({
+            "immutableHash": binding._data["immutableHash"],
+            "pendingRevision": binding._data["pendingRevision"],
+        })
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "disabled"},
+        ), self._mock_clients_module(fake_fs), self.assertRaises(
+            send_permits.GraphSendPermitBlocked
+        ):
+            pending_responses._pending_completion_linkage(
+                "uid-1",
+                fake_fs.collection("users").document("uid-1"),
+                obligations[0],
+            )
+
+    def test_shadow_pending_paths_have_zero_firestore_or_provider_effects(self):
+        fake_fs = MagicMock(name="firestore")
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_SOURCE_COORDINATOR_MODE": "shadow"},
+        ), self._mock_clients_module(fake_fs), patch.object(
+            processing, "send_reply_in_thread"
+        ) as graph_send:
+            with self.assertRaises(pending_responses.PendingResponseRetryable):
+                pending_responses.queue_pending_response(
+                    "uid-1",
+                    "thread-A",
+                    "message-A",
+                    "broker@example.com",
+                    "Source A body",
+                    "client-1",
+                    canonical_source_id="source-A",
+                    work_key="1" * 64,
+                    proposal_hash="2" * 64,
+                    selection_hash="3" * 64,
+                )
+            with self.assertRaises(pending_responses.PendingResponseRetryable):
+                pending_responses.record_sent_unindexed_response(
+                    "uid-1",
+                    "thread-A",
+                    "message-A",
+                    "broker@example.com",
+                    "Source A body",
+                    "client-1",
+                    "Sent indexing failed",
+                    canonical_source_id="source-A",
+                    work_key="1" * 64,
+                    proposal_hash="2" * 64,
+                    selection_hash="3" * 64,
+                )
+            with self.assertRaises(pending_responses.PendingResponseRetryable):
+                pending_responses.require_pending_response_exact(
+                    "uid-1",
+                    "thread-A",
+                    "source-A",
+                    "1" * 64,
+                )
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual([], states)
+        fake_fs.collection.assert_not_called()
+        graph_send.assert_not_called()
 
 
 if __name__ == "__main__":

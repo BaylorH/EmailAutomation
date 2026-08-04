@@ -2477,6 +2477,497 @@ class ClassificationTests(unittest.TestCase):
         )
 
 
+class RetainedTerminalAuthorityTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_source_coordinator(self)
+        self.fake = FakeFirestore()
+        self.clock = MutableClock(FROZEN_NOW)
+        self.uuids = SequentialUUIDs()
+        self.loader_calls = []
+        self.loader_result = self.active_result()
+
+        def loader(*args, **kwargs):
+            self.loader_calls.append((args, kwargs))
+            return deepcopy(self.loader_result)
+
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            retained_terminal_authority_loader=loader,
+        )
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={
+                "id": "graph-A",
+                "internetMessageId": "internet-A@example.test",
+            },
+            evidence_kind="graph_hydration",
+            thread_id="thread-1",
+        )
+        self.source_id = identity.canonical_source_id
+        self.thread_ref = (
+            self.fake.collection("users")
+            .document("user-1")
+            .collection("threads")
+            .document("thread-1")
+        )
+        self.thread_ref.set({"clientId": "client-1"})
+        self.fake.events.clear()
+
+    @staticmethod
+    def active_record():
+        return {
+            "clientId": "client-1",
+            "sourceMessageKey": "internet-A@example.test",
+            "sourceGraphMessageId": "graph-A",
+            "sourceInternetMessageId": "internet-A@example.test",
+            "sagaKey": "saga-A",
+            "immutableHash": "a" * 64,
+            "phase": "classified",
+        }
+
+    @classmethod
+    def active_result(cls):
+        return {
+            "kind": "active",
+            "saga": cls.active_record(),
+            "settlement": None,
+            "exactSourceConfirmed": True,
+        }
+
+    @classmethod
+    def settled_result(cls):
+        record = cls.active_record()
+        record.pop("immutableHash")
+        record.pop("clientId")
+        record["sagaSnapshot"] = {"clientId": "client-1"}
+        record["projectionHash"] = "b" * 64
+        record["settledAt"] = FROZEN_NOW
+        return {
+            "kind": "settled",
+            "saga": None,
+            "settlement": record,
+            "exactSourceConfirmed": True,
+        }
+
+    @property
+    def classification_path(self):
+        return f"users/user-1/sourceClassifications/{self.source_id}"
+
+    def write_events(self):
+        return [
+            event
+            for event in self.fake.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def quarantine(self, **overrides):
+        arguments = {
+            "user_id": "user-1",
+            "canonical_source_id": self.source_id,
+            "thread_id": "thread-1",
+            "graph_message_id": "graph-A",
+            "internet_message_id": "internet-A@example.test",
+        }
+        arguments.update(overrides)
+        return self.coordinator.quarantine_retained_terminal_authority(**arguments)
+
+    def assertErrorCode(self, expected_code, callable_):
+        with self.assertRaises(self.module.SourceCoordinatorError) as raised:
+            callable_()
+        self.assertEqual(expected_code, raised.exception.code)
+
+    def test_public_boundary_has_loader_but_no_evidence_or_hash_parameters(self):
+        constructor = inspect.signature(self.module.SourceCoordinator).parameters
+        self.assertIn("retained_terminal_authority_loader", constructor)
+        public = inspect.signature(
+            self.module.SourceCoordinator.quarantine_retained_terminal_authority
+        ).parameters
+        self.assertEqual(
+            {
+                "self",
+                "user_id",
+                "canonical_source_id",
+                "thread_id",
+                "graph_message_id",
+                "internet_message_id",
+            },
+            set(public),
+        )
+        self.assertFalse(
+            any("evidence" in name or "hash" in name for name in public)
+        )
+        with self.assertRaises(TypeError):
+            self.module._VerifiedRetainedTerminalEvidence()
+
+    def test_active_authority_creates_hash_only_quarantine(self):
+        result = self.quarantine()
+
+        self.assertIsInstance(
+            result,
+            self.module.RetainedTerminalAuthorityDisposition,
+        )
+        self.assertEqual(self.source_id, result.canonical_source_id)
+        self.assertEqual("legacy_terminal_authority_retained", result.state)
+        self.assertEqual("active", result.terminal_kind)
+        self.assertRegex(result.evidence_hash, r"^[0-9a-f]{64}$")
+        self.assertTrue(result.created)
+        self.assertEqual(1, len(self.loader_calls))
+        loader_args, loader_kwargs = self.loader_calls[0]
+        self.assertEqual(("user-1", "thread-1"), loader_args)
+        transaction = loader_kwargs.pop("transaction")
+        self.assertIsNotNone(transaction)
+        self.assertEqual(
+            {
+                "graph_message_id": "graph-A",
+                "internet_message_id": "internet-A@example.test",
+            },
+            loader_kwargs,
+        )
+        stored = self.fake.data[self.classification_path]
+        self.assertEqual("legacy_terminal_quarantined", stored["classificationState"])
+        self.assertEqual("not_applicable", stored["modelRequestState"])
+        self.assertEqual("active", stored["retainedTerminalKind"])
+        self.assertEqual("a" * 64, stored["retainedTerminalImmutableHash"])
+        self.assertRegex(stored["retainedTerminalRecordHash"], r"^[0-9a-f]{64}$")
+        self.assertEqual(result.evidence_hash, stored["retainedTerminalBindingHash"])
+        self.assertIsNone(stored["classificationInputHash"])
+        for field in (
+            "completeProposalSnapshot",
+            "completeProposalHash",
+            "transitionCandidates",
+            "ordinaryObligations",
+            "selectionSnapshot",
+            "selectionHash",
+            "snapshotImmutableHash",
+            "proposalEvidence",
+            "proposalEvidenceHash",
+            "deterministicEvidence",
+            "deterministicEvidenceHash",
+            "snapshotPersistedAt",
+        ):
+            self.assertIsNone(stored[field], field)
+        self.assertFalse(
+            any(
+                segment in path
+                for path in self.fake.data
+                for segment in (
+                    "/sourceTransitionOwners/",
+                    "/sourceWorkLedgers/",
+                    "/sourceSettlements/",
+                )
+            )
+        )
+
+    def test_settled_authority_hashes_aware_datetime_and_exact_retry_is_idempotent(self):
+        self.loader_result = self.settled_result()
+        first = self.quarantine()
+        self.fake.events.clear()
+
+        second = self.quarantine()
+
+        self.assertEqual("settled", first.terminal_kind)
+        self.assertEqual(first.evidence_hash, second.evidence_hash)
+        self.assertFalse(second.created)
+        self.assertEqual([], self.write_events())
+
+    def test_active_authority_client_mismatch_stops_before_quarantine(self):
+        self.loader_result["saga"]["clientId"] = "client-2"
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+
+        self.assertErrorCode(
+            "legacy_terminal_authority_conflict",
+            self.quarantine,
+        )
+
+        self.assertEqual(before, self.fake.data)
+        self.assertNotIn(self.classification_path, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+    def test_settled_authority_snapshot_client_mismatch_stops_before_quarantine(self):
+        self.loader_result = self.settled_result()
+        self.loader_result["settlement"]["sagaSnapshot"]["clientId"] = "client-2"
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+
+        self.assertErrorCode(
+            "legacy_terminal_authority_conflict",
+            self.quarantine,
+        )
+
+        self.assertEqual(before, self.fake.data)
+        self.assertNotIn(self.classification_path, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+    def test_conflicting_retained_evidence_has_zero_writes(self):
+        self.quarantine()
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+        self.loader_result["saga"]["phase"] = "different"
+
+        self.assertErrorCode(
+            "legacy_terminal_authority_conflict",
+            self.quarantine,
+        )
+
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+    def test_alias_owner_conflict_and_thread_drift_stop_before_loader_or_writes(self):
+        second = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"internetMessageId": "internet-B@example.test"},
+            evidence_kind="graph_hydration",
+            thread_id="thread-1",
+        )
+        self.assertNotEqual(self.source_id, second.canonical_source_id)
+        self.fake.events.clear()
+
+        for case, overrides in (
+            (
+                "conflicting alias owners",
+                {"internet_message_id": "internet-B@example.test"},
+            ),
+            ("thread drift", {"thread_id": "thread-2"}),
+            ("missing alias", {"graph_message_id": "graph-missing"}),
+        ):
+            with self.subTest(case=case):
+                before = deepcopy(self.fake.data)
+                before_calls = len(self.loader_calls)
+                self.assertErrorCode(
+                    (
+                        "source_thread_conflict"
+                        if case == "thread drift"
+                        else "source_alias_conflict"
+                    ),
+                    lambda: self.quarantine(**overrides),
+                )
+                self.assertEqual(before, self.fake.data)
+                self.assertEqual(before_calls, len(self.loader_calls))
+                self.assertEqual([], self.write_events())
+
+    def test_request_started_and_snapshot_ready_are_never_reclassified(self):
+        claim = self.coordinator.claim_source_classification(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            lease_seconds=60,
+        )
+        self.coordinator.record_classification_request_started(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            model_request_key="model-request-1",
+            classification_input=CLASSIFICATION_INPUT,
+        )
+        started = deepcopy(self.fake.data[self.classification_path])
+        self.fake.events.clear()
+
+        self.assertErrorCode(
+            "legacy_terminal_authority_conflict",
+            self.quarantine,
+        )
+        self.assertEqual(started, self.fake.data[self.classification_path])
+        self.assertEqual([], self.loader_calls)
+        self.assertEqual([], self.write_events())
+
+        fake = FakeFirestore()
+        clock = MutableClock(FROZEN_NOW)
+        loader_calls = []
+        coordinator = self.module.SourceCoordinator(
+            fake,
+            uuid_factory=SequentialUUIDs(),
+            now_factory=clock,
+            retained_terminal_authority_loader=lambda *args, **kwargs: (
+                loader_calls.append((args, kwargs)) or self.active_result()
+            ),
+        )
+        source = coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={
+                "id": "graph-A",
+                "internetMessageId": "internet-A@example.test",
+            },
+            evidence_kind="graph_hydration",
+            thread_id="thread-1",
+        )
+        coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=source.canonical_source_id,
+            lease_seconds=60,
+            classification_input=CLASSIFICATION_INPUT,
+            classifier=lambda: (
+                deepcopy(COMPLETE_PROPOSAL),
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        path = f"users/user-1/sourceClassifications/{source.canonical_source_id}"
+        snapshot_ready = deepcopy(fake.data[path])
+        fake.events.clear()
+
+        disposition = coordinator.quarantine_retained_terminal_authority(
+            user_id="user-1",
+            canonical_source_id=source.canonical_source_id,
+            thread_id="thread-1",
+            graph_message_id="graph-A",
+            internet_message_id="internet-A@example.test",
+        )
+
+        self.assertEqual("migrated_b1", disposition.state)
+        self.assertIsNone(disposition.terminal_kind)
+        self.assertIsNone(disposition.evidence_hash)
+        self.assertFalse(disposition.created)
+        self.assertEqual(snapshot_ready, fake.data[path])
+        self.assertEqual([], loader_calls)
+        self.assertEqual(
+            [],
+            [
+                event
+                for event in fake.events
+                if event[0] in {"create", "set", "update", "delete"}
+            ],
+        )
+
+    def test_ordinary_loader_does_not_block_or_mutate_an_existing_claim(self):
+        claim = self.coordinator.claim_source_classification(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            lease_seconds=60,
+        )
+        self.loader_result = {
+            "kind": "ordinary",
+            "saga": None,
+            "settlement": None,
+            "exactSourceConfirmed": False,
+        }
+        before = deepcopy(self.fake.data[self.classification_path])
+        self.fake.events.clear()
+
+        result = self.quarantine()
+
+        self.assertEqual(1, claim.classification_epoch)
+        self.assertEqual("no_retained_terminal_authority", result.state)
+        self.assertEqual(before, self.fake.data[self.classification_path])
+        self.assertEqual([], self.write_events())
+
+    def test_ordinary_to_active_thread_race_cannot_return_no_authority(self):
+        thread_ref = (
+            self.fake.collection("users")
+            .document("user-1")
+            .collection("threads")
+            .document("thread-1")
+        )
+        thread_ref.set({"clientId": "client-1"})
+
+        def snapshot_loader(*args, **kwargs):
+            transaction = kwargs.get("transaction")
+            snapshot = thread_ref.get(transaction=transaction)
+            data = snapshot.to_dict() or {}
+            if isinstance(data.get("terminalSaga"), dict):
+                return self.active_result()
+            return {
+                "kind": "ordinary",
+                "saga": None,
+                "settlement": None,
+                "exactSourceConfirmed": False,
+            }
+
+        coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            retained_terminal_authority_loader=snapshot_loader,
+        )
+        self.fake.events.clear()
+        self.fake.before_next_commit_hook = lambda: thread_ref.set({
+            "clientId": "client-1",
+            "terminalSaga": self.active_record(),
+        })
+
+        self.assertErrorCode(
+            "legacy_terminal_authority_conflict",
+            lambda: coordinator.quarantine_retained_terminal_authority(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                thread_id="thread-1",
+                graph_message_id="graph-A",
+                internet_message_id="internet-A@example.test",
+            ),
+        )
+
+        self.assertNotIn(self.classification_path, self.fake.data)
+        self.assertEqual(
+            self.active_record(),
+            self.fake.data[thread_ref.path]["terminalSaga"],
+        )
+
+    def test_ordinary_and_malformed_loader_results_never_create_authority(self):
+        self.loader_result = {
+            "kind": "ordinary",
+            "saga": None,
+            "settlement": None,
+            "exactSourceConfirmed": False,
+        }
+        result = self.quarantine()
+        self.assertEqual("no_retained_terminal_authority", result.state)
+        self.assertIsNone(result.terminal_kind)
+        self.assertIsNone(result.evidence_hash)
+        self.assertFalse(result.created)
+        self.assertNotIn(self.classification_path, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+        hostile_record = {
+            HostileString(key): value
+            for key, value in self.active_record().items()
+        }
+        invalid_results = (
+            {**self.active_result(), "extra": True},
+            {**self.active_result(), "exactSourceConfirmed": False},
+            {**self.active_result(), "saga": None},
+            {**self.active_result(), "saga": hostile_record},
+            {
+                **self.active_result(),
+                "saga": JsonMappingSubclass(self.active_record()),
+            },
+            self.module._VerifiedRetainedTerminalEvidence,
+        )
+        for loader_result in invalid_results:
+            with self.subTest(loader_result=repr(loader_result)):
+                self.loader_result = loader_result
+                before = deepcopy(self.fake.data)
+                self.fake.events.clear()
+                self.assertErrorCode("source_coordinator_config", self.quarantine)
+                self.assertEqual(before, self.fake.data)
+                self.assertEqual([], self.write_events())
+
+    def test_quarantine_blocks_fresh_classification_and_survives_commit_ambiguity(self):
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown commit")
+        retained = self.quarantine()
+        self.assertTrue(retained.created)
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+
+        self.assertErrorCode(
+            "legacy_terminal_authority_conflict",
+            lambda: self.coordinator.claim_source_classification(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                lease_seconds=60,
+            ),
+        )
+        self.assertErrorCode(
+            "legacy_terminal_authority_conflict",
+            lambda: self.coordinator.require_authoritative_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+            ),
+        )
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+
 class SelectionAndLedgerTests(unittest.TestCase):
     def setUp(self):
         self.module = _load_source_coordinator(self)
