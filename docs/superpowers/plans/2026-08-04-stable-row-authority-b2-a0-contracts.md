@@ -298,7 +298,7 @@ git commit -m "test: isolate B2 authority write bounds"
 - Create: `email_automation/row_authority.py`
 - Modify: `tests/test_row_authority_contracts.py`
 
-- [ ] **Step 1: Append the complete failing primitive test class**
+- [x] **Step 1: Append the complete failing primitive test class**
 
 Before the file's final `if __name__ == "__main__":` block, add exactly:
 
@@ -695,7 +695,7 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
 Move the existing final `if __name__ == "__main__": unittest.main()` block to
 the end of the file after this class.
 
-- [ ] **Step 2: Run the exact RED**
+- [x] **Step 2: Run the exact RED**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -706,7 +706,7 @@ Expected: the module-existence, standard-library import, and error-code tests
 fail because the module is missing; the runtime non-adoption test passes; the
 nine behavior tests skip. A test-module import error is not an accepted RED.
 
-- [ ] **Step 3: Create the importable error/constant skeleton and make its contracts GREEN**
+- [x] **Step 3: Create the importable error/constant skeleton and make its contracts GREEN**
 
 Create `email_automation/row_authority.py` with exactly:
 
@@ -770,7 +770,7 @@ Run only the skeleton contracts:
 Expected: four tests pass. This is the minimal GREEN for the initial RED; none
 of the behavior functions exist yet.
 
-- [ ] **Step 4: Run canonical-JSON RED, append its implementation, and make it GREEN**
+- [x] **Step 4: Run canonical-JSON RED, append its implementation, and make it GREEN**
 
 Run the two canonical tests before adding code:
 
@@ -863,7 +863,7 @@ def canonical_json_bytes(value):
 
 Rerun the same two-test command. Expected GREEN: 2/2 pass.
 
-- [ ] **Step 5: Run domain-hash RED, append its implementation, and make it GREEN**
+- [x] **Step 5: Run domain-hash RED, append its implementation, and make it GREEN**
 
 Run the domain-focused tests before adding code:
 
@@ -932,7 +932,7 @@ def domain_hash(domain, payload, *, user_scope_hash):
 Rerun the same three-test command. Expected GREEN: 3/3 pass and both frozen
 domain vectors match independently computed values.
 
-- [ ] **Step 6: Run verified-user scope RED, append its implementation, and make it GREEN**
+- [x] **Step 6: Run verified-user scope RED, append its implementation, and make it GREEN**
 
 Run the user-scope tests before adding code:
 
@@ -980,7 +980,7 @@ def user_scope_hash(verified_user_id):
 Rerun the same two-test command. Expected GREEN: 2/2 pass and the exact user
 scope is neither trimmed nor case-normalized.
 
-- [ ] **Step 7: Run UUIDv4 row-ID RED, append its implementation, and make it GREEN**
+- [x] **Step 7: Run UUIDv4 row-ID RED, append its implementation, and make it GREEN**
 
 Run the row-ID tests before adding code:
 
@@ -1021,7 +1021,7 @@ def new_row_id(*, uuid_factory=uuid4):
 
 Rerun the same two-test command. Expected GREEN: 2/2 pass.
 
-- [ ] **Step 8: Run complete Task 1 GREEN and containment**
+- [x] **Step 8: Run complete Task 1 GREEN and containment**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -1034,7 +1034,7 @@ git diff --check
 
 Expected: every test passes, compilation exits 0, and diff check has no output.
 
-- [ ] **Step 9: Commit Task 1**
+- [x] **Step 9: Commit Task 1**
 
 Mark Task 1 checkboxes complete, then run:
 
