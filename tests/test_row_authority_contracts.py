@@ -6,6 +6,7 @@ import importlib
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -129,15 +130,21 @@ def _direct_import_roots(tree):
     return roots
 
 
+def _literal_string_value(node):
+    if isinstance(node, ast.Constant) and type(node.value) is str:
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _literal_string_value(node.left)
+        right = _literal_string_value(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
 def _literal_dynamic_imports(tree):
     targets = []
     for node in ast.walk(tree):
-        if (
-            not isinstance(node, ast.Call)
-            or not node.args
-            or not isinstance(node.args[0], ast.Constant)
-            or type(node.args[0].value) is not str
-        ):
+        if not isinstance(node, ast.Call):
             continue
         call_name = None
         if isinstance(node.func, ast.Name):
@@ -145,7 +152,8 @@ def _literal_dynamic_imports(tree):
         elif isinstance(node.func, ast.Attribute):
             call_name = node.func.attr
         if call_name in {"__import__", "import_module"}:
-            targets.append(node.args[0].value)
+            target = _literal_string_value(node.args[0]) if node.args else None
+            targets.append(target)
     return targets
 
 
@@ -167,7 +175,7 @@ def _tree_imports_row_authority(tree):
                 or (node.level and node.module is None)
             ) and any(alias.name == "row_authority" for alias in node.names):
                 return True
-    return "email_automation.row_authority" in _literal_dynamic_imports(tree)
+    return bool(_literal_dynamic_imports(tree))
 
 
 def _application_python_paths():
@@ -214,6 +222,24 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
         self.assertEqual([], _literal_dynamic_imports(tree))
 
     def test_row_authority_is_not_imported_by_runtime(self):
+        synthetic_dynamic_imports = (
+            ("__import__('google.' + 'cloud')", "google.cloud"),
+            (
+                "importlib.import_module("
+                "'email_automation.' + 'row_authority'"
+                ")",
+                "email_automation.row_authority",
+            ),
+            ("import_module(name)", None),
+        )
+        for source, expected_target in synthetic_dynamic_imports:
+            tree = ast.parse(source)
+            with self.subTest(source=source):
+                self.assertTrue(_tree_imports_row_authority(tree))
+                self.assertEqual(
+                    [expected_target],
+                    _literal_dynamic_imports(tree),
+                )
         importers = [
             relative.as_posix()
             for relative in _application_python_paths()
@@ -261,6 +287,71 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
             b'{"left":[1],"right":[1]}',
             module.canonical_json_bytes({"left": shared, "right": shared}),
         )
+
+        expected_limits = (
+            ("MAX_CANONICAL_JSON_DEPTH", 64),
+            ("MAX_CANONICAL_JSON_NODES", 4096),
+            ("MAX_CANONICAL_JSON_BYTES", 16 * 1024 * 1024),
+        )
+        for name, expected in expected_limits:
+            with self.subTest(limit=name):
+                self.assertEqual(expected, getattr(module, name, None))
+
+        def nested_lists(levels):
+            value = None
+            for _ in range(levels):
+                value = [value]
+            return value
+
+        self.assertEqual(
+            b"[" * 64 + b"null" + b"]" * 64,
+            module.canonical_json_bytes(nested_lists(64)),
+        )
+        with self.subTest(boundary="depth-65"), self.assertRaises(
+            module.RowAuthorityConfigError
+        ):
+            module.canonical_json_bytes(nested_lists(65))
+
+        self.assertIsInstance(
+            module.canonical_json_bytes([0] * 4095),
+            bytes,
+        )
+        with self.subTest(boundary="nodes-4097"), self.assertRaises(
+            module.RowAuthorityConfigError
+        ):
+            module.canonical_json_bytes([0] * 4096)
+
+        byte_boundary_value = {"a": "é"}
+        expected_bytes = b'{"a":"\xc3\xa9"}'
+        with patch.object(
+            module,
+            "MAX_CANONICAL_JSON_BYTES",
+            len(expected_bytes),
+            create=True,
+        ):
+            self.assertEqual(
+                expected_bytes,
+                module.canonical_json_bytes(byte_boundary_value),
+            )
+        with self.subTest(boundary="encoded-bytes-over"), patch.object(
+            module,
+            "MAX_CANONICAL_JSON_BYTES",
+            len(expected_bytes) - 1,
+            create=True,
+        ), self.assertRaises(module.RowAuthorityConfigError):
+            module.canonical_json_bytes(byte_boundary_value)
+        for value in ("x" * 9, {"x" * 9: None}):
+            with self.subTest(
+                boundary="input-bytes-over",
+                value=type(value).__name__,
+            ), patch.object(
+                module,
+                "MAX_CANONICAL_JSON_BYTES",
+                8,
+                create=True,
+            ), self.assertRaises(module.RowAuthorityConfigError):
+                module.canonical_json_bytes(value)
+
         cyclic = []
         cyclic.append(cyclic)
         invalid_values = (
@@ -422,13 +513,23 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
 
     def test_domain_and_scope_hash_validation_is_exact(self):
         module = self._require_module()
+        exact_max_domain = "sitesift." + "a" * 116 + ".v1"
+        self.assertEqual(128, len(exact_max_domain.encode("utf-8")))
+        self.assertRegex(
+            module.domain_hash(
+                exact_max_domain,
+                {},
+                user_scope_hash="a" * 64,
+            ),
+            r"^[0-9a-f]{64}$",
+        )
         for domain in (
             "",
             "sitesift.test",
             "sitesift.TEST.v1",
             "sitesift.test.v0",
             "sitesift." + chr(0xD800) + ".v1",
-            "x" * 129,
+            "sitesift." + "a" * 117 + ".v1",
             None,
         ):
             with self.subTest(domain=domain), self.assertRaises(

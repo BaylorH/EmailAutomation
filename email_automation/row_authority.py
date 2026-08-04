@@ -14,6 +14,9 @@ MAX_ROW_BINDINGS = 128
 MAX_ROW_AUTHORITY_PLANNED_WRITES = 400
 MAX_OPAQUE_BYTES = 512
 MAX_JSON_SAFE_INTEGER = 9007199254740991
+MAX_CANONICAL_JSON_DEPTH = 64
+MAX_CANONICAL_JSON_NODES = 4096
+MAX_CANONICAL_JSON_BYTES = 16 * 1024 * 1024
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DOMAIN_PATTERN = re.compile(
@@ -53,11 +56,29 @@ def _utf8_bytes(value, *, field_name):
         ) from exc
 
 
-def _canonical_json_value(value, *, path, seen):
+def _track_canonical_utf8(encoded, *, path, state):
+    state["utf8_bytes"] += len(encoded)
+    if state["utf8_bytes"] > MAX_CANONICAL_JSON_BYTES:
+        raise RowAuthorityConfigError(
+            f"{path} exceeds the canonical JSON byte bound"
+        )
+
+
+def _canonical_json_value(value, *, path, seen, depth, state):
+    if depth > MAX_CANONICAL_JSON_DEPTH:
+        raise RowAuthorityConfigError(
+            f"{path} exceeds the canonical JSON depth bound"
+        )
+    state["nodes"] += 1
+    if state["nodes"] > MAX_CANONICAL_JSON_NODES:
+        raise RowAuthorityConfigError(
+            f"{path} exceeds the canonical JSON node bound"
+        )
     if value is None or type(value) is bool:
         return value
     if type(value) is str:
-        _utf8_bytes(value, field_name=path)
+        encoded = _utf8_bytes(value, field_name=path)
+        _track_canonical_utf8(encoded, path=path, state=state)
         return value
     if type(value) is int:
         if abs(value) > MAX_JSON_SAFE_INTEGER:
@@ -78,6 +99,8 @@ def _canonical_json_value(value, *, path, seen):
                     item,
                     path=f"{path}[{index}]",
                     seen=seen,
+                    depth=depth + 1,
+                    state=state,
                 )
                 for index, item in enumerate(value)
             ]
@@ -95,11 +118,18 @@ def _canonical_json_value(value, *, path, seen):
                     raise RowAuthorityConfigError(
                         f"{path} contains a non-string key"
                     )
-                _utf8_bytes(key, field_name=f"{path} key")
+                encoded_key = _utf8_bytes(key, field_name=f"{path} key")
+                _track_canonical_utf8(
+                    encoded_key,
+                    path=f"{path} key",
+                    state=state,
+                )
                 normalized[key] = _canonical_json_value(
                     item,
                     path=f"{path}.{key}",
                     seen=seen,
+                    depth=depth + 1,
+                    state=state,
                 )
             return normalized
         finally:
@@ -110,14 +140,26 @@ def _canonical_json_value(value, *, path, seen):
 
 
 def canonical_json_bytes(value):
-    normalized = _canonical_json_value(value, path="$", seen=set())
-    return json.dumps(
+    state = {"nodes": 0, "utf8_bytes": 0}
+    normalized = _canonical_json_value(
+        value,
+        path="$",
+        seen=set(),
+        depth=0,
+        state=state,
+    )
+    encoded = json.dumps(
         normalized,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    if len(encoded) > MAX_CANONICAL_JSON_BYTES:
+        raise RowAuthorityConfigError(
+            "canonical JSON output exceeds the byte bound"
+        )
+    return encoded
 
 
 def _require_sha256(value, *, field_name):
