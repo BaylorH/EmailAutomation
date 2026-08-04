@@ -10,7 +10,7 @@ from collections.abc import Mapping as MappingABC
 from collections.abc import Sequence as SequenceABC
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -25,6 +25,7 @@ MAX_CLASSIFICATION_SNAPSHOT_BYTES = 614400
 MAX_SOURCE_WORK_ENTRIES = 128
 MAX_SOURCE_WORK_LEDGER_BYTES = 600 * 1024
 MAX_SOURCE_WORK_TRANSACTION_WRITES = 400
+MAX_BLOCKED_SOURCES_PER_THREAD = 100
 _SOURCE_ALIAS_KEY_DOMAIN = "source-alias-v2"
 _SOURCE_ALIAS_TYPES = {"graph", "internet_message_id"}
 _SOURCE_ADMISSION_EVIDENCE_KINDS = {"graph_hydration", "operator_replay"}
@@ -174,6 +175,179 @@ _SOURCE_WORK_ENTRY_FIELDS = {
     "dominanceOutcome",
     "completionContract",
     "state",
+    "resolutionEvidence",
+    "resolutionEvidenceHash",
+}
+_SOURCE_WORK_ENTRY_MUTABLE_FIELDS = {
+    "state",
+    "resolutionEvidence",
+    "resolutionEvidenceHash",
+}
+_SOURCE_WORK_ENTRY_IMMUTABLE_FIELDS = (
+    _SOURCE_WORK_ENTRY_FIELDS - _SOURCE_WORK_ENTRY_MUTABLE_FIELDS
+)
+_SOURCE_WORK_RESOLUTION_EVIDENCE_HASH_KIND = (
+    "source-work-resolution-evidence-v1"
+)
+_SOURCE_DEFERRED_WORK_SCHEMA_VERSION = 1
+_SOURCE_DEFERRED_WORK_HASH_KIND = "source-deferred-work-v1"
+_COMPLETION_RECORD_FIELDS = {
+    "schemaVersion",
+    "evidenceKind",
+    "workKind",
+    "resultHash",
+}
+_COMPLETION_EVIDENCE_FIELDS = {
+    "schemaVersion",
+    "evidenceKind",
+    "canonicalSourceId",
+    "ledgerHash",
+    "workKey",
+    "payloadHash",
+    "workKind",
+    "resultHash",
+}
+_DELEGATION_EVIDENCE_FIELDS = {
+    "schemaVersion",
+    "evidenceKind",
+    "canonicalSourceId",
+    "ledgerHash",
+    "workKey",
+    "payloadHash",
+    "workKind",
+    "deferredBindingHash",
+}
+_DOMINANCE_EVIDENCE_FIELDS = {
+    "schemaVersion",
+    "evidenceKind",
+    "canonicalSourceId",
+    "ledgerHash",
+    "workKey",
+    "payloadHash",
+    "workKind",
+    "selectionHash",
+    "ownerDecisionHash",
+    "dominatingOwnerKind",
+    "dominatingOwnerKey",
+    "dominanceOutcome",
+}
+_SOURCE_DEFERRED_WORK_FIELDS = {
+    "schemaVersion",
+    "workKey",
+    "canonicalSourceId",
+    "ledgerHash",
+    "entryPayloadHash",
+    "targetOwnerKind",
+    "targetOwnerKey",
+    "wakeCondition",
+    "completionContract",
+    "bindingHash",
+    "state",
+    "createdAt",
+    "updatedAt",
+}
+_SOURCE_SETTLEMENT_SCHEMA_VERSION = 1
+_PROCESSED_ALIAS_SCHEMA_VERSION = 1
+_SOURCE_SETTLEMENT_IDENTITY_HASH_KIND = "source-settlement-identity-v1"
+_SOURCE_SETTLEMENT_ALIAS_SET_HASH_KIND = "source-settlement-alias-set-v1"
+_FINAL_LEDGER_EVIDENCE_HASH_KIND = "source-final-ledger-evidence-v1"
+_SOURCE_SETTLEMENT_HASH_KIND = "source-settlement-v1"
+_SOURCE_SETTLEMENT_FIELDS = {
+    "schemaVersion",
+    "canonicalSourceId",
+    "identityHash",
+    "snapshotImmutableHash",
+    "selectionHash",
+    "ownerDecisionHash",
+    "ledgerHash",
+    "finalLedgerEvidenceHash",
+    "aliases",
+    "aliasSetHash",
+    "settlementRevision",
+    "settlementHash",
+    "settledAt",
+}
+_PROCESSED_ALIAS_FIELDS = {
+    "schemaVersion",
+    "sourceAliasKey",
+    "aliasType",
+    "normalizedValueHash",
+    "canonicalSourceId",
+    "settlementRevision",
+    "settlementHash",
+    "processedAt",
+}
+_THREAD_HEAD_SCHEMA_VERSION = 1
+_PENDING_ADMISSION_SCHEMA_VERSION = 1
+_BLOCKED_SOURCE_SCHEMA_VERSION = 1
+_THREAD_HEAD_HASH_KIND = "thread-transition-head-v1"
+_PENDING_ADMISSION_HASH_KIND = "inbound-pending-admission-v1"
+_WAKE_TOKEN_HASH_KIND = "source-wake-token-v1"
+_THREAD_HEAD_FIELDS = {
+    "schemaVersion",
+    "threadId",
+    "threadHeadRevision",
+    "activeOwnerKey",
+    "activeOwnerKind",
+    "activeCanonicalSourceId",
+    "activeGeneration",
+    "activeState",
+    "headHash",
+    "createdAt",
+    "updatedAt",
+}
+_BLOCKER_FIELDS = {
+    "canonicalSourceId",
+    "ownerKind",
+    "ownerKey",
+    "generation",
+    "threadHeadRevision",
+    "headHash",
+}
+_PENDING_ADMISSION_FIELDS = {
+    "schemaVersion",
+    "canonicalSourceId",
+    "threadId",
+    "identityCreationHash",
+    "snapshotImmutableHash",
+    "selectionHash",
+    "ownerDecisionHash",
+    "ledgerHash",
+    "ownerKind",
+    "ownerKey",
+    "savedHistoryBinding",
+    "savedHistoryBindingHash",
+    "indexBinding",
+    "indexBindingHash",
+    "receivedAt",
+    "sentAt",
+    "admissionHash",
+    "admissionState",
+    "blockedLifecycleState",
+    "initialBlocker",
+    "currentBlocker",
+    "wakeGeneration",
+    "wakeToken",
+    "wakeState",
+    "wakeClaimId",
+    "revision",
+    "createdAt",
+    "updatedAt",
+}
+_BLOCKED_SOURCE_FIELDS = {
+    "schemaVersion",
+    "canonicalSourceId",
+    "threadId",
+    "admissionHash",
+    "admissionRevision",
+    "receivedAt",
+    "sentAt",
+    "blockedLifecycleState",
+    "currentBlocker",
+    "wakeGeneration",
+    "wakeState",
+    "createdAt",
+    "updatedAt",
 }
 
 
@@ -267,6 +441,42 @@ class SourceWorkLedgerLimitExceeded(SourceCoordinatorConfigError):
     code = "source_work_ledger_limit_exceeded"
 
 
+class PendingAdmissionConflict(SourceCoordinatorConflict):
+    code = "pending_admission_conflict"
+
+
+class ThreadTransitionConflict(SourceCoordinatorConflict):
+    code = "thread_transition_conflict"
+
+
+class ThreadQueueLimitExceeded(SourceCoordinatorConflict):
+    code = "thread_queue_limit_exceeded"
+
+
+class WakeReleaseConflict(SourceCoordinatorConflict):
+    code = "wake_release_conflict"
+
+
+class WakeClaimConflict(SourceCoordinatorConflict):
+    code = "wake_claim_conflict"
+
+
+class SourceWorkTransitionConflict(SourceCoordinatorConflict):
+    code = "source_work_transition_conflict"
+
+
+class DeferredWorkConflict(SourceCoordinatorConflict):
+    code = "source_deferred_work_conflict"
+
+
+class SourceSettlementNotReady(SourceCoordinatorRetryable):
+    code = "source_settlement_not_ready"
+
+
+class SourceSettlementConflict(SourceCoordinatorConflict):
+    code = "source_settlement_conflict"
+
+
 @dataclass(frozen=True)
 class SourceAlias:
     alias_type: str
@@ -308,6 +518,75 @@ class ClassificationSnapshot:
     selection_snapshot: Mapping[str, Any]
     selection_hash: str
     snapshot_immutable_hash: str
+
+
+@dataclass(frozen=True)
+class PendingAdmissionResult:
+    canonical_source_id: str
+    thread_id: str
+    admission_hash: str
+    state: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class ThreadTransitionResult:
+    canonical_source_id: str
+    thread_id: str
+    disposition: str
+    generation: int
+    head_revision: int
+    blocker_canonical_source_id: str | None
+
+
+@dataclass(frozen=True)
+class WakeReleaseResult:
+    thread_id: str
+    released_canonical_source_id: str
+    next_canonical_source_id: str | None
+    wake_generation: int | None
+    wake_token: str | None
+    head_state: str
+
+
+@dataclass(frozen=True)
+class WakeClaimResult:
+    thread_id: str
+    canonical_source_id: str
+    wake_generation: int
+    wake_token: str
+    wake_claim_id: str
+    head_revision: int
+
+
+@dataclass(frozen=True)
+class SourceWorkTransitionResult:
+    canonical_source_id: str
+    work_key: str
+    state: str
+    ledger_hash: str
+    ledger_revision: int
+    evidence_hash: str | None
+
+
+@dataclass(frozen=True)
+class DeferredWorkResult:
+    canonical_source_id: str
+    work_key: str
+    ledger_hash: str
+    binding_hash: str
+    deferred_state: str
+    ledger_state: str
+    ledger_revision: int
+
+
+@dataclass(frozen=True)
+class SourceSettlementResult:
+    canonical_source_id: str
+    settlement_hash: str
+    settlement_revision: int
+    alias_projection_count: int
+    repaired_projection_count: int
 
 
 @dataclass(frozen=True)
@@ -437,6 +716,16 @@ class _AuthorityCreatePlan:
     target_ref: Any
     before_data: Mapping[str, Any] | None
     expected_data: Mapping[str, Any]
+    ambiguous_error_type: type[SourceCoordinatorError] = SourceCoordinatorAmbiguous
+
+
+@dataclass(frozen=True)
+class _MultiDocumentTransactionPlan:
+    result: Any
+    prerequisites: Sequence[tuple[Any, Mapping[str, Any] | None]]
+    mutations: Sequence[
+        tuple[Any, Mapping[str, Any] | None, Mapping[str, Any] | None]
+    ]
     ambiguous_error_type: type[SourceCoordinatorError] = SourceCoordinatorAmbiguous
 
 
@@ -1099,9 +1388,521 @@ def _build_source_work_entries(
                     dominance_outcome=dominance_outcome,
                 ),
                 "state": "pending",
+                "resolutionEvidence": None,
+                "resolutionEvidenceHash": None,
             }
         )
     return entries
+
+
+def _source_work_resolution_evidence_hash(
+    evidence: Mapping[str, Any],
+) -> str:
+    return canonical_json_hash(
+        {
+            "hashKind": _SOURCE_WORK_RESOLUTION_EVIDENCE_HASH_KIND,
+            "evidence": evidence,
+        }
+    )
+
+
+def _validate_source_work_entry_resolution(
+    entry: Mapping[str, Any],
+    *,
+    canonical_source_id: str,
+    ledger_hash: str,
+    selection_hash: str,
+    owner_decision_hash: str,
+) -> None:
+    state = entry["state"]
+    evidence = entry["resolutionEvidence"]
+    evidence_hash = entry["resolutionEvidenceHash"]
+    if state in {"pending", "applying"}:
+        if evidence is not None or evidence_hash is not None:
+            raise SourceWorkLedgerConflict(
+                "unsettled work entry contains resolution evidence"
+            )
+        return
+    if type(evidence) is not dict or not _is_sha256(evidence_hash):
+        raise SourceWorkLedgerConflict(
+            "settled work entry lacks exact resolution evidence"
+        )
+    if evidence_hash != _source_work_resolution_evidence_hash(evidence):
+        raise SourceWorkLedgerConflict("work resolution evidence hash conflicts")
+    common_conflict = (
+        not _is_exact_schema_version(
+            evidence.get("schemaVersion"),
+            _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        )
+        or evidence.get("canonicalSourceId") != canonical_source_id
+        or evidence.get("ledgerHash") != ledger_hash
+        or evidence.get("workKey") != entry["workKey"]
+        or evidence.get("payloadHash") != entry["payloadHash"]
+        or evidence.get("workKind") != entry["kind"]
+    )
+    if common_conflict:
+        raise SourceWorkLedgerConflict(
+            "work resolution evidence conflicts with its ledger entry"
+        )
+    if state == "completed":
+        valid = (
+            set(evidence) == _COMPLETION_EVIDENCE_FIELDS
+            and evidence.get("evidenceKind") == "work_completion"
+            and entry["completionContract"]["evidenceKind"]
+            == "work_completion"
+            and _is_sha256(evidence.get("resultHash"))
+        )
+    elif state == "delegated":
+        valid = (
+            set(evidence) == _DELEGATION_EVIDENCE_FIELDS
+            and evidence.get("evidenceKind")
+            == entry["completionContract"]["evidenceKind"]
+            and entry["dominanceOutcome"]
+            in {"delegate_owner", "delegate_terminal_policy"}
+            and _is_sha256(evidence.get("deferredBindingHash"))
+        )
+    else:
+        valid = (
+            set(evidence) == _DOMINANCE_EVIDENCE_FIELDS
+            and evidence.get("evidenceKind") == "selection_dominance"
+            and entry["completionContract"]["evidenceKind"]
+            == "selection_dominance"
+            and entry["dominanceOutcome"]
+            in {"dominated_by_owner", "dominated_no_send"}
+            and evidence.get("selectionHash") == selection_hash
+            and evidence.get("ownerDecisionHash") == owner_decision_hash
+            and evidence.get("dominatingOwnerKind")
+            == entry["selectedOwnerKind"]
+            and evidence.get("dominatingOwnerKey")
+            == entry["selectedOwnerKey"]
+            and evidence.get("dominanceOutcome")
+            == entry["dominanceOutcome"]
+        )
+    if not valid:
+        raise SourceWorkLedgerConflict(
+            "work resolution evidence schema is unsupported"
+        )
+
+
+def _validate_completion_record(
+    completion_record: Mapping[str, Any],
+    *,
+    work_kind: str,
+) -> dict[str, Any]:
+    copied = _copy_exact_json_mapping(
+        completion_record,
+        field_name="completion record",
+    )
+    if (
+        set(copied) != _COMPLETION_RECORD_FIELDS
+        or not _is_exact_schema_version(
+            copied.get("schemaVersion"),
+            _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        )
+        or copied.get("evidenceKind") != "work_completion"
+        or copied.get("workKind") != work_kind
+        or not _is_sha256(copied.get("resultHash"))
+    ):
+        raise SourceCoordinatorConfigError(
+            "completion record schema is unsupported for the work kind"
+        )
+    return copied
+
+
+def _completion_resolution_evidence(
+    *,
+    canonical_source_id: str,
+    ledger_hash: str,
+    entry: Mapping[str, Any],
+    completion_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        "evidenceKind": "work_completion",
+        "canonicalSourceId": canonical_source_id,
+        "ledgerHash": ledger_hash,
+        "workKey": entry["workKey"],
+        "payloadHash": entry["payloadHash"],
+        "workKind": entry["kind"],
+        "resultHash": completion_record["resultHash"],
+    }
+
+
+def _source_deferred_work_immutable_material(
+    *,
+    canonical_source_id: str,
+    ledger_hash: str,
+    entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    if entry["dominanceOutcome"] == "delegate_owner":
+        wake_condition = "owner_adapter_ready"
+    elif entry["dominanceOutcome"] == "delegate_terminal_policy":
+        wake_condition = "terminal_policy_ready"
+    else:
+        raise SourceWorkTransitionConflict(
+            "source work entry is not eligible for delegation"
+        )
+    if (
+        entry["selectedOwnerKind"] not in _TRANSITION_OWNER_KINDS - {"none"}
+        or not _is_sha256(entry["selectedOwnerKey"])
+    ):
+        raise SourceWorkTransitionConflict(
+            "delegated work lacks a selected transition owner"
+        )
+    material = {
+        "schemaVersion": _SOURCE_DEFERRED_WORK_SCHEMA_VERSION,
+        "workKey": entry["workKey"],
+        "canonicalSourceId": canonical_source_id,
+        "ledgerHash": ledger_hash,
+        "entryPayloadHash": entry["payloadHash"],
+        "targetOwnerKind": entry["selectedOwnerKind"],
+        "targetOwnerKey": entry["selectedOwnerKey"],
+        "wakeCondition": wake_condition,
+        "completionContract": deepcopy(entry["completionContract"]),
+    }
+    material["bindingHash"] = canonical_json_hash(
+        {
+            "hashKind": _SOURCE_DEFERRED_WORK_HASH_KIND,
+            **material,
+        }
+    )
+    return material
+
+
+def _validate_source_deferred_work_document(
+    data: Mapping[str, Any],
+    *,
+    expected_immutable: Mapping[str, Any],
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _SOURCE_DEFERRED_WORK_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _SOURCE_DEFERRED_WORK_SCHEMA_VERSION,
+        )
+        or data.get("state") != "deferred"
+        or not _is_aware_datetime(data.get("createdAt"))
+        or not _is_aware_datetime(data.get("updatedAt"))
+        or any(data.get(field) != value for field, value in expected_immutable.items())
+    ):
+        raise DeferredWorkConflict(
+            "source deferred work conflicts with ledger authority"
+        )
+
+
+def _delegation_resolution_evidence(
+    *,
+    canonical_source_id: str,
+    ledger_hash: str,
+    entry: Mapping[str, Any],
+    deferred_binding_hash: str,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        "evidenceKind": entry["completionContract"]["evidenceKind"],
+        "canonicalSourceId": canonical_source_id,
+        "ledgerHash": ledger_hash,
+        "workKey": entry["workKey"],
+        "payloadHash": entry["payloadHash"],
+        "workKind": entry["kind"],
+        "deferredBindingHash": deferred_binding_hash,
+    }
+
+
+def _dominance_resolution_evidence(
+    *,
+    canonical_source_id: str,
+    ledger_data: Mapping[str, Any],
+    entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    if entry["dominanceOutcome"] not in {
+        "dominated_by_owner",
+        "dominated_no_send",
+    }:
+        raise SourceWorkTransitionConflict(
+            "source work entry is not dominated by the stored selection"
+        )
+    return {
+        "schemaVersion": _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        "evidenceKind": "selection_dominance",
+        "canonicalSourceId": canonical_source_id,
+        "ledgerHash": ledger_data["ledgerHash"],
+        "workKey": entry["workKey"],
+        "payloadHash": entry["payloadHash"],
+        "workKind": entry["kind"],
+        "selectionHash": ledger_data["selectionHash"],
+        "ownerDecisionHash": ledger_data["ownerDecisionHash"],
+        "dominatingOwnerKind": entry["selectedOwnerKind"],
+        "dominatingOwnerKey": entry["selectedOwnerKey"],
+        "dominanceOutcome": entry["dominanceOutcome"],
+    }
+
+
+def _source_settlement_identity_hash(
+    identity_data: Mapping[str, Any],
+) -> str:
+    return canonical_json_hash(
+        {
+            "hashKind": _SOURCE_SETTLEMENT_IDENTITY_HASH_KIND,
+            "schemaVersion": identity_data["schemaVersion"],
+            "canonicalSourceId": identity_data["canonicalSourceId"],
+            "creationHash": identity_data["creationHash"],
+            "threadId": identity_data["threadId"],
+        }
+    )
+
+
+def _final_ledger_evidence_hash(
+    ledger_data: Mapping[str, Any],
+) -> str:
+    if any(
+        entry["state"] not in {"completed", "delegated", "dominated"}
+        for entry in ledger_data["entries"]
+    ):
+        raise SourceSettlementNotReady(
+            "source work ledger contains unsettled entries"
+        )
+    ordered_evidence = [
+        {
+            "workKey": entry["workKey"],
+            "payloadHash": entry["payloadHash"],
+            "state": entry["state"],
+            "resolutionEvidenceHash": entry["resolutionEvidenceHash"],
+        }
+        for entry in ledger_data["entries"]
+    ]
+    return canonical_json_hash(
+        {
+            "hashKind": _FINAL_LEDGER_EVIDENCE_HASH_KIND,
+            "ledgerHash": ledger_data["ledgerHash"],
+            "entries": ordered_evidence,
+        }
+    )
+
+
+def _source_settlement_hash_material(
+    data: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "hashKind": _SOURCE_SETTLEMENT_HASH_KIND,
+        **{
+            field: data[field]
+            for field in (
+                "schemaVersion",
+                "canonicalSourceId",
+                "identityHash",
+                "snapshotImmutableHash",
+                "selectionHash",
+                "ownerDecisionHash",
+                "ledgerHash",
+                "finalLedgerEvidenceHash",
+                "aliases",
+                "aliasSetHash",
+                "settlementRevision",
+            )
+        },
+    }
+
+
+def _source_settlement_immutable_material(
+    *,
+    canonical_source_id: str,
+    identity_data: Mapping[str, Any],
+    classification_data: Mapping[str, Any],
+    owner_data: Mapping[str, Any],
+    ledger_data: Mapping[str, Any],
+    aliases: Sequence[Mapping[str, str]],
+) -> dict[str, Any]:
+    alias_list = [deepcopy(dict(alias)) for alias in aliases]
+    material = {
+        "schemaVersion": _SOURCE_SETTLEMENT_SCHEMA_VERSION,
+        "canonicalSourceId": canonical_source_id,
+        "identityHash": _source_settlement_identity_hash(identity_data),
+        "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
+        "selectionHash": classification_data["selectionHash"],
+        "ownerDecisionHash": owner_data["ownerDecisionHash"],
+        "ledgerHash": ledger_data["ledgerHash"],
+        "finalLedgerEvidenceHash": _final_ledger_evidence_hash(ledger_data),
+        "aliases": alias_list,
+        "aliasSetHash": canonical_json_hash(
+            {
+                "hashKind": _SOURCE_SETTLEMENT_ALIAS_SET_HASH_KIND,
+                "aliases": alias_list,
+            }
+        ),
+        "settlementRevision": 1,
+    }
+    material["settlementHash"] = canonical_json_hash(
+        _source_settlement_hash_material(material)
+    )
+    return material
+
+
+def _validate_source_settlement_document(
+    data: Mapping[str, Any],
+    *,
+    canonical_source_id: str,
+    identity_data: Mapping[str, Any],
+    classification_data: Mapping[str, Any],
+    owner_data: Mapping[str, Any],
+    ledger_data: Mapping[str, Any],
+    current_aliases: Sequence[Mapping[str, str]],
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _SOURCE_SETTLEMENT_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _SOURCE_SETTLEMENT_SCHEMA_VERSION,
+        )
+        or data.get("canonicalSourceId") != canonical_source_id
+        or type(data.get("settlementRevision")) is not int
+        or data.get("settlementRevision") != 1
+        or not _is_aware_datetime(data.get("settledAt"))
+        or not _is_sha256(data.get("settlementHash"))
+    ):
+        raise SourceSettlementConflict("source settlement is malformed")
+    aliases = data.get("aliases")
+    if type(aliases) is not list or not aliases:
+        raise SourceSettlementConflict("source settlement alias set is malformed")
+    seen = set()
+    for descriptor in aliases:
+        if (
+            type(descriptor) is not dict
+            or set(descriptor)
+            != {"sourceAliasKey", "aliasType", "normalizedValueHash"}
+            or not _is_sha256(descriptor.get("sourceAliasKey"))
+            or descriptor.get("aliasType") not in _SOURCE_ALIAS_TYPES
+            or not _is_sha256(descriptor.get("normalizedValueHash"))
+            or descriptor["sourceAliasKey"] in seen
+        ):
+            raise SourceSettlementConflict(
+                "source settlement alias set is malformed"
+            )
+        seen.add(descriptor["sourceAliasKey"])
+    if aliases != sorted(aliases, key=lambda item: item["sourceAliasKey"]):
+        raise SourceSettlementConflict("source settlement aliases are unordered")
+    current_by_key = {
+        descriptor["sourceAliasKey"]: descriptor for descriptor in current_aliases
+    }
+    if any(
+        current_by_key.get(descriptor["sourceAliasKey"]) != descriptor
+        for descriptor in aliases
+    ):
+        raise SourceSettlementConflict(
+            "retained settlement aliases conflict with source identity"
+        )
+    expected_bindings = {
+        "identityHash": _source_settlement_identity_hash(identity_data),
+        "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
+        "selectionHash": classification_data["selectionHash"],
+        "ownerDecisionHash": owner_data["ownerDecisionHash"],
+        "ledgerHash": ledger_data["ledgerHash"],
+        "finalLedgerEvidenceHash": _final_ledger_evidence_hash(ledger_data),
+    }
+    expected_alias_hash = canonical_json_hash(
+        {
+            "hashKind": _SOURCE_SETTLEMENT_ALIAS_SET_HASH_KIND,
+            "aliases": aliases,
+        }
+    )
+    expected_settlement_hash = canonical_json_hash(
+        _source_settlement_hash_material(data)
+    )
+    if (
+        any(data.get(field) != value for field, value in expected_bindings.items())
+        or data.get("aliasSetHash") != expected_alias_hash
+        or data.get("settlementHash") != expected_settlement_hash
+    ):
+        raise SourceSettlementConflict(
+            "source settlement conflicts with retained authority"
+        )
+
+
+def _processed_alias_projection(
+    *,
+    descriptor: Mapping[str, str],
+    canonical_source_id: str,
+    settlement_data: Mapping[str, Any],
+    processed_at: datetime,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": _PROCESSED_ALIAS_SCHEMA_VERSION,
+        **deepcopy(dict(descriptor)),
+        "canonicalSourceId": canonical_source_id,
+        "settlementRevision": settlement_data["settlementRevision"],
+        "settlementHash": settlement_data["settlementHash"],
+        "processedAt": processed_at,
+    }
+
+
+def _validate_processed_alias_projection(
+    data: Mapping[str, Any],
+    *,
+    descriptor: Mapping[str, str],
+    canonical_source_id: str,
+    settlement_data: Mapping[str, Any],
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _PROCESSED_ALIAS_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _PROCESSED_ALIAS_SCHEMA_VERSION,
+        )
+        or not _is_aware_datetime(data.get("processedAt"))
+    ):
+        raise SourceSettlementConflict(
+            "processed alias projection is malformed"
+        )
+    expected = _processed_alias_projection(
+        descriptor=descriptor,
+        canonical_source_id=canonical_source_id,
+        settlement_data=settlement_data,
+        processed_at=data["processedAt"],
+    )
+    if data != expected:
+        raise SourceSettlementConflict(
+            "processed alias projection conflicts with settlement"
+        )
+
+
+def _validate_source_work_transition_bindings(
+    *,
+    ledger_hash: str,
+    work_key: str,
+    payload_hash: str,
+) -> None:
+    if not _is_sha256(ledger_hash):
+        raise SourceCoordinatorConfigError("ledger hash must be a full hash")
+    if not _is_sha256(work_key):
+        raise SourceCoordinatorConfigError("work key must be a full hash")
+    if not _is_sha256(payload_hash):
+        raise SourceCoordinatorConfigError("payload hash must be a full hash")
+
+
+def _find_bound_source_work_entry(
+    ledger_data: Mapping[str, Any],
+    *,
+    ledger_hash: str,
+    work_key: str,
+    payload_hash: str,
+) -> tuple[int, Mapping[str, Any]]:
+    if ledger_data["ledgerHash"] != ledger_hash:
+        raise SourceWorkTransitionConflict(
+            "caller ledger hash conflicts with source authority"
+        )
+    matches = [
+        (index, entry)
+        for index, entry in enumerate(ledger_data["entries"])
+        if entry["workKey"] == work_key
+    ]
+    if len(matches) != 1 or matches[0][1]["payloadHash"] != payload_hash:
+        raise SourceWorkTransitionConflict(
+            "caller work binding conflicts with source ledger"
+        )
+    return matches[0]
 
 
 def _source_work_ledger_immutable_material(
@@ -1120,7 +1921,10 @@ def _source_work_ledger_immutable_material(
             "source work entry limit exceeded"
         )
     immutable_entries = [
-        {field: value for field, value in entry.items() if field != "state"}
+        {
+            field: entry[field]
+            for field in sorted(_SOURCE_WORK_ENTRY_IMMUTABLE_FIELDS)
+        }
         for entry in entries
     ]
     ledger_hash = canonical_json_hash(
@@ -1174,7 +1978,7 @@ def _validate_source_work_ledger_document(
         )
         or data.get("canonicalSourceId") != canonical_source_id
         or type(data.get("revision")) is not int
-        or data.get("revision") != 1
+        or data.get("revision") < 1
         or not _is_aware_datetime(data.get("createdAt"))
         or not _is_aware_datetime(data.get("updatedAt"))
         or type(data.get("entries")) is not list
@@ -1198,7 +2002,6 @@ def _validate_source_work_ledger_document(
             "ownerDecisionHash",
             "entryCount",
             "ledgerHash",
-            "revision",
         )
     ):
         raise SourceWorkLedgerConflict(
@@ -1212,16 +2015,510 @@ def _validate_source_work_ledger_document(
             type(stored) is not dict
             or set(stored) != _SOURCE_WORK_ENTRY_FIELDS
             or stored.get("state")
-            not in {"pending", "applying"}
+            not in {"pending", "applying", "completed", "delegated", "dominated"}
             or any(
                 stored.get(field) != value
                 for field, value in initial.items()
-                if field != "state"
+                if field in _SOURCE_WORK_ENTRY_IMMUTABLE_FIELDS
             )
         ):
             raise SourceWorkLedgerConflict(
                 "source work ledger entry conflicts with authority"
             )
+        _validate_source_work_entry_resolution(
+            stored,
+            canonical_source_id=canonical_source_id,
+            ledger_hash=data["ledgerHash"],
+            selection_hash=data["selectionHash"],
+            owner_decision_hash=data["ownerDecisionHash"],
+        )
+
+
+def _canonical_datetime_token(value: datetime, *, field_name: str) -> str:
+    if not _is_aware_datetime(value):
+        raise SourceCoordinatorConfigError(f"{field_name} must be an aware datetime")
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _thread_head_hash_material(data: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "hashKind": _THREAD_HEAD_HASH_KIND,
+        "schemaVersion": data["schemaVersion"],
+        "threadId": data["threadId"],
+        "threadHeadRevision": data["threadHeadRevision"],
+        "activeOwnerKey": data["activeOwnerKey"],
+        "activeOwnerKind": data["activeOwnerKind"],
+        "activeCanonicalSourceId": data["activeCanonicalSourceId"],
+        "activeGeneration": data["activeGeneration"],
+        "activeState": data["activeState"],
+    }
+
+
+def _build_thread_head_document(
+    *,
+    thread_id: str,
+    canonical_source_id: str | None,
+    owner_data: Mapping[str, Any] | None,
+    generation: int,
+    state: str,
+    revision: int,
+    now: datetime,
+    created_at: datetime | None = None,
+) -> dict[str, Any]:
+    if state == "clear":
+        owner_kind = None
+        owner_key = None
+        canonical_source_id = None
+    else:
+        if owner_data is None or canonical_source_id is None:
+            raise ThreadTransitionConflict("active thread head requires an owner")
+        owner_kind = owner_data["ownerKind"]
+        owner_key = owner_data["ownerKey"]
+        if owner_kind == "none" or owner_key is None:
+            raise ThreadTransitionConflict(
+                "explicit none owner cannot hold a thread transition head"
+            )
+    document = {
+        "schemaVersion": _THREAD_HEAD_SCHEMA_VERSION,
+        "threadId": thread_id,
+        "threadHeadRevision": revision,
+        "activeOwnerKey": owner_key,
+        "activeOwnerKind": owner_kind,
+        "activeCanonicalSourceId": canonical_source_id,
+        "activeGeneration": generation,
+        "activeState": state,
+    }
+    document["headHash"] = canonical_json_hash(
+        _thread_head_hash_material(document)
+    )
+    document["createdAt"] = now if created_at is None else created_at
+    document["updatedAt"] = now
+    return document
+
+
+def _validate_thread_head_document(
+    data: Mapping[str, Any],
+    *,
+    thread_id: str,
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _THREAD_HEAD_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _THREAD_HEAD_SCHEMA_VERSION,
+        )
+        or data.get("threadId") != thread_id
+        or type(data.get("threadHeadRevision")) is not int
+        or data.get("threadHeadRevision") < 1
+        or type(data.get("activeGeneration")) is not int
+        or data.get("activeGeneration") < 0
+        or data.get("activeState") not in {"active", "releasing", "clear"}
+        or not _is_aware_datetime(data.get("createdAt"))
+        or not _is_aware_datetime(data.get("updatedAt"))
+    ):
+        raise SourceCoordinatorAmbiguous("thread transition head is malformed")
+    if data["activeState"] == "clear":
+        if any(
+            data.get(field) is not None
+            for field in (
+                "activeOwnerKey",
+                "activeOwnerKind",
+                "activeCanonicalSourceId",
+            )
+        ):
+            raise SourceCoordinatorAmbiguous("clear thread head retains an owner")
+    elif (
+        data.get("activeOwnerKind") not in _TRANSITION_OWNER_KINDS - {"none"}
+        or not _is_sha256(data.get("activeOwnerKey"))
+        or type(data.get("activeCanonicalSourceId")) is not str
+        or not data.get("activeCanonicalSourceId")
+        or data.get("activeGeneration") < 1
+    ):
+        raise SourceCoordinatorAmbiguous("active thread head owner is malformed")
+    expected_hash = canonical_json_hash(_thread_head_hash_material(data))
+    if data.get("headHash") != expected_hash:
+        raise ThreadTransitionConflict("thread transition head hash conflicts")
+
+
+def _blocker_from_head(data: Mapping[str, Any]) -> dict[str, Any]:
+    if data["activeState"] not in {"active", "releasing"}:
+        raise ThreadTransitionConflict("clear thread head cannot block a source")
+    return {
+        "canonicalSourceId": data["activeCanonicalSourceId"],
+        "ownerKind": data["activeOwnerKind"],
+        "ownerKey": data["activeOwnerKey"],
+        "generation": data["activeGeneration"],
+        "threadHeadRevision": data["threadHeadRevision"],
+        "headHash": data["headHash"],
+    }
+
+
+def _validate_blocker(value: Any) -> None:
+    if (
+        type(value) is not dict
+        or set(value) != _BLOCKER_FIELDS
+        or type(value.get("canonicalSourceId")) is not str
+        or not value.get("canonicalSourceId")
+        or value.get("ownerKind") not in _TRANSITION_OWNER_KINDS - {"none"}
+        or not _is_sha256(value.get("ownerKey"))
+        or type(value.get("generation")) is not int
+        or value.get("generation") < 1
+        or type(value.get("threadHeadRevision")) is not int
+        or value.get("threadHeadRevision") < 1
+        or not _is_sha256(value.get("headHash"))
+    ):
+        raise SourceCoordinatorAmbiguous("thread blocker evidence is malformed")
+
+
+def _pending_admission_hash_material(data: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "hashKind": _PENDING_ADMISSION_HASH_KIND,
+        "schemaVersion": data["schemaVersion"],
+        "canonicalSourceId": data["canonicalSourceId"],
+        "threadId": data["threadId"],
+        "identityCreationHash": data["identityCreationHash"],
+        "snapshotImmutableHash": data["snapshotImmutableHash"],
+        "selectionHash": data["selectionHash"],
+        "ownerDecisionHash": data["ownerDecisionHash"],
+        "ledgerHash": data["ledgerHash"],
+        "ownerKind": data["ownerKind"],
+        "ownerKey": data["ownerKey"],
+        "savedHistoryBindingHash": data["savedHistoryBindingHash"],
+        "indexBindingHash": data["indexBindingHash"],
+        "receivedAt": _canonical_datetime_token(
+            data["receivedAt"],
+            field_name="received at",
+        ),
+        "sentAt": _canonical_datetime_token(
+            data["sentAt"],
+            field_name="sent at",
+        ),
+    }
+
+
+def _pending_admission_immutable_material(
+    *,
+    canonical_source_id: str,
+    thread_id: str,
+    identity_data: Mapping[str, Any],
+    classification_data: Mapping[str, Any],
+    owner_data: Mapping[str, Any],
+    ledger_data: Mapping[str, Any],
+    received_at: datetime,
+    sent_at: datetime,
+    saved_history_binding: Mapping[str, Any],
+    index_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    _canonical_datetime_token(received_at, field_name="received at")
+    _canonical_datetime_token(sent_at, field_name="sent at")
+    history_copy = _copy_exact_json_mapping(
+        saved_history_binding,
+        field_name="saved history binding",
+    )
+    index_copy = _copy_exact_json_mapping(
+        index_binding,
+        field_name="index binding",
+    )
+    material = {
+        "schemaVersion": _PENDING_ADMISSION_SCHEMA_VERSION,
+        "canonicalSourceId": canonical_source_id,
+        "threadId": thread_id,
+        "identityCreationHash": identity_data["creationHash"],
+        "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
+        "selectionHash": classification_data["selectionHash"],
+        "ownerDecisionHash": owner_data["ownerDecisionHash"],
+        "ledgerHash": ledger_data["ledgerHash"],
+        "ownerKind": owner_data["ownerKind"],
+        "ownerKey": owner_data["ownerKey"],
+        "savedHistoryBinding": history_copy,
+        "savedHistoryBindingHash": canonical_json_hash(history_copy),
+        "indexBinding": index_copy,
+        "indexBindingHash": canonical_json_hash(index_copy),
+        "receivedAt": received_at,
+        "sentAt": sent_at,
+    }
+    material["admissionHash"] = canonical_json_hash(
+        _pending_admission_hash_material(material)
+    )
+    return material
+
+
+def _validate_pending_admission_document(
+    data: Mapping[str, Any],
+    *,
+    canonical_source_id: str,
+    thread_id: str,
+    expected_immutable: Mapping[str, Any] | None = None,
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _PENDING_ADMISSION_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _PENDING_ADMISSION_SCHEMA_VERSION,
+        )
+        or data.get("canonicalSourceId") != canonical_source_id
+        or data.get("threadId") != thread_id
+        or data.get("ownerKind") not in _TRANSITION_OWNER_KINDS
+        or (data.get("ownerKind") == "none") != (data.get("ownerKey") is None)
+        or (
+            data.get("ownerKey") is not None
+            and not _is_sha256(data.get("ownerKey"))
+        )
+        or any(
+            not _is_sha256(data.get(field))
+            for field in (
+                "identityCreationHash",
+                "snapshotImmutableHash",
+                "selectionHash",
+                "ownerDecisionHash",
+                "ledgerHash",
+                "savedHistoryBindingHash",
+                "indexBindingHash",
+                "admissionHash",
+            )
+        )
+        or not _is_aware_datetime(data.get("receivedAt"))
+        or not _is_aware_datetime(data.get("sentAt"))
+        or type(data.get("revision")) is not int
+        or data.get("revision") < 1
+        or not _is_aware_datetime(data.get("createdAt"))
+        or not _is_aware_datetime(data.get("updatedAt"))
+        or data.get("admissionState")
+        not in {"pending", "blocked", "processing", "settled"}
+        or data.get("blockedLifecycleState")
+        not in {
+            None,
+            "blocked",
+            "eligible",
+            "claimed",
+            "settled",
+            "settled_as_new_blocker",
+        }
+        or data.get("wakeState")
+        not in {"none", "eligible", "claimed", "consumed"}
+    ):
+        raise SourceCoordinatorAmbiguous("pending admission is malformed")
+    try:
+        history_hash = canonical_json_hash(data["savedHistoryBinding"])
+        index_hash = canonical_json_hash(data["indexBinding"])
+        admission_hash = canonical_json_hash(_pending_admission_hash_material(data))
+    except SourceCoordinatorError:
+        raise
+    except Exception as error:
+        raise SourceCoordinatorAmbiguous(
+            "pending admission immutable material is unreadable"
+        ) from error
+    if (
+        history_hash != data["savedHistoryBindingHash"]
+        or index_hash != data["indexBindingHash"]
+        or admission_hash != data["admissionHash"]
+    ):
+        raise PendingAdmissionConflict("pending admission hashes conflict")
+    for blocker_field in ("initialBlocker", "currentBlocker"):
+        blocker = data[blocker_field]
+        if blocker is not None:
+            _validate_blocker(blocker)
+    state = data["admissionState"]
+    lifecycle = data["blockedLifecycleState"]
+    wake_state = data["wakeState"]
+    wake_generation = data["wakeGeneration"]
+    wake_token = data["wakeToken"]
+    wake_claim_id = data["wakeClaimId"]
+    if wake_state == "none":
+        wake_valid = (
+            wake_generation is None
+            and wake_token is None
+            and wake_claim_id is None
+        )
+    elif wake_state == "eligible":
+        wake_valid = (
+            type(wake_generation) is int
+            and wake_generation > 0
+            and _is_sha256(wake_token)
+            and wake_claim_id is None
+            and state == "blocked"
+            and lifecycle == "eligible"
+        )
+    elif wake_state == "claimed":
+        wake_valid = (
+            type(wake_generation) is int
+            and wake_generation > 0
+            and _is_sha256(wake_token)
+            and type(wake_claim_id) is str
+            and bool(wake_claim_id)
+            and lifecycle == "claimed"
+        )
+    else:
+        wake_valid = (
+            type(wake_generation) is int
+            and wake_generation > 0
+            and _is_sha256(wake_token)
+            and type(wake_claim_id) is str
+            and bool(wake_claim_id)
+            and lifecycle in {"settled", "settled_as_new_blocker"}
+        )
+    if not wake_valid:
+        raise SourceCoordinatorAmbiguous("pending admission wake state is malformed")
+    if state == "pending":
+        state_valid = (
+            lifecycle is None
+            and data["initialBlocker"] is None
+            and data["currentBlocker"] is None
+            and wake_state == "none"
+        )
+    elif state == "blocked":
+        state_valid = (
+            lifecycle in {"blocked", "eligible", "claimed"}
+            and data["initialBlocker"] is not None
+            and data["currentBlocker"] is not None
+        )
+    elif lifecycle is None:
+        state_valid = (
+            data["initialBlocker"] is None
+            and data["currentBlocker"] is None
+            and wake_state == "none"
+        )
+    else:
+        state_valid = (
+            lifecycle in {"settled", "settled_as_new_blocker"}
+            and data["initialBlocker"] is not None
+            and data["currentBlocker"] is not None
+            and wake_state == "consumed"
+        )
+    if not state_valid:
+        raise SourceCoordinatorAmbiguous("pending admission state conflicts")
+    if expected_immutable is not None and any(
+        data.get(field) != value for field, value in expected_immutable.items()
+    ):
+        raise PendingAdmissionConflict(
+            "pending admission conflicts with stored source authority"
+        )
+
+
+def _initial_pending_admission_document(
+    immutable: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    return {
+        **deepcopy(dict(immutable)),
+        "admissionState": "pending",
+        "blockedLifecycleState": None,
+        "initialBlocker": None,
+        "currentBlocker": None,
+        "wakeGeneration": None,
+        "wakeToken": None,
+        "wakeState": "none",
+        "wakeClaimId": None,
+        "revision": 1,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+def _validate_admission_authority_bindings(
+    admission: Mapping[str, Any],
+    *,
+    identity_data: Mapping[str, Any],
+    classification_data: Mapping[str, Any],
+    owner_data: Mapping[str, Any],
+    ledger_data: Mapping[str, Any],
+) -> None:
+    expected = {
+        "identityCreationHash": identity_data["creationHash"],
+        "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
+        "selectionHash": classification_data["selectionHash"],
+        "ownerDecisionHash": owner_data["ownerDecisionHash"],
+        "ledgerHash": ledger_data["ledgerHash"],
+        "ownerKind": owner_data["ownerKind"],
+        "ownerKey": owner_data["ownerKey"],
+    }
+    if any(admission.get(field) != value for field, value in expected.items()):
+        raise PendingAdmissionConflict(
+            "pending admission authority bindings conflict"
+        )
+
+
+def _blocked_projection_from_admission(
+    admission: Mapping[str, Any],
+    *,
+    now: datetime,
+    created_at: datetime | None = None,
+) -> dict[str, Any]:
+    if admission["currentBlocker"] is None:
+        raise ThreadTransitionConflict(
+            "blocked projection requires current blocker evidence"
+        )
+    return {
+        "schemaVersion": _BLOCKED_SOURCE_SCHEMA_VERSION,
+        "canonicalSourceId": admission["canonicalSourceId"],
+        "threadId": admission["threadId"],
+        "admissionHash": admission["admissionHash"],
+        "admissionRevision": admission["revision"],
+        "receivedAt": admission["receivedAt"],
+        "sentAt": admission["sentAt"],
+        "blockedLifecycleState": admission["blockedLifecycleState"],
+        "currentBlocker": deepcopy(admission["currentBlocker"]),
+        "wakeGeneration": admission["wakeGeneration"],
+        "wakeState": admission["wakeState"],
+        "createdAt": now if created_at is None else created_at,
+        "updatedAt": now,
+    }
+
+
+def _validate_blocked_projection_document(
+    data: Mapping[str, Any],
+    *,
+    admission: Mapping[str, Any],
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _BLOCKED_SOURCE_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _BLOCKED_SOURCE_SCHEMA_VERSION,
+        )
+        or not _is_aware_datetime(data.get("createdAt"))
+        or not _is_aware_datetime(data.get("updatedAt"))
+    ):
+        raise SourceCoordinatorAmbiguous("blocked source projection is malformed")
+    expected = _blocked_projection_from_admission(
+        admission,
+        now=data["updatedAt"],
+        created_at=data["createdAt"],
+    )
+    if data != expected:
+        raise ThreadTransitionConflict(
+            "blocked source projection conflicts with admission authority"
+        )
+
+
+def _wake_token_for_release(
+    *,
+    user_id: str,
+    thread_id: str,
+    admission: Mapping[str, Any],
+    released_blocker: Mapping[str, Any],
+    wake_generation: int,
+) -> str:
+    return canonical_json_hash(
+        {
+            "hashKind": _WAKE_TOKEN_HASH_KIND,
+            "userId": user_id,
+            "threadId": thread_id,
+            "canonicalSourceId": admission["canonicalSourceId"],
+            "admissionHash": admission["admissionHash"],
+            "releasedHeadHash": released_blocker["headHash"],
+            "releasedGeneration": released_blocker["generation"],
+            "wakeGeneration": wake_generation,
+        }
+    )
 
 
 def _build_classification_snapshot_material(
@@ -1812,6 +3109,178 @@ class SourceCoordinator:
             raise prepared_plan.ambiguous_error_type(
                 f"{authority_name} commit outcome is ambiguous"
             ) from transaction_error
+
+    def _run_multi_document_transaction(self, prepare, *, authority_name):
+        try:
+            transaction = self._firestore.transaction(max_attempts=3)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                f"{authority_name} transaction is unavailable"
+            ) from transaction_error
+        prepared_plan = None
+
+        @transactional
+        def run_once(active_transaction):
+            nonlocal prepared_plan
+            prepared_plan = None
+            prepared_plan = prepare(active_transaction)
+            return prepared_plan.result
+
+        try:
+            return run_once(transaction)
+        except Exception as transaction_error:
+            if prepared_plan is None:
+                if isinstance(transaction_error, SourceCoordinatorError):
+                    raise
+                raise SourceCoordinatorAmbiguous(
+                    f"{authority_name} transaction failed before commit"
+                ) from transaction_error
+            try:
+                prerequisite_matches = all(
+                    _snapshot_data(reference.get()) == expected
+                    for reference, expected in prepared_plan.prerequisites
+                )
+                mutation_readbacks = [
+                    (_snapshot_data(reference.get()), before, expected)
+                    for reference, before, expected in prepared_plan.mutations
+                ]
+            except Exception as readback_error:
+                raise prepared_plan.ambiguous_error_type(
+                    f"{authority_name} commit outcome is unreadable"
+                ) from readback_error
+            if prerequisite_matches and all(
+                readback == expected
+                for readback, _before, expected in mutation_readbacks
+            ):
+                return prepared_plan.result
+            if prerequisite_matches and all(
+                readback == before
+                for readback, before, _expected in mutation_readbacks
+            ):
+                raise SourceCoordinatorRetryable(
+                    f"{authority_name} commit was not applied"
+                ) from transaction_error
+            raise prepared_plan.ambiguous_error_type(
+                f"{authority_name} commit outcome is ambiguous"
+            ) from transaction_error
+
+    @staticmethod
+    def _stage_document_mutations(transaction, mutations) -> None:
+        for reference, before, expected in mutations:
+            if expected is None:
+                transaction.delete(reference)
+            elif before is None:
+                transaction.create(reference, deepcopy(expected))
+            else:
+                transaction.set(reference, deepcopy(expected))
+
+    def _read_source_authority_bundle(
+        self,
+        *,
+        transaction,
+        user_ref,
+        canonical_source_id: str,
+        expected_thread_id: str | None = None,
+    ) -> tuple[
+        tuple[Any, Mapping[str, Any]],
+        tuple[Any, Mapping[str, Any]],
+        tuple[Any, Mapping[str, Any]],
+        tuple[Any, Mapping[str, Any]],
+    ]:
+        identity_ref = user_ref.collection("sourceIdentities").document(
+            canonical_source_id
+        )
+        classification_ref = user_ref.collection("sourceClassifications").document(
+            canonical_source_id
+        )
+        owner_ref = user_ref.collection("sourceTransitionOwners").document(
+            canonical_source_id
+        )
+        ledger_ref = user_ref.collection("sourceWorkLedgers").document(
+            canonical_source_id
+        )
+        identity_data = self._require_source_identity_snapshot(
+            identity_ref.get(transaction=transaction),
+            canonical_source_id=canonical_source_id,
+        )
+        thread_id = identity_data.get("threadId")
+        if type(thread_id) is not str or not thread_id:
+            raise ThreadTransitionConflict(
+                "source authority requires a retained thread binding"
+            )
+        if expected_thread_id is not None and thread_id != expected_thread_id:
+            raise ThreadTransitionConflict(
+                "source authority conflicts with the requested thread"
+            )
+        classification_data = _snapshot_data(
+            classification_ref.get(transaction=transaction)
+        )
+        if classification_data is None:
+            raise ClassificationSnapshotNotReady(
+                "thread authority requires a classification snapshot"
+            )
+        _validate_classification_document(
+            classification_data,
+            canonical_source_id=canonical_source_id,
+        )
+        if classification_data["classificationState"] != "snapshot_ready":
+            raise ClassificationSnapshotNotReady(
+                "thread authority requires snapshot_ready classification"
+            )
+        owner_data = _snapshot_data(owner_ref.get(transaction=transaction))
+        if owner_data is None:
+            raise TransitionOwnerConflict(
+                "thread authority requires an explicit transition owner"
+            )
+        _validate_transition_owner_document(
+            owner_data,
+            canonical_source_id=canonical_source_id,
+            classification_data=classification_data,
+        )
+        ledger_data = _snapshot_data(ledger_ref.get(transaction=transaction))
+        if ledger_data is None:
+            raise SourceWorkLedgerConflict(
+                "thread authority requires a source work ledger"
+            )
+        _validate_source_work_ledger_document(
+            ledger_data,
+            canonical_source_id=canonical_source_id,
+            classification_data=classification_data,
+            owner_data=owner_data,
+        )
+        return (
+            (identity_ref, identity_data),
+            (classification_ref, classification_data),
+            (owner_ref, owner_data),
+            (ledger_ref, ledger_data),
+        )
+
+    def _query_pending_admissions(
+        self,
+        *,
+        transaction,
+        collection_ref,
+        thread_id: str,
+    ) -> list[tuple[Any, dict[str, Any]]]:
+        query = collection_ref.where("threadId", "==", thread_id)
+        snapshots = list(transaction.get(query))
+        admissions = []
+        for snapshot in snapshots:
+            data = _snapshot_data(snapshot)
+            if data is None:
+                raise SourceCoordinatorAmbiguous(
+                    "pending admission query returned an absent document"
+                )
+            _validate_pending_admission_document(
+                data,
+                canonical_source_id=snapshot.id,
+                thread_id=thread_id,
+            )
+            admissions.append((snapshot.reference, data))
+        admissions.sort(key=lambda item: item[1]["canonicalSourceId"])
+        return admissions
 
     def claim_source_classification(
         self,
@@ -2797,6 +4266,1931 @@ class SourceCoordinator:
         return self._run_authority_create_transaction(
             prepare,
             authority_name="source work ledger",
+        )
+
+    def admit_pending_inbound(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        received_at: datetime,
+        sent_at: datetime,
+        saved_history_binding: Mapping[str, Any],
+        index_binding: Mapping[str, Any],
+    ) -> PendingAdmissionResult:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        _canonical_datetime_token(received_at, field_name="received at")
+        _canonical_datetime_token(sent_at, field_name="sent at")
+        user_ref = self._firestore.collection("users").document(user_id)
+        admission_collection = user_ref.collection("inboundPendingAdmissions")
+        admission_ref = admission_collection.document(canonical_source_id)
+
+        def prepare(transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            (identity_ref, identity_data), (
+                classification_ref,
+                classification_data,
+            ), (owner_ref, owner_data), (ledger_ref, ledger_data) = bundle
+            thread_id = identity_data["threadId"]
+            head_ref = user_ref.collection("threadTransitionHeads").document(
+                thread_id
+            )
+            head_before = _snapshot_data(head_ref.get(transaction=transaction))
+            if head_before is not None:
+                _validate_thread_head_document(head_before, thread_id=thread_id)
+            admissions = self._query_pending_admissions(
+                transaction=transaction,
+                collection_ref=admission_collection,
+                thread_id=thread_id,
+            )
+            immutable = _pending_admission_immutable_material(
+                canonical_source_id=canonical_source_id,
+                thread_id=thread_id,
+                identity_data=identity_data,
+                classification_data=classification_data,
+                owner_data=owner_data,
+                ledger_data=ledger_data,
+                received_at=received_at,
+                sent_at=sent_at,
+                saved_history_binding=saved_history_binding,
+                index_binding=index_binding,
+            )
+            existing = next(
+                (
+                    data
+                    for reference, data in admissions
+                    if reference.id == canonical_source_id
+                ),
+                None,
+            )
+            authority_prerequisites = (
+                (identity_ref, identity_data),
+                (classification_ref, classification_data),
+                (owner_ref, owner_data),
+                (ledger_ref, ledger_data),
+                (head_ref, head_before),
+            )
+            if existing is not None:
+                _validate_pending_admission_document(
+                    existing,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                    expected_immutable=immutable,
+                )
+                return _MultiDocumentTransactionPlan(
+                    result=PendingAdmissionResult(
+                        canonical_source_id=canonical_source_id,
+                        thread_id=thread_id,
+                        admission_hash=existing["admissionHash"],
+                        state=existing["admissionState"],
+                        created=False,
+                    ),
+                    prerequisites=(
+                        *authority_prerequisites,
+                        *((reference, data) for reference, data in admissions),
+                    ),
+                    mutations=(),
+                    ambiguous_error_type=PendingAdmissionConflict,
+                )
+            if (
+                owner_data["ownerKind"] != "none"
+                and head_before is not None
+                and head_before["activeState"] != "clear"
+            ):
+                raise ThreadTransitionConflict(
+                    "occupied thread requires atomic blocked-source enqueue"
+                )
+            now = self._current_time()
+            expected = _initial_pending_admission_document(immutable, now=now)
+            mutations = ((admission_ref, None, expected),)
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=PendingAdmissionResult(
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                    admission_hash=expected["admissionHash"],
+                    state="pending",
+                    created=True,
+                ),
+                prerequisites=(
+                    *authority_prerequisites,
+                    *((reference, data) for reference, data in admissions),
+                ),
+                mutations=mutations,
+                ambiguous_error_type=PendingAdmissionConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="pending inbound admission",
+        )
+
+    def enqueue_blocked_source(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        received_at: datetime,
+        sent_at: datetime,
+        saved_history_binding: Mapping[str, Any],
+        index_binding: Mapping[str, Any],
+    ) -> ThreadTransitionResult:
+        return self._claim_or_block_thread_transition(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+            received_at=received_at,
+            sent_at=sent_at,
+            saved_history_binding=saved_history_binding,
+            index_binding=index_binding,
+            required_disposition="blocked",
+        )
+
+    def claim_or_block_thread_transition(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        received_at: datetime | None = None,
+        sent_at: datetime | None = None,
+        saved_history_binding: Mapping[str, Any] | None = None,
+        index_binding: Mapping[str, Any] | None = None,
+    ) -> ThreadTransitionResult:
+        return self._claim_or_block_thread_transition(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+            received_at=received_at,
+            sent_at=sent_at,
+            saved_history_binding=saved_history_binding,
+            index_binding=index_binding,
+            required_disposition=None,
+        )
+
+    def _claim_or_block_thread_transition(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        received_at: datetime | None,
+        sent_at: datetime | None,
+        saved_history_binding: Mapping[str, Any] | None,
+        index_binding: Mapping[str, Any] | None,
+        required_disposition: str | None,
+    ) -> ThreadTransitionResult:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        supplied_admission_values = (
+            received_at,
+            sent_at,
+            saved_history_binding,
+            index_binding,
+        )
+        has_all_admission_values = all(
+            value is not None for value in supplied_admission_values
+        )
+        if any(value is not None for value in supplied_admission_values) and not (
+            has_all_admission_values
+        ):
+            raise SourceCoordinatorConfigError(
+                "inline pending admission requires all binding fields"
+            )
+        if has_all_admission_values:
+            _canonical_datetime_token(received_at, field_name="received at")
+            _canonical_datetime_token(sent_at, field_name="sent at")
+        user_ref = self._firestore.collection("users").document(user_id)
+        admission_collection = user_ref.collection("inboundPendingAdmissions")
+        admission_ref = admission_collection.document(canonical_source_id)
+        projection_ref = user_ref.collection("blockedSources").document(
+            canonical_source_id
+        )
+
+        def prepare(transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            (identity_ref, identity_data), (
+                classification_ref,
+                classification_data,
+            ), (owner_ref, owner_data), (ledger_ref, ledger_data) = bundle
+            if owner_data["ownerKind"] == "none":
+                raise ThreadTransitionConflict(
+                    "explicit none owner does not require a transition head"
+                )
+            thread_id = identity_data["threadId"]
+            head_ref = user_ref.collection("threadTransitionHeads").document(
+                thread_id
+            )
+            head_before = _snapshot_data(head_ref.get(transaction=transaction))
+            if head_before is not None:
+                _validate_thread_head_document(head_before, thread_id=thread_id)
+            admissions = self._query_pending_admissions(
+                transaction=transaction,
+                collection_ref=admission_collection,
+                thread_id=thread_id,
+            )
+            admissions_by_id = {
+                data["canonicalSourceId"]: (reference, data)
+                for reference, data in admissions
+            }
+            admission_before = admissions_by_id.get(
+                canonical_source_id,
+                (admission_ref, None),
+            )[1]
+            immutable = None
+            if has_all_admission_values:
+                immutable = _pending_admission_immutable_material(
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                    received_at=received_at,
+                    sent_at=sent_at,
+                    saved_history_binding=saved_history_binding,
+                    index_binding=index_binding,
+                )
+            if admission_before is None:
+                if immutable is None:
+                    raise PendingAdmissionConflict(
+                        "thread transition requires a pending admission"
+                    )
+            else:
+                _validate_pending_admission_document(
+                    admission_before,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                    expected_immutable=immutable,
+                )
+                _validate_admission_authority_bindings(
+                    admission_before,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                )
+            authority_prerequisites = [
+                (identity_ref, identity_data),
+                (classification_ref, classification_data),
+                (owner_ref, owner_data),
+                (ledger_ref, ledger_data),
+            ]
+            if head_before is not None and head_before["activeState"] != "clear":
+                winner_source_id = head_before["activeCanonicalSourceId"]
+                winner_bundle = self._read_source_authority_bundle(
+                    transaction=transaction,
+                    user_ref=user_ref,
+                    canonical_source_id=winner_source_id,
+                    expected_thread_id=thread_id,
+                )
+                winner_owner = winner_bundle[2][1]
+                if (
+                    head_before["activeOwnerKind"] != winner_owner["ownerKind"]
+                    or head_before["activeOwnerKey"] != winner_owner["ownerKey"]
+                ):
+                    raise ThreadTransitionConflict(
+                        "thread head conflicts with retained winner authority"
+                    )
+                winner_admission = admissions_by_id.get(winner_source_id)
+                if winner_admission is None:
+                    raise ThreadTransitionConflict(
+                        "thread head has no authoritative pending admission"
+                    )
+                _validate_admission_authority_bindings(
+                    winner_admission[1],
+                    identity_data=winner_bundle[0][1],
+                    classification_data=winner_bundle[1][1],
+                    owner_data=winner_owner,
+                    ledger_data=winner_bundle[3][1],
+                )
+                authority_prerequisites.extend(winner_bundle)
+            now = self._current_time()
+            if head_before is None or head_before["activeState"] == "clear":
+                if required_disposition == "blocked":
+                    raise ThreadTransitionConflict(
+                        "blocked enqueue requires an occupied thread head"
+                    )
+                if admission_before is not None and admission_before[
+                    "admissionState"
+                ] != "pending":
+                    raise ThreadTransitionConflict(
+                        "thread claim conflicts with admission state"
+                    )
+                generation = (
+                    1
+                    if head_before is None
+                    else head_before["activeGeneration"] + 1
+                )
+                head_expected = _build_thread_head_document(
+                    thread_id=thread_id,
+                    canonical_source_id=canonical_source_id,
+                    owner_data=owner_data,
+                    generation=generation,
+                    state="active",
+                    revision=(
+                        1
+                        if head_before is None
+                        else head_before["threadHeadRevision"] + 1
+                    ),
+                    now=now,
+                    created_at=(
+                        None if head_before is None else head_before["createdAt"]
+                    ),
+                )
+                if admission_before is None:
+                    admission_expected = _initial_pending_admission_document(
+                        immutable,
+                        now=now,
+                    )
+                else:
+                    admission_expected = deepcopy(admission_before)
+                    admission_expected["revision"] += 1
+                admission_expected.update(
+                    {
+                        "admissionState": "processing",
+                        "updatedAt": now,
+                    }
+                )
+                mutations = (
+                    (head_ref, head_before, head_expected),
+                    (admission_ref, admission_before, admission_expected),
+                )
+                mutation_refs = {head_ref, admission_ref}
+                prerequisites = [
+                    *authority_prerequisites,
+                    *(
+                        (reference, data)
+                        for reference, data in admissions
+                        if reference not in mutation_refs
+                    ),
+                ]
+                self._stage_document_mutations(transaction, mutations)
+                return _MultiDocumentTransactionPlan(
+                    result=ThreadTransitionResult(
+                        canonical_source_id=canonical_source_id,
+                        thread_id=thread_id,
+                        disposition="claimed",
+                        generation=generation,
+                        head_revision=head_expected["threadHeadRevision"],
+                        blocker_canonical_source_id=None,
+                    ),
+                    prerequisites=prerequisites,
+                    mutations=mutations,
+                    ambiguous_error_type=ThreadTransitionConflict,
+                )
+            if head_before["activeCanonicalSourceId"] == canonical_source_id:
+                if required_disposition == "blocked":
+                    raise ThreadTransitionConflict(
+                        "source already owns the occupied thread head"
+                    )
+                if (
+                    head_before["activeState"] != "active"
+                    or head_before["activeOwnerKind"] != owner_data["ownerKind"]
+                    or head_before["activeOwnerKey"] != owner_data["ownerKey"]
+                    or admission_before is None
+                    or admission_before["admissionState"] != "processing"
+                ):
+                    raise ThreadTransitionConflict(
+                        "same-source thread-head retry conflicts with authority"
+                    )
+                return _MultiDocumentTransactionPlan(
+                    result=ThreadTransitionResult(
+                        canonical_source_id=canonical_source_id,
+                        thread_id=thread_id,
+                        disposition="claimed",
+                        generation=head_before["activeGeneration"],
+                        head_revision=head_before["threadHeadRevision"],
+                        blocker_canonical_source_id=None,
+                    ),
+                    prerequisites=(
+                        *authority_prerequisites,
+                        (head_ref, head_before),
+                        *((reference, data) for reference, data in admissions),
+                    ),
+                    mutations=(),
+                    ambiguous_error_type=ThreadTransitionConflict,
+                )
+            blocker = _blocker_from_head(head_before)
+            blocked_count = sum(
+                data["admissionState"] == "blocked"
+                and data["canonicalSourceId"] != canonical_source_id
+                for _reference, data in admissions
+            )
+            if (
+                admission_before is None
+                or admission_before["admissionState"] == "pending"
+            ) and blocked_count >= MAX_BLOCKED_SOURCES_PER_THREAD:
+                raise ThreadQueueLimitExceeded(
+                    "thread blocked-source capacity is exhausted"
+                )
+            projection_before = _snapshot_data(
+                projection_ref.get(transaction=transaction)
+            )
+            if admission_before is not None and admission_before[
+                "admissionState"
+            ] == "blocked":
+                if (
+                    admission_before["blockedLifecycleState"] != "blocked"
+                    or admission_before["wakeState"] != "none"
+                    or admission_before["currentBlocker"] != blocker
+                    or projection_before is None
+                ):
+                    raise ThreadTransitionConflict(
+                        "blocked admission retry conflicts with current head"
+                    )
+                _validate_blocked_projection_document(
+                    projection_before,
+                    admission=admission_before,
+                )
+                return _MultiDocumentTransactionPlan(
+                    result=ThreadTransitionResult(
+                        canonical_source_id=canonical_source_id,
+                        thread_id=thread_id,
+                        disposition="blocked",
+                        generation=head_before["activeGeneration"],
+                        head_revision=head_before["threadHeadRevision"],
+                        blocker_canonical_source_id=head_before[
+                            "activeCanonicalSourceId"
+                        ],
+                    ),
+                    prerequisites=(
+                        *authority_prerequisites,
+                        (head_ref, head_before),
+                        *((reference, data) for reference, data in admissions),
+                        (projection_ref, projection_before),
+                    ),
+                    mutations=(),
+                    ambiguous_error_type=ThreadTransitionConflict,
+                )
+            if admission_before is not None and admission_before[
+                "admissionState"
+            ] != "pending":
+                raise ThreadTransitionConflict(
+                    "source cannot enter the blocked lifecycle from its state"
+                )
+            if projection_before is not None:
+                raise ThreadTransitionConflict(
+                    "blocked projection exists without blocked admission authority"
+                )
+            if admission_before is None:
+                admission_expected = _initial_pending_admission_document(
+                    immutable,
+                    now=now,
+                )
+            else:
+                admission_expected = deepcopy(admission_before)
+                admission_expected["revision"] += 1
+            admission_expected.update(
+                {
+                    "admissionState": "blocked",
+                    "blockedLifecycleState": "blocked",
+                    "initialBlocker": deepcopy(blocker),
+                    "currentBlocker": deepcopy(blocker),
+                    "updatedAt": now,
+                }
+            )
+            projection_expected = _blocked_projection_from_admission(
+                admission_expected,
+                now=now,
+            )
+            mutations = (
+                (admission_ref, admission_before, admission_expected),
+                (projection_ref, None, projection_expected),
+            )
+            mutation_refs = {admission_ref, projection_ref}
+            prerequisites = [
+                *authority_prerequisites,
+                (head_ref, head_before),
+                *(
+                    (reference, data)
+                    for reference, data in admissions
+                    if reference not in mutation_refs
+                ),
+            ]
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=ThreadTransitionResult(
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                    disposition="blocked",
+                    generation=head_before["activeGeneration"],
+                    head_revision=head_before["threadHeadRevision"],
+                    blocker_canonical_source_id=head_before[
+                        "activeCanonicalSourceId"
+                    ],
+                ),
+                prerequisites=prerequisites,
+                mutations=mutations,
+                ambiguous_error_type=ThreadTransitionConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="thread transition claim",
+        )
+
+    def release_generation_and_wake_oldest(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        canonical_source_id: str,
+    ) -> WakeReleaseResult:
+        _validate_user_id(user_id)
+        _validate_document_id(thread_id, field_name="thread id")
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+        head_ref = user_ref.collection("threadTransitionHeads").document(thread_id)
+        admission_collection = user_ref.collection("inboundPendingAdmissions")
+        projection_collection = user_ref.collection("blockedSources")
+
+        def prepare(transaction):
+            head_before = _snapshot_data(head_ref.get(transaction=transaction))
+            if head_before is None:
+                raise WakeReleaseConflict("thread head is absent")
+            _validate_thread_head_document(head_before, thread_id=thread_id)
+            admissions = self._query_pending_admissions(
+                transaction=transaction,
+                collection_ref=admission_collection,
+                thread_id=thread_id,
+            )
+            admissions_by_id = {
+                data["canonicalSourceId"]: (reference, data)
+                for reference, data in admissions
+            }
+            active_admission = admissions_by_id.get(canonical_source_id)
+            if active_admission is None:
+                raise WakeReleaseConflict(
+                    "released source has no authoritative admission"
+                )
+            if head_before["activeState"] == "clear":
+                raise WakeReleaseConflict(
+                    "clear thread head retains no exact release ownership evidence"
+                )
+            if head_before["activeState"] == "releasing":
+                if head_before["activeCanonicalSourceId"] != canonical_source_id:
+                    raise WakeReleaseConflict(
+                        "releasing head belongs to a different source"
+                    )
+                released_bundle = self._read_source_authority_bundle(
+                    transaction=transaction,
+                    user_ref=user_ref,
+                    canonical_source_id=canonical_source_id,
+                    expected_thread_id=thread_id,
+                )
+                released_owner = released_bundle[2][1]
+                _validate_admission_authority_bindings(
+                    active_admission[1],
+                    identity_data=released_bundle[0][1],
+                    classification_data=released_bundle[1][1],
+                    owner_data=released_owner,
+                    ledger_data=released_bundle[3][1],
+                )
+                if (
+                    active_admission[1]["admissionState"] != "settled"
+                    or head_before["activeOwnerKind"]
+                    != released_owner["ownerKind"]
+                    or head_before["activeOwnerKey"]
+                    != released_owner["ownerKey"]
+                ):
+                    raise WakeReleaseConflict(
+                        "releasing head conflicts with retained source authority"
+                    )
+                eligible = [
+                    (reference, data)
+                    for reference, data in admissions
+                    if data["admissionState"] == "blocked"
+                    and data["blockedLifecycleState"] == "eligible"
+                    and data["wakeState"] == "eligible"
+                ]
+                if len(eligible) != 1:
+                    raise WakeReleaseConflict(
+                        "releasing head lacks one authoritative eligible wake"
+                    )
+                eligible_ref, eligible_data = eligible[0]
+                blocker = eligible_data["currentBlocker"]
+                if (
+                    blocker is None
+                    or blocker["canonicalSourceId"] != canonical_source_id
+                    or blocker["generation"] != head_before["activeGeneration"]
+                    or eligible_data["wakeGeneration"]
+                    != head_before["activeGeneration"] + 1
+                    or eligible_data["wakeToken"]
+                    != _wake_token_for_release(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        admission=eligible_data,
+                        released_blocker=blocker,
+                        wake_generation=eligible_data["wakeGeneration"],
+                    )
+                ):
+                    raise WakeReleaseConflict(
+                        "eligible wake conflicts with released generation"
+                    )
+                projection_ref = projection_collection.document(
+                    eligible_data["canonicalSourceId"]
+                )
+                projection = _snapshot_data(
+                    projection_ref.get(transaction=transaction)
+                )
+                if projection is None:
+                    raise WakeReleaseConflict(
+                        "eligible wake lacks its blocked projection"
+                    )
+                _validate_blocked_projection_document(
+                    projection,
+                    admission=eligible_data,
+                )
+                return _MultiDocumentTransactionPlan(
+                    result=WakeReleaseResult(
+                        thread_id=thread_id,
+                        released_canonical_source_id=canonical_source_id,
+                        next_canonical_source_id=eligible_data[
+                            "canonicalSourceId"
+                        ],
+                        wake_generation=eligible_data["wakeGeneration"],
+                        wake_token=eligible_data["wakeToken"],
+                        head_state="releasing",
+                    ),
+                    prerequisites=(
+                        *released_bundle,
+                        (head_ref, head_before),
+                        *((reference, data) for reference, data in admissions),
+                        (projection_ref, projection),
+                    ),
+                    mutations=(),
+                    ambiguous_error_type=WakeReleaseConflict,
+                )
+            if (
+                head_before["activeState"] != "active"
+                or head_before["activeCanonicalSourceId"]
+                != canonical_source_id
+            ):
+                raise WakeReleaseConflict(
+                    "source does not own an active thread generation"
+                )
+            active_bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+                expected_thread_id=thread_id,
+            )
+            active_owner = active_bundle[2][1]
+            if (
+                head_before["activeOwnerKind"] != active_owner["ownerKind"]
+                or head_before["activeOwnerKey"] != active_owner["ownerKey"]
+            ):
+                raise WakeReleaseConflict(
+                    "active thread head conflicts with owner authority"
+                )
+            _validate_admission_authority_bindings(
+                active_admission[1],
+                identity_data=active_bundle[0][1],
+                classification_data=active_bundle[1][1],
+                owner_data=active_owner,
+                ledger_data=active_bundle[3][1],
+            )
+            if active_admission[1]["admissionState"] != "settled":
+                raise WakeReleaseConflict(
+                    "active source is not settled and cannot release its head"
+                )
+            for _reference, admission in admissions:
+                if admission["canonicalSourceId"] == canonical_source_id:
+                    continue
+                if admission["ownerKind"] == "none":
+                    continue
+                if admission["admissionState"] == "settled":
+                    continue
+                if (
+                    admission["admissionState"] != "blocked"
+                    or admission["blockedLifecycleState"] != "blocked"
+                    or admission["wakeState"] != "none"
+                ):
+                    raise WakeReleaseConflict(
+                        "thread release found an unbound pending admission"
+                    )
+            blocked = [
+                (reference, data)
+                for reference, data in admissions
+                if data["admissionState"] == "blocked"
+                and data["blockedLifecycleState"] == "blocked"
+                and data["wakeState"] == "none"
+            ]
+            now = self._current_time()
+            if not blocked:
+                head_expected = _build_thread_head_document(
+                    thread_id=thread_id,
+                    canonical_source_id=None,
+                    owner_data=None,
+                    generation=head_before["activeGeneration"],
+                    state="clear",
+                    revision=head_before["threadHeadRevision"] + 1,
+                    now=now,
+                    created_at=head_before["createdAt"],
+                )
+                mutations = ((head_ref, head_before, head_expected),)
+                self._stage_document_mutations(transaction, mutations)
+                return _MultiDocumentTransactionPlan(
+                    result=WakeReleaseResult(
+                        thread_id=thread_id,
+                        released_canonical_source_id=canonical_source_id,
+                        next_canonical_source_id=None,
+                        wake_generation=None,
+                        wake_token=None,
+                        head_state="clear",
+                    ),
+                    prerequisites=(
+                        *active_bundle,
+                        *((reference, data) for reference, data in admissions),
+                    ),
+                    mutations=mutations,
+                    ambiguous_error_type=WakeReleaseConflict,
+                )
+            blocked.sort(
+                key=lambda item: (
+                    item[1]["receivedAt"],
+                    item[1]["sentAt"],
+                    item[1]["canonicalSourceId"],
+                )
+            )
+            selected_ref, selected_before = blocked[0]
+            released_blocker = _blocker_from_head(head_before)
+            if selected_before["currentBlocker"] != released_blocker:
+                raise WakeReleaseConflict(
+                    "oldest blocked source is not bound to the active head"
+                )
+            wake_generation = head_before["activeGeneration"] + 1
+            wake_token = _wake_token_for_release(
+                user_id=user_id,
+                thread_id=thread_id,
+                admission=selected_before,
+                released_blocker=released_blocker,
+                wake_generation=wake_generation,
+            )
+            selected_expected = deepcopy(selected_before)
+            selected_expected.update(
+                {
+                    "blockedLifecycleState": "eligible",
+                    "wakeGeneration": wake_generation,
+                    "wakeToken": wake_token,
+                    "wakeState": "eligible",
+                    "wakeClaimId": None,
+                    "revision": selected_before["revision"] + 1,
+                    "updatedAt": now,
+                }
+            )
+            selected_projection_ref = projection_collection.document(
+                selected_before["canonicalSourceId"]
+            )
+            selected_projection_before = _snapshot_data(
+                selected_projection_ref.get(transaction=transaction)
+            )
+            if selected_projection_before is None:
+                raise WakeReleaseConflict(
+                    "oldest blocked source lacks its projection"
+                )
+            _validate_blocked_projection_document(
+                selected_projection_before,
+                admission=selected_before,
+            )
+            selected_projection_expected = _blocked_projection_from_admission(
+                selected_expected,
+                now=now,
+                created_at=selected_projection_before["createdAt"],
+            )
+            head_expected = _build_thread_head_document(
+                thread_id=thread_id,
+                canonical_source_id=canonical_source_id,
+                owner_data=active_owner,
+                generation=head_before["activeGeneration"],
+                state="releasing",
+                revision=head_before["threadHeadRevision"] + 1,
+                now=now,
+                created_at=head_before["createdAt"],
+            )
+            mutations = (
+                (head_ref, head_before, head_expected),
+                (selected_ref, selected_before, selected_expected),
+                (
+                    selected_projection_ref,
+                    selected_projection_before,
+                    selected_projection_expected,
+                ),
+            )
+            mutation_refs = {head_ref, selected_ref, selected_projection_ref}
+            prerequisites = [
+                *active_bundle,
+                *(
+                    (reference, data)
+                    for reference, data in admissions
+                    if reference not in mutation_refs
+                ),
+            ]
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=WakeReleaseResult(
+                    thread_id=thread_id,
+                    released_canonical_source_id=canonical_source_id,
+                    next_canonical_source_id=selected_before[
+                        "canonicalSourceId"
+                    ],
+                    wake_generation=wake_generation,
+                    wake_token=wake_token,
+                    head_state="releasing",
+                ),
+                prerequisites=prerequisites,
+                mutations=mutations,
+                ambiguous_error_type=WakeReleaseConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="thread generation release",
+        )
+
+    def claim_wake_and_rebind_generation(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        canonical_source_id: str,
+        wake_token: str,
+        wake_claim_id: str,
+    ) -> WakeClaimResult:
+        _validate_user_id(user_id)
+        _validate_document_id(thread_id, field_name="thread id")
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        if not _is_sha256(wake_token):
+            raise SourceCoordinatorConfigError("wake token must be a full hash")
+        _validate_document_id(wake_claim_id, field_name="wake claim id")
+        user_ref = self._firestore.collection("users").document(user_id)
+        head_ref = user_ref.collection("threadTransitionHeads").document(thread_id)
+        admission_collection = user_ref.collection("inboundPendingAdmissions")
+        projection_collection = user_ref.collection("blockedSources")
+
+        def prepare(transaction):
+            head_before = _snapshot_data(head_ref.get(transaction=transaction))
+            if head_before is None:
+                raise WakeClaimConflict("wake claim requires a thread head")
+            _validate_thread_head_document(head_before, thread_id=thread_id)
+            admissions = self._query_pending_admissions(
+                transaction=transaction,
+                collection_ref=admission_collection,
+                thread_id=thread_id,
+            )
+            admissions_by_id = {
+                data["canonicalSourceId"]: (reference, data)
+                for reference, data in admissions
+            }
+            selected = admissions_by_id.get(canonical_source_id)
+            if selected is None:
+                raise WakeClaimConflict(
+                    "wake claim source has no authoritative admission"
+                )
+            selected_ref, selected_before = selected
+            selected_bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+                expected_thread_id=thread_id,
+            )
+            selected_owner = selected_bundle[2][1]
+            if selected_owner["ownerKind"] == "none":
+                raise WakeClaimConflict(
+                    "explicit none owner cannot become a thread blocker"
+                )
+            _validate_admission_authority_bindings(
+                selected_before,
+                identity_data=selected_bundle[0][1],
+                classification_data=selected_bundle[1][1],
+                owner_data=selected_owner,
+                ledger_data=selected_bundle[3][1],
+            )
+            selected_projection_ref = projection_collection.document(
+                canonical_source_id
+            )
+            selected_projection_before = _snapshot_data(
+                selected_projection_ref.get(transaction=transaction)
+            )
+            if selected_projection_before is None:
+                raise WakeClaimConflict(
+                    "wake claim source lacks its blocked projection"
+                )
+            _validate_blocked_projection_document(
+                selected_projection_before,
+                admission=selected_before,
+            )
+            if selected_before["wakeState"] == "consumed":
+                consumed_released_blocker = selected_before["currentBlocker"]
+                if (
+                    consumed_released_blocker is None
+                    or selected_before["wakeToken"]
+                    != _wake_token_for_release(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        admission=selected_before,
+                        released_blocker=consumed_released_blocker,
+                        wake_generation=selected_before["wakeGeneration"],
+                    )
+                ):
+                    raise WakeClaimConflict(
+                        "consumed wake token conflicts with release evidence"
+                    )
+                if (
+                    selected_before["wakeToken"] != wake_token
+                    or selected_before["wakeClaimId"] != wake_claim_id
+                    or head_before["activeState"] != "active"
+                    or head_before["activeCanonicalSourceId"]
+                    != canonical_source_id
+                    or head_before["activeGeneration"]
+                    != selected_before["wakeGeneration"]
+                    or head_before["activeOwnerKind"]
+                    != selected_owner["ownerKind"]
+                    or head_before["activeOwnerKey"]
+                    != selected_owner["ownerKey"]
+                ):
+                    raise WakeClaimConflict(
+                        "wake token was consumed by a different claim"
+                    )
+                active_blocker = _blocker_from_head(head_before)
+                rebound_projection_prerequisites = []
+                for reference, admission in admissions:
+                    if admission["canonicalSourceId"] == canonical_source_id:
+                        continue
+                    if admission["ownerKind"] == "none":
+                        continue
+                    if admission["admissionState"] == "settled":
+                        continue
+                    if (
+                        admission["admissionState"] != "blocked"
+                        or admission["blockedLifecycleState"] != "blocked"
+                        or admission["wakeState"] != "none"
+                        or admission["currentBlocker"] != active_blocker
+                    ):
+                        raise WakeClaimConflict(
+                            "consumed wake retry found stale queue authority"
+                        )
+                    projection_ref = projection_collection.document(
+                        admission["canonicalSourceId"]
+                    )
+                    projection_data = _snapshot_data(
+                        projection_ref.get(transaction=transaction)
+                    )
+                    if projection_data is None:
+                        raise WakeClaimConflict(
+                            "rebound admission lacks its blocked projection"
+                        )
+                    _validate_blocked_projection_document(
+                        projection_data,
+                        admission=admission,
+                    )
+                    rebound_projection_prerequisites.append(
+                        (projection_ref, projection_data)
+                    )
+                return _MultiDocumentTransactionPlan(
+                    result=WakeClaimResult(
+                        thread_id=thread_id,
+                        canonical_source_id=canonical_source_id,
+                        wake_generation=selected_before["wakeGeneration"],
+                        wake_token=wake_token,
+                        wake_claim_id=wake_claim_id,
+                        head_revision=head_before["threadHeadRevision"],
+                    ),
+                    prerequisites=(
+                        *selected_bundle,
+                        (head_ref, head_before),
+                        *((reference, data) for reference, data in admissions),
+                        (selected_projection_ref, selected_projection_before),
+                        *rebound_projection_prerequisites,
+                    ),
+                    mutations=(),
+                    ambiguous_error_type=WakeClaimConflict,
+                )
+            if (
+                head_before["activeState"] != "releasing"
+                or selected_before["admissionState"] != "blocked"
+                or selected_before["blockedLifecycleState"] != "eligible"
+                or selected_before["wakeState"] != "eligible"
+                or selected_before["wakeToken"] != wake_token
+                or selected_before["wakeGeneration"]
+                != head_before["activeGeneration"] + 1
+            ):
+                raise WakeClaimConflict(
+                    "wake claim does not match the eligible generation"
+                )
+            released_blocker = selected_before["currentBlocker"]
+            if (
+                released_blocker is None
+                or released_blocker["canonicalSourceId"]
+                != head_before["activeCanonicalSourceId"]
+                or released_blocker["generation"]
+                != head_before["activeGeneration"]
+                or wake_token
+                != _wake_token_for_release(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    admission=selected_before,
+                    released_blocker=released_blocker,
+                    wake_generation=selected_before["wakeGeneration"],
+                )
+            ):
+                raise WakeClaimConflict(
+                    "wake token conflicts with released head evidence"
+                )
+            released_bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=head_before["activeCanonicalSourceId"],
+                expected_thread_id=thread_id,
+            )
+            released_owner = released_bundle[2][1]
+            if (
+                head_before["activeOwnerKind"] != released_owner["ownerKind"]
+                or head_before["activeOwnerKey"] != released_owner["ownerKey"]
+            ):
+                raise WakeClaimConflict(
+                    "releasing head conflicts with retained owner authority"
+                )
+            now = self._current_time()
+            head_expected = _build_thread_head_document(
+                thread_id=thread_id,
+                canonical_source_id=canonical_source_id,
+                owner_data=selected_owner,
+                generation=selected_before["wakeGeneration"],
+                state="active",
+                revision=head_before["threadHeadRevision"] + 1,
+                now=now,
+                created_at=head_before["createdAt"],
+            )
+            selected_expected = deepcopy(selected_before)
+            selected_expected.update(
+                {
+                    "admissionState": "processing",
+                    "blockedLifecycleState": "settled_as_new_blocker",
+                    "wakeState": "consumed",
+                    "wakeClaimId": wake_claim_id,
+                    "revision": selected_before["revision"] + 1,
+                    "updatedAt": now,
+                }
+            )
+            selected_projection_expected = _blocked_projection_from_admission(
+                selected_expected,
+                now=now,
+                created_at=selected_projection_before["createdAt"],
+            )
+            next_blocker = _blocker_from_head(head_expected)
+            mutations = [
+                (head_ref, head_before, head_expected),
+                (selected_ref, selected_before, selected_expected),
+                (
+                    selected_projection_ref,
+                    selected_projection_before,
+                    selected_projection_expected,
+                ),
+            ]
+            for reference, admission_before in admissions:
+                if (
+                    admission_before["canonicalSourceId"]
+                    in {canonical_source_id, head_before["activeCanonicalSourceId"]}
+                    or admission_before["admissionState"] != "blocked"
+                    or admission_before["blockedLifecycleState"] != "blocked"
+                ):
+                    continue
+                projection_ref = projection_collection.document(
+                    admission_before["canonicalSourceId"]
+                )
+                projection_before = _snapshot_data(
+                    projection_ref.get(transaction=transaction)
+                )
+                if projection_before is None:
+                    raise WakeClaimConflict(
+                        "remaining blocked admission lacks its projection"
+                    )
+                _validate_blocked_projection_document(
+                    projection_before,
+                    admission=admission_before,
+                )
+                if admission_before["currentBlocker"] != released_blocker:
+                    raise WakeClaimConflict(
+                        "remaining admission conflicts with released blocker"
+                    )
+                admission_expected = deepcopy(admission_before)
+                admission_expected.update(
+                    {
+                        "currentBlocker": deepcopy(next_blocker),
+                        "revision": admission_before["revision"] + 1,
+                        "updatedAt": now,
+                    }
+                )
+                projection_expected = _blocked_projection_from_admission(
+                    admission_expected,
+                    now=now,
+                    created_at=projection_before["createdAt"],
+                )
+                mutations.extend(
+                    (
+                        (reference, admission_before, admission_expected),
+                        (projection_ref, projection_before, projection_expected),
+                    )
+                )
+            mutation_refs = {reference for reference, _before, _expected in mutations}
+            prerequisites = [
+                *selected_bundle,
+                *released_bundle,
+                *(
+                    (reference, data)
+                    for reference, data in admissions
+                    if reference not in mutation_refs
+                ),
+            ]
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=WakeClaimResult(
+                    thread_id=thread_id,
+                    canonical_source_id=canonical_source_id,
+                    wake_generation=selected_expected["wakeGeneration"],
+                    wake_token=wake_token,
+                    wake_claim_id=wake_claim_id,
+                    head_revision=head_expected["threadHeadRevision"],
+                ),
+                prerequisites=prerequisites,
+                mutations=tuple(mutations),
+                ambiguous_error_type=WakeClaimConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="wake generation claim",
+        )
+
+    def record_source_work_applying(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+        work_key: str,
+        payload_hash: str,
+    ) -> SourceWorkTransitionResult:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        _validate_source_work_transition_bindings(
+            ledger_hash=ledger_hash,
+            work_key=work_key,
+            payload_hash=payload_hash,
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+
+        def prepare(transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            ledger_ref, ledger_before = bundle[3]
+            entry_index, entry_before = _find_bound_source_work_entry(
+                ledger_before,
+                ledger_hash=ledger_hash,
+                work_key=work_key,
+                payload_hash=payload_hash,
+            )
+            if entry_before["state"] == "applying":
+                return _MultiDocumentTransactionPlan(
+                    result=SourceWorkTransitionResult(
+                        canonical_source_id=canonical_source_id,
+                        work_key=work_key,
+                        state="applying",
+                        ledger_hash=ledger_hash,
+                        ledger_revision=ledger_before["revision"],
+                        evidence_hash=None,
+                    ),
+                    prerequisites=bundle,
+                    mutations=(),
+                    ambiguous_error_type=SourceWorkTransitionConflict,
+                )
+            if (
+                entry_before["state"] != "pending"
+                or entry_before["completionContract"]["evidenceKind"]
+                != "work_completion"
+            ):
+                raise SourceWorkTransitionConflict(
+                    "source work entry cannot transition to applying"
+                )
+            now = self._current_time()
+            ledger_expected = deepcopy(ledger_before)
+            ledger_expected["entries"][entry_index]["state"] = "applying"
+            ledger_expected["revision"] += 1
+            ledger_expected["updatedAt"] = now
+            mutations = ((ledger_ref, ledger_before, ledger_expected),)
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=SourceWorkTransitionResult(
+                    canonical_source_id=canonical_source_id,
+                    work_key=work_key,
+                    state="applying",
+                    ledger_hash=ledger_hash,
+                    ledger_revision=ledger_expected["revision"],
+                    evidence_hash=None,
+                ),
+                prerequisites=bundle[:3],
+                mutations=mutations,
+                ambiguous_error_type=SourceWorkTransitionConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="source work applying transition",
+        )
+
+    def complete_source_work_entry(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+        work_key: str,
+        payload_hash: str,
+        completion_record: Mapping[str, Any],
+    ) -> SourceWorkTransitionResult:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        _validate_source_work_transition_bindings(
+            ledger_hash=ledger_hash,
+            work_key=work_key,
+            payload_hash=payload_hash,
+        )
+        preliminary = _copy_exact_json_mapping(
+            completion_record,
+            field_name="completion record",
+        )
+        completion_copy = _validate_completion_record(
+            preliminary,
+            work_kind=(
+                preliminary.get("workKind")
+                if type(preliminary.get("workKind")) is str
+                else ""
+            ),
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+
+        def prepare(transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            ledger_ref, ledger_before = bundle[3]
+            entry_index, entry_before = _find_bound_source_work_entry(
+                ledger_before,
+                ledger_hash=ledger_hash,
+                work_key=work_key,
+                payload_hash=payload_hash,
+            )
+            completion = _validate_completion_record(
+                completion_copy,
+                work_kind=entry_before["kind"],
+            )
+            evidence = _completion_resolution_evidence(
+                canonical_source_id=canonical_source_id,
+                ledger_hash=ledger_hash,
+                entry=entry_before,
+                completion_record=completion,
+            )
+            evidence_hash = _source_work_resolution_evidence_hash(evidence)
+            if entry_before["state"] == "completed":
+                if (
+                    entry_before["resolutionEvidence"] != evidence
+                    or entry_before["resolutionEvidenceHash"] != evidence_hash
+                ):
+                    raise SourceWorkTransitionConflict(
+                        "completed work retry conflicts with evidence"
+                    )
+                return _MultiDocumentTransactionPlan(
+                    result=SourceWorkTransitionResult(
+                        canonical_source_id=canonical_source_id,
+                        work_key=work_key,
+                        state="completed",
+                        ledger_hash=ledger_hash,
+                        ledger_revision=ledger_before["revision"],
+                        evidence_hash=evidence_hash,
+                    ),
+                    prerequisites=bundle,
+                    mutations=(),
+                    ambiguous_error_type=SourceWorkTransitionConflict,
+                )
+            if (
+                entry_before["state"] != "applying"
+                or entry_before["completionContract"]["evidenceKind"]
+                != "work_completion"
+            ):
+                raise SourceWorkTransitionConflict(
+                    "source work completion requires applying state"
+                )
+            now = self._current_time()
+            ledger_expected = deepcopy(ledger_before)
+            expected_entry = ledger_expected["entries"][entry_index]
+            expected_entry.update(
+                {
+                    "state": "completed",
+                    "resolutionEvidence": evidence,
+                    "resolutionEvidenceHash": evidence_hash,
+                }
+            )
+            ledger_expected["revision"] += 1
+            ledger_expected["updatedAt"] = now
+            mutations = ((ledger_ref, ledger_before, ledger_expected),)
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=SourceWorkTransitionResult(
+                    canonical_source_id=canonical_source_id,
+                    work_key=work_key,
+                    state="completed",
+                    ledger_hash=ledger_hash,
+                    ledger_revision=ledger_expected["revision"],
+                    evidence_hash=evidence_hash,
+                ),
+                prerequisites=bundle[:3],
+                mutations=mutations,
+                ambiguous_error_type=SourceWorkTransitionConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="source work completion",
+        )
+
+    def create_or_verify_deferred_work(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+        work_key: str,
+        payload_hash: str,
+    ) -> DeferredWorkResult:
+        return self._delegate_source_work_entry(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+            ledger_hash=ledger_hash,
+            work_key=work_key,
+            payload_hash=payload_hash,
+        )
+
+    def delegate_source_work_entry(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+        work_key: str,
+        payload_hash: str,
+    ) -> DeferredWorkResult:
+        return self._delegate_source_work_entry(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+            ledger_hash=ledger_hash,
+            work_key=work_key,
+            payload_hash=payload_hash,
+        )
+
+    def _delegate_source_work_entry(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+        work_key: str,
+        payload_hash: str,
+    ) -> DeferredWorkResult:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        _validate_source_work_transition_bindings(
+            ledger_hash=ledger_hash,
+            work_key=work_key,
+            payload_hash=payload_hash,
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+        deferred_ref = user_ref.collection("sourceDeferredWork").document(work_key)
+
+        def prepare(transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            ledger_ref, ledger_before = bundle[3]
+            entry_index, entry_before = _find_bound_source_work_entry(
+                ledger_before,
+                ledger_hash=ledger_hash,
+                work_key=work_key,
+                payload_hash=payload_hash,
+            )
+            immutable = _source_deferred_work_immutable_material(
+                canonical_source_id=canonical_source_id,
+                ledger_hash=ledger_hash,
+                entry=entry_before,
+            )
+            evidence = _delegation_resolution_evidence(
+                canonical_source_id=canonical_source_id,
+                ledger_hash=ledger_hash,
+                entry=entry_before,
+                deferred_binding_hash=immutable["bindingHash"],
+            )
+            evidence_hash = _source_work_resolution_evidence_hash(evidence)
+            deferred_before = _snapshot_data(
+                deferred_ref.get(transaction=transaction)
+            )
+            if entry_before["state"] == "delegated":
+                if deferred_before is None:
+                    raise DeferredWorkConflict(
+                        "delegated ledger entry lacks deferred authority"
+                    )
+                _validate_source_deferred_work_document(
+                    deferred_before,
+                    expected_immutable=immutable,
+                )
+                if (
+                    entry_before["resolutionEvidence"] != evidence
+                    or entry_before["resolutionEvidenceHash"] != evidence_hash
+                ):
+                    raise DeferredWorkConflict(
+                        "delegated ledger evidence conflicts with deferred work"
+                    )
+                return _MultiDocumentTransactionPlan(
+                    result=DeferredWorkResult(
+                        canonical_source_id=canonical_source_id,
+                        work_key=work_key,
+                        ledger_hash=ledger_hash,
+                        binding_hash=immutable["bindingHash"],
+                        deferred_state=deferred_before["state"],
+                        ledger_state="delegated",
+                        ledger_revision=ledger_before["revision"],
+                    ),
+                    prerequisites=(*bundle, (deferred_ref, deferred_before)),
+                    mutations=(),
+                    ambiguous_error_type=DeferredWorkConflict,
+                )
+            if entry_before["state"] != "pending":
+                raise SourceWorkTransitionConflict(
+                    "source work entry cannot transition to delegated"
+                )
+            if deferred_before is not None:
+                raise DeferredWorkConflict(
+                    "deferred authority exists before ledger delegation"
+                )
+            now = self._current_time()
+            deferred_expected = {
+                **immutable,
+                "state": "deferred",
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            ledger_expected = deepcopy(ledger_before)
+            expected_entry = ledger_expected["entries"][entry_index]
+            expected_entry.update(
+                {
+                    "state": "delegated",
+                    "resolutionEvidence": evidence,
+                    "resolutionEvidenceHash": evidence_hash,
+                }
+            )
+            ledger_expected["revision"] += 1
+            ledger_expected["updatedAt"] = now
+            mutations = (
+                (ledger_ref, ledger_before, ledger_expected),
+                (deferred_ref, None, deferred_expected),
+            )
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=DeferredWorkResult(
+                    canonical_source_id=canonical_source_id,
+                    work_key=work_key,
+                    ledger_hash=ledger_hash,
+                    binding_hash=immutable["bindingHash"],
+                    deferred_state="deferred",
+                    ledger_state="delegated",
+                    ledger_revision=ledger_expected["revision"],
+                ),
+                prerequisites=bundle[:3],
+                mutations=mutations,
+                ambiguous_error_type=DeferredWorkConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="source work delegation",
+        )
+
+    def dominate_source_work_entry_from_selection(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+        work_key: str,
+        payload_hash: str,
+    ) -> SourceWorkTransitionResult:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        _validate_source_work_transition_bindings(
+            ledger_hash=ledger_hash,
+            work_key=work_key,
+            payload_hash=payload_hash,
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+
+        def prepare(transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            ledger_ref, ledger_before = bundle[3]
+            entry_index, entry_before = _find_bound_source_work_entry(
+                ledger_before,
+                ledger_hash=ledger_hash,
+                work_key=work_key,
+                payload_hash=payload_hash,
+            )
+            evidence = _dominance_resolution_evidence(
+                canonical_source_id=canonical_source_id,
+                ledger_data=ledger_before,
+                entry=entry_before,
+            )
+            evidence_hash = _source_work_resolution_evidence_hash(evidence)
+            if entry_before["state"] == "dominated":
+                if (
+                    entry_before["resolutionEvidence"] != evidence
+                    or entry_before["resolutionEvidenceHash"] != evidence_hash
+                ):
+                    raise SourceWorkTransitionConflict(
+                        "dominated work retry conflicts with selection evidence"
+                    )
+                return _MultiDocumentTransactionPlan(
+                    result=SourceWorkTransitionResult(
+                        canonical_source_id=canonical_source_id,
+                        work_key=work_key,
+                        state="dominated",
+                        ledger_hash=ledger_hash,
+                        ledger_revision=ledger_before["revision"],
+                        evidence_hash=evidence_hash,
+                    ),
+                    prerequisites=bundle,
+                    mutations=(),
+                    ambiguous_error_type=SourceWorkTransitionConflict,
+                )
+            if entry_before["state"] != "pending":
+                raise SourceWorkTransitionConflict(
+                    "source work entry cannot transition to dominated"
+                )
+            now = self._current_time()
+            ledger_expected = deepcopy(ledger_before)
+            expected_entry = ledger_expected["entries"][entry_index]
+            expected_entry.update(
+                {
+                    "state": "dominated",
+                    "resolutionEvidence": evidence,
+                    "resolutionEvidenceHash": evidence_hash,
+                }
+            )
+            ledger_expected["revision"] += 1
+            ledger_expected["updatedAt"] = now
+            mutations = ((ledger_ref, ledger_before, ledger_expected),)
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=SourceWorkTransitionResult(
+                    canonical_source_id=canonical_source_id,
+                    work_key=work_key,
+                    state="dominated",
+                    ledger_hash=ledger_hash,
+                    ledger_revision=ledger_expected["revision"],
+                    evidence_hash=evidence_hash,
+                ),
+                prerequisites=bundle[:3],
+                mutations=mutations,
+                ambiguous_error_type=SourceWorkTransitionConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="source work dominance",
+        )
+
+    def settle_source_markers_if_ready(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        ledger_hash: str,
+    ) -> SourceSettlementResult:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        if not _is_sha256(ledger_hash):
+            raise SourceCoordinatorConfigError("ledger hash must be a full hash")
+        user_ref = self._firestore.collection("users").document(user_id)
+        admission_ref = user_ref.collection("inboundPendingAdmissions").document(
+            canonical_source_id
+        )
+        settlement_ref = user_ref.collection("sourceSettlements").document(
+            canonical_source_id
+        )
+        processed_collection = user_ref.collection("processedMessages")
+
+        def prepare(transaction):
+            bundle = self._read_source_authority_bundle(
+                transaction=transaction,
+                user_ref=user_ref,
+                canonical_source_id=canonical_source_id,
+            )
+            (identity_ref, identity_data), (
+                classification_ref,
+                classification_data,
+            ), (owner_ref, owner_data), (ledger_ref, ledger_data) = bundle
+            if ledger_data["ledgerHash"] != ledger_hash:
+                raise SourceSettlementConflict(
+                    "settlement ledger hash conflicts with source authority"
+                )
+            _final_ledger_evidence_hash(ledger_data)
+            aliases = _validated_identity_descriptors(
+                identity_data,
+                canonical_source_id=canonical_source_id,
+            )
+            alias_owner_prerequisites = []
+            source_alias_collection = user_ref.collection("sourceAliases")
+            for descriptor in aliases:
+                alias_owner_ref = source_alias_collection.document(
+                    descriptor["sourceAliasKey"]
+                )
+                alias_owner_data = _snapshot_data(
+                    alias_owner_ref.get(transaction=transaction)
+                )
+                if alias_owner_data is None:
+                    raise SourceSettlementConflict(
+                        "source identity alias lacks retained owner authority"
+                    )
+                _validate_alias_projection(
+                    alias_owner_data,
+                    descriptor=descriptor,
+                    canonical_source_id=canonical_source_id,
+                )
+                alias_owner_prerequisites.append(
+                    (alias_owner_ref, alias_owner_data)
+                )
+            admission_before = _snapshot_data(
+                admission_ref.get(transaction=transaction)
+            )
+            if admission_before is None:
+                raise SourceSettlementNotReady(
+                    "source settlement requires a pending admission"
+                )
+            _validate_pending_admission_document(
+                admission_before,
+                canonical_source_id=canonical_source_id,
+                thread_id=identity_data["threadId"],
+            )
+            _validate_admission_authority_bindings(
+                admission_before,
+                identity_data=identity_data,
+                classification_data=classification_data,
+                owner_data=owner_data,
+                ledger_data=ledger_data,
+            )
+            head_ref = user_ref.collection("threadTransitionHeads").document(
+                identity_data["threadId"]
+            )
+            head_before = _snapshot_data(head_ref.get(transaction=transaction))
+            if head_before is not None:
+                _validate_thread_head_document(
+                    head_before,
+                    thread_id=identity_data["threadId"],
+                )
+            settlement_before = _snapshot_data(
+                settlement_ref.get(transaction=transaction)
+            )
+            deferred_prerequisites = []
+            for entry in ledger_data["entries"]:
+                if entry["state"] != "delegated":
+                    continue
+                deferred_ref = user_ref.collection("sourceDeferredWork").document(
+                    entry["workKey"]
+                )
+                deferred_data = _snapshot_data(
+                    deferred_ref.get(transaction=transaction)
+                )
+                if deferred_data is None:
+                    raise SourceSettlementNotReady(
+                        "delegated source work lacks durable deferred authority"
+                    )
+                expected_deferred = _source_deferred_work_immutable_material(
+                    canonical_source_id=canonical_source_id,
+                    ledger_hash=ledger_hash,
+                    entry=entry,
+                )
+                _validate_source_deferred_work_document(
+                    deferred_data,
+                    expected_immutable=expected_deferred,
+                )
+                if entry["resolutionEvidence"]["deferredBindingHash"] != (
+                    deferred_data["bindingHash"]
+                ):
+                    raise DeferredWorkConflict(
+                        "delegated ledger evidence conflicts with deferred binding"
+                    )
+                deferred_prerequisites.append((deferred_ref, deferred_data))
+            processed_readbacks = []
+            for descriptor in aliases:
+                projection_ref = processed_collection.document(
+                    descriptor["sourceAliasKey"]
+                )
+                projection_data = _snapshot_data(
+                    projection_ref.get(transaction=transaction)
+                )
+                processed_readbacks.append(
+                    (projection_ref, descriptor, projection_data)
+                )
+            now = self._current_time()
+            if settlement_before is not None:
+                _validate_source_settlement_document(
+                    settlement_before,
+                    canonical_source_id=canonical_source_id,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                    current_aliases=aliases,
+                )
+                if admission_before["admissionState"] != "settled":
+                    raise SourceSettlementConflict(
+                        "canonical settlement conflicts with admission state"
+                    )
+                mutations = []
+                projection_prerequisites = []
+                for projection_ref, descriptor, projection_before in (
+                    processed_readbacks
+                ):
+                    if projection_before is None:
+                        projection_expected = _processed_alias_projection(
+                            descriptor=descriptor,
+                            canonical_source_id=canonical_source_id,
+                            settlement_data=settlement_before,
+                            processed_at=now,
+                        )
+                        mutations.append(
+                            (projection_ref, None, projection_expected)
+                        )
+                    else:
+                        _validate_processed_alias_projection(
+                            projection_before,
+                            descriptor=descriptor,
+                            canonical_source_id=canonical_source_id,
+                            settlement_data=settlement_before,
+                        )
+                        projection_prerequisites.append(
+                            (projection_ref, projection_before)
+                        )
+                prerequisites = (
+                    *bundle,
+                    (admission_ref, admission_before),
+                    (head_ref, head_before),
+                    (settlement_ref, settlement_before),
+                    *alias_owner_prerequisites,
+                    *deferred_prerequisites,
+                    *projection_prerequisites,
+                )
+                self._stage_document_mutations(transaction, mutations)
+                return _MultiDocumentTransactionPlan(
+                    result=SourceSettlementResult(
+                        canonical_source_id=canonical_source_id,
+                        settlement_hash=settlement_before["settlementHash"],
+                        settlement_revision=settlement_before[
+                            "settlementRevision"
+                        ],
+                        alias_projection_count=len(aliases),
+                        repaired_projection_count=len(mutations),
+                    ),
+                    prerequisites=prerequisites,
+                    mutations=tuple(mutations),
+                    ambiguous_error_type=SourceSettlementConflict,
+                )
+            if any(
+                projection_before is not None
+                for _reference, _descriptor, projection_before in processed_readbacks
+            ):
+                raise SourceSettlementConflict(
+                    "processed alias projection cannot synthesize settlement authority"
+                )
+            if owner_data["ownerKind"] == "none":
+                admission_ready = admission_before["admissionState"] == "pending"
+            else:
+                admission_ready = admission_before["admissionState"] == "processing"
+                if (
+                    head_before is None
+                    or head_before["activeState"] != "active"
+                    or head_before["activeCanonicalSourceId"]
+                    != canonical_source_id
+                    or head_before["activeOwnerKind"] != owner_data["ownerKind"]
+                    or head_before["activeOwnerKey"] != owner_data["ownerKey"]
+                ):
+                    raise SourceSettlementNotReady(
+                        "source settlement requires its active thread-head outcome"
+                    )
+            if not admission_ready:
+                raise SourceSettlementNotReady(
+                    "pending admission is not ready for canonical settlement"
+                )
+            settlement_immutable = _source_settlement_immutable_material(
+                canonical_source_id=canonical_source_id,
+                identity_data=identity_data,
+                classification_data=classification_data,
+                owner_data=owner_data,
+                ledger_data=ledger_data,
+                aliases=aliases,
+            )
+            settlement_expected = {
+                **settlement_immutable,
+                "settledAt": now,
+            }
+            admission_expected = deepcopy(admission_before)
+            admission_expected.update(
+                {
+                    "admissionState": "settled",
+                    "revision": admission_before["revision"] + 1,
+                    "updatedAt": now,
+                }
+            )
+            mutations = [
+                (settlement_ref, None, settlement_expected),
+                (admission_ref, admission_before, admission_expected),
+            ]
+            for projection_ref, descriptor, _projection_before in processed_readbacks:
+                mutations.append(
+                    (
+                        projection_ref,
+                        None,
+                        _processed_alias_projection(
+                            descriptor=descriptor,
+                            canonical_source_id=canonical_source_id,
+                            settlement_data=settlement_expected,
+                            processed_at=now,
+                        ),
+                    )
+                )
+            prerequisites = (
+                *bundle,
+                (head_ref, head_before),
+                *alias_owner_prerequisites,
+                *deferred_prerequisites,
+            )
+            self._stage_document_mutations(transaction, mutations)
+            return _MultiDocumentTransactionPlan(
+                result=SourceSettlementResult(
+                    canonical_source_id=canonical_source_id,
+                    settlement_hash=settlement_expected["settlementHash"],
+                    settlement_revision=1,
+                    alias_projection_count=len(aliases),
+                    repaired_projection_count=0,
+                ),
+                prerequisites=prerequisites,
+                mutations=tuple(mutations),
+                ambiguous_error_type=SourceSettlementConflict,
+            )
+
+        return self._run_multi_document_transaction(
+            prepare,
+            authority_name="source marker settlement",
         )
 
     def classify_source_once(

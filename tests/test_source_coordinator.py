@@ -6,7 +6,8 @@ import json
 import unittest
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from threading import Barrier, Thread
 from unittest import mock
 
 from tests.source_coordinator_fakes import (
@@ -397,6 +398,23 @@ class SourceCoordinatorFakeTests(unittest.TestCase):
             {"value": 1},
             document.get(transaction=transaction).to_dict(),
         )
+
+    def test_transaction_query_orders_and_detects_collection_phantoms(self):
+        fake = FakeFirestore()
+        items = fake.collection("items")
+        items.document("later").create({"threadId": "thread-1", "rank": 2})
+        items.document("earlier").create({"threadId": "thread-1", "rank": 1})
+        items.document("other").create({"threadId": "thread-2", "rank": 0})
+        transaction = fake.transaction(max_attempts=1)
+        transaction._begin()
+        query = items.where("threadId", "==", "thread-1").order_by("rank")
+
+        snapshots = list(transaction.get(query))
+
+        self.assertEqual(["earlier", "later"], [item.id for item in snapshots])
+        items.document("phantom").create({"threadId": "thread-1", "rank": 3})
+        with self.assertRaisesRegex(RuntimeError, "snapshot is stale"):
+            transaction._commit()
 
 
 class SourceIdentityTests(unittest.TestCase):
@@ -2864,6 +2882,1347 @@ class SelectionAndLedgerTests(unittest.TestCase):
             self.ledger()
         self.assertEqual(writes, self.write_events())
         self.assertEqual(ledger["ledgerHash"], self.fake.data[self.ledger_path]["ledgerHash"])
+
+
+class ThreadHeadAndWakeTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_source_coordinator(self)
+        for name in (
+            "admit_pending_inbound",
+            "enqueue_blocked_source",
+            "claim_or_block_thread_transition",
+            "release_generation_and_wake_oldest",
+            "claim_wake_and_rebind_generation",
+        ):
+            self.assertTrue(
+                hasattr(self.module.SourceCoordinator, name),
+                f"SourceCoordinator.{name} is absent",
+            )
+
+        self.fake = FakeFirestore()
+        self.clock = MutableClock(FROZEN_NOW)
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=SequentialUUIDs(),
+            now_factory=self.clock,
+        )
+
+    def prepare_authority(self, graph_id, *, thread_id="thread-queue"):
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": graph_id},
+            evidence_kind="graph_hydration",
+            thread_id=thread_id,
+        )
+        self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+            lease_seconds=60,
+            classification_input={
+                "schemaVersion": 1,
+                "message": {"id": graph_id},
+            },
+            classifier=lambda: (
+                deepcopy(COMPLETE_PROPOSAL),
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        self.coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+        )
+        self.coordinator.create_or_verify_source_work_ledger(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+        )
+        return identity.canonical_source_id
+
+    def prepare_none_authority(self, graph_id, *, thread_id="thread-queue"):
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": graph_id},
+            evidence_kind="graph_hydration",
+            thread_id=thread_id,
+        )
+        source_id = identity.canonical_source_id
+        self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=source_id,
+            lease_seconds=60,
+            classification_input={
+                "schemaVersion": 1,
+                "message": {"id": graph_id},
+            },
+            classifier=lambda: (
+                {
+                    "schemaVersion": 1,
+                    "transitionCandidates": [],
+                    "ordinaryObligations": [
+                        {
+                            "type": "field_update",
+                            "field": "stage",
+                            "value": "warm",
+                        }
+                    ],
+                },
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        owner = self.coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        self.assertEqual("none", owner["ownerKind"])
+        self.coordinator.create_or_verify_source_work_ledger(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        return source_id
+
+    def admission_arguments(
+        self,
+        source_id,
+        *,
+        received_offset=0,
+        sent_offset=0,
+    ):
+        return {
+            "user_id": "user-1",
+            "canonical_source_id": source_id,
+            "received_at": FROZEN_NOW + timedelta(seconds=received_offset),
+            "sent_at": FROZEN_NOW + timedelta(seconds=sent_offset),
+            "saved_history_binding": {
+                "schemaVersion": 1,
+                "historyKey": f"history-{source_id}",
+            },
+            "index_binding": {
+                "schemaVersion": 1,
+                "indexKey": f"index-{source_id}",
+            },
+        }
+
+    def admit(self, source_id, **offsets):
+        return self.coordinator.admit_pending_inbound(
+            **self.admission_arguments(source_id, **offsets)
+        )
+
+    def write_events(self):
+        return [
+            event
+            for event in self.fake.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def test_two_worker_race_leaves_one_head_and_one_durable_block(self):
+        first = self.prepare_authority("graph-race-a")
+        second = self.prepare_authority("graph-race-b")
+        self.admit(first, received_offset=1, sent_offset=1)
+        self.admit(second, received_offset=2, sent_offset=2)
+        self.fake.events.clear()
+        self.fake.before_commit_barrier = Barrier(2)
+        results = []
+        errors = []
+
+        def contend(source_id):
+            try:
+                results.append(
+                    self.coordinator.claim_or_block_thread_transition(
+                        user_id="user-1",
+                        canonical_source_id=source_id,
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        workers = [Thread(target=contend, args=(source_id,)) for source_id in (first, second)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual([], errors)
+        self.assertEqual({"claimed", "blocked"}, {result.disposition for result in results})
+        head_path = "users/user-1/threadTransitionHeads/thread-queue"
+        head = self.fake.data[head_path]
+        winner = head["activeCanonicalSourceId"]
+        loser = second if winner == first else first
+        admission_path = f"users/user-1/inboundPendingAdmissions/{loser}"
+        projection_path = f"users/user-1/blockedSources/{loser}"
+        admission = self.fake.data[admission_path]
+        projection = self.fake.data[projection_path]
+
+        self.assertEqual("active", head["activeState"])
+        self.assertEqual(1, head["activeGeneration"])
+        self.assertEqual("blocked", admission["admissionState"])
+        self.assertEqual("blocked", admission["blockedLifecycleState"])
+        self.assertEqual(winner, admission["currentBlocker"]["canonicalSourceId"])
+        self.assertEqual(
+            admission["currentBlocker"]["headHash"],
+            projection["currentBlocker"]["headHash"],
+        )
+        forbidden_fragments = (
+            "processedMessages",
+            "sourceSettlements",
+            "cursor",
+            "domain",
+            "notification",
+        )
+        written_paths = [event[1] for event in self.write_events()]
+        self.assertFalse(
+            any(fragment in path for fragment in forbidden_fragments for path in written_paths)
+        )
+
+    def test_same_source_retry_tamper_and_apply_then_raise_are_strict(self):
+        source_id = self.prepare_authority("graph-strict-head")
+        self.admit(source_id)
+        self.fake.events.clear()
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown head commit")
+
+        claimed = self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+
+        self.assertEqual("claimed", claimed.disposition)
+        head_path = "users/user-1/threadTransitionHeads/thread-queue"
+        self.assertEqual(source_id, self.fake.data[head_path]["activeCanonicalSourceId"])
+        writes = list(self.write_events())
+        retry = self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        self.assertEqual(claimed, retry)
+        self.assertEqual(writes, self.write_events())
+
+        self.fake.data[head_path]["activeOwnerKey"] = "f" * 64
+        with self.assertRaises(self.module.ThreadTransitionConflict):
+            self.coordinator.claim_or_block_thread_transition(
+                user_id="user-1",
+                canonical_source_id=source_id,
+            )
+        self.assertEqual(writes, self.write_events())
+
+    def test_queue_bound_fails_before_source_101_materialization(self):
+        self.assertEqual(100, self.module.MAX_BLOCKED_SOURCES_PER_THREAD)
+        active = self.prepare_authority("graph-bound-active")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+
+        with mock.patch.object(
+            self.module,
+            "MAX_BLOCKED_SOURCES_PER_THREAD",
+            2,
+        ):
+            for index in range(2):
+                source_id = self.prepare_authority(f"graph-bound-{index}")
+                result = self.coordinator.enqueue_blocked_source(
+                    **self.admission_arguments(
+                        source_id,
+                        received_offset=index + 1,
+                        sent_offset=index + 1,
+                    )
+                )
+                self.assertEqual("blocked", result.disposition)
+
+            overflow = self.prepare_authority("graph-bound-overflow")
+            before = deepcopy(self.fake.data)
+            self.fake.events.clear()
+            with self.assertRaises(self.module.ThreadQueueLimitExceeded):
+                self.coordinator.enqueue_blocked_source(
+                    **self.admission_arguments(
+                        overflow,
+                        received_offset=3,
+                        sent_offset=3,
+                    )
+                )
+            self.assertEqual(before, self.fake.data)
+            self.assertEqual([], self.write_events())
+            self.assertNotIn(
+                f"users/user-1/inboundPendingAdmissions/{overflow}",
+                self.fake.data,
+            )
+            self.assertNotIn(
+                f"users/user-1/blockedSources/{overflow}",
+                self.fake.data,
+            )
+
+    def test_occupied_head_requires_atomic_enqueue_and_pending_blocks_release(self):
+        active = self.prepare_authority("graph-pending-active")
+        pending = self.prepare_authority("graph-pending-existing")
+        self.admit(active)
+        self.admit(pending, received_offset=1, sent_offset=1)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        late = self.prepare_authority("graph-pending-late")
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.ThreadTransitionConflict):
+            self.admit(late, received_offset=2, sent_offset=2)
+
+        self.assertNotIn(
+            f"users/user-1/inboundPendingAdmissions/{late}",
+            self.fake.data,
+        )
+        self.assertEqual([], self.write_events())
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+        head_before = deepcopy(
+            self.fake.data["users/user-1/threadTransitionHeads/thread-queue"]
+        )
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.WakeReleaseConflict):
+            self.coordinator.release_generation_and_wake_oldest(
+                user_id="user-1",
+                thread_id="thread-queue",
+                canonical_source_id=active,
+            )
+
+        self.assertEqual(
+            head_before,
+            self.fake.data["users/user-1/threadTransitionHeads/thread-queue"],
+        )
+        self.assertEqual("pending", self.fake.data[
+            f"users/user-1/inboundPendingAdmissions/{pending}"
+        ]["admissionState"])
+        self.assertEqual([], self.write_events())
+
+    def test_none_owner_admits_pending_while_another_source_holds_head(self):
+        active = self.prepare_authority("graph-none-admit-active")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        head_path = "users/user-1/threadTransitionHeads/thread-queue"
+        head_before = deepcopy(self.fake.data[head_path])
+        ordinary = self.prepare_none_authority("graph-none-admit-ordinary")
+        self.fake.events.clear()
+
+        admitted = self.coordinator.admit_pending_inbound(
+            **self.admission_arguments(
+                ordinary,
+                received_offset=1,
+                sent_offset=1,
+            )
+        )
+
+        self.assertEqual("pending", admitted.state)
+        self.assertEqual(head_before, self.fake.data[head_path])
+        self.assertNotIn(
+            f"users/user-1/blockedSources/{ordinary}",
+            self.fake.data,
+        )
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+        self.fake.events.clear()
+
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+
+        self.assertEqual("clear", released.head_state)
+        self.assertEqual(
+            "pending",
+            self.fake.data[
+                f"users/user-1/inboundPendingAdmissions/{ordinary}"
+            ]["admissionState"],
+        )
+        writes = list(self.write_events())
+        with self.assertRaises(self.module.WakeReleaseConflict):
+            self.coordinator.release_generation_and_wake_oldest(
+                user_id="user-1",
+                thread_id="thread-queue",
+                canonical_source_id=active,
+            )
+        self.assertEqual(writes, self.write_events())
+
+    def test_release_chooses_oldest_and_claim_rebinds_all_remaining(self):
+        active = self.prepare_authority("graph-wake-active")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        candidates = []
+        for graph_id, received_offset, sent_offset in (
+            ("graph-wake-late", 20, 10),
+            ("graph-wake-tie-late", 10, 8),
+            ("graph-wake-oldest", 10, 5),
+        ):
+            source_id = self.prepare_authority(graph_id)
+            candidates.append(source_id)
+            self.coordinator.enqueue_blocked_source(
+                **self.admission_arguments(
+                    source_id,
+                    received_offset=received_offset,
+                    sent_offset=sent_offset,
+                )
+            )
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+
+        oldest = candidates[2]
+        self.assertEqual(oldest, released.next_canonical_source_id)
+        self.assertEqual(2, released.wake_generation)
+        oldest_path = f"users/user-1/inboundPendingAdmissions/{oldest}"
+        self.assertEqual("eligible", self.fake.data[oldest_path]["wakeState"])
+        self.assertEqual(released.wake_token, self.fake.data[oldest_path]["wakeToken"])
+        release_writes = list(self.write_events())
+        release_retry = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+        self.assertEqual(released, release_retry)
+        self.assertEqual(release_writes, self.write_events())
+
+        claimed = self.coordinator.claim_wake_and_rebind_generation(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=oldest,
+            wake_token=released.wake_token,
+            wake_claim_id="wake-claim-1",
+        )
+
+        self.assertEqual(oldest, claimed.canonical_source_id)
+        head = self.fake.data["users/user-1/threadTransitionHeads/thread-queue"]
+        self.assertEqual(oldest, head["activeCanonicalSourceId"])
+        self.assertEqual(2, head["activeGeneration"])
+        self.assertEqual(
+            "settled_as_new_blocker",
+            self.fake.data[oldest_path]["blockedLifecycleState"],
+        )
+        self.assertEqual("consumed", self.fake.data[oldest_path]["wakeState"])
+        for remaining in candidates[:2]:
+            path = f"users/user-1/inboundPendingAdmissions/{remaining}"
+            projection = f"users/user-1/blockedSources/{remaining}"
+            self.assertEqual(
+                oldest,
+                self.fake.data[path]["currentBlocker"]["canonicalSourceId"],
+            )
+            self.assertEqual(2, self.fake.data[path]["currentBlocker"]["generation"])
+            self.assertEqual(
+                self.fake.data[path]["currentBlocker"]["headHash"],
+                self.fake.data[projection]["currentBlocker"]["headHash"],
+            )
+            self.assertEqual("none", self.fake.data[path]["wakeState"])
+        ordinary = self.prepare_none_authority("graph-wake-ordinary")
+        self.admit(ordinary, received_offset=30, sent_offset=30)
+        self.fake.events.clear()
+        claim_retry = self.coordinator.claim_wake_and_rebind_generation(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=oldest,
+            wake_token=released.wake_token,
+            wake_claim_id="wake-claim-1",
+        )
+        self.assertEqual(claimed, claim_retry)
+        self.assertEqual([], self.write_events())
+
+    def test_empty_queue_release_clears_head_and_retry_fails_closed(self):
+        active = self.prepare_authority("graph-wake-empty")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+        self.fake.events.clear()
+
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+
+        self.assertEqual("clear", released.head_state)
+        self.assertIsNone(released.next_canonical_source_id)
+        head = self.fake.data["users/user-1/threadTransitionHeads/thread-queue"]
+        self.assertEqual("clear", head["activeState"])
+        self.assertIsNone(head["activeCanonicalSourceId"])
+        writes = list(self.write_events())
+        with self.assertRaises(self.module.WakeReleaseConflict):
+            self.coordinator.release_generation_and_wake_oldest(
+                user_id="user-1",
+                thread_id="thread-queue",
+                canonical_source_id=active,
+            )
+        self.assertEqual(writes, self.write_events())
+
+    def test_two_workers_racing_wake_claim_leave_one_complete_rebind(self):
+        active = self.prepare_authority("graph-wake-race-active")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        blocked = []
+        for index in range(3):
+            source_id = self.prepare_authority(f"graph-wake-race-{index}")
+            blocked.append(source_id)
+            self.coordinator.enqueue_blocked_source(
+                **self.admission_arguments(
+                    source_id,
+                    received_offset=index + 1,
+                    sent_offset=index + 1,
+                )
+            )
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+        selected = blocked[0]
+        self.fake.before_commit_barrier = Barrier(2)
+        results = []
+        errors = []
+
+        def contend(claim_id):
+            try:
+                results.append(
+                    self.coordinator.claim_wake_and_rebind_generation(
+                        user_id="user-1",
+                        thread_id="thread-queue",
+                        canonical_source_id=selected,
+                        wake_token=released.wake_token,
+                        wake_claim_id=claim_id,
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        workers = [
+            Thread(target=contend, args=(claim_id,))
+            for claim_id in ("wake-claim-race-a", "wake-claim-race-b")
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(1, len(results))
+        self.assertEqual(1, len(errors))
+        self.assertIsInstance(errors[0], self.module.WakeClaimConflict)
+        winner = results[0]
+        head = self.fake.data["users/user-1/threadTransitionHeads/thread-queue"]
+        self.assertEqual(selected, head["activeCanonicalSourceId"])
+        self.assertEqual(2, head["activeGeneration"])
+        selected_path = f"users/user-1/inboundPendingAdmissions/{selected}"
+        self.assertEqual("consumed", self.fake.data[selected_path]["wakeState"])
+        self.assertEqual(winner.wake_claim_id, self.fake.data[selected_path]["wakeClaimId"])
+        for remaining in blocked[1:]:
+            admission = self.fake.data[
+                f"users/user-1/inboundPendingAdmissions/{remaining}"
+            ]
+            projection = self.fake.data[
+                f"users/user-1/blockedSources/{remaining}"
+            ]
+            self.assertEqual(selected, admission["currentBlocker"]["canonicalSourceId"])
+            self.assertEqual(2, admission["currentBlocker"]["generation"])
+            self.assertEqual(admission["currentBlocker"], projection["currentBlocker"])
+
+    def test_wake_apply_then_raise_and_competing_claim_are_fenced(self):
+        active = self.prepare_authority("graph-wake-fence-active")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        blocked = self.prepare_authority("graph-wake-fence-blocked")
+        self.coordinator.enqueue_blocked_source(
+            **self.admission_arguments(blocked, received_offset=1, sent_offset=1)
+        )
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown release")
+
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown wake claim")
+        claimed = self.coordinator.claim_wake_and_rebind_generation(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=blocked,
+            wake_token=released.wake_token,
+            wake_claim_id="wake-claim-winner",
+        )
+        self.assertEqual("wake-claim-winner", claimed.wake_claim_id)
+        with self.assertRaises(self.module.WakeClaimConflict):
+            self.coordinator.claim_wake_and_rebind_generation(
+                user_id="user-1",
+                thread_id="thread-queue",
+                canonical_source_id=blocked,
+                wake_token=released.wake_token,
+                wake_claim_id="wake-claim-loser",
+            )
+        admission_path = f"users/user-1/inboundPendingAdmissions/{blocked}"
+        projection_path = f"users/user-1/blockedSources/{blocked}"
+        forged_admission = deepcopy(self.fake.data[admission_path])
+        forged_admission["wakeToken"] = "f" * 64
+        forged_admission["wakeClaimId"] = "wake-claim-forged"
+        self.fake.data[admission_path] = forged_admission
+        projection_before = self.fake.data[projection_path]
+        self.fake.data[projection_path] = (
+            self.module._blocked_projection_from_admission(
+                forged_admission,
+                now=projection_before["updatedAt"],
+                created_at=projection_before["createdAt"],
+            )
+        )
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.WakeClaimConflict):
+            self.coordinator.claim_wake_and_rebind_generation(
+                user_id="user-1",
+                thread_id="thread-queue",
+                canonical_source_id=blocked,
+                wake_token="f" * 64,
+                wake_claim_id="wake-claim-forged",
+            )
+
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+    def test_wake_rebind_rejects_foreign_remaining_blocker(self):
+        active = self.prepare_authority("graph-rebind-active")
+        self.admit(active)
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=active,
+        )
+        selected = self.prepare_authority("graph-rebind-selected")
+        remaining = self.prepare_authority("graph-rebind-remaining")
+        self.coordinator.enqueue_blocked_source(
+            **self.admission_arguments(selected, received_offset=1, sent_offset=1)
+        )
+        self.coordinator.enqueue_blocked_source(
+            **self.admission_arguments(remaining, received_offset=2, sent_offset=2)
+        )
+        active_path = f"users/user-1/inboundPendingAdmissions/{active}"
+        self.fake.data[active_path]["admissionState"] = "settled"
+        released = self.coordinator.release_generation_and_wake_oldest(
+            user_id="user-1",
+            thread_id="thread-queue",
+            canonical_source_id=active,
+        )
+        remaining_path = f"users/user-1/inboundPendingAdmissions/{remaining}"
+        projection_path = f"users/user-1/blockedSources/{remaining}"
+        foreign_blocker = deepcopy(
+            self.fake.data[remaining_path]["currentBlocker"]
+        )
+        foreign_blocker.update(
+            {
+                "canonicalSourceId": "source-foreign",
+                "generation": 99,
+                "threadHeadRevision": 99,
+                "headHash": "f" * 64,
+            }
+        )
+        self.fake.data[remaining_path]["currentBlocker"] = deepcopy(
+            foreign_blocker
+        )
+        self.fake.data[projection_path]["currentBlocker"] = deepcopy(
+            foreign_blocker
+        )
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.WakeClaimConflict):
+            self.coordinator.claim_wake_and_rebind_generation(
+                user_id="user-1",
+                thread_id="thread-queue",
+                canonical_source_id=selected,
+                wake_token=released.wake_token,
+                wake_claim_id="wake-claim-foreign-blocker",
+            )
+
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+
+class LedgerTransitionAndSettlementTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_source_coordinator(self)
+        for name in (
+            "create_or_verify_deferred_work",
+            "record_source_work_applying",
+            "complete_source_work_entry",
+            "delegate_source_work_entry",
+            "dominate_source_work_entry_from_selection",
+            "settle_source_markers_if_ready",
+        ):
+            self.assertTrue(
+                hasattr(self.module.SourceCoordinator, name),
+                f"SourceCoordinator.{name} is absent",
+            )
+
+        self.fake = FakeFirestore()
+        self.clock = MutableClock(FROZEN_NOW)
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=SequentialUUIDs(),
+            now_factory=self.clock,
+        )
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={
+                "id": "graph-ledger",
+                "internetMessageId": "<ledger@example.test>",
+            },
+            evidence_kind="graph_hydration",
+            thread_id="thread-ledger",
+        )
+        self.source_id = identity.canonical_source_id
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "property_unavailable", "property": "A"},
+                {"type": "call_requested", "phone": "555-0100"},
+            ],
+            "ordinaryObligations": [
+                {"type": "generic_reply", "template": "terminal"},
+                {"type": "field_update", "field": "stage", "value": "closed"},
+                {"type": "informational", "message": "retained"},
+            ],
+        }
+        self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            lease_seconds=60,
+            classification_input=deepcopy(CLASSIFICATION_INPUT),
+            classifier=lambda: (
+                deepcopy(proposal),
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        self.coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+        )
+        self.ledger = self.coordinator.create_or_verify_source_work_ledger(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+        )
+        self.coordinator.admit_pending_inbound(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            received_at=FROZEN_NOW,
+            sent_at=FROZEN_NOW,
+            saved_history_binding={
+                "schemaVersion": 1,
+                "historyKey": "history-ledger",
+            },
+            index_binding={
+                "schemaVersion": 1,
+                "indexKey": "index-ledger",
+            },
+        )
+        self.coordinator.claim_or_block_thread_transition(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+        )
+        self.fake.events.clear()
+
+    @property
+    def ledger_path(self):
+        return f"users/user-1/sourceWorkLedgers/{self.source_id}"
+
+    @property
+    def admission_path(self):
+        return f"users/user-1/inboundPendingAdmissions/{self.source_id}"
+
+    def entry(self, kind):
+        return next(entry for entry in self.ledger["entries"] if entry["kind"] == kind)
+
+    def work_arguments(self, kind):
+        entry = self.entry(kind)
+        return {
+            "user_id": "user-1",
+            "canonical_source_id": self.source_id,
+            "ledger_hash": self.ledger["ledgerHash"],
+            "work_key": entry["workKey"],
+            "payload_hash": entry["payloadHash"],
+        }
+
+    def completion_record(self, kind="field_update", result_hash="d" * 64):
+        return {
+            "schemaVersion": 1,
+            "evidenceKind": "work_completion",
+            "workKind": kind,
+            "resultHash": result_hash,
+        }
+
+    def write_events(self):
+        return [
+            event
+            for event in self.fake.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def stored_entry(self, kind):
+        return next(
+            entry
+            for entry in self.fake.data[self.ledger_path]["entries"]
+            if entry["kind"] == kind
+        )
+
+    def test_ledger_transition_graph_and_exact_completion_evidence(self):
+        applying = self.coordinator.record_source_work_applying(
+            **self.work_arguments("field_update")
+        )
+        self.assertEqual("applying", applying.state)
+        self.assertIsNone(self.stored_entry("field_update")["resolutionEvidence"])
+        writes = list(self.write_events())
+        retry = self.coordinator.record_source_work_applying(
+            **self.work_arguments("field_update")
+        )
+        self.assertEqual(applying, retry)
+        self.assertEqual(writes, self.write_events())
+
+        with self.assertRaises(self.module.SourceWorkTransitionConflict):
+            self.coordinator.complete_source_work_entry(
+                **self.work_arguments("informational"),
+                completion_record=self.completion_record("informational"),
+            )
+
+        completed = self.coordinator.complete_source_work_entry(
+            **self.work_arguments("field_update"),
+            completion_record=self.completion_record(),
+        )
+        self.assertEqual("completed", completed.state)
+        stored = self.stored_entry("field_update")
+        self.assertEqual("work_completion", stored["resolutionEvidence"]["evidenceKind"])
+        self.assertEqual(completed.evidence_hash, stored["resolutionEvidenceHash"])
+        writes = list(self.write_events())
+        exact_retry = self.coordinator.complete_source_work_entry(
+            **self.work_arguments("field_update"),
+            completion_record=self.completion_record(),
+        )
+        self.assertEqual(completed, exact_retry)
+        self.assertEqual(writes, self.write_events())
+
+        with self.assertRaises(self.module.SourceWorkTransitionConflict):
+            self.coordinator.record_source_work_applying(
+                **self.work_arguments("field_update")
+            )
+
+    def test_wrong_work_bindings_and_completion_schema_write_nothing(self):
+        before = deepcopy(self.fake.data)
+        bad_arguments = self.work_arguments("field_update")
+        bad_arguments["ledger_hash"] = "0" * 64
+        with self.assertRaises(self.module.SourceWorkTransitionConflict):
+            self.coordinator.record_source_work_applying(**bad_arguments)
+        with self.assertRaises(self.module.SourceCoordinatorConfigError):
+            self.coordinator.complete_source_work_entry(
+                **self.work_arguments("field_update"),
+                completion_record={
+                    "schemaVersion": 1,
+                    "evidenceKind": "handled_log",
+                    "workKind": "field_update",
+                    "resultHash": "d" * 64,
+                },
+            )
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+    def test_delegation_is_atomic_idempotent_and_split_brain_blocks(self):
+        delegated = self.coordinator.delegate_source_work_entry(
+            **self.work_arguments("property_unavailable")
+        )
+        entry = self.stored_entry("property_unavailable")
+        deferred_path = f"users/user-1/sourceDeferredWork/{entry['workKey']}"
+
+        self.assertEqual("delegated", entry["state"])
+        self.assertEqual("deferred", self.fake.data[deferred_path]["state"])
+        self.assertEqual(delegated.binding_hash, self.fake.data[deferred_path]["bindingHash"])
+        self.assertEqual(
+            self.fake.data[deferred_path]["bindingHash"],
+            entry["resolutionEvidence"]["deferredBindingHash"],
+        )
+        writes = list(self.write_events())
+        retry = self.coordinator.create_or_verify_deferred_work(
+            **self.work_arguments("property_unavailable")
+        )
+        self.assertEqual(delegated, retry)
+        self.assertEqual(writes, self.write_events())
+
+        del self.fake.data[deferred_path]
+        with self.assertRaises(self.module.DeferredWorkConflict):
+            self.coordinator.delegate_source_work_entry(
+                **self.work_arguments("property_unavailable")
+            )
+        self.assertEqual(writes, self.write_events())
+
+    def test_dominance_is_derived_from_selection_and_preserve_cannot_dominate(self):
+        dominated = self.coordinator.dominate_source_work_entry_from_selection(
+            **self.work_arguments("call_requested")
+        )
+        entry = self.stored_entry("call_requested")
+        self.assertEqual("dominated", dominated.state)
+        self.assertEqual("selection_dominance", entry["resolutionEvidence"]["evidenceKind"])
+        self.assertEqual("terminal", entry["resolutionEvidence"]["dominatingOwnerKind"])
+
+        with self.assertRaises(self.module.SourceWorkTransitionConflict):
+            self.coordinator.dominate_source_work_entry_from_selection(
+                **self.work_arguments("informational")
+            )
+
+    def test_ledger_transition_apply_then_raise_uses_exact_readback(self):
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown applying")
+        applying = self.coordinator.record_source_work_applying(
+            **self.work_arguments("field_update")
+        )
+        self.assertEqual("applying", applying.state)
+
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown delegation")
+        delegated = self.coordinator.delegate_source_work_entry(
+            **self.work_arguments("generic_reply")
+        )
+        self.assertEqual("delegated", delegated.ledger_state)
+
+    def settle_all_work(self):
+        for kind, result_hash in (
+            ("field_update", "d" * 64),
+            ("informational", "e" * 64),
+        ):
+            self.coordinator.record_source_work_applying(
+                **self.work_arguments(kind)
+            )
+            self.coordinator.complete_source_work_entry(
+                **self.work_arguments(kind),
+                completion_record=self.completion_record(kind, result_hash),
+            )
+        for kind in ("property_unavailable", "generic_reply"):
+            self.coordinator.delegate_source_work_entry(
+                **self.work_arguments(kind)
+            )
+        self.coordinator.dominate_source_work_entry_from_selection(
+            **self.work_arguments("call_requested")
+        )
+
+    def settle(self):
+        return self.coordinator.settle_source_markers_if_ready(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            ledger_hash=self.ledger["ledgerHash"],
+        )
+
+    def test_settlement_rejects_pending_applying_and_missing_head(self):
+        before = deepcopy(self.fake.data)
+        with self.assertRaises(self.module.SourceSettlementNotReady):
+            self.settle()
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+        self.coordinator.record_source_work_applying(
+            **self.work_arguments("field_update")
+        )
+        self.fake.events.clear()
+        with self.assertRaises(self.module.SourceSettlementNotReady):
+            self.settle()
+        self.assertEqual([], self.write_events())
+
+        self.settle_all_work()
+        head_path = "users/user-1/threadTransitionHeads/thread-ledger"
+        del self.fake.data[head_path]
+        self.fake.events.clear()
+        with self.assertRaises(self.module.SourceSettlementNotReady):
+            self.settle()
+        self.assertEqual([], self.write_events())
+
+    def test_settlement_rejects_missing_malformed_or_conflicting_authority(self):
+        self.settle_all_work()
+        prefix = "users/user-1"
+        identity_path = f"{prefix}/sourceIdentities/{self.source_id}"
+        classification_path = f"{prefix}/sourceClassifications/{self.source_id}"
+        owner_path = f"{prefix}/sourceTransitionOwners/{self.source_id}"
+        ledger_path = f"{prefix}/sourceWorkLedgers/{self.source_id}"
+        head_path = f"{prefix}/threadTransitionHeads/thread-ledger"
+        settlement_path = f"{prefix}/sourceSettlements/{self.source_id}"
+        baseline = deepcopy(self.fake.data)
+
+        def remove(path):
+            return lambda data: data.pop(path)
+
+        def replace_field(path, field, value):
+            return lambda data: data[path].__setitem__(field, value)
+
+        def install_conflicting_head(data):
+            retained = data[head_path]
+            data[head_path] = self.module._build_thread_head_document(
+                thread_id="thread-ledger",
+                canonical_source_id="source-attacker",
+                owner_data=data[owner_path],
+                generation=retained["activeGeneration"],
+                state="active",
+                revision=retained["threadHeadRevision"],
+                now=retained["updatedAt"],
+                created_at=retained["createdAt"],
+            )
+
+        cases = (
+            ("missing_identity", remove(identity_path)),
+            (
+                "malformed_identity",
+                replace_field(identity_path, "threadId", None),
+            ),
+            ("missing_classification", remove(classification_path)),
+            (
+                "conflicting_snapshot",
+                replace_field(
+                    classification_path,
+                    "snapshotImmutableHash",
+                    "0" * 64,
+                ),
+            ),
+            ("missing_explicit_owner", remove(owner_path)),
+            (
+                "nonmatching_explicit_owner",
+                replace_field(owner_path, "ownerDecisionHash", "0" * 64),
+            ),
+            ("missing_ledger", remove(ledger_path)),
+            (
+                "unreadable_ledger",
+                replace_field(ledger_path, "ledgerHash", "0" * 64),
+            ),
+            ("missing_admission", remove(self.admission_path)),
+            (
+                "nonsettleable_admission",
+                replace_field(self.admission_path, "admissionState", "pending"),
+            ),
+            ("conflicting_thread_head", install_conflicting_head),
+        )
+        for case, corrupt in cases:
+            with self.subTest(case=case):
+                self.fake.data.clear()
+                self.fake.data.update(deepcopy(baseline))
+                corrupt(self.fake.data)
+                before = deepcopy(self.fake.data)
+                self.fake.events.clear()
+
+                with self.assertRaises(self.module.SourceCoordinatorError):
+                    self.settle()
+
+                self.assertEqual(before, self.fake.data)
+                self.assertNotIn(settlement_path, self.fake.data)
+                self.assertEqual([], self.write_events())
+
+    def test_marker_fail_before_apply_is_retryable_and_writes_nothing(self):
+        self.settle_all_work()
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+        self.fake.fail_next_commit = RuntimeError("marker commit unavailable")
+
+        with self.assertRaises(self.module.SourceCoordinatorRetryable):
+            self.settle()
+
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+        settlement = self.settle()
+        self.assertEqual(
+            settlement.settlement_hash,
+            self.fake.data[
+                f"users/user-1/sourceSettlements/{self.source_id}"
+            ]["settlementHash"],
+        )
+
+    def test_ordinary_only_none_owner_settles_without_thread_head(self):
+        fake = FakeFirestore()
+        coordinator = self.module.SourceCoordinator(
+            fake,
+            uuid_factory=SequentialUUIDs(),
+            now_factory=MutableClock(FROZEN_NOW),
+        )
+        identity = coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": "graph-ordinary-only"},
+            evidence_kind="graph_hydration",
+            thread_id="thread-ordinary-only",
+        )
+        source_id = identity.canonical_source_id
+        coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=source_id,
+            lease_seconds=60,
+            classification_input=deepcopy(CLASSIFICATION_INPUT),
+            classifier=lambda: (
+                {
+                    "schemaVersion": 1,
+                    "transitionCandidates": [],
+                    "ordinaryObligations": [
+                        {
+                            "type": "field_update",
+                            "field": "stage",
+                            "value": "warm",
+                        }
+                    ],
+                },
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        owner = coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        self.assertEqual("none", owner["ownerKind"])
+        ledger = coordinator.create_or_verify_source_work_ledger(
+            user_id="user-1",
+            canonical_source_id=source_id,
+        )
+        entry = ledger["entries"][0]
+        coordinator.admit_pending_inbound(
+            user_id="user-1",
+            canonical_source_id=source_id,
+            received_at=FROZEN_NOW,
+            sent_at=FROZEN_NOW,
+            saved_history_binding={
+                "schemaVersion": 1,
+                "historyKey": "history-ordinary-only",
+            },
+            index_binding={
+                "schemaVersion": 1,
+                "indexKey": "index-ordinary-only",
+            },
+        )
+        work_arguments = {
+            "user_id": "user-1",
+            "canonical_source_id": source_id,
+            "ledger_hash": ledger["ledgerHash"],
+            "work_key": entry["workKey"],
+            "payload_hash": entry["payloadHash"],
+        }
+        coordinator.record_source_work_applying(**work_arguments)
+        coordinator.complete_source_work_entry(
+            **work_arguments,
+            completion_record={
+                "schemaVersion": 1,
+                "evidenceKind": "work_completion",
+                "workKind": "field_update",
+                "resultHash": "f" * 64,
+            },
+        )
+        head_path = (
+            "users/user-1/threadTransitionHeads/thread-ordinary-only"
+        )
+        self.assertNotIn(head_path, fake.data)
+
+        settlement = coordinator.settle_source_markers_if_ready(
+            user_id="user-1",
+            canonical_source_id=source_id,
+            ledger_hash=ledger["ledgerHash"],
+        )
+
+        self.assertNotIn(head_path, fake.data)
+        self.assertEqual(1, settlement.alias_projection_count)
+        self.assertEqual(
+            "settled",
+            fake.data[
+                f"users/user-1/inboundPendingAdmissions/{source_id}"
+            ]["admissionState"],
+        )
+
+    def test_fully_ready_source_creates_settlement_and_all_alias_projections(self):
+        self.settle_all_work()
+        self.fake.events.clear()
+
+        settlement = self.settle()
+
+        settlement_path = f"users/user-1/sourceSettlements/{self.source_id}"
+        stored = self.fake.data[settlement_path]
+        self.assertEqual(settlement.settlement_hash, stored["settlementHash"])
+        self.assertEqual(2, len(stored["aliases"]))
+        self.assertEqual("settled", self.fake.data[self.admission_path]["admissionState"])
+        for descriptor in stored["aliases"]:
+            projection_path = (
+                "users/user-1/processedMessages/"
+                f"{descriptor['sourceAliasKey']}"
+            )
+            projection = self.fake.data[projection_path]
+            self.assertEqual(self.source_id, projection["canonicalSourceId"])
+            self.assertEqual(stored["settlementHash"], projection["settlementHash"])
+        writes = list(self.write_events())
+        retry = self.settle()
+        self.assertEqual(settlement, retry)
+        self.assertEqual(writes, self.write_events())
+
+    def test_tampered_deferred_or_dominance_evidence_blocks_markers(self):
+        self.settle_all_work()
+        delegated = self.stored_entry("property_unavailable")
+        deferred_path = (
+            "users/user-1/sourceDeferredWork/"
+            f"{delegated['workKey']}"
+        )
+        self.fake.data[deferred_path]["bindingHash"] = "0" * 64
+        before = deepcopy(self.fake.data)
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.SourceCoordinatorError):
+            self.settle()
+
+        self.assertEqual(before, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+    def test_missing_or_differently_owned_alias_authority_blocks_settlement(self):
+        self.settle_all_work()
+        identity_path = f"users/user-1/sourceIdentities/{self.source_id}"
+        alias_key = self.fake.data[identity_path]["verifiedAliases"][0][
+            "sourceAliasKey"
+        ]
+        alias_path = f"users/user-1/sourceAliases/{alias_key}"
+        baseline = deepcopy(self.fake.data)
+
+        for case in ("missing", "different_owner"):
+            with self.subTest(case=case):
+                self.fake.data.clear()
+                self.fake.data.update(deepcopy(baseline))
+                if case == "missing":
+                    del self.fake.data[alias_path]
+                else:
+                    self.fake.data[alias_path]["canonicalSourceId"] = (
+                        "source-attacker"
+                    )
+                before = deepcopy(self.fake.data)
+                self.fake.events.clear()
+
+                with self.assertRaises(self.module.SourceCoordinatorError):
+                    self.settle()
+
+                self.assertEqual(before, self.fake.data)
+                self.assertEqual([], self.write_events())
+
+    def test_naked_legacy_marker_never_authorizes_or_gets_overwritten(self):
+        self.settle_all_work()
+        identity_path = f"users/user-1/sourceIdentities/{self.source_id}"
+        alias_key = self.fake.data[identity_path]["verifiedAliases"][0][
+            "sourceAliasKey"
+        ]
+        marker_path = f"users/user-1/processedMessages/{alias_key}"
+        naked_marker = {"processedAt": FROZEN_NOW}
+        self.fake.data[marker_path] = deepcopy(naked_marker)
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.SourceSettlementConflict):
+            self.settle()
+
+        self.assertEqual(naked_marker, self.fake.data[marker_path])
+        self.assertNotIn(
+            f"users/user-1/sourceSettlements/{self.source_id}",
+            self.fake.data,
+        )
+        self.assertEqual([], self.write_events())
+
+    def test_late_alias_repair_adds_projection_without_mutating_settlement(self):
+        self.settle_all_work()
+        self.settle()
+        settlement_path = f"users/user-1/sourceSettlements/{self.source_id}"
+        original_settlement = deepcopy(self.fake.data[settlement_path])
+        self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={
+                "id": "graph-ledger-late",
+                "internetMessageId": "<ledger@example.test>",
+            },
+            evidence_kind="graph_hydration",
+            thread_id="thread-ledger",
+        )
+        identity_path = f"users/user-1/sourceIdentities/{self.source_id}"
+        aliases = self.fake.data[identity_path]["verifiedAliases"]
+        late_alias = next(
+            descriptor
+            for descriptor in aliases
+            if descriptor not in original_settlement["aliases"]
+        )
+        late_projection_path = (
+            "users/user-1/processedMessages/"
+            f"{late_alias['sourceAliasKey']}"
+        )
+        late_owner_path = (
+            "users/user-1/sourceAliases/"
+            f"{late_alias['sourceAliasKey']}"
+        )
+        self.assertNotIn(late_projection_path, self.fake.data)
+        retained_owner = deepcopy(self.fake.data[late_owner_path])
+        self.fake.data[late_owner_path]["canonicalSourceId"] = "source-attacker"
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.SourceCoordinatorError):
+            self.settle()
+
+        self.assertEqual(original_settlement, self.fake.data[settlement_path])
+        self.assertNotIn(late_projection_path, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+        self.fake.data[late_owner_path] = retained_owner
+        self.fake.events.clear()
+
+        repaired = self.settle()
+
+        self.assertEqual(original_settlement, self.fake.data[settlement_path])
+        self.assertEqual(
+            original_settlement["settlementHash"],
+            repaired.settlement_hash,
+        )
+        self.assertIn(late_projection_path, self.fake.data)
+        self.assertEqual(1, len(self.write_events()))
+
+    def test_marker_partial_commit_blocks_cursor(self):
+        self.settle_all_work()
+        identity_path = f"users/user-1/sourceIdentities/{self.source_id}"
+        hidden_alias_key = self.fake.data[identity_path]["verifiedAliases"][0][
+            "sourceAliasKey"
+        ]
+        hidden_path = f"users/user-1/processedMessages/{hidden_alias_key}"
+        original_snapshot = self.fake._snapshot
+
+        def corrupting_snapshot(document_ref):
+            snapshot = original_snapshot(document_ref)
+            applied_unknown_commit = any(
+                event[0] == "commit_raised_after_apply"
+                for event in self.fake.events
+            )
+            if applied_unknown_commit and document_ref.path == hidden_path:
+                return FakeDocumentSnapshot(document_ref, None)
+            return snapshot
+
+        self.fake._snapshot = corrupting_snapshot
+        self.fake.apply_then_raise_next_commit = RuntimeError(
+            "unknown marker commit"
+        )
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.SourceSettlementConflict):
+            self.settle()
+
+        cursor_writes = [
+            event
+            for event in self.write_events()
+            if "sync/inbox" in event[1] or "cursor" in event[1]
+        ]
+        self.assertEqual([], cursor_writes)
 
 
 if __name__ == "__main__":

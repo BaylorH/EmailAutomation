@@ -85,6 +85,40 @@ class FakeCollectionReference:
             raise ValueError("fake document id must be a non-empty string")
         return FakeDocumentReference(self._store, (*self._parts, document_id))
 
+    def where(self, field_path, operator, value):
+        return FakeQuery(self).where(field_path, operator, value)
+
+    def order_by(self, field_path):
+        return FakeQuery(self).order_by(field_path)
+
+
+class FakeQuery:
+    def __init__(self, collection, *, filters=(), ordering=()):
+        self._collection = collection
+        self._store = collection._store
+        self._filters = tuple(filters)
+        self._ordering = tuple(ordering)
+
+    def where(self, field_path, operator, value):
+        if type(field_path) is not str or not field_path:
+            raise ValueError("fake query field path must be non-empty")
+        if operator != "==":
+            raise ValueError("fake query supports equality filters only")
+        return FakeQuery(
+            self._collection,
+            filters=(*self._filters, (field_path, operator, deepcopy(value))),
+            ordering=self._ordering,
+        )
+
+    def order_by(self, field_path):
+        if type(field_path) is not str or not field_path:
+            raise ValueError("fake query order field must be non-empty")
+        return FakeQuery(
+            self._collection,
+            filters=self._filters,
+            ordering=(*self._ordering, field_path),
+        )
+
 
 class FakeDocumentReference:
     def __init__(self, store, path):
@@ -153,6 +187,7 @@ class FakeTransaction:
         self._snapshot_data = None
         self._snapshot_versions = None
         self._read_set = {}
+        self._query_read_set = {}
 
     @property
     def in_progress(self):
@@ -165,6 +200,7 @@ class FakeTransaction:
         self._snapshot_data = None
         self._snapshot_versions = None
         self._read_set = {}
+        self._query_read_set = {}
 
     def _begin(self, retry_id=None):
         if self.in_progress:
@@ -174,6 +210,7 @@ class FakeTransaction:
             self._snapshot_data = deepcopy(self._store.data)
             self._snapshot_versions = dict(self._store._versions)
             self._read_set = {}
+            self._query_read_set = {}
             self._store.events.append(("transaction_began", retry_id))
 
     def _commit(self):
@@ -191,7 +228,53 @@ class FakeTransaction:
 
     def get(self, document_ref):
         """Match Firestore Transaction.get(): return a snapshot iterator."""
+        if isinstance(document_ref, FakeQuery):
+            return iter(self.get_query(document_ref))
         return iter((self.get_document(document_ref),))
+
+    def get_query(self, query):
+        self._ensure_open()
+        if not self.in_progress:
+            raise ValueError("fake transaction is not in progress")
+        if not isinstance(query, FakeQuery) or query._store is not self._store:
+            raise TypeError("fake transaction query belongs to another store")
+        if self._operations:
+            raise RuntimeError("fake Firestore forbids reads after writes")
+        collection_parts = query._collection._parts
+        collection_path = query._collection.path
+        collection_state = {}
+        matching = []
+        for path, payload in self._snapshot_data.items():
+            parts = tuple(path.split("/"))
+            if (
+                len(parts) != len(collection_parts) + 1
+                or parts[: len(collection_parts)] != collection_parts
+            ):
+                continue
+            collection_state[path] = (
+                self._snapshot_versions.get(path, 0),
+                deepcopy(payload),
+            )
+            if all(
+                payload.get(field_path) == expected
+                for field_path, _operator, expected in query._filters
+            ):
+                matching.append((path, deepcopy(payload)))
+        self._query_read_set[collection_path] = collection_state
+        self._store.events.append(
+            ("query", collection_path, query._filters, query._ordering)
+        )
+        matching.sort(
+            key=lambda item: tuple(item[1].get(field) for field in query._ordering)
+            + (item[0],)
+        )
+        return [
+            FakeDocumentSnapshot(
+                FakeDocumentReference(self._store, tuple(path.split("/"))),
+                payload,
+            )
+            for path, payload in matching
+        ]
 
     def get_document(self, document_ref):
         self._ensure_open()
@@ -253,6 +336,11 @@ class FakeTransaction:
         return self._apply_buffered()
 
     def _apply_buffered(self):
+        barrier = self._store.before_commit_barrier
+        if barrier is not None:
+            barrier_index = barrier.wait(timeout=5)
+            if barrier_index == 0 and self._store.before_commit_barrier is barrier:
+                self._store.before_commit_barrier = None
         with self._store._lock:
             if self._store.fail_next_commit is not None:
                 failure = self._store.fail_next_commit
@@ -331,6 +419,23 @@ class FakeTransaction:
                 raise FakeTransactionAborted(
                     f"fake transaction snapshot is stale for {path}"
                 )
+        for collection_path, snapshot_state in self._query_read_set.items():
+            prefix = tuple(collection_path.split("/"))
+            current_state = {}
+            for path, payload in self._store.data.items():
+                parts = tuple(path.split("/"))
+                if len(parts) == len(prefix) + 1 and parts[: len(prefix)] == prefix:
+                    current_state[path] = (
+                        self._store._versions.get(path, 0),
+                        deepcopy(payload),
+                    )
+            if current_state != snapshot_state:
+                self._store.events.append(
+                    ("commit_aborted_stale_query", collection_path)
+                )
+                raise FakeTransactionAborted(
+                    f"fake transaction query snapshot is stale for {collection_path}"
+                )
 
 
 class FakeFirestore:
@@ -340,6 +445,7 @@ class FakeFirestore:
         self.fail_next_commit = None
         self.apply_then_raise_next_commit = None
         self.before_next_commit_hook = None
+        self.before_commit_barrier = None
         self._lock = RLock()
         self._versions = {}
         self._version_clock = 0
