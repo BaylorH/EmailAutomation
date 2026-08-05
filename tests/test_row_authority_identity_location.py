@@ -10,6 +10,7 @@ import unittest
 import unicodedata
 from copy import deepcopy
 from pathlib import Path
+from threading import Barrier, Thread
 from unittest.mock import patch
 
 from tests import test_row_authority_contracts as authority_contracts
@@ -1910,6 +1911,903 @@ class RowIdentityInitializationTests(_RowIdentityFixtures, unittest.TestCase):
                 self._initialize(module, bounded_store)
         self.assertEqual([], bounded_store.events)
         self.assertEqual({}, bounded_store.data)
+
+
+class RowLocationRevisionTests(_RowIdentityFixtures, unittest.TestCase):
+    @staticmethod
+    def _fakes():
+        return importlib.import_module("tests.row_authority_fakes")
+
+    @classmethod
+    def _initialized(
+        cls,
+        module,
+        *,
+        marker_observation=None,
+        headers=(" Email ", "Status\r\nLine"),
+        cells=("USER@EXAMPLE.COM", "  Keep  \rValue"),
+    ):
+        store = cls._fakes().BoundedFakeFirestore()
+        coordinator = module.RowAuthorityStore(
+            store,
+            transaction_executor=cls._fakes().run_bounded_transaction,
+        )
+        marker = marker_observation or cls._marker_observation()
+        result = coordinator.initialize_row_identity(
+            verified_user_id="uid-1",
+            client_id="client-A",
+            spreadsheet_id="spreadsheet-A",
+            marker_observation=marker,
+            headers=headers,
+            cells=cells,
+            lifecycle="active",
+            creation_kind="fresh",
+            creation_source_hash=CREATION_SOURCE_HASH,
+            created_at=CREATED_AT,
+        )
+        store.events.clear()
+        return store, coordinator, result
+
+    @classmethod
+    def _observation(
+        cls,
+        module,
+        *,
+        row_id=ROW_ID,
+        sheet_id=7,
+        provider_row_index=4,
+        metadata_id=11,
+        headers=(" Email ", "Status\r\nLine"),
+        cells=("USER@EXAMPLE.COM", "  Keep  \rValue"),
+        spreadsheet_id="spreadsheet-A",
+    ):
+        return module.build_row_observation(
+            spreadsheet_id=spreadsheet_id,
+            marker_observation={
+                "rowId": row_id,
+                "sheetId": sheet_id,
+                "providerRowIndex": provider_row_index,
+                "displayRowNumber": provider_row_index + 1,
+                "metadataId": metadata_id,
+            },
+            ordered_headers=headers,
+            ordered_cell_values=cells,
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+
+    @staticmethod
+    def _advance(
+        coordinator,
+        *,
+        expected_head,
+        observations,
+        lifecycle="active",
+        observed_at=LATER_AT,
+        row_id=ROW_ID,
+    ):
+        return coordinator.advance_row_location(
+            verified_user_id="uid-1",
+            row_id=row_id,
+            expected_head=expected_head,
+            observations=observations,
+            lifecycle=lifecycle,
+            observed_at=observed_at,
+        )
+
+    @staticmethod
+    def _references(store, *, row_id=ROW_ID, previous=1, candidate=2):
+        user = store.collection("users").document("uid-1")
+        return {
+            "identity": user.collection("rowIdentities").document(row_id),
+            "head": user.collection("rowAuthorityHeads").document(row_id),
+            "previous": user.collection("rowLocationRevisions").document(
+                f"{row_id}--{previous}"
+            ),
+            "candidate": user.collection("rowLocationRevisions").document(
+                f"{row_id}--{candidate}"
+            ),
+        }
+
+    def _owned_head(self, module, head, *, state):
+        owned = deepcopy(head)
+        owned.update(
+            {
+                "effectiveOwnerGeneration": 1,
+                "effectiveOwnerGenerationHash": "a" * 64,
+                "effectiveOwnerKind": (
+                    "human_decision" if state == "review_pending" else "terminal"
+                ),
+                "effectivePriority": 1 if state == "review_pending" else 2,
+                "state": state,
+                "fencingToken": 1,
+            }
+        )
+        if state in {"claimed", "review_pending"}:
+            owned.update(
+                {
+                    "leaseOwnerHash": "b" * 64,
+                    "leaseUntil": "2026-08-04T13:35:57.654321Z",
+                    "latestSettlementHash": None,
+                    "effectiveSettlementHash": None,
+                }
+            )
+        elif state == "settled":
+            owned.update(
+                {
+                    "leaseOwnerHash": None,
+                    "leaseUntil": None,
+                    "latestSettlementHash": "c" * 64,
+                    "effectiveSettlementHash": "c" * 64,
+                }
+            )
+        return self._rehash_head(owned)
+
+    def test_move_sort_restart_preserves_identity_and_appends_revision(self):
+        module = self._authority()
+        metadata = importlib.import_module("email_automation.row_metadata")
+        fakes = self._fakes()
+        sheet = fakes.MarkerAwareSheet(
+            sheet_id=7,
+            rows=(("target",), ("alpha",), ("zulu",)),
+        )
+        created_marker = sheet.create_row_marker(
+            provider_row_index=0,
+            row_id=ROW_ID,
+        )
+        parsed_initial = metadata.parse_row_developer_metadata(created_marker)
+        store, coordinator, initialized = self._initialized(
+            module,
+            marker_observation=parsed_initial,
+            headers=("Name",),
+            cells=("target",),
+        )
+        sheet.insert_row(0, ("inserted",))
+        sheet.move_row(1, 3)
+        sheet.sort_rows(key=lambda values: values[0])
+        restarted = sheet.restart()
+        parsed_moved = metadata.parse_row_developer_metadata(
+            restarted.search_row_markers(ROW_ID)[0]
+        )
+        observation = module.build_row_observation(
+            spreadsheet_id="spreadsheet-A",
+            marker_observation=parsed_moved,
+            ordered_headers=("Name",),
+            ordered_cell_values=("target",),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        result = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(observation,),
+        )
+        self.assertEqual("advanced", result["disposition"])
+        self.assertEqual(ROW_ID, result["identity"]["rowId"])
+        self.assertEqual(2, result["locationRevision"]["revision"])
+        self.assertEqual(
+            parsed_moved["providerRowIndex"],
+            result["locationRevision"]["providerRowIndex"],
+        )
+        self.assertEqual(
+            parsed_moved["providerRowIndex"] + 1,
+            result["locationRevision"]["displayRowNumber"],
+        )
+        self.assertEqual(
+            created_marker["metadataId"],
+            result["locationRevision"]["metadataId"],
+        )
+        self.assertEqual(2, result["authorityHead"]["stateRevision"])
+        self.assertEqual(2, result["authorityHead"]["currentLocationRevision"])
+        self.assertEqual(4, len(store.data))
+
+    def test_nonviable_transition_retains_snapshot_and_advances_counters(self):
+        module = self._authority()
+        _store, coordinator, initialized = self._initialized(module)
+        observation = self._observation(
+            module,
+            provider_row_index=2,
+            cells=("not viable",),
+        )
+        result = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(observation,),
+            lifecycle="nonviable",
+        )
+        revision = result["locationRevision"]
+        self.assertEqual("nonviable", revision["lifecycle"])
+        self.assertEqual(observation["rowSnapshotHash"], revision["rowSnapshotHash"])
+        self.assertEqual(2, revision["revision"])
+        self.assertEqual(2, result["authorityHead"]["stateRevision"])
+
+    def test_location_and_state_counters_advance_independently(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        expected = deepcopy(initialized["authorityHead"])
+        expected["stateRevision"] = 7
+        expected = self._rehash_head(expected)
+        references = self._references(store)
+        references["head"].set(expected, merge=False)
+        result = self._advance(
+            coordinator,
+            expected_head=expected,
+            observations=(self._observation(module),),
+        )
+        self.assertEqual(8, result["authorityHead"]["stateRevision"])
+        self.assertEqual(2, result["authorityHead"]["currentLocationRevision"])
+
+    def test_valid_timestamp_lineage_drift_conflicts_without_writes(self):
+        module = self._authority()
+        cases = (
+            ("head_created_at", None),
+            ("revision_before_identity", "2026-08-04T12:00:00.000000Z"),
+            ("revision_after_head", "2026-08-04T13:00:00.000000Z"),
+        )
+        for drift_kind, revision_time in cases:
+            with self.subTest(drift_kind=drift_kind):
+                store, coordinator, initialized = self._initialized(module)
+                references = self._references(store)
+                expected = deepcopy(initialized["authorityHead"])
+                if drift_kind == "head_created_at":
+                    expected["createdAt"] = "2026-08-04T12:00:00.000000Z"
+                else:
+                    previous = deepcopy(initialized["locationRevision"])
+                    previous["observedAt"] = revision_time
+                    previous = self._rehash_revision(previous)
+                    references["previous"].set(previous, merge=False)
+                    expected["currentLocationHash"] = previous["revisionHash"]
+                expected = self._rehash_head(expected)
+                references["head"].set(expected, merge=False)
+                data_before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(module.RowAuthorityConflict):
+                    self._advance(
+                        coordinator,
+                        expected_head=expected,
+                        observations=(self._observation(module),),
+                    )
+                self.assertEqual(data_before, store.data)
+                self.assertFalse(
+                    any(
+                        event[0] in {"create", "set", "update", "delete"}
+                        for event in store.events
+                    )
+                )
+
+    def test_repeat_semantic_observation_ignores_timestamp_and_is_unchanged(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        observation = self._observation(module)
+        advanced = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(observation,),
+        )
+        data_before = deepcopy(store.data)
+        store.events.clear()
+        unchanged = self._advance(
+            coordinator,
+            expected_head=advanced["authorityHead"],
+            observations=(observation,),
+            observed_at="2026-08-04T12:40:00.000000Z",
+        )
+        self.assertEqual("unchanged", unchanged["disposition"])
+        self.assertEqual(advanced["locationRevision"], unchanged["locationRevision"])
+        self.assertEqual(advanced["authorityHead"], unchanged["authorityHead"])
+        self.assertEqual(data_before, store.data)
+        self.assertFalse(
+            any(event[0] in {"create", "set", "update", "delete"} for event in store.events)
+        )
+
+
+    def test_delete_appends_tombstone_with_null_location_and_snapshot(self):
+        module = self._authority()
+        _store, coordinator, initialized = self._initialized(module)
+        deleted = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(),
+            lifecycle="deleted",
+        )
+        revision = deleted["locationRevision"]
+        self.assertEqual("advanced", deleted["disposition"])
+        self.assertEqual("deleted", revision["lifecycle"])
+        for field in (
+            "providerRowIndex",
+            "displayRowNumber",
+            "metadataId",
+            "rowSnapshotHash",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(revision[field])
+        self.assertEqual("deleted", deleted["authorityHead"]["currentLocationLifecycle"])
+
+    def test_deleted_row_id_can_never_be_reactivated(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        deleted = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(),
+            lifecycle="deleted",
+        )
+        data_before = deepcopy(store.data)
+        for lifecycle, observations in (
+            ("active", (self._observation(module),)),
+            (
+                "ambiguous",
+                (
+                    self._observation(module),
+                    self._observation(module, provider_row_index=5, metadata_id=12),
+                ),
+            ),
+            ("deleted", ()),
+        ):
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(
+                module.RowAuthorityConflict
+            ):
+                self._advance(
+                    coordinator,
+                    expected_head=deleted["authorityHead"],
+                    observations=observations,
+                    lifecycle=lifecycle,
+                    observed_at="2026-08-04T12:50:00.000000Z",
+                )
+        self.assertEqual(data_before, store.data)
+
+    def test_deleted_precedence_ignores_malformed_candidate_drift(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        deleted = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(),
+            lifecycle="deleted",
+        )
+        references = self._references(store, previous=2, candidate=3)
+        references["candidate"].create({"malformed": True})
+        data_before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(module.RowAuthorityConflict):
+            self._advance(
+                coordinator,
+                expected_head=deleted["authorityHead"],
+                observations=(self._observation(module),),
+            )
+        self.assertEqual(data_before, store.data)
+        self.assertFalse(
+            any(
+                event[0] in {"create", "set", "update", "delete"}
+                for event in store.events
+            )
+        )
+
+    def test_coordinate_reuse_initializes_a_different_random_row_id(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        deleted = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(),
+            lifecycle="deleted",
+        )
+        with self.assertRaises(module.RowAuthorityConflict):
+            self._advance(
+                coordinator,
+                expected_head=deleted["authorityHead"],
+                observations=(self._observation(module),),
+                lifecycle="active",
+            )
+        replacement_marker = self._marker_observation(rowId=SECOND_ROW_ID)
+        replacement = coordinator.initialize_row_identity(
+            verified_user_id="uid-1",
+            client_id="client-A",
+            spreadsheet_id="spreadsheet-A",
+            marker_observation=replacement_marker,
+            headers=(" Email ", "Status\r\nLine"),
+            cells=("replacement",),
+            lifecycle="active",
+            creation_kind="fresh",
+            creation_source_hash="2" * 64,
+            created_at="2026-08-04T12:50:00.000000Z",
+        )
+        self.assertEqual("created", replacement["disposition"])
+        self.assertEqual(SECOND_ROW_ID, replacement["identity"]["rowId"])
+        self.assertNotEqual(ROW_ID, replacement["identity"]["rowId"])
+        identity_paths = {
+            path
+            for path in store.data
+            if "/rowIdentities/" in path
+        }
+        self.assertEqual(2, len(identity_paths))
+
+    def test_duplicate_markers_append_ambiguous_revision_without_election(self):
+        module = self._authority()
+        _store, coordinator, initialized = self._initialized(module)
+        first = self._observation(module, provider_row_index=1, metadata_id=11)
+        second = self._observation(module, provider_row_index=4, metadata_id=12)
+        ambiguous = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(second, first),
+            lifecycle="ambiguous",
+        )
+        revision = ambiguous["locationRevision"]
+        self.assertEqual("advanced", ambiguous["disposition"])
+        self.assertEqual("ambiguous", revision["lifecycle"])
+        self.assertEqual("ambiguous", ambiguous["authorityHead"]["currentLocationLifecycle"])
+        self.assertNotEqual(
+            initialized["locationRevision"]["observationEvidenceHash"],
+            revision["observationEvidenceHash"],
+        )
+        self.assertNotIn(first["providerRowIndex"], (
+            revision["providerRowIndex"],
+            revision["displayRowNumber"],
+        ))
+
+    def test_ambiguous_revision_has_null_location_and_commits_all_evidence(self):
+        module = self._authority()
+        _store, coordinator, initialized = self._initialized(module)
+        observations = (
+            self._observation(module, provider_row_index=7, metadata_id=17),
+            self._observation(module, provider_row_index=2, metadata_id=12),
+            self._observation(module, provider_row_index=2, metadata_id=13),
+        )
+        result = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=observations,
+            lifecycle="ambiguous",
+        )
+        revision = result["locationRevision"]
+        self.assertTrue(
+            all(
+                revision[field] is None
+                for field in (
+                    "providerRowIndex",
+                    "displayRowNumber",
+                    "metadataId",
+                    "rowSnapshotHash",
+                )
+            )
+        )
+        self.assertEqual(
+            module.observation_evidence_hash(
+                lifecycle="ambiguous",
+                observations=observations,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            revision["observationEvidenceHash"],
+        )
+
+    def test_sheet_or_spreadsheet_drift_cannot_move_an_identity_across_grids(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        data_before = deepcopy(store.data)
+        drifting = (
+            self._observation(module, sheet_id=8),
+            self._observation(module, spreadsheet_id="spreadsheet-B"),
+        )
+        for observation in drifting:
+            with self.subTest(marker_hash=observation["markerHash"]), self.assertRaises(
+                module.RowAuthorityConflict
+            ):
+                self._advance(
+                    coordinator,
+                    expected_head=initialized["authorityHead"],
+                    observations=(observation,),
+                )
+        self.assertEqual(data_before, store.data)
+
+
+    def test_exact_location_retry_is_zero_write_noop(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        observation = self._observation(module)
+        advanced = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(observation,),
+        )
+        data_before = deepcopy(store.data)
+        store.events.clear()
+        replayed = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(observation,),
+        )
+        self.assertEqual("already_applied", replayed["disposition"])
+        self.assertEqual(advanced["locationRevision"], replayed["locationRevision"])
+        self.assertEqual(advanced["authorityHead"], replayed["authorityHead"])
+        self.assertEqual(data_before, store.data)
+        self.assertFalse(
+            any(event[0] in {"create", "set", "update", "delete"} for event in store.events)
+        )
+
+    def test_stale_expected_head_writes_nothing(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        first = self._observation(module, provider_row_index=4)
+        self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(first,),
+        )
+        data_before = deepcopy(store.data)
+        store.events.clear()
+        different = self._observation(
+            module,
+            provider_row_index=5,
+            metadata_id=12,
+        )
+        with self.assertRaises(module.RowAuthorityConflict):
+            self._advance(
+                coordinator,
+                expected_head=initialized["authorityHead"],
+                observations=(different,),
+            )
+        self.assertEqual(data_before, store.data)
+        self.assertFalse(
+            any(event[0] in {"create", "set", "update", "delete"} for event in store.events)
+        )
+
+    def test_existing_candidate_revision_drift_writes_nothing(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        identity = initialized["identity"]
+        drift_observation = self._observation(
+            module,
+            provider_row_index=6,
+            cells=("drift",),
+        )
+        drift_candidate = module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=2,
+            lifecycle="nonviable",
+            observations=(drift_observation,),
+            previous_revision_hash=initialized["locationRevision"]["revisionHash"],
+            observed_at=LATER_AT,
+        )
+        references = self._references(store)
+        references["candidate"].create(drift_candidate)
+        data_before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(module.RowAuthorityConflict):
+            self._advance(
+                coordinator,
+                expected_head=initialized["authorityHead"],
+                observations=(self._observation(module),),
+            )
+        self.assertEqual(data_before, store.data)
+        self.assertFalse(
+            any(event[0] in {"create", "set", "update", "delete"} for event in store.events)
+        )
+
+    def test_two_identical_workers_create_one_revision_and_both_succeed(self):
+        module = self._authority()
+        store, _coordinator, initialized = self._initialized(module)
+        store.before_commit_barrier = Barrier(2)
+        coordinators = [
+            module.RowAuthorityStore(
+                store,
+                transaction_executor=self._fakes().run_bounded_transaction,
+            )
+            for _index in range(2)
+        ]
+        observation = self._observation(module)
+        results = []
+        failures = []
+
+        def worker(coordinator):
+            try:
+                results.append(
+                    self._advance(
+                        coordinator,
+                        expected_head=deepcopy(initialized["authorityHead"]),
+                        observations=(deepcopy(observation),),
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        threads = [Thread(target=worker, args=(coordinator,)) for coordinator in coordinators]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual([], failures)
+        self.assertEqual(2, len(results))
+        self.assertEqual(
+            {"advanced", "already_applied"},
+            {result["disposition"] for result in results},
+        )
+        candidate_path = self._references(store)["candidate"].path
+        self.assertIn(candidate_path, store.data)
+        self.assertEqual(4, len(store.data))
+
+    def test_two_different_observations_from_one_head_yield_one_conflict(self):
+        module = self._authority()
+        store, _coordinator, initialized = self._initialized(module)
+        store.before_commit_barrier = Barrier(2)
+        observations = (
+            self._observation(module, provider_row_index=4, metadata_id=11),
+            self._observation(module, provider_row_index=5, metadata_id=12),
+        )
+        results = []
+        failures = []
+
+        def worker(observation):
+            coordinator = module.RowAuthorityStore(
+                store,
+                transaction_executor=self._fakes().run_bounded_transaction,
+            )
+            try:
+                results.append(
+                    self._advance(
+                        coordinator,
+                        expected_head=deepcopy(initialized["authorityHead"]),
+                        observations=(observation,),
+                    )
+                )
+            except Exception as exc:
+                failures.append(exc)
+
+        threads = [Thread(target=worker, args=(observation,)) for observation in observations]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(1, len(results))
+        self.assertEqual("advanced", results[0]["disposition"])
+        self.assertEqual(1, len(failures))
+        self.assertIsInstance(failures[0], module.RowAuthorityConflict)
+        self.assertEqual(4, len(store.data))
+
+    def test_transaction_abort_retries_from_fresh_reads(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        references = self._references(store)
+
+        def touch_expected_head():
+            references["head"].set(deepcopy(initialized["authorityHead"]))
+
+        store.before_next_commit_hook = touch_expected_head
+        result = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(self._observation(module),),
+        )
+        self.assertEqual("advanced", result["disposition"])
+        self.assertTrue(
+            any(event[0] == "commit_aborted_stale_read" for event in store.events)
+        )
+        self.assertIn(("transaction_began", 1), store.events)
+
+    def test_preapply_failure_is_retryable_with_zero_writes(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        data_before = deepcopy(store.data)
+        store.fail_next_commit = RuntimeError("preapply location failure")
+        with self.assertRaises(module.RowAuthorityRetryable):
+            self._advance(
+                coordinator,
+                expected_head=initialized["authorityHead"],
+                observations=(self._observation(module),),
+            )
+        self.assertEqual(data_before, store.data)
+        self.assertNotIn(self._references(store)["candidate"].path, store.data)
+
+    def test_apply_then_raise_requires_exact_revision_and_head_readback(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        store.apply_then_raise_next_commit = RuntimeError("unknown location commit")
+        result = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(self._observation(module),),
+        )
+        self.assertEqual("advanced", result["disposition"])
+        references = self._references(store)
+        self.assertEqual(
+            result["locationRevision"],
+            store.data[references["candidate"].path],
+        )
+        self.assertEqual(result["authorityHead"], store.data[references["head"].path])
+        self.assertIn(("commit_raised_after_apply",), store.events)
+        failure_index = store.events.index(("commit_raised_after_apply",))
+        readback_events = [
+            event
+            for event in store.events[failure_index + 1 :]
+            if event[0] == "get"
+        ]
+        self.assertEqual(
+            [
+                ("get", references["identity"].path),
+                ("get", references["previous"].path),
+                ("get", references["candidate"].path),
+                ("get", references["head"].path),
+            ],
+            readback_events,
+        )
+
+    def test_partial_apply_then_raise_readback_is_ambiguous(self):
+        module = self._authority()
+        fakes = self._fakes()
+        for applied_operation in ("create", "set"):
+            with self.subTest(applied_operation=applied_operation):
+                store = fakes.BoundedFakeFirestore()
+                initializer = module.RowAuthorityStore(
+                    store,
+                    transaction_executor=fakes.run_bounded_transaction,
+                )
+                initialized = initializer.initialize_row_identity(
+                    verified_user_id="uid-1",
+                    client_id="client-A",
+                    spreadsheet_id="spreadsheet-A",
+                    marker_observation=self._marker_observation(),
+                    headers=(" Email ", "Status\r\nLine"),
+                    cells=("USER@EXAMPLE.COM", "  Keep  \rValue"),
+                    lifecycle="active",
+                    creation_kind="fresh",
+                    creation_source_hash=CREATION_SOURCE_HASH,
+                    created_at=CREATED_AT,
+                )
+
+                def partial_executor(transaction, callback):
+                    transaction._begin()
+                    callback(transaction)
+                    operations = [
+                        (operation, reference, deepcopy(payload), merge)
+                        for operation, reference, payload, merge
+                        in transaction._operations
+                    ]
+                    transaction._rollback()
+                    matching = [
+                        item for item in operations if item[0] == applied_operation
+                    ]
+                    self.assertEqual(1, len(matching))
+                    operation, reference, payload, merge = matching[0]
+                    if operation == "create":
+                        reference.create(payload)
+                    else:
+                        self.assertFalse(merge)
+                        reference.set(payload, merge=False)
+                    raise RuntimeError("partial unknown location commit")
+
+                coordinator = module.RowAuthorityStore(
+                    store,
+                    transaction_executor=partial_executor,
+                )
+                with self.assertRaises(module.RowAuthorityAmbiguous):
+                    self._advance(
+                        coordinator,
+                        expected_head=initialized["authorityHead"],
+                        observations=(self._observation(module),),
+                    )
+                references = self._references(store)
+                candidate_present = references["candidate"].path in store.data
+                head_changed = (
+                    store.data[references["head"].path]
+                    != initialized["authorityHead"]
+                )
+                self.assertEqual(applied_operation == "create", candidate_present)
+                self.assertEqual(applied_operation == "set", head_changed)
+
+    def test_apply_then_raise_immutable_readback_drift_is_ambiguous(self):
+        module = self._authority()
+        fakes = self._fakes()
+        for drift_kind in ("identity", "previous"):
+            with self.subTest(drift_kind=drift_kind):
+                store, _coordinator, initialized = self._initialized(module)
+                references = self._references(store)
+
+                def drifted_executor(transaction, callback):
+                    transaction._begin()
+                    callback(transaction)
+                    operations = [
+                        (operation, reference, deepcopy(payload), merge)
+                        for operation, reference, payload, merge
+                        in transaction._operations
+                    ]
+                    transaction._rollback()
+                    for operation, reference, payload, merge in operations:
+                        if operation == "create":
+                            reference.create(payload)
+                        else:
+                            reference.set(payload, merge=merge)
+                    if drift_kind == "identity":
+                        identity = initialized["identity"]
+                        drifted = module.build_row_identity_document(
+                            user_scope_hash=identity["userScopeHash"],
+                            row_id=identity["rowId"],
+                            client_id="client-B",
+                            spreadsheet_id=identity["spreadsheetId"],
+                            sheet_id=identity["sheetId"],
+                            creation_kind=identity["creationKind"],
+                            creation_source_hash=identity["creationSourceHash"],
+                            created_at=identity["createdAt"],
+                        )
+                        references["identity"].set(drifted, merge=False)
+                    else:
+                        drifted = module.build_row_location_revision_document(
+                            identity_document=initialized["identity"],
+                            revision=1,
+                            lifecycle="nonviable",
+                            observations=(self._observation(module),),
+                            previous_revision_hash=None,
+                            observed_at=CREATED_AT,
+                        )
+                        references["previous"].set(drifted, merge=False)
+                    raise RuntimeError("unknown commit with immutable drift")
+
+                coordinator = module.RowAuthorityStore(
+                    store,
+                    transaction_executor=drifted_executor,
+                )
+                with self.assertRaises(module.RowAuthorityAmbiguous):
+                    self._advance(
+                        coordinator,
+                        expected_head=initialized["authorityHead"],
+                        observations=(self._observation(module),),
+                    )
+
+    def test_location_change_is_exactly_two_planned_writes(self):
+        module = self._authority()
+        store, coordinator, initialized = self._initialized(module)
+        result = self._advance(
+            coordinator,
+            expected_head=initialized["authorityHead"],
+            observations=(self._observation(module),),
+        )
+        self.assertEqual("advanced", result["disposition"])
+        self.assertIn(("commit_applied", 2), store.events)
+        bounded_store, bounded_coordinator, bounded_initial = self._initialized(module)
+        bounded_store.events.clear()
+        with patch.object(module, "MAX_ROW_AUTHORITY_PLANNED_WRITES", 1):
+            with self.assertRaises(module.RowAuthorityConfigError):
+                self._advance(
+                    bounded_coordinator,
+                    expected_head=bounded_initial["authorityHead"],
+                    observations=(self._observation(module),),
+                )
+        self.assertEqual([], bounded_store.events)
+
+    def test_location_change_preserves_all_nonlocation_head_fields(self):
+        module = self._authority()
+        for state in ("claimed", "review_pending", "settled"):
+            with self.subTest(state=state):
+                store, coordinator, initialized = self._initialized(module)
+                owned = self._owned_head(
+                    module,
+                    initialized["authorityHead"],
+                    state=state,
+                )
+                references = self._references(store)
+                references["head"].set(owned)
+                store.events.clear()
+                advanced = self._advance(
+                    coordinator,
+                    expected_head=owned,
+                    observations=(self._observation(module),),
+                )
+                for field in (
+                    "effectiveOwnerGeneration",
+                    "effectiveOwnerGenerationHash",
+                    "effectiveOwnerKind",
+                    "effectivePriority",
+                    "state",
+                    "leaseOwnerHash",
+                    "leaseUntil",
+                    "fencingToken",
+                    "latestSettlementHash",
+                    "effectiveSettlementHash",
+                    "latestSourceSettlementLinkHash",
+                    "latestOptOutReleaseResultHash",
+                    "projectionBacklogCount",
+                    "createdAt",
+                ):
+                    self.assertEqual(owned[field], advanced["authorityHead"][field])
 
 
 class RowAuthorityA1ContainmentTests(unittest.TestCase):

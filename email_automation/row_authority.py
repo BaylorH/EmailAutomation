@@ -1340,6 +1340,36 @@ def _initialization_result(*, disposition, identity, revision, head):
     }
 
 
+def _location_result(*, disposition, identity, revision, head):
+    if disposition not in {"advanced", "unchanged", "already_applied"}:
+        raise RowAuthorityConfigError(
+            "location disposition is not approved"
+        )
+    return {
+        "disposition": disposition,
+        "identity": dict(identity),
+        "locationRevision": dict(revision),
+        "authorityHead": dict(head),
+    }
+
+
+def _location_semantics(revision):
+    return tuple(
+        revision[field]
+        for field in (
+            "lifecycle",
+            "spreadsheetId",
+            "sheetId",
+            "providerRowIndex",
+            "displayRowNumber",
+            "metadataId",
+            "markerHash",
+            "rowSnapshotHash",
+            "observationEvidenceHash",
+        )
+    )
+
+
 class RowAuthorityStore:
     def __init__(self, firestore, *, transaction_executor):
         if firestore is None:
@@ -1370,6 +1400,30 @@ class RowAuthorityStore:
                     f"{row_id}--1"
                 ),
                 user_ref.collection("rowAuthorityHeads").document(row_id),
+            )
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "verified user ID or row ID cannot form exact document paths"
+            ) from exc
+
+    def _location_references(
+        self,
+        *,
+        verified_user_id,
+        row_id,
+        previous_revision,
+        candidate_revision,
+    ):
+        try:
+            user_ref = self._firestore.collection("users").document(
+                verified_user_id
+            )
+            revisions = user_ref.collection("rowLocationRevisions")
+            return (
+                user_ref.collection("rowIdentities").document(row_id),
+                user_ref.collection("rowAuthorityHeads").document(row_id),
+                revisions.document(f"{row_id}--{previous_revision}"),
+                revisions.document(f"{row_id}--{candidate_revision}"),
             )
         except Exception as exc:
             raise RowAuthorityConfigError(
@@ -1554,4 +1608,336 @@ class RowAuthorityStore:
             identity=identity,
             revision=revision,
             head=head,
+        )
+
+    def advance_row_location(
+        self,
+        *,
+        verified_user_id,
+        row_id,
+        expected_head,
+        observations,
+        lifecycle,
+        observed_at,
+    ):
+        planned_writes = 2
+        if planned_writes > MAX_ROW_AUTHORITY_PLANNED_WRITES:
+            raise RowAuthorityConfigError(
+                "row location change exceeds the planned-write ceiling"
+            )
+        expected = validate_row_authority_head(document=expected_head)
+        checked_row_id = validate_row_id(row_id)
+        checked_scope = user_scope_hash(verified_user_id)
+        if expected["userScopeHash"] != checked_scope:
+            raise RowAuthorityConfigError(
+                "expected head does not belong to the verified user"
+            )
+        if expected["rowId"] != checked_row_id:
+            raise RowAuthorityConfigError(
+                "expected head does not belong to the requested row"
+            )
+        checked_observed_at = _require_timestamp(
+            observed_at,
+            field_name="observed_at",
+        )
+        if checked_observed_at < expected["updatedAt"]:
+            raise RowAuthorityConfigError(
+                "location observation cannot predate the expected head"
+            )
+        canonical_observations = _validated_evidence_observations(
+            lifecycle=lifecycle,
+            observations=observations,
+        )
+        previous_number = expected["currentLocationRevision"]
+        candidate_number = previous_number + 1
+        references = self._location_references(
+            verified_user_id=verified_user_id,
+            row_id=checked_row_id,
+            previous_revision=previous_number,
+            candidate_revision=candidate_number,
+        )
+        identity_ref, head_ref, previous_ref, candidate_ref = references
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "disposition": None,
+            "identity": None,
+            "previous": None,
+            "candidate": None,
+            "result_head": None,
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def validate_required_documents(observed):
+            if any(not exists for exists, _payload in observed[:3]):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "row location state is missing a required document"
+                    )
+                )
+            identity_payload = observed[0][1]
+            actual_head_payload = observed[1][1]
+            previous_payload = observed[2][1]
+            try:
+                identity = validate_row_identity_document(
+                    document=identity_payload
+                )
+                actual_head = validate_row_authority_head(
+                    document=actual_head_payload
+                )
+                previous = _validate_row_location_revision(previous_payload)
+                candidate = (
+                    _validate_row_location_revision(observed[3][1])
+                    if observed[3][0]
+                    else None
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "row location state contains a malformed document"
+                    )
+                )
+            identity_correlations = (
+                identity["userScopeHash"] == expected["userScopeHash"],
+                identity["rowId"] == expected["rowId"],
+                identity["createdAt"] == expected["createdAt"],
+            )
+            if not all(identity_correlations):
+                reject(
+                    RowAuthorityConflict(
+                        "row identity does not correlate to the expected head"
+                    )
+                )
+            previous_correlations = (
+                previous["userScopeHash"] == identity["userScopeHash"],
+                previous["rowId"] == identity["rowId"],
+                previous["spreadsheetId"] == identity["spreadsheetId"],
+                previous["sheetId"] == identity["sheetId"],
+                previous["markerHash"] == identity["markerHash"],
+                previous["revision"] == previous_number,
+                previous["revisionHash"] == expected["currentLocationHash"],
+                previous["lifecycle"]
+                == expected["currentLocationLifecycle"],
+                identity["createdAt"]
+                <= previous["observedAt"]
+                <= expected["updatedAt"],
+            )
+            if not all(previous_correlations):
+                reject(
+                    RowAuthorityConflict(
+                        "immutable location revision does not match the head"
+                    )
+                )
+            if (
+                actual_head["userScopeHash"] != expected["userScopeHash"]
+                or actual_head["rowId"] != expected["rowId"]
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "actual head does not correlate to the requested row"
+                    )
+                )
+            if candidate is not None:
+                candidate_correlations = (
+                    candidate["userScopeHash"] == identity["userScopeHash"],
+                    candidate["rowId"] == identity["rowId"],
+                    candidate["spreadsheetId"] == identity["spreadsheetId"],
+                    candidate["sheetId"] == identity["sheetId"],
+                    candidate["markerHash"] == identity["markerHash"],
+                    candidate["revision"] == candidate_number,
+                    candidate["previousRevisionHash"]
+                    == expected["currentLocationHash"],
+                )
+                if not all(candidate_correlations):
+                    reject(
+                        RowAuthorityConflict(
+                            "candidate location revision is immutable drift"
+                        )
+                    )
+            return identity, actual_head, previous, candidate
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "disposition": None,
+                    "identity": None,
+                    "previous": None,
+                    "candidate": None,
+                    "result_head": None,
+                }
+            )
+            try:
+                observed = self._read_reference_payloads(
+                    references,
+                    transaction=transaction,
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "row location state cannot be read transactionally"
+                    )
+                )
+            if expected["currentLocationLifecycle"] == "deleted":
+                reject(
+                    RowAuthorityConflict(
+                        "a deleted row identity cannot be reactivated"
+                    )
+                )
+            identity, actual_head, previous, stored_candidate = (
+                validate_required_documents(observed)
+            )
+            callback_state["identity"] = identity
+            callback_state["previous"] = previous
+            try:
+                candidate = build_row_location_revision_document(
+                    identity_document=identity,
+                    revision=candidate_number,
+                    lifecycle=lifecycle,
+                    observations=canonical_observations,
+                    previous_revision_hash=expected["currentLocationHash"],
+                    observed_at=checked_observed_at,
+                )
+                result_head = build_location_advanced_head(
+                    expected_head=expected,
+                    location_revision_document=candidate,
+                )
+            except RowAuthorityConfigError as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "row observations do not match the immutable identity"
+                    )
+                )
+            callback_state["candidate"] = candidate
+            callback_state["result_head"] = result_head
+            if actual_head == result_head and stored_candidate == candidate:
+                callback_state["disposition"] = "already_applied"
+                return "already_applied"
+            if actual_head != expected:
+                reject(
+                    RowAuthorityConflict(
+                        "actual row authority head is stale or drifted"
+                    )
+                )
+            if stored_candidate is not None:
+                reject(
+                    RowAuthorityConflict(
+                        "candidate location revision already exists without its head"
+                    )
+                )
+            if _location_semantics(candidate) == _location_semantics(previous):
+                callback_state["disposition"] = "unchanged"
+                return "unchanged"
+            callback_state["prepared"] = True
+            callback_state["disposition"] = "advanced"
+            transaction.create(candidate_ref, candidate)
+            transaction.set(head_ref, result_head, merge=False)
+            return "advanced"
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "row location transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "row location transaction could not start"
+                ) from exc
+            identity = callback_state["identity"]
+            previous = callback_state["previous"]
+            candidate = callback_state["candidate"]
+            result_head = callback_state["result_head"]
+            readback_references = (
+                identity_ref,
+                previous_ref,
+                candidate_ref,
+                head_ref,
+            )
+            try:
+                readback = self._read_reference_payloads(readback_references)
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "row location commit outcome cannot be read back"
+                ) from readback_exc
+            exact_before = (
+                identity is not None
+                and previous is not None
+                and readback
+                == (
+                    (True, identity),
+                    (True, previous),
+                    (False, None),
+                    (True, expected),
+                )
+            )
+            exact_after = (
+                identity is not None
+                and previous is not None
+                and candidate is not None
+                and result_head is not None
+                and readback
+                == (
+                    (True, identity),
+                    (True, previous),
+                    (True, candidate),
+                    (True, result_head),
+                )
+            )
+            if exact_after and callback_state["prepared"]:
+                disposition = "advanced"
+            elif (
+                exact_after
+                and callback_state["disposition"] == "already_applied"
+            ):
+                disposition = "already_applied"
+            elif exact_before and callback_state["disposition"] == "unchanged":
+                disposition = "unchanged"
+            elif exact_before:
+                raise RowAuthorityRetryable(
+                    "row location commit failed before any apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "row location commit readback is partial or drifted"
+                ) from exc
+        if disposition not in {"advanced", "unchanged", "already_applied"}:
+            raise RowAuthorityRetryable(
+                "row location transaction returned no approved disposition"
+            )
+        if disposition == "advanced" and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "row location transaction reported an unprepared advance"
+            )
+        if disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "row location transaction returned a mismatched disposition"
+            )
+        identity = callback_state["identity"]
+        if disposition == "unchanged":
+            revision = callback_state["previous"]
+            result_head = expected
+        else:
+            revision = callback_state["candidate"]
+            result_head = callback_state["result_head"]
+        if any(value is None for value in (identity, revision, result_head)):
+            raise RowAuthorityRetryable(
+                "row location transaction returned an incomplete result"
+            )
+        return _location_result(
+            disposition=disposition,
+            identity=identity,
+            revision=revision,
+            head=result_head,
         )
