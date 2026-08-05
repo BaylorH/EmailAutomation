@@ -188,6 +188,14 @@ while preserving v1 bytes. Task 3 performs complete verification, two fresh
 reviews, evidence publication, and exact-SHA GitHub proof. B2-C planning resumes
 only after Task 3 is green.
 
+## Implementation log
+
+- Independently approved design/plan commit:
+  `778e50208e42c91aab501340efdbeb8f88939202`.
+- Exact plan-shape GitHub proof:
+  `https://github.com/BaylorH/EmailAutomation/actions/runs/31001047514`
+  (`offline-verification` job `92289728426`, successful at the exact commit).
+
 Use this interpreter for every Python command:
 
 ```bash
@@ -231,7 +239,7 @@ B2 link domain discrimination, byte-compatible v1 claims/source links,
 cross-user safety, TDD completeness, and B2-C eligibility. Any Critical or
 Important finding resets that approval.
 
-- [ ] **Step 2: Mark the approved design and roadmap plan checkpoint**
+- [x] **Step 2: Mark the approved design and roadmap plan checkpoint**
 
 Change the amendment status to `Approved`. Add these status items immediately
 after B2-B in the roadmap:
@@ -246,7 +254,7 @@ after B2-B in the roadmap:
 Add a short dependency subsection before B2-C that links this plan and states
 that B2-C accepts only v2 verified-contact links.
 
-- [ ] **Step 3: Commit and inspect only the approved documentation milestone**
+- [x] **Step 3: Commit and inspect only the approved documentation milestone**
 
 ```bash
 git add \
@@ -261,7 +269,7 @@ git diff --cached
 git commit -m "docs: bind B1 opt-outs to contact identity"
 ```
 
-- [ ] **Step 4: Push and prove exact-SHA plan CI**
+- [x] **Step 4: Push and prove exact-SHA plan CI**
 
 ```bash
 git push origin codex/sitesift-production-clearance-20260804
