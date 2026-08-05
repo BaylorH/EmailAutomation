@@ -1422,7 +1422,7 @@ git add docs/superpowers/plans/2026-08-04-stable-row-authority-b2.md \
 git commit -m "docs: freeze B2-A0 local evidence"
 ```
 
-- [ ] **Step 5: Push once and prove the exact remote SHA and CI conclusion**
+- [x] **Step 5: Push once and prove the exact remote SHA and CI conclusion**
 
 ```bash
 git push origin codex/sitesift-production-clearance-20260804
@@ -1464,7 +1464,7 @@ Expected: local/remote SHA equality and successful exact-SHA workflow containing
 release/auth, B1, B2 discovery, retained M2, compile, and diff steps. Do not
 open a PR, merge, or deploy.
 
-- [ ] **Step 6: Append remote evidence, commit, push, and reverify**
+- [x] **Step 6: Append remote evidence, commit, push, and reverify**
 
 Replace the pending phrase with the exact run/job URLs, remote SHA, B2 count,
 release/auth count, B1 count, retained M2 count, and durations. Mark the

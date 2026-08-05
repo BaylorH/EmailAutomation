@@ -4,7 +4,7 @@
 
 - Approved-plan baseline: `be092ede8cc44d69d3fb9729456481d26c032645`.
 - Independently reviewed code candidate: `c05e4521920629ccafd3fb65849b4c363d3066d3`.
-- Publication candidate: pending exact-SHA publication.
+- Published candidate: `61592023a53a9ba0f7d3822e477ea540186e68b4`.
 - Deliverable: both provider-free B2-A0 code and clearance evidence.
 - Changed implementation inventory is exactly:
   - `.github/workflows/production-clearance-ci.yml`
@@ -29,6 +29,7 @@
 - `8ab98f0f65ea1fdb7c101d4f74ecb5cf694bce8a` — `fix: bound canonical row authority inputs`
 - `8f206ba144a81bc29c40601a22143dd5792f7079` — `feat: add contact identity primitives`
 - `c05e4521920629ccafd3fb65849b4c363d3066d3` — `fix: make mailbox normalization idempotent`
+- `61592023a53a9ba0f7d3822e477ea540186e68b4` — `docs: freeze B2-A0 local evidence`
 
 ## Canonical-domain and identity proof
 
@@ -104,7 +105,20 @@ disabled, and outbound mode matched the gate definition.
 
 ## GitHub exact-SHA run
 
-pending exact-SHA publication
+- Branch: `codex/sitesift-production-clearance-20260804`.
+- Local and remote candidate SHA:
+  `61592023a53a9ba0f7d3822e477ea540186e68b4`.
+- [Production Clearance CI run 30962659515](https://github.com/BaylorH/EmailAutomation/actions/runs/30962659515)
+  completed successfully for that exact head SHA.
+- [offline-verification job 92169729024](https://github.com/BaylorH/EmailAutomation/actions/runs/30962659515/job/92169729024)
+  completed successfully from `2026-08-05T00:14:35Z` through
+  `2026-08-05T00:16:11Z`.
+- Release/auth: 95/95 passed in 0.968 seconds.
+- Complete B1: 606/606 passed in 31.364 seconds.
+- Complete B2 discovery: 23/23 passed in 1.488 seconds.
+- Retained M2: 669/669 passed in 25.198 seconds.
+- Changed-Python compilation and `git diff --check 2b5e785` both completed
+  successfully.
 
 ## Production posture and next milestone
 
