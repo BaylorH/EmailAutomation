@@ -192,6 +192,9 @@ select a run for a different SHA.
 - [x] B2-A0 child plan is independently approved and published at its plan milestone.
 - [x] B2-A0 code is green and published.
 - [x] B2-A1 child plan is independently approved and published.
+- B2-A1 local code candidate
+  `4c35f941b762975c589ead4a117e98ae79470b5b` is independently approved;
+  exact-SHA publication is pending.
 - [ ] B2-A1 is green and published.
 - [ ] B2-B is green and published.
 - [ ] B2-C is green and published.

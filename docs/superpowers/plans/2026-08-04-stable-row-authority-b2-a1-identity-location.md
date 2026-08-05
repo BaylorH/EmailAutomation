@@ -253,7 +253,7 @@ merge, deploy, or touch production. Task 0 starts only after this succeeds.
 - Create: `tests/test_row_authority_identity_location.py`
 - Modify: `tests/row_authority_fakes.py`
 
-- [ ] **Step 1: Write failing containment and transaction-runner tests**
+- [x] **Step 1: Write failing containment and transaction-runner tests**
 
 Create the A1 test file with `RowAuthorityA1ContainmentTests` and
 `RowAuthorityA1HarnessTests`. Add discriminating tests named:
@@ -291,7 +291,7 @@ The test fake contract is:
   row, and returns all duplicate matches in deterministic coordinate/ID order;
 - the fake never imports or calls a Sheets client.
 
-- [ ] **Step 2: Run the exact RED**
+- [x] **Step 2: Run the exact RED**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -303,7 +303,7 @@ Expected: only the missing A1 harness behaviors fail. Containment and all 23
 retained A0 tests pass; a marker-module, B1 fake, or unrelated failure is an
 invalid RED.
 
-- [ ] **Step 3: Implement only the test harness**
+- [x] **Step 3: Implement only the test harness**
 
 Append the transaction executor and marker-aware sheet to
 `tests/row_authority_fakes.py`. Keep `BoundedFakeFirestore` and retained B1
@@ -315,7 +315,7 @@ each row object owns an internal token; marker metadata attaches to that token;
 all coordinate operations derive their response dictionaries from the token's
 current index.
 
-- [ ] **Step 4: Run the complete Task 0 GREEN**
+- [x] **Step 4: Run the complete Task 0 GREEN**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -327,7 +327,7 @@ current index.
 Expected: all selected harness, containment, and retained A0 fake tests pass.
 No red test is committed at the Task 0 boundary.
 
-- [ ] **Step 5: Commit Task 0**
+- [x] **Step 5: Commit Task 0**
 
 ```bash
 git add tests/row_authority_fakes.py \
@@ -345,7 +345,7 @@ git commit -m "test: add B2-A1 marker transaction harness"
 - Modify: `tests/test_row_authority_identity_location.py`
 - Modify: `tests/test_row_authority_contracts.py`
 
-- [ ] **Step 1: Write complete failing marker contract tests**
+- [x] **Step 1: Write complete failing marker contract tests**
 
 Add `RowMetadataContractTests` covering:
 
@@ -420,7 +420,7 @@ malformed or irrelevant returned match fails the whole response rather than
 being filtered into a false deletion. The result is a defensive tuple sorted
 by `(providerRowIndex, metadataId, rowId)` and is bounded to 128.
 
-- [ ] **Step 2: Run marker RED**
+- [x] **Step 2: Run marker RED**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -429,14 +429,14 @@ by `(providerRowIndex, metadataId, rowId)` and is bounded to 128.
 
 Expected: failures identify the missing module/functions only.
 
-- [ ] **Step 3: Implement the minimum pure module**
+- [x] **Step 3: Implement the minimum pure module**
 
 Create `row_metadata.py` with no network-capable object, service builder,
 credential handling, execution method, or logging. Reuse
 `row_authority.validate_row_id`; do not duplicate the regex or UUID contract.
 Return fresh dictionaries and never retain caller dictionaries.
 
-- [ ] **Step 4: Run marker and containment GREEN**
+- [x] **Step 4: Run marker and containment GREEN**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -449,7 +449,7 @@ Expected: all selected tests pass and the only application import of
 `row_authority` is `row_metadata`; no application module imports
 `row_metadata`.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add email_automation/row_metadata.py \
@@ -466,7 +466,7 @@ git commit -m "feat: add pure row metadata contracts"
 - Modify: `email_automation/row_authority.py`
 - Modify: `tests/test_row_authority_identity_location.py`
 
-- [ ] **Step 1: Write failing normalization/hash tests**
+- [x] **Step 1: Write failing normalization/hash tests**
 
 Add `RowIdentityHashContractTests` for:
 
@@ -549,7 +549,7 @@ callers cannot override them. Initial `created_at` must equal identity
 `createdAt` and revision `observedAt`; advanced `updatedAt` is derived from the
 new revision's `observedAt` while prior `createdAt` is preserved.
 
-- [ ] **Step 2: Write complete failing exact-schema tests**
+- [x] **Step 2: Write complete failing exact-schema tests**
 
 Add `RowIdentityDocumentSchemaTests` that prove:
 
@@ -569,7 +569,7 @@ Add `RowIdentityDocumentSchemaTests` that prove:
   identity, revision, observation, or timestamp instead of accepting an
   override.
 
-- [ ] **Step 3: Run the combined Task 2 RED before implementation**
+- [x] **Step 3: Run the combined Task 2 RED before implementation**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -582,7 +582,7 @@ Expected: only the missing A1 helpers fail; both test classes load and execute,
 and all retained A0 canonical vectors remain green. Do not implement one class
 before the other class's RED is observed.
 
-- [ ] **Step 4: Implement primitive validation, fixed domains, and schemas**
+- [x] **Step 4: Implement primitive validation, fixed domains, and schemas**
 
 Use `domain_hash` and flat payloads only. Never put a `payload` object below
 the canonical envelope. Hash inputs are exactly the approved design table:
@@ -616,7 +616,7 @@ copies only after recomputing every hash and correlation. They never mutate or
 retain caller data. Catch `RecursionError`, encoding errors, and calendar parse
 errors and raise `RowAuthorityConfigError`.
 
-- [ ] **Step 5: Make all Task 2 tests GREEN**
+- [x] **Step 5: Make all Task 2 tests GREEN**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -627,7 +627,7 @@ errors and raise `RowAuthorityConfigError`.
 
 Expected: all selected tests pass and every A0 frozen vector is unchanged.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 ```bash
 git add email_automation/row_authority.py \
@@ -643,7 +643,7 @@ git commit -m "feat: add row identity location schemas"
 - Modify: `email_automation/row_authority.py`
 - Modify: `tests/test_row_authority_identity_location.py`
 
-- [ ] **Step 1: Write complete failing initialization tests**
+- [x] **Step 1: Write complete failing initialization tests**
 
 Add `RowIdentityInitializationTests`:
 
@@ -702,14 +702,14 @@ created all three documents. `existing` means all three exact documents were
 already present before the transaction and no write was buffered. No other
 return key or disposition is permitted.
 
-- [ ] **Step 2: Run initialization RED**
+- [x] **Step 2: Run initialization RED**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
   tests.test_row_authority_identity_location.RowIdentityInitializationTests -v
 ```
 
-- [ ] **Step 3: Implement reference construction and prepare phase**
+- [x] **Step 3: Implement reference construction and prepare phase**
 
 References are exactly:
 
@@ -725,7 +725,7 @@ any write. All absent creates exact documents; all exact returns without
 writes; every other combination raises `RowAuthorityAmbiguous` with zero
 writes.
 
-- [ ] **Step 4: Implement commit-outcome readback**
+- [x] **Step 4: Implement commit-outcome readback**
 
 If the required transaction dependency cannot start, raise
 `RowAuthorityRetryable`. If a prepared commit raises:
@@ -738,7 +738,7 @@ If the required transaction dependency cannot start, raise
 Never treat one or two matching records as success. Never retry a non-abort
 inside the generic executor.
 
-- [ ] **Step 5: Run initialization and retained fake GREEN**
+- [x] **Step 5: Run initialization and retained fake GREEN**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -747,7 +747,7 @@ inside the generic executor.
   tests.test_row_authority_contracts -v
 ```
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```bash
 git add email_automation/row_authority.py \
@@ -763,7 +763,7 @@ git commit -m "feat: initialize stable row identities"
 - Modify: `email_automation/row_authority.py`
 - Modify: `tests/test_row_authority_identity_location.py`
 
-- [ ] **Step 1: Write failing move/sort/nonviable tests**
+- [x] **Step 1: Write failing move/sort/nonviable tests**
 
 Add `RowLocationRevisionTests` proving insert/move/sort/restart preserves the
 row ID while appending revisions, provider/display indexes advance together,
@@ -813,7 +813,7 @@ candidate was allocated. `already_applied` means the caller supplied the prior
 head but the exact deterministic candidate revision/head were already durable.
 No other return key or disposition is permitted.
 
-- [ ] **Step 2: Write failing deletion, ambiguity, and coordinate-reuse tests**
+- [x] **Step 2: Write failing deletion, ambiguity, and coordinate-reuse tests**
 
 Cover:
 
@@ -830,7 +830,7 @@ An old deleted/ambiguous identity is never repurposed to authorize a new
 coordinate. A different spreadsheet or numeric sheet ID requires another row
 ID and later migration review/link work; A1 writes no migration object.
 
-- [ ] **Step 3: Write failing retry, race, and readback tests**
+- [x] **Step 3: Write failing retry, race, and readback tests**
 
 Cover:
 
@@ -852,14 +852,14 @@ The test with a claimed or settled synthetic head is schema-only: it proves
 location CAS preserves valid ownership fields, but A1 does not create any
 claim, generation, or settlement document.
 
-- [ ] **Step 4: Run the complete Task 4 RED**
+- [x] **Step 4: Run the complete Task 4 RED**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
   tests.test_row_authority_identity_location.RowLocationRevisionTests -v
 ```
 
-- [ ] **Step 5: Implement exact revision/head CAS**
+- [x] **Step 5: Implement exact revision/head CAS**
 
 Before writes, validate the full caller-supplied `expected_head`, then read:
 
@@ -891,7 +891,7 @@ revision, and head. Accept only exact before or exact after sets using the same
 retryable/ambiguous distinction as initialization. Do not infer success from a
 matching head hash alone.
 
-- [ ] **Step 6: Run complete A1 and retained A0 GREEN**
+- [x] **Step 6: Run complete A1 and retained A0 GREEN**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest discover \
@@ -901,7 +901,7 @@ matching head hash alone.
 Expected: every A0 and A1 test passes. Record the actual test count and
 duration; do not copy a planned count into evidence.
 
-- [ ] **Step 7: Commit Task 4**
+- [x] **Step 7: Commit Task 4**
 
 ```bash
 git add email_automation/row_authority.py \
@@ -920,7 +920,7 @@ git commit -m "feat: add row location revision CAS"
 - Create:
   `docs/superpowers/evidence/2026-08-04-stable-row-authority-b2-a1.md`
 
-- [ ] **Step 1: Run the complete offline local gate**
+- [x] **Step 1: Run the complete offline local gate**
 
 ```bash
 B2_A1_PY=../codex-release-a-medium-recovery-20260714/.venv/bin/python
@@ -1001,7 +1001,7 @@ Expected: all commands exit 0. The release/auth baseline remains 95, complete
 B1 remains 606, retained M2 remains 669, B2 is the actual newly measured count,
 and static checks are clean.
 
-- [ ] **Step 2: Obtain two fresh independent full-diff approvals**
+- [x] **Step 2: Obtain two fresh independent full-diff approvals**
 
 One reviewer checks exact B2 design/A1-plan compliance. A different reviewer
 checks correctness, security/privacy, resource bounds, transaction/readback
@@ -1009,7 +1009,7 @@ semantics, race discrimination, fake fidelity, provider/runtime containment,
 and maintainability. Critical/Important findings block publication and require
 a failing test, focused/full rerun, new commit, and re-review.
 
-- [ ] **Step 3: Create exact evidence and pre-publication commit**
+- [x] **Step 3: Create exact evidence and pre-publication commit**
 
 Create the evidence file with exactly:
 
