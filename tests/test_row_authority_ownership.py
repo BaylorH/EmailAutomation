@@ -5619,76 +5619,28 @@ class RowClaimStoreTests(unittest.TestCase):
         return settlement, settled_head
 
     def _install_settled_human_owner(self, store, row_id):
-        _identity_ref, head_ref = self._row_references(store, row_id)
-        predecessor = deepcopy(store.data[head_ref.path])
         binding_ref = self._user_reference(store).collection(
             "threadRowBindings"
         ).document("thread-1")
         binding = deepcopy(store.data[binding_ref.path])
-        action = self.module.build_operator_action_document(
-            user_scope_hash=self.scope,
+        self.assertEqual([row_id], [
+            item["rowId"] for item in binding["rowBindings"]
+        ])
+        result = self._authority(store).record_operator_decline(
+            verified_user_id=self.user_id,
+            thread_id=binding["threadId"],
             actor_scope_hash="5" * 64,
-            row_bindings_hash=binding["rowBindingsHash"],
             client_request_id="settled-human-request",
-            issued_at=self.claimed_at,
+            issued_at="2026-08-04T12:00:03.000000Z",
         )
-        claim = self.module.build_claim_set_document(
-            user_scope_hash=self.scope,
-            authority_origin="authenticated_operator",
-            authority_link=None,
-            operator_action_document=action,
-            fanout_id=None,
-            row_ids=[row_id],
-            primary_row_id=row_id,
-            planned_writes=3,
-            outcome="accepted",
-            row_decisions=[
-                {
-                    "rowId": row_id,
-                    "decision": "accepted",
-                    "plannedGeneration": 1,
-                    "winnerGenerationHash": None,
-                    "winnerSettlementHash": None,
-                }
-            ],
-            created_at=self.claimed_at,
+        self.assertEqual("declined", result["disposition"])
+        return (
+            result["action"],
+            result["claimSet"],
+            result["generations"][0],
+            result["settlements"][0],
+            result["heads"][0],
         )
-        generation = self.module.build_owner_generation_document(
-            claim_set_document=claim,
-            row_id=row_id,
-            generation=1,
-            predecessor_head_hash=predecessor["headHash"],
-            predecessor_settlement_hash=None,
-            lease_epoch=1,
-            first_fencing_token=1,
-            created_at=self.claimed_at,
-        )
-        claimed_head = self.module._build_claim_advanced_head(
-            expected_head=predecessor,
-            generation_document=generation,
-            lease_owner_hash="4" * 64,
-            lease_until=self.lease_until,
-            dominated_predecessor_settlement_hash=None,
-            claimed_at=self.claimed_at,
-        )
-        settlement = self.module.build_owner_settlement_document(
-            generation_document=generation,
-            claim_set_document=claim,
-            fencing_token=1,
-            outcome="human_declined",
-            settled_at="2026-08-04T12:00:03.000000Z",
-            operator_action_document=action,
-        )
-        settled_head = self.module._build_settlement_advanced_head(
-            expected_head=claimed_head,
-            generation_document=generation,
-            settlement_document=settlement,
-        )
-        self._claim_reference(store, claim["requestId"]).create(claim)
-        self._generation_reference(store, row_id, 1).create(generation)
-        self._settlement_reference(store, row_id, 1).create(settlement)
-        head_ref.set(settled_head, merge=False)
-        return action, claim, generation, settlement, settled_head
 
     def test_claim_row_set_has_exact_public_surface_and_non_b1_public_claims_do_not_exist(self):
         method = getattr(self.module.RowAuthorityStore, "claim_row_set", None)
@@ -8473,6 +8425,1229 @@ class RowLeaseTakeoverTests(unittest.TestCase):
                 unreadable_store,
                 unreadable_claim["heads"][0],
             )
+
+class RowSettlementStoreTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+        RowClaimStoreTests.setUpClass()
+
+    def setUp(self):
+        self.fixture = RowClaimStoreTests("test_terminal_claim_enters_claimed")
+        self.fixture.setUp()
+        self.user_id = self.fixture.user_id
+        self.scope = self.fixture.scope
+        self.row_id = self.fixture.first
+        self.settled_at = "2026-08-04T12:00:03.000000Z"
+
+    def _store(self):
+        return self.fixture._store()
+
+    def _authority(self, store, *, executor=None):
+        return self.fixture._authority(store, executor=executor)
+
+    def _seed_terminal(self):
+        store = self._store()
+        bundle, binding = self.fixture._seed_prerequisites(store)
+        claim = self.fixture._claim(store, bundle=bundle)
+        return store, binding, claim
+
+    def _settle(self, store, expected_head, *, executor=None, **overrides):
+        arguments = {
+            "verified_user_id": self.user_id,
+            "row_id": self.row_id,
+            "expected_head": expected_head,
+            "settled_at": self.settled_at,
+        }
+        arguments.update(overrides)
+        return self._authority(store, executor=executor).settle_owner_generation(
+            **arguments
+        )
+
+    def _identity_reference(self, store):
+        return self.fixture._row_references(store, self.row_id)[0]
+
+    def _head_reference(self, store):
+        return self.fixture._row_references(store, self.row_id)[1]
+
+    def _generation_reference(self, store, generation=1):
+        return self.fixture._generation_reference(
+            store,
+            self.row_id,
+            generation,
+        )
+
+    def _settlement_reference(self, store, generation=1):
+        return self.fixture._settlement_reference(
+            store,
+            self.row_id,
+            generation,
+        )
+
+    @staticmethod
+    def _writes(store):
+        return RowClaimStoreTests._write_events(store)
+
+    def _apply_claim_plan(self, store, plan):
+        self.fixture._claim_reference(
+            store,
+            plan["claimSet"]["requestId"],
+        ).create(plan["claimSet"])
+        for generation in plan["generations"]:
+            self.fixture._generation_reference(
+                store,
+                generation["rowId"],
+                generation["generation"],
+            ).create(generation)
+        for settlement in plan["predecessorSettlements"]:
+            self.fixture._settlement_reference(
+                store,
+                settlement["rowId"],
+                settlement["generation"],
+            ).create(settlement)
+        for head in plan["heads"]:
+            self.fixture._row_references(store, head["rowId"])[1].set(
+                head,
+                merge=False,
+            )
+
+    def _seed_contact_after_human(self):
+        store = self._store()
+        _bundle, binding = self.fixture._seed_prerequisites(store)
+        (
+            action,
+            human_claim,
+            human_generation,
+            human_settlement,
+            human_head,
+        ) = self.fixture._install_settled_human_owner(store, self.row_id)
+        contact_plan = self.fixture._contact_plan(
+            store,
+            binding,
+            created_at="2026-08-04T12:00:04.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self._apply_claim_plan(store, contact_plan)
+        return {
+            "store": store,
+            "binding": binding,
+            "priorAction": action,
+            "priorClaim": human_claim,
+            "priorGeneration": human_generation,
+            "priorSettlement": human_settlement,
+            "priorHead": human_head,
+            "claimPlan": contact_plan,
+            "claim": contact_plan["claimSet"],
+            "generation": contact_plan["generations"][0],
+            "head": contact_plan["heads"][0],
+        }
+
+    def _seed_terminal_after_human(self):
+        store = self._store()
+        bundle, _binding = self.fixture._seed_prerequisites(store)
+        prior = self.fixture._install_settled_human_owner(store, self.row_id)
+        terminal = self.fixture._claim(
+            store,
+            bundle=bundle,
+            created_at="2026-08-04T12:00:04.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        return store, prior, terminal
+
+    def _private_plan(
+        self,
+        store,
+        expected_head,
+        *,
+        actual_head=None,
+        generation=None,
+        claim=None,
+        stored_settlement=None,
+        prior_effective_settlement=None,
+        operator_action=None,
+        settled_at=None,
+    ):
+        generation_number = expected_head["effectiveOwnerGeneration"]
+        if generation is None:
+            generation = deepcopy(
+                store.data[
+                    self._generation_reference(
+                        store,
+                        generation_number,
+                    ).path
+                ]
+            )
+        if claim is None:
+            claim = deepcopy(
+                store.data[
+                    self.fixture._claim_reference(
+                        store,
+                        generation["requestId"],
+                    ).path
+                ]
+            )
+        if stored_settlement is None:
+            stored_settlement = deepcopy(
+                store.data.get(
+                    self._settlement_reference(
+                        store,
+                        generation_number,
+                    ).path
+                )
+            )
+        return self.module._plan_owner_generation_settlement(
+            user_scope_hash=self.scope,
+            row_id=self.row_id,
+            expected_head=expected_head,
+            actual_head_document=(
+                actual_head if actual_head is not None else expected_head
+            ),
+            identity_document=store.data[self._identity_reference(store).path],
+            generation_document=generation,
+            claim_set_document=claim,
+            stored_settlement_document=stored_settlement,
+            prior_effective_settlement_document=prior_effective_settlement,
+            settled_at=settled_at or self.settled_at,
+            operator_action_document=operator_action,
+        )
+
+    def _location_advance(self, store, expected_head, *, observed_at):
+        identity = deepcopy(store.data[self._identity_reference(store).path])
+        next_revision = expected_head["currentLocationRevision"] + 1
+        observation = self.module.build_row_observation(
+            spreadsheet_id=identity["spreadsheetId"],
+            marker_observation={
+                "rowId": self.row_id,
+                "sheetId": identity["sheetId"],
+                "providerRowIndex": next_revision + 2,
+                "displayRowNumber": next_revision + 3,
+                "metadataId": next_revision + 3,
+            },
+            ordered_headers=("Email",),
+            ordered_cell_values=("settled-move@example.test",),
+            user_scope_hash=self.scope,
+        )
+        revision = self.module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=next_revision,
+            lifecycle="active",
+            observations=(observation,),
+            previous_revision_hash=expected_head["currentLocationHash"],
+            observed_at=observed_at,
+        )
+        return self.module.build_location_advanced_head(
+            expected_head=expected_head,
+            location_revision_document=revision,
+        )
+
+    def test_terminal_settlement_creates_exact_record_and_settled_head(self):
+        method = self.module.RowAuthorityStore.settle_owner_generation
+        self.assertEqual(
+            [
+                "self",
+                "verified_user_id",
+                "row_id",
+                "expected_head",
+                "settled_at",
+            ],
+            list(inspect.signature(method).parameters),
+        )
+        store, _binding, claimed = self._seed_terminal()
+        expected = claimed["heads"][0]
+        generation_before = deepcopy(claimed["generations"][0])
+        store.events.clear()
+
+        with patch.object(
+            self.module,
+            "_require_row_authority_planned_writes",
+            wraps=self.module._require_row_authority_planned_writes,
+        ) as write_bound:
+            result = self._settle(store, expected)
+
+        self.assertEqual(
+            1,
+            sum(call.args == (2,) for call in write_bound.call_args_list),
+        )
+        self.assertEqual("settled", result["disposition"])
+        self.assertEqual(generation_before, result["generation"])
+        self.assertEqual("terminal", result["settlement"]["outcome"])
+        self.assertEqual("settled", result["head"]["state"])
+        self.assertIsNone(result["head"]["leaseOwnerHash"])
+        self.assertIsNone(result["head"]["leaseUntil"])
+        self.assertEqual(expected["fencingToken"], result["head"]["fencingToken"])
+        self.assertEqual(
+            result["settlement"]["settlementHash"],
+            result["head"]["effectiveSettlementHash"],
+        )
+        self.assertEqual(
+            [
+                (
+                    "create",
+                    self._settlement_reference(store).path,
+                    result["settlement"],
+                    False,
+                ),
+                ("set", self._head_reference(store).path, result["head"], False),
+            ],
+            self._writes(store),
+        )
+        first_write = next(
+            index
+            for index, event in enumerate(store.events)
+            if event[0] in {"create", "set", "update", "delete"}
+        )
+        self.assertTrue(
+            all(event[0] == "get" for event in store.events[1:first_write])
+        )
+
+    def test_private_contact_optout_settlement_freezes_prior_effective_settlement(self):
+        state = self._seed_contact_after_human()
+
+        plan = self._private_plan(
+            state["store"],
+            state["head"],
+            generation=state["generation"],
+            claim=state["claim"],
+            prior_effective_settlement=state["priorSettlement"],
+            settled_at="2026-08-04T12:00:05.000000Z",
+        )
+
+        self.assertEqual("settled", plan["disposition"])
+        self.assertEqual("contact_optout", plan["settlement"]["outcome"])
+        self.assertEqual(
+            state["priorSettlement"]["settlementHash"],
+            plan["settlement"]["supersededEffectiveSettlementHash"],
+        )
+        self.assertEqual(
+            plan["settlement"]["settlementHash"],
+            plan["head"]["effectiveSettlementHash"],
+        )
+
+    def test_public_contact_optout_settlement_is_blocked_until_b2c(self):
+        state = self._seed_contact_after_human()
+        before = deepcopy(state["store"].data)
+        state["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._settle(
+                state["store"],
+                state["head"],
+                settled_at="2026-08-04T12:00:05.000000Z",
+            )
+
+        self.assertEqual(before, state["store"].data)
+        self.assertEqual([], self._writes(state["store"]))
+
+    def test_terminal_cannot_carry_superseded_effective_settlement(self):
+        store, prior, terminal = self._seed_terminal_after_human()
+
+        plan = self._private_plan(
+            store,
+            terminal["heads"][0],
+            generation=terminal["generations"][0],
+            claim=terminal["claimSet"],
+            prior_effective_settlement=prior[3],
+            settled_at="2026-08-04T12:00:05.000000Z",
+        )
+
+        self.assertEqual("terminal", plan["settlement"]["outcome"])
+        self.assertIsNone(
+            plan["settlement"]["supersededEffectiveSettlementHash"]
+        )
+
+    def test_settlement_derives_outcome_reason_evidence_and_logical_hash(self):
+        store, _binding, claimed = self._seed_terminal()
+        result = self._settle(store, claimed["heads"][0])
+        settlement = result["settlement"]
+        expected = self.module.build_owner_settlement_document(
+            generation_document=claimed["generations"][0],
+            claim_set_document=claimed["claimSet"],
+            fencing_token=claimed["heads"][0]["fencingToken"],
+            outcome="terminal",
+            settled_at=self.settled_at,
+        )
+        self.assertEqual(expected, settlement)
+        self.assertEqual("terminal_source", settlement["outcomeReasonCode"])
+        self.assertNotIn("outcome", inspect.signature(
+            self.module.RowAuthorityStore.settle_owner_generation
+        ).parameters)
+
+    def test_settlement_requires_current_generation_current_fence_and_claimed_state(self):
+        drift_store, _binding, drift_claim = self._seed_terminal()
+        generation_ref = self._generation_reference(drift_store)
+        drift_store.data[generation_ref.path]["generationHash"] = "f" * 64
+        before = deepcopy(drift_store.data)
+        drift_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._settle(drift_store, drift_claim["heads"][0])
+        self.assertEqual(before, drift_store.data)
+        self.assertEqual([], self._writes(drift_store))
+
+        pending_store = self._store()
+        bundle, _binding = self.fixture._seed_prerequisites(
+            pending_store,
+            owner_kind="human_decision",
+        )
+        pending = self.fixture._claim(pending_store, bundle=bundle)
+        before = deepcopy(pending_store.data)
+        pending_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._settle(pending_store, pending["heads"][0])
+        self.assertEqual(before, pending_store.data)
+        self.assertEqual([], self._writes(pending_store))
+
+    def test_stale_fence_after_takeover_cannot_settle_or_change_head(self):
+        store, _binding, claimed = self._seed_terminal()
+        stale = claimed["heads"][0]
+        takeover = self._authority(store).take_over_expired_lease(
+            verified_user_id=self.user_id,
+            row_id=self.row_id,
+            expected_head=stale,
+            new_lease_owner_hash="b" * 64,
+            new_lease_until="2026-08-04T12:10:00.000000Z",
+            taken_at="2026-08-04T12:05:01.000000Z",
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._settle(
+                store,
+                stale,
+                settled_at="2026-08-04T12:05:02.000000Z",
+            )
+
+        self.assertEqual(before, store.data)
+        self.assertEqual(takeover["head"], store.data[self._head_reference(store).path])
+        self.assertEqual([], self._writes(store))
+        current = self._settle(
+            store,
+            takeover["head"],
+            settled_at="2026-08-04T12:05:02.000000Z",
+        )
+        self.assertEqual(2, current["settlement"]["fencingToken"])
+
+    def test_exact_settlement_retry_is_zero_write_already_applied(self):
+        store, _binding, claimed = self._seed_terminal()
+        expected = claimed["heads"][0]
+        first = self._settle(store, expected)
+        store.events.clear()
+
+        replay = self._settle(store, expected)
+
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(first["settlement"], replay["settlement"])
+        self.assertEqual(first["head"], replay["head"])
+        self.assertEqual([], self._writes(store))
+
+    def test_settlement_retry_after_location_or_higher_generation_preserves_later_head(self):
+        location_store, _binding, location_claim = self._seed_terminal()
+        expected = location_claim["heads"][0]
+        settled = self._settle(location_store, expected)
+        advanced = self._location_advance(
+            location_store,
+            settled["head"],
+            observed_at="2026-08-04T12:00:04.000000Z",
+        )
+        self._head_reference(location_store).set(advanced, merge=False)
+        location_store.events.clear()
+        replay = self._settle(location_store, expected)
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(advanced, replay["head"])
+        self.assertEqual([], self._writes(location_store))
+
+        higher_store, binding, higher_claim = self._seed_terminal()
+        old_head = higher_claim["heads"][0]
+        self._settle(higher_store, old_head)
+        contact_plan = self.fixture._contact_plan(
+            higher_store,
+            binding,
+            created_at="2026-08-04T12:00:05.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self._apply_claim_plan(higher_store, contact_plan)
+        later_head = contact_plan["heads"][0]
+        higher_store.events.clear()
+        replay = self._settle(higher_store, old_head)
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(later_head, replay["head"])
+        self.assertEqual([], self._writes(higher_store))
+
+        later_generation_ref = self._generation_reference(higher_store, 2)
+        valid_later_generation = deepcopy(
+            higher_store.data[later_generation_ref.path]
+        )
+        del higher_store.data[later_generation_ref.path]
+        before = deepcopy(higher_store.data)
+        higher_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._settle(higher_store, old_head)
+        self.assertEqual(before, higher_store.data)
+        self.assertEqual([], self._writes(higher_store))
+
+        malformed_later_generation = deepcopy(valid_later_generation)
+        malformed_later_generation["generationHash"] = "f" * 64
+        higher_store.data[later_generation_ref.path] = (
+            malformed_later_generation
+        )
+        before = deepcopy(higher_store.data)
+        higher_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._settle(higher_store, old_head)
+        self.assertEqual(before, higher_store.data)
+        self.assertEqual([], self._writes(higher_store))
+
+    def test_settlement_time_must_follow_claim_generation_and_current_head(self):
+        equal_store, _binding, equal_claim = self._seed_terminal()
+        equal = self._settle(
+            equal_store,
+            equal_claim["heads"][0],
+            settled_at=equal_claim["heads"][0]["updatedAt"],
+        )
+        self.assertEqual("settled", equal["disposition"])
+
+        early_store, _binding, early_claim = self._seed_terminal()
+        before = deepcopy(early_store.data)
+        early_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self._settle(
+                early_store,
+                early_claim["heads"][0],
+                settled_at="2026-08-04T12:00:01.000000Z",
+            )
+        self.assertEqual(before, early_store.data)
+        self.assertEqual([], self._writes(early_store))
+
+        claim_store, _binding, claim_result = self._seed_terminal()
+        claim_ref = self.fixture._claim_reference(
+            claim_store,
+            claim_result["claimSet"]["requestId"],
+        )
+        drifted_claim = deepcopy(claim_store.data[claim_ref.path])
+        drifted_claim["createdAt"] = "2026-08-04T12:06:00.000000Z"
+        drifted_claim = self.fixture._rehash_claim(drifted_claim)
+        claim_ref.set(drifted_claim, merge=False)
+        generation_ref = self._generation_reference(claim_store)
+        drifted_generation = deepcopy(claim_store.data[generation_ref.path])
+        drifted_generation["claimSetHash"] = drifted_claim["claimSetHash"]
+        drifted_generation = self.fixture._rehash_generation(
+            drifted_generation
+        )
+        generation_ref.set(drifted_generation, merge=False)
+        head_ref = self._head_reference(claim_store)
+        drifted_head = deepcopy(claim_store.data[head_ref.path])
+        drifted_head["effectiveOwnerGenerationHash"] = drifted_generation[
+            "generationHash"
+        ]
+        drifted_head = self.fixture._rehash_head(drifted_head)
+        head_ref.set(drifted_head, merge=False)
+        before = deepcopy(claim_store.data)
+        claim_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._settle(
+                claim_store,
+                drifted_head,
+                settled_at="2026-08-04T12:05:01.000000Z",
+            )
+        self.assertEqual(before, claim_store.data)
+        self.assertEqual([], self._writes(claim_store))
+
+    def test_settlement_preapply_apply_then_raise_and_partial_readback_are_classified(self):
+        pre_store, _binding, pre_claim = self._seed_terminal()
+        before = deepcopy(pre_store.data)
+        pre_store.events.clear()
+        pre_store.fail_next_commit = RuntimeError("settlement preapply failure")
+        with self.assertRaises(self.module.RowAuthorityRetryable):
+            self._settle(pre_store, pre_claim["heads"][0])
+        self.assertEqual(before, pre_store.data)
+        self.assertEqual([], self._writes(pre_store))
+
+        applied_store, _binding, applied_claim = self._seed_terminal()
+        applied_store.apply_then_raise_next_commit = RuntimeError(
+            "unknown settlement commit outcome"
+        )
+        applied = self._settle(applied_store, applied_claim["heads"][0])
+        self.assertEqual("settled", applied["disposition"])
+
+        def partial_executor(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            operation, reference, payload, merge = transaction._operations[0]
+            transaction._rollback()
+            self.assertEqual(("create", False), (operation, merge))
+            reference.create(payload)
+            raise RuntimeError("partial settlement apply")
+
+        partial_store, _binding, partial_claim = self._seed_terminal()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._settle(
+                partial_store,
+                partial_claim["heads"][0],
+                executor=partial_executor,
+            )
+
+        location_store, _binding, location_claim = self._seed_terminal()
+        advanced_after_apply = {}
+
+        def apply_then_location(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            transaction._commit()
+            head_ref = self._head_reference(location_store)
+            advanced = self._location_advance(
+                location_store,
+                location_store.data[head_ref.path],
+                observed_at="2026-08-04T12:00:04.000000Z",
+            )
+            head_ref.set(advanced, merge=False)
+            advanced_after_apply["head"] = advanced
+            raise RuntimeError("settlement head advanced after apply")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._settle(
+                location_store,
+                location_claim["heads"][0],
+                executor=apply_then_location,
+            )
+        self.assertEqual(
+            advanced_after_apply["head"],
+            location_store.data[self._head_reference(location_store).path],
+        )
+
+    def test_settlement_schema_contains_no_provider_effect_fields(self):
+        store, _binding, claimed = self._seed_terminal()
+        result = self._settle(store, claimed["heads"][0])
+        settlement = result["settlement"]
+        self.assertEqual(
+            {
+                "schemaVersion",
+                "userScopeHash",
+                "rowId",
+                "generation",
+                "generationHash",
+                "fencingToken",
+                "outcome",
+                "dominantGenerationHash",
+                "supersededEffectiveSettlementHash",
+                "operatorActionHash",
+                "outcomeReasonCode",
+                "outcomeEvidenceHash",
+                "logicalOutcomeHash",
+                "settledAt",
+                "settlementHash",
+            },
+            set(settlement),
+        )
+        serialized = json.dumps(settlement, sort_keys=True).lower()
+        for forbidden in ("send", "draft", "messageid", "provider", "sheetwrite"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_private_settlement_planner_never_opens_or_commits_a_transaction(self):
+        store, _binding, claimed = self._seed_terminal()
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        plan = self._private_plan(store, claimed["heads"][0])
+
+        self.assertEqual("settled", plan["disposition"])
+        self.assertEqual(before, store.data)
+        self.assertEqual([], store.events)
+        source = inspect.getsource(
+            self.module._plan_owner_generation_settlement
+        )
+        self.assertNotIn("_transaction_executor", source)
+        self.assertNotIn(".transaction(", source)
+        self.assertNotIn("commit(", source)
+
+
+class RowOperatorDeclineStoreTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+        RowClaimStoreTests.setUpClass()
+
+    def setUp(self):
+        self.fixture = RowClaimStoreTests(
+            "test_human_claim_enters_review_pending_without_settlement"
+        )
+        self.fixture.setUp()
+        self.user_id = self.fixture.user_id
+        self.scope = self.fixture.scope
+        self.thread_id = "thread-1"
+        self.actor_scope_hash = "5" * 64
+        self.client_request_id = "decline-request-1"
+        self.issued_at = "2026-08-04T12:00:03.000000Z"
+
+    def _store(self):
+        return self.fixture._store()
+
+    def _authority(self, store, *, executor=None):
+        return self.fixture._authority(store, executor=executor)
+
+    def _decline(self, store, *, executor=None, **overrides):
+        arguments = {
+            "verified_user_id": self.user_id,
+            "thread_id": self.thread_id,
+            "actor_scope_hash": self.actor_scope_hash,
+            "client_request_id": self.client_request_id,
+            "issued_at": self.issued_at,
+        }
+        arguments.update(overrides)
+        return self._authority(
+            store,
+            executor=executor,
+        ).record_operator_decline(**arguments)
+
+    def _seed_clear(self, *, row_ids=None):
+        rows = list(row_ids or [self.fixture.first])
+        store = self._store()
+        for row_id in rows:
+            self.fixture._seed_row(store, row_id)
+        binding = self.fixture._seed_thread_binding(store, rows)
+        return store, binding
+
+    def _seed_pending(self, *, row_ids=None):
+        rows = list(row_ids or [self.fixture.first])
+        store = self._store()
+        bundle, binding = self.fixture._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+            row_ids=rows,
+        )
+        claim = self.fixture._claim(store, bundle=bundle)
+        return store, binding, claim
+
+    def _seed_terminal(self, *, row_ids=None):
+        rows = list(row_ids or [self.fixture.first])
+        store = self._store()
+        bundle, binding = self.fixture._seed_prerequisites(
+            store,
+            row_ids=rows,
+        )
+        claim = self.fixture._claim(store, bundle=bundle)
+        return store, binding, claim
+
+    def _action(self, binding, **overrides):
+        arguments = {
+            "user_scope_hash": self.scope,
+            "actor_scope_hash": self.actor_scope_hash,
+            "row_bindings_hash": binding["rowBindingsHash"],
+            "client_request_id": self.client_request_id,
+            "issued_at": self.issued_at,
+        }
+        arguments.update(overrides)
+        return self.module.build_operator_action_document(**arguments)
+
+    def _action_reference(self, store, action):
+        return self.fixture._user_reference(store).collection(
+            "rowOperatorActions"
+        ).document(action["actionId"])
+
+    @staticmethod
+    def _writes(store):
+        return RowClaimStoreTests._write_events(store)
+
+    def test_pending_decline_creates_action_and_settles_same_generation_without_claim(self):
+        method = getattr(
+            self.module.RowAuthorityStore,
+            "record_operator_decline",
+            None,
+        )
+        self.assertIsNotNone(method)
+        self.assertEqual(
+            [
+                "self",
+                "verified_user_id",
+                "thread_id",
+                "actor_scope_hash",
+                "client_request_id",
+                "issued_at",
+            ],
+            list(inspect.signature(method).parameters),
+        )
+        store, binding, pending = self._seed_pending()
+        before_claim_paths = {
+            path for path in store.data if "/rowClaimSets/" in path
+        }
+        store.events.clear()
+
+        result = self._decline(store)
+
+        self.assertEqual("declined", result["disposition"])
+        self.assertEqual(self._action(binding), result["action"])
+        self.assertEqual(pending["claimSet"], result["claimSet"])
+        self.assertEqual(pending["generations"], result["generations"])
+        self.assertEqual(1, len(result["settlements"]))
+        self.assertEqual("human_declined", result["settlements"][0]["outcome"])
+        self.assertEqual(
+            result["action"]["operatorActionHash"],
+            result["settlements"][0]["operatorActionHash"],
+        )
+        self.assertEqual("settled", result["heads"][0]["state"])
+        self.assertEqual(
+            pending["heads"][0]["effectiveOwnerGeneration"],
+            result["heads"][0]["effectiveOwnerGeneration"],
+        )
+        self.assertEqual(
+            before_claim_paths,
+            {path for path in store.data if "/rowClaimSets/" in path},
+        )
+        self.assertEqual(
+            ["create", "create", "set"],
+            [event[0] for event in self._writes(store)],
+        )
+        self.assertIn(("commit_applied", 3), store.events)
+
+    def test_no_pending_decline_creates_action_claim_generation_settlement_and_head_atomically(self):
+        store, binding = self._seed_clear()
+        original_head = deepcopy(
+            store.data[
+                self.fixture._row_references(
+                    store,
+                    self.fixture.first,
+                )[1].path
+            ]
+        )
+        store.events.clear()
+
+        result = self._decline(store)
+
+        self.assertEqual("declined", result["disposition"])
+        self.assertEqual(self._action(binding), result["action"])
+        self.assertEqual("authenticated_operator", result["claimSet"]["authorityOrigin"])
+        self.assertEqual("accepted", result["claimSet"]["outcome"])
+        self.assertEqual(5, result["claimSet"]["plannedWrites"])
+        self.assertEqual(1, len(result["generations"]))
+        self.assertEqual(1, result["generations"][0]["generation"])
+        self.assertEqual("human_decision", result["generations"][0]["ownerKind"])
+        self.assertEqual("human_declined", result["settlements"][0]["outcome"])
+        self.assertEqual("settled", result["heads"][0]["state"])
+        self.assertEqual(
+            original_head["stateRevision"] + 1,
+            result["heads"][0]["stateRevision"],
+        )
+        self.assertEqual(
+            result["generations"][0]["firstFencingToken"],
+            result["heads"][0]["fencingToken"],
+        )
+        self.assertIsNone(result["heads"][0]["leaseOwnerHash"])
+        self.assertIsNone(result["heads"][0]["leaseUntil"])
+        self.assertEqual(
+            ["create", "create", "create", "create", "set"],
+            [event[0] for event in self._writes(store)],
+        )
+        self.assertIn(("commit_applied", 5), store.events)
+
+    def test_higher_owner_dominates_operator_decline_with_only_action_and_claim_set(self):
+        store, binding, terminal = self._seed_terminal()
+        current_head = deepcopy(terminal["heads"][0])
+        store.events.clear()
+
+        result = self._decline(store)
+
+        self.assertEqual("dominated", result["disposition"])
+        self.assertEqual(self._action(binding), result["action"])
+        self.assertEqual("dominated", result["claimSet"]["outcome"])
+        self.assertEqual(2, result["claimSet"]["plannedWrites"])
+        self.assertEqual([], result["generations"])
+        self.assertEqual([], result["settlements"])
+        self.assertEqual([current_head], result["heads"])
+        self.assertEqual(
+            ["create", "create"],
+            [event[0] for event in self._writes(store)],
+        )
+        self.assertIn(("commit_applied", 2), store.events)
+
+    def test_mixed_pending_and_nonpending_binding_fails_closed(self):
+        store, _binding = self._seed_clear(
+            row_ids=[self.fixture.first, self.fixture.second]
+        )
+        self.fixture._install_owner(
+            store,
+            self.fixture.first,
+            owner_kind="human_decision",
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._decline(store)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._writes(store))
+
+    def test_actor_target_client_request_action_or_timestamp_drift_writes_nothing(self):
+        for field, value in (
+            ("actorScopeHash", "0" * 64),
+            ("rowBindingsHash", "1" * 64),
+            ("clientRequestHash", "2" * 64),
+            ("actionKind", "dismiss"),
+            ("issuedAt", "2026-08-04T12:00:04.000000Z"),
+            ("operatorActionHash", "3" * 64),
+        ):
+            with self.subTest(field=field):
+                store, binding = self._seed_clear()
+                expected_action = self._action(binding)
+                drifted = deepcopy(expected_action)
+                drifted[field] = value
+                self._action_reference(store, expected_action).create(drifted)
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._decline(store)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._writes(store))
+
+    def test_operator_action_time_equal_current_head_is_valid_and_earlier_is_rejected(self):
+        equal_store, _binding, pending = self._seed_pending()
+        equal = self._decline(
+            equal_store,
+            issued_at=pending["heads"][0]["updatedAt"],
+        )
+        self.assertEqual("declined", equal["disposition"])
+
+        early_store, _binding, _pending = self._seed_pending()
+        before = deepcopy(early_store.data)
+        early_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._decline(
+                early_store,
+                issued_at="2026-08-04T12:00:01.999999Z",
+            )
+        self.assertEqual(before, early_store.data)
+        self.assertEqual([], self._writes(early_store))
+
+        binding_store, _binding = self._seed_clear()
+        before = deepcopy(binding_store.data)
+        binding_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._decline(
+                binding_store,
+                issued_at="2026-08-04T12:00:00.500000Z",
+            )
+        self.assertEqual(before, binding_store.data)
+        self.assertEqual([], self._writes(binding_store))
+
+    def test_pending_decline_128_rows_plans_257_writes(self):
+        rows = [_row_id(index) for index in range(1, 129)]
+        store, _binding, pending = self._seed_pending(row_ids=rows)
+        store.events.clear()
+
+        result = self._decline(store)
+
+        self.assertEqual(pending["claimSet"], result["claimSet"])
+        self.assertEqual(128, len(result["settlements"]))
+        self.assertEqual(128, len(result["heads"]))
+        self.assertIn(("commit_applied", 257), store.events)
+        self.assertFalse(
+            any(event[0] == "commit_refused_write_ceiling" for event in store.events)
+        )
+
+    def test_no_pending_decline_128_rows_plans_386_writes(self):
+        rows = [_row_id(index) for index in range(1, 129)]
+        store, _binding = self._seed_clear(row_ids=rows)
+        store.events.clear()
+
+        result = self._decline(store)
+
+        self.assertEqual(386, result["claimSet"]["plannedWrites"])
+        self.assertEqual(128, len(result["generations"]))
+        self.assertEqual(128, len(result["settlements"]))
+        self.assertEqual(128, len(result["heads"]))
+        self.assertIn(("commit_applied", 386), store.events)
+        self.assertFalse(
+            any(event[0] == "commit_refused_write_ceiling" for event in store.events)
+        )
+
+    def test_decline_validates_386_worst_case_before_executor_and_exact_count_before_write(self):
+        rejected_store, _binding = self._seed_clear()
+        rejected_store.events.clear()
+        with patch.object(
+            self.module,
+            "_require_row_authority_planned_writes",
+            side_effect=self.module.RowAuthorityConfigError("bound rejected"),
+        ) as validator, self.assertRaises(self.module.RowAuthorityConfigError):
+            self._decline(rejected_store)
+        self.assertEqual([((386,), {})], validator.call_args_list)
+        self.assertFalse(
+            any(event[0] == "transaction_began" for event in rejected_store.events)
+        )
+
+        store, _binding = self._seed_clear()
+        original = self.module._require_row_authority_planned_writes
+        with patch.object(
+            self.module,
+            "_require_row_authority_planned_writes",
+            wraps=original,
+        ) as validator:
+            result = self._decline(store)
+        observed = [call.args[0] for call in validator.call_args_list]
+        self.assertEqual(386, observed[0])
+        self.assertIn(5, observed[1:])
+        self.assertEqual(5, result["claimSet"]["plannedWrites"])
+
+    def test_decline_does_not_expose_dismiss_stop_or_resume_mutations(self):
+        method = self.module.RowAuthorityStore.record_operator_decline
+        signature = inspect.signature(method)
+        for forbidden_parameter in (
+            "action_kind",
+            "reason_code",
+            "outcome",
+            "priority",
+            "planned_writes",
+        ):
+            self.assertNotIn(forbidden_parameter, signature.parameters)
+        for forbidden_method in (
+            "record_operator_dismiss",
+            "record_operator_stop",
+            "record_operator_resume",
+            "dismiss_operator_action",
+            "stop_operator_action",
+            "resume_operator_action",
+        ):
+            self.assertFalse(hasattr(self.module.RowAuthorityStore, forbidden_method))
+
+    def test_operator_decline_exact_retry_race_and_readback_are_idempotent(self):
+        store, _binding = self._seed_clear()
+        first = self._decline(store)
+        store.events.clear()
+        replay = self._decline(store)
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(first["action"], replay["action"])
+        self.assertEqual(first["claimSet"], replay["claimSet"])
+        self.assertEqual(first["settlements"], replay["settlements"])
+        self.assertEqual([], self._writes(store))
+
+        pending_store, _binding, _pending = self._seed_pending()
+        pending_first = self._decline(pending_store)
+        pending_store.events.clear()
+        pending_replay = self._decline(pending_store)
+        self.assertEqual("already_applied", pending_replay["disposition"])
+        self.assertEqual(
+            pending_first["settlements"],
+            pending_replay["settlements"],
+        )
+        self.assertEqual([], self._writes(pending_store))
+
+        dominated_store, _binding, _terminal = self._seed_terminal()
+        dominated_first = self._decline(dominated_store)
+        dominated_store.events.clear()
+        dominated_replay = self._decline(dominated_store)
+        self.assertEqual("already_applied", dominated_replay["disposition"])
+        self.assertEqual(
+            dominated_first["claimSet"],
+            dominated_replay["claimSet"],
+        )
+        self.assertEqual([], self._writes(dominated_store))
+
+        race_store, _binding = self._seed_clear()
+        race_store.events.clear()
+        race_store.before_commit_barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [
+                future.result(timeout=10)
+                for future in (
+                    pool.submit(self._decline, race_store),
+                    pool.submit(self._decline, race_store),
+                )
+            ]
+        self.assertEqual(
+            ["already_applied", "declined"],
+            sorted(result["disposition"] for result in results),
+        )
+        self.assertEqual(1, race_store.events.count(("commit_applied", 5)))
+        self.assertEqual(1, race_store.events.count(("commit_applied", 0)))
+
+        pending_race_store, _binding, _pending = self._seed_pending()
+        pending_race_store.events.clear()
+        pending_race_store.before_commit_barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending_results = [
+                future.result(timeout=10)
+                for future in (
+                    pool.submit(self._decline, pending_race_store),
+                    pool.submit(self._decline, pending_race_store),
+                )
+            ]
+        self.assertEqual(
+            ["already_applied", "declined"],
+            sorted(result["disposition"] for result in pending_results),
+        )
+        self.assertEqual(
+            1,
+            pending_race_store.events.count(("commit_applied", 3)),
+        )
+        self.assertEqual(
+            1,
+            pending_race_store.events.count(("commit_applied", 0)),
+        )
+
+        pre_store, _binding = self._seed_clear()
+        before = deepcopy(pre_store.data)
+        pre_store.events.clear()
+        pre_store.fail_next_commit = RuntimeError("decline preapply failure")
+        with self.assertRaises(self.module.RowAuthorityRetryable):
+            self._decline(pre_store)
+        self.assertEqual(before, pre_store.data)
+        self.assertEqual([], self._writes(pre_store))
+
+        applied_store, _binding = self._seed_clear()
+        applied_store.apply_then_raise_next_commit = RuntimeError(
+            "unknown decline commit outcome"
+        )
+        applied = self._decline(applied_store)
+        self.assertEqual("declined", applied["disposition"])
+
+        pending_applied_store, _binding, _pending = self._seed_pending()
+        pending_applied_store.apply_then_raise_next_commit = RuntimeError(
+            "unknown pending decline commit outcome"
+        )
+        pending_applied = self._decline(pending_applied_store)
+        self.assertEqual("declined", pending_applied["disposition"])
+
+        def partial_executor(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            operation, reference, payload, merge = transaction._operations[0]
+            transaction._rollback()
+            self.assertEqual(("create", False), (operation, merge))
+            reference.create(payload)
+            raise RuntimeError("partial decline apply")
+
+        partial_store, _binding = self._seed_clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._decline(partial_store, executor=partial_executor)
+
+        pending_partial_store, pending_binding, _pending = (
+            self._seed_pending()
+        )
+        partial_action = self._action(pending_binding)
+        self._action_reference(
+            pending_partial_store,
+            partial_action,
+        ).create(partial_action)
+        before = deepcopy(pending_partial_store.data)
+        pending_partial_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._decline(pending_partial_store)
+        self.assertEqual(before, pending_partial_store.data)
+        self.assertEqual([], self._writes(pending_partial_store))
+
+    def test_operator_decline_retry_after_higher_transition_preserves_later_head(self):
+        def seed_higher(*, settle_higher=False):
+            seeded_store, _binding = self._seed_clear()
+            terminal_bundle = self.fixture._seed_b1_bundle(seeded_store)
+            seeded_decline = self._decline(seeded_store)
+            seeded_higher = self.fixture._claim(
+                seeded_store,
+                bundle=terminal_bundle,
+                created_at="2026-08-04T12:00:04.000000Z",
+                lease_until="2026-08-04T12:06:00.000000Z",
+            )
+            if settle_higher:
+                settled = self._authority(
+                    seeded_store
+                ).settle_owner_generation(
+                    verified_user_id=self.user_id,
+                    row_id=self.fixture.first,
+                    expected_head=seeded_higher["heads"][0],
+                    settled_at="2026-08-04T12:00:05.000000Z",
+                )
+                later = settled["head"]
+            else:
+                later = seeded_higher["heads"][0]
+            return seeded_store, seeded_decline, seeded_higher, later
+
+        store, declined, higher, later_head = seed_higher()
+        later_head = deepcopy(later_head)
+        store.events.clear()
+
+        replay = self._decline(store)
+
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(declined["settlements"], replay["settlements"])
+        self.assertEqual([later_head], replay["heads"])
+        self.assertEqual(
+            later_head,
+            store.data[
+                self.fixture._row_references(store, self.fixture.first)[1].path
+            ],
+        )
+        self.assertEqual([], self._writes(store))
+
+        for artifact, mode, error_type in (
+            ("generation", "missing", self.module.RowAuthorityAmbiguous),
+            ("generation", "malformed", self.module.RowAuthorityConflict),
+            ("claim", "missing", self.module.RowAuthorityAmbiguous),
+            ("claim", "malformed", self.module.RowAuthorityConflict),
+            ("settlement", "missing", self.module.RowAuthorityAmbiguous),
+            ("settlement", "malformed", self.module.RowAuthorityConflict),
+        ):
+            with self.subTest(artifact=artifact, mode=mode):
+                corrupt_store, _declined, corrupt_higher, _later = (
+                    seed_higher(settle_higher=artifact == "settlement")
+                )
+                if artifact == "generation":
+                    reference = self.fixture._generation_reference(
+                        corrupt_store,
+                        self.fixture.first,
+                        2,
+                    )
+                    hash_field = "generationHash"
+                elif artifact == "claim":
+                    reference = self.fixture._claim_reference(
+                        corrupt_store,
+                        corrupt_higher["claimSet"]["requestId"],
+                    )
+                    hash_field = "claimSetHash"
+                else:
+                    reference = self.fixture._settlement_reference(
+                        corrupt_store,
+                        self.fixture.first,
+                        2,
+                    )
+                    hash_field = "settlementHash"
+                if mode == "missing":
+                    del corrupt_store.data[reference.path]
+                else:
+                    corrupt_store.data[reference.path][hash_field] = "f" * 64
+                before = deepcopy(corrupt_store.data)
+                corrupt_store.events.clear()
+                with self.assertRaises(error_type):
+                    self._decline(corrupt_store)
+                self.assertEqual(before, corrupt_store.data)
+                self.assertEqual([], self._writes(corrupt_store))
+
+        forged_store, _binding = self._seed_clear()
+        forged_decline = self._decline(forged_store)
+        head_ref = self.fixture._row_references(
+            forged_store,
+            self.fixture.first,
+        )[1]
+        forged_head = deepcopy(forged_decline["heads"][0])
+        forged_head.update(
+            {
+                "stateRevision": forged_head["stateRevision"] + 1,
+                "state": "claimed",
+                "effectiveOwnerGeneration": 2,
+                "effectiveOwnerGenerationHash": "e" * 64,
+                "effectiveOwnerKind": "terminal",
+                "effectivePriority": 2,
+                "leaseOwnerHash": "d" * 64,
+                "leaseUntil": "2026-08-04T12:06:00.000000Z",
+                "fencingToken": 2,
+                "updatedAt": "2026-08-04T12:00:04.000000Z",
+            }
+        )
+        head_ref.set(self.fixture._rehash_head(forged_head), merge=False)
+        before = deepcopy(forged_store.data)
+        forged_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._decline(forged_store)
+        self.assertEqual(before, forged_store.data)
+        self.assertEqual([], self._writes(forged_store))
 
 
 if __name__ == "__main__":

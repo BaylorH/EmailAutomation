@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import RFC_4122, UUID, uuid4
 
 
@@ -4719,6 +4719,72 @@ def _build_settlement_advanced_head(
     return validate_row_authority_head(document=_with_head_hash(result))
 
 
+def _settlement_head_is_forward(
+    *,
+    settled_head,
+    current_head,
+    generation_document,
+    settlement_document,
+    higher_generation_proven=False,
+):
+    settled = validate_row_authority_head(document=settled_head)
+    current = validate_row_authority_head(document=current_head)
+    generation = validate_owner_generation_document(
+        document=generation_document
+    )
+    settlement = validate_owner_settlement_document(
+        document=settlement_document
+    )
+    if current == settled:
+        return True
+    if _lease_takeover_head_is_location_only_forward(
+        takeover_head=settled,
+        current_head=current,
+    ):
+        return True
+    if not higher_generation_proven:
+        return False
+    if (
+        current["userScopeHash"] != settled["userScopeHash"]
+        or current["rowId"] != settled["rowId"]
+        or current["createdAt"] != settled["createdAt"]
+        or current["effectiveOwnerGeneration"] is None
+        or current["effectiveOwnerGeneration"]
+        <= generation["generation"]
+        or current["effectiveOwnerGeneration"] > 3
+        or current["effectivePriority"] <= generation["priority"]
+        or current["fencingToken"] <= settlement["fencingToken"]
+        or current["updatedAt"] < settlement["settledAt"]
+        or current["currentLocationRevision"]
+        < settled["currentLocationRevision"]
+    ):
+        return False
+    location_delta = (
+        current["currentLocationRevision"]
+        - settled["currentLocationRevision"]
+    )
+    generation_delta = (
+        current["effectiveOwnerGeneration"] - generation["generation"]
+    )
+    if current["stateRevision"] < (
+        settled["stateRevision"] + location_delta + generation_delta
+    ):
+        return False
+    if location_delta == 0 and (
+        current["currentLocationHash"] != settled["currentLocationHash"]
+        or current["currentLocationLifecycle"]
+        != settled["currentLocationLifecycle"]
+    ):
+        return False
+    if current["state"] in {"claimed", "review_pending"} and (
+        current["latestSettlementHash"] != settlement["settlementHash"]
+        or current["effectiveSettlementHash"]
+        != settlement["settlementHash"]
+    ):
+        return False
+    return True
+
+
 def _build_source_link_advanced_head(
     *, expected_head, source_link_document
 ):
@@ -4940,11 +5006,15 @@ def _validate_current_owner_state(*, scope, row_id, head, row_state):
             raise RowAuthorityConflict(
                 "owner lineage generation or claim set contains immutable drift"
             ) from exc
-        minimum_planned_writes = 1 + (2 * claim["bindingCount"])
-        maximum_planned_writes = minimum_planned_writes + sum(
-            decision["plannedGeneration"] > 1
-            for decision in claim["rowDecisions"]
-        )
+        if claim["authorityOrigin"] == "authenticated_operator":
+            minimum_planned_writes = 2 + (3 * claim["bindingCount"])
+            maximum_planned_writes = minimum_planned_writes
+        else:
+            minimum_planned_writes = 1 + (2 * claim["bindingCount"])
+            maximum_planned_writes = minimum_planned_writes + sum(
+                decision["plannedGeneration"] > 1
+                for decision in claim["rowDecisions"]
+            )
         if (
             generation["userScopeHash"] != scope
             or claim["userScopeHash"] != scope
@@ -5160,7 +5230,11 @@ def _validate_complete_accepted_claim_cohorts(*, row_states):
                     predecessor_settlement["outcome"] == "dominated"
                 )
         expected_writes = (
-            1 + (2 * claim["bindingCount"]) + dominated_predecessors
+            2 + (3 * claim["bindingCount"])
+            if claim["authorityOrigin"] == "authenticated_operator"
+            else 1
+            + (2 * claim["bindingCount"])
+            + dominated_predecessors
         )
         if claim["plannedWrites"] != expected_writes:
             raise RowAuthorityConflict(
@@ -5217,6 +5291,7 @@ def _plan_row_claim_set(
     created_at,
     lease_owner_hash,
     lease_until,
+    combined_operator_decline=False,
 ):
     scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
     created = _require_timestamp(created_at, field_name="created_at")
@@ -5355,7 +5430,13 @@ def _plan_row_claim_set(
                 "stored claim set differs from the exact request"
             )
         if stored_claim["outcome"] == "dominated":
-            if stored_claim["plannedWrites"] != 1:
+            expected_dominated_writes = (
+                2 if combined_operator_decline else 1
+            )
+            if (
+                stored_claim["plannedWrites"]
+                != expected_dominated_writes
+            ):
                 raise RowAuthorityConflict(
                     "dominated claim replay has a nonsemantic write count"
                 )
@@ -5541,7 +5622,11 @@ def _plan_row_claim_set(
                     predecessor_settlements.append(predecessor)
             generations.append(generation)
         expected_replay_writes = (
-            1 + (2 * binding["bindingCount"]) + len(predecessor_settlements)
+            2 + (3 * binding["bindingCount"])
+            if combined_operator_decline
+            else 1
+            + (2 * binding["bindingCount"])
+            + len(predecessor_settlements)
         )
         if stored_claim["plannedWrites"] != expected_replay_writes:
             raise RowAuthorityConflict(
@@ -5624,7 +5709,7 @@ def _plan_row_claim_set(
             fanout_id=fanout_id,
             row_ids=[item["rowId"] for item in binding["rowBindings"]],
             primary_row_id=binding["primaryRowId"],
-            planned_writes=1,
+            planned_writes=(2 if combined_operator_decline else 1),
             outcome="dominated",
             row_decisions=decisions,
             created_at=created,
@@ -5653,7 +5738,11 @@ def _plan_row_claim_set(
         for state in validated_states
         if state["head"]["effectiveOwnerGeneration"] is not None
     )
-    planned_writes = 1 + (2 * len(validated_states)) + dominated_count
+    planned_writes = (
+        2 + (3 * len(validated_states))
+        if combined_operator_decline
+        else 1 + (2 * len(validated_states)) + dominated_count
+    )
     _require_row_authority_planned_writes(planned_writes)
     decisions = []
     for state in validated_states:
@@ -5763,7 +5852,12 @@ def _plan_row_claim_set(
                 "document": head,
             }
         )
-    if len(mutations) != planned_writes:
+    expected_planner_mutations = (
+        planned_writes - 1 - len(validated_states)
+        if combined_operator_decline
+        else planned_writes
+    )
+    if len(mutations) != expected_planner_mutations:
         raise RowAuthorityConfigError("claim planned-write count drifted")
     return {
         "disposition": "created",
@@ -5782,6 +5876,7 @@ def _plan_operator_row_claim(**arguments):
         fanout_id=None,
         canonical_mailbox_identity_hash=None,
         contact_settlement_hash=None,
+        combined_operator_decline=True,
         **arguments,
     )
 
@@ -5792,6 +5887,747 @@ def _plan_contact_fanout_row_claim(**arguments):
         operator_action_document=None,
         **arguments,
     )
+
+
+def _plan_owner_generation_settlement(
+    *,
+    user_scope_hash,
+    row_id,
+    expected_head,
+    actual_head_document,
+    identity_document,
+    generation_document,
+    claim_set_document,
+    stored_settlement_document,
+    prior_effective_settlement_document,
+    settled_at,
+    operator_action_document,
+    actual_owner_lineage=None,
+):
+    scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    checked_row_id = validate_row_id(row_id)
+    expected = validate_row_authority_head(document=expected_head)
+    actual = validate_row_authority_head(document=actual_head_document)
+    identity = validate_row_identity_document(document=identity_document)
+    generation = validate_owner_generation_document(
+        document=generation_document
+    )
+    claim = validate_claim_set_document(document=claim_set_document)
+    settled = _require_timestamp(settled_at, field_name="settled_at")
+    if (
+        expected["userScopeHash"] != scope
+        or actual["userScopeHash"] != scope
+        or identity["userScopeHash"] != scope
+        or generation["userScopeHash"] != scope
+        or claim["userScopeHash"] != scope
+        or expected["rowId"] != checked_row_id
+        or actual["rowId"] != checked_row_id
+        or identity["rowId"] != checked_row_id
+        or generation["rowId"] != checked_row_id
+        or expected["createdAt"] != identity["createdAt"]
+        or actual["createdAt"] != identity["createdAt"]
+        or generation["createdAt"] < identity["createdAt"]
+        or generation["createdAt"] > expected["updatedAt"]
+        or generation["createdAt"] < claim["createdAt"]
+    ):
+        raise RowAuthorityConfigError(
+            "settlement identity, head, generation, and claim do not correlate"
+        )
+    expected_state = {
+        "contact_optout": "claimed",
+        "terminal": "claimed",
+        "human_decision": "review_pending",
+    }[generation["ownerKind"]]
+    if (
+        expected["state"] != expected_state
+        or expected["effectiveOwnerGeneration"]
+        != generation["generation"]
+        or expected["effectiveOwnerGenerationHash"]
+        != generation["generationHash"]
+        or expected["effectiveOwnerKind"] != generation["ownerKind"]
+        or expected["effectivePriority"] != generation["priority"]
+        or expected["fencingToken"] < generation["firstFencingToken"]
+        or generation["requestId"] != claim["requestId"]
+        or generation["claimSetHash"] != claim["claimSetHash"]
+        or generation["ownerKind"] != claim["ownerKind"]
+        or generation["ownerKey"] != claim["ownerKey"]
+        or generation["predecessorSettlementHash"]
+        != expected["effectiveSettlementHash"]
+    ):
+        raise RowAuthorityConfigError(
+            "settlement generation is not the expected active owner"
+        )
+    if (
+        settled < claim["createdAt"]
+        or settled < generation["createdAt"]
+        or settled < expected["updatedAt"]
+    ):
+        raise RowAuthorityConfigError(
+            "settlement cannot predate generation or current head"
+        )
+    predecessor_hash = generation["predecessorSettlementHash"]
+    if predecessor_hash is None:
+        if prior_effective_settlement_document is not None:
+            raise RowAuthorityConfigError(
+                "ownerless predecessor cannot carry effective settlement proof"
+            )
+        prior_settlement = None
+    else:
+        if prior_effective_settlement_document is None:
+            raise RowAuthorityConfigError(
+                "effective predecessor settlement proof is required"
+            )
+        prior_settlement = validate_owner_settlement_document(
+            document=prior_effective_settlement_document
+        )
+        if (
+            prior_settlement["userScopeHash"] != scope
+            or prior_settlement["rowId"] != checked_row_id
+            or prior_settlement["settlementHash"] != predecessor_hash
+            or prior_settlement["generation"] >= generation["generation"]
+            or prior_settlement["fencingToken"]
+            >= generation["firstFencingToken"]
+            or prior_settlement["outcome"] == "dominated"
+            or prior_settlement["settledAt"] > generation["createdAt"]
+        ):
+            raise RowAuthorityConfigError(
+                "effective predecessor settlement proof does not correlate"
+            )
+    outcome = _expected_owner_settlement_outcome(generation["ownerKind"])
+    candidate = build_owner_settlement_document(
+        generation_document=generation,
+        claim_set_document=claim,
+        fencing_token=expected["fencingToken"],
+        outcome=outcome,
+        settled_at=settled,
+        superseded_effective_settlement_hash=(
+            predecessor_hash
+            if generation["ownerKind"] == "contact_optout"
+            else None
+        ),
+        operator_action_document=operator_action_document,
+    )
+    immediate_head = _build_settlement_advanced_head(
+        expected_head=expected,
+        generation_document=generation,
+        settlement_document=candidate,
+    )
+    if stored_settlement_document is not None:
+        stored = _validate_correlated_owner_settlement(
+            scope=scope,
+            row_id=checked_row_id,
+            generation=generation,
+            claim=claim,
+            settlement_document=stored_settlement_document,
+        )
+        if stored != candidate:
+            raise RowAuthorityConflict(
+                "stored settlement differs from the requested logical outcome"
+            )
+        if actual == expected:
+            raise RowAuthorityAmbiguous(
+                "settlement exists without its settled head"
+            )
+        higher_generation_proven = False
+        if (
+            actual["effectiveOwnerGeneration"] is not None
+            and actual["effectiveOwnerGeneration"]
+            > generation["generation"]
+        ):
+            if type(actual_owner_lineage) not in {list, tuple}:
+                raise RowAuthorityAmbiguous(
+                    "settlement replay lacks complete later owner lineage"
+                )
+            lineage_documents = tuple(actual_owner_lineage)
+            if len(lineage_documents) != actual[
+                "effectiveOwnerGeneration"
+            ]:
+                raise RowAuthorityAmbiguous(
+                    "settlement replay later owner lineage is incomplete"
+                )
+            last = lineage_documents[-1]
+            predecessor = (
+                lineage_documents[-2]
+                if len(lineage_documents) > 1
+                else None
+            )
+            try:
+                (
+                    _current_generation,
+                    _current_claim,
+                    _current_settlement,
+                    validated_lineage,
+                ) = _validate_current_owner_state(
+                    scope=scope,
+                    row_id=checked_row_id,
+                    head=actual,
+                    row_state={
+                        "ownerLineage": lineage_documents,
+                        "currentGeneration": last.get("generation"),
+                        "currentClaimSet": last.get("claimSet"),
+                        "currentSettlement": last.get("settlement"),
+                        "currentPredecessorGeneration": (
+                            predecessor.get("generation")
+                            if predecessor is not None
+                            else None
+                        ),
+                        "currentPredecessorClaimSet": (
+                            predecessor.get("claimSet")
+                            if predecessor is not None
+                            else None
+                        ),
+                        "currentPredecessorSettlement": (
+                            predecessor.get("settlement")
+                            if predecessor is not None
+                            else None
+                        ),
+                    },
+                )
+            except (RowAuthorityConflict, RowAuthorityAmbiguous):
+                raise
+            except Exception as exc:
+                raise RowAuthorityConflict(
+                    "settlement replay later owner lineage is malformed"
+                ) from exc
+            target_entry = validated_lineage[generation["generation"] - 1]
+            if (
+                target_entry["generation"] != generation
+                or target_entry["claimSet"] != claim
+                or target_entry["settlement"] != stored
+            ):
+                raise RowAuthorityConflict(
+                    "settlement replay target differs from later owner lineage"
+                )
+            higher_generation_proven = True
+        if not _settlement_head_is_forward(
+            settled_head=immediate_head,
+            current_head=actual,
+            generation_document=generation,
+            settlement_document=stored,
+            higher_generation_proven=higher_generation_proven,
+        ):
+            raise RowAuthorityConflict(
+                "settlement replay cannot prove a forward row head"
+            )
+        return {
+            "disposition": "already_applied",
+            "generation": generation,
+            "settlement": stored,
+            "head": actual,
+            "mutations": (),
+            "higherGenerationProven": higher_generation_proven,
+        }
+    if actual != expected:
+        raise RowAuthorityConflict(
+            "settlement expected head is stale or drifted"
+        )
+    return {
+        "disposition": "settled",
+        "generation": generation,
+        "settlement": candidate,
+        "head": immediate_head,
+        "higherGenerationProven": False,
+        "mutations": (
+            {
+                "target": "settlement",
+                "operation": "create",
+                "document": candidate,
+            },
+            {
+                "target": "head",
+                "operation": "set",
+                "document": immediate_head,
+            },
+        ),
+    }
+
+
+def _operator_decline_lease_until(issued_at):
+    issued = _timestamp_as_datetime(
+        issued_at,
+        field_name="operator action issuedAt",
+    )
+    return (issued + timedelta(microseconds=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+
+
+def _build_immediate_operator_decline_head(
+    *,
+    expected_head,
+    generation_document,
+    settlement_document,
+    operator_action_document,
+):
+    expected = validate_row_authority_head(document=expected_head)
+    generation = validate_owner_generation_document(
+        document=generation_document
+    )
+    settlement = validate_owner_settlement_document(
+        document=settlement_document
+    )
+    action = validate_operator_action_document(
+        document=operator_action_document
+    )
+    if (
+        expected["state"] != "clear"
+        or expected["effectiveOwnerGeneration"] is not None
+        or expected["effectiveOwnerGenerationHash"] is not None
+        or expected["effectiveOwnerKind"] is not None
+        or expected["effectivePriority"] is not None
+        or expected["fencingToken"] is not None
+        or expected["latestSettlementHash"] is not None
+        or expected["effectiveSettlementHash"] is not None
+        or generation["predecessorHeadHash"] != expected["headHash"]
+        or generation["predecessorSettlementHash"] is not None
+        or generation["firstFencingToken"] != 1
+        or generation["ownerKind"] != "human_decision"
+        or settlement["generationHash"] != generation["generationHash"]
+        or settlement["fencingToken"]
+        != generation["firstFencingToken"]
+        or settlement["outcome"] != "human_declined"
+        or settlement["operatorActionHash"]
+        != action["operatorActionHash"]
+        or settlement["settledAt"] != action["issuedAt"]
+    ):
+        raise RowAuthorityConfigError(
+            "immediate operator decline does not correlate to a clear row"
+        )
+    transient_claimed = _build_claim_advanced_head(
+        expected_head=expected,
+        generation_document=generation,
+        lease_owner_hash=action["actorScopeHash"],
+        lease_until=_operator_decline_lease_until(action["issuedAt"]),
+        dominated_predecessor_settlement_hash=None,
+        claimed_at=action["issuedAt"],
+    )
+    settled = _build_settlement_advanced_head(
+        expected_head=transient_claimed,
+        generation_document=generation,
+        settlement_document=settlement,
+    )
+    material = {
+        key: value for key, value in settled.items() if key != "headHash"
+    }
+    material["stateRevision"] = expected["stateRevision"] + 1
+    return validate_row_authority_head(document=_with_head_hash(material))
+
+
+def _plan_operator_decline(
+    *,
+    user_scope_hash,
+    thread_binding_document,
+    operator_action_document,
+    stored_operator_action_document,
+    row_states,
+    stored_claim_set_document,
+):
+    scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    binding = validate_thread_row_binding_document(
+        document=thread_binding_document
+    )
+    action = validate_operator_action_document(
+        document=operator_action_document
+    )
+    if (
+        binding["userScopeHash"] != scope
+        or action["userScopeHash"] != scope
+        or action["rowBindingsHash"] != binding["rowBindingsHash"]
+        or action["issuedAt"] < binding["createdAt"]
+    ):
+        raise RowAuthorityConflict(
+            "operator action does not correlate to its stable thread binding"
+        )
+    stored_action = None
+    if stored_operator_action_document is not None:
+        try:
+            stored_action = validate_operator_action_document(
+                document=stored_operator_action_document
+            )
+        except Exception as exc:
+            raise RowAuthorityConflict(
+                "stored operator action contains immutable drift"
+            ) from exc
+        if stored_action != action:
+            raise RowAuthorityConflict(
+                "stored operator action differs from the exact request"
+            )
+    if type(row_states) not in {list, tuple} or len(row_states) != binding[
+        "bindingCount"
+    ]:
+        raise RowAuthorityConfigError(
+            "operator decline row state must cover every bound row"
+        )
+    states_by_row = {}
+    for state in row_states:
+        if type(state) is not dict or "rowId" not in state:
+            raise RowAuthorityConfigError(
+                "operator decline row state is malformed"
+            )
+        row_id = validate_row_id(state["rowId"])
+        if row_id in states_by_row:
+            raise RowAuthorityConfigError(
+                "operator decline row state is duplicated"
+            )
+        states_by_row[row_id] = state
+    if list(states_by_row) != [
+        item["rowId"] for item in binding["rowBindings"]
+    ]:
+        raise RowAuthorityConfigError(
+            "operator decline row state is not canonical"
+        )
+
+    validated_states = []
+    for row_binding in binding["rowBindings"]:
+        row_id = row_binding["rowId"]
+        state = states_by_row[row_id]
+        try:
+            identity = validate_row_identity_document(
+                document=state.get("identity")
+            )
+            head = validate_row_authority_head(document=state.get("head"))
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "operator decline row identity or head is missing or malformed"
+            ) from exc
+        if (
+            identity["userScopeHash"] != scope
+            or identity["rowId"] != row_id
+            or identity["clientId"] != binding["clientId"]
+            or head["userScopeHash"] != scope
+            or head["rowId"] != row_id
+            or head["createdAt"] != identity["createdAt"]
+            or binding["createdAt"] < identity["createdAt"]
+        ):
+            raise RowAuthorityConflict(
+                "operator decline identity, binding, and head do not correlate"
+            )
+        if stored_action is None and action["issuedAt"] < head["updatedAt"]:
+            raise RowAuthorityConflict(
+                "operator action predates a current row head"
+            )
+        (
+            current_generation,
+            current_claim,
+            current_settlement,
+            owner_lineage,
+        ) = _validate_current_owner_state(
+            scope=scope,
+            row_id=row_id,
+            head=head,
+            row_state=state,
+        )
+        validated_states.append(
+            {
+                **state,
+                "identity": identity,
+                "head": head,
+                "currentGeneration": current_generation,
+                "currentClaimSet": current_claim,
+                "currentSettlement": current_settlement,
+                "ownerLineage": owner_lineage,
+            }
+        )
+    _validate_complete_accepted_claim_cohorts(
+        row_states=validated_states
+    )
+
+    matching_action_settlements = []
+    for state in validated_states:
+        matches = [
+            entry
+            for entry in state["ownerLineage"]
+            if entry["settlement"] is not None
+            and entry["settlement"]["operatorActionHash"]
+            == action["operatorActionHash"]
+        ]
+        matching_action_settlements.append(matches)
+    if stored_action is None and any(matching_action_settlements):
+        raise RowAuthorityAmbiguous(
+            "operator decline artifacts exist without their immutable action"
+        )
+    if stored_action is None and stored_claim_set_document is not None:
+        raise RowAuthorityAmbiguous(
+            "operator decline claim exists without its immutable action"
+        )
+
+    lease_until = _operator_decline_lease_until(action["issuedAt"])
+    if stored_action is not None:
+        if stored_claim_set_document is not None:
+            claim_plan = _plan_operator_row_claim(
+                user_scope_hash=scope,
+                operator_action_document=action,
+                thread_binding_document=binding,
+                row_states=validated_states,
+                stored_claim_set_document=stored_claim_set_document,
+                created_at=action["issuedAt"],
+                lease_owner_hash=action["actorScopeHash"],
+                lease_until=lease_until,
+            )
+            if claim_plan["disposition"] != "already_applied":
+                raise RowAuthorityAmbiguous(
+                    "stored operator claim is not a complete replay"
+                )
+            settlements = []
+            if claim_plan["claimSet"]["outcome"] == "accepted":
+                for state, generation in zip(
+                    validated_states,
+                    claim_plan["generations"],
+                ):
+                    entry = state["ownerLineage"][
+                        generation["generation"] - 1
+                    ]
+                    settlement = entry["settlement"]
+                    if settlement is None:
+                        raise RowAuthorityAmbiguous(
+                            "accepted operator decline lacks its settlement"
+                        )
+                    if (
+                        settlement["outcome"] != "human_declined"
+                        or settlement["operatorActionHash"]
+                        != action["operatorActionHash"]
+                        or settlement["settledAt"] != action["issuedAt"]
+                    ):
+                        raise RowAuthorityConflict(
+                            "operator decline settlement differs from its action"
+                        )
+                    settlements.append(settlement)
+            return {
+                "disposition": "already_applied",
+                "action": action,
+                "claimSet": claim_plan["claimSet"],
+                "generations": claim_plan["generations"],
+                "settlements": tuple(settlements),
+                "heads": tuple(
+                    state["head"] for state in validated_states
+                ),
+                "mutations": (),
+            }
+
+        replay_entries = []
+        for matches in matching_action_settlements:
+            if len(matches) != 1:
+                raise RowAuthorityAmbiguous(
+                    "pending operator decline replay is incomplete"
+                )
+            replay_entries.append(matches[0])
+        claims = [entry["claimSet"] for entry in replay_entries]
+        if (
+            any(claim != claims[0] for claim in claims[1:])
+            or claims[0]["rowBindingsHash"]
+            != binding["rowBindingsHash"]
+        ):
+            raise RowAuthorityConflict(
+                "pending operator decline spans different claim cohorts"
+            )
+        generations = []
+        settlements = []
+        for entry in replay_entries:
+            generation = entry["generation"]
+            settlement = entry["settlement"]
+            if (
+                generation["ownerKind"] != "human_decision"
+                or settlement["outcome"] != "human_declined"
+                or settlement["settledAt"] != action["issuedAt"]
+            ):
+                raise RowAuthorityConflict(
+                    "pending operator decline replay differs from its action"
+                )
+            generations.append(generation)
+            settlements.append(settlement)
+        return {
+            "disposition": "already_applied",
+            "action": action,
+            "claimSet": claims[0],
+            "generations": tuple(generations),
+            "settlements": tuple(settlements),
+            "heads": tuple(state["head"] for state in validated_states),
+            "mutations": (),
+        }
+
+    pending = [
+        state["head"]["state"] == "review_pending"
+        and state["head"]["effectiveOwnerKind"] == "human_decision"
+        for state in validated_states
+    ]
+    if any(pending) and not all(pending):
+        raise RowAuthorityConflict(
+            "operator decline cannot mix pending and nonpending rows"
+        )
+    if all(pending):
+        claims = [state["currentClaimSet"] for state in validated_states]
+        if (
+            any(claim != claims[0] for claim in claims[1:])
+            or claims[0]["rowBindingsHash"] != binding["rowBindingsHash"]
+        ):
+            raise RowAuthorityConflict(
+                "pending operator decline does not match one bound claim cohort"
+            )
+        planned_writes = 1 + (2 * len(validated_states))
+        _require_row_authority_planned_writes(planned_writes)
+        generations = []
+        settlements = []
+        heads = []
+        mutations = [
+            {
+                "target": "action",
+                "operation": "create",
+                "document": action,
+            }
+        ]
+        for state in validated_states:
+            settlement_plan = _plan_owner_generation_settlement(
+                user_scope_hash=scope,
+                row_id=state["rowId"],
+                expected_head=state["head"],
+                actual_head_document=state["head"],
+                identity_document=state["identity"],
+                generation_document=state["currentGeneration"],
+                claim_set_document=state["currentClaimSet"],
+                stored_settlement_document=None,
+                prior_effective_settlement_document=None,
+                settled_at=action["issuedAt"],
+                operator_action_document=action,
+            )
+            generations.append(settlement_plan["generation"])
+            settlements.append(settlement_plan["settlement"])
+            heads.append(settlement_plan["head"])
+            mutations.extend(
+                (
+                    {
+                        "target": f"settlement:{state['rowId']}",
+                        "operation": "create",
+                        "document": settlement_plan["settlement"],
+                    },
+                    {
+                        "target": f"head:{state['rowId']}",
+                        "operation": "set",
+                        "document": settlement_plan["head"],
+                    },
+                )
+            )
+        if len(mutations) != planned_writes:
+            raise RowAuthorityConfigError(
+                "pending decline planned-write count drifted"
+            )
+        return {
+            "disposition": "declined",
+            "action": action,
+            "claimSet": claims[0],
+            "generations": tuple(generations),
+            "settlements": tuple(settlements),
+            "heads": tuple(heads),
+            "mutations": tuple(mutations),
+        }
+
+    claim_plan = _plan_operator_row_claim(
+        user_scope_hash=scope,
+        operator_action_document=action,
+        thread_binding_document=binding,
+        row_states=validated_states,
+        stored_claim_set_document=None,
+        created_at=action["issuedAt"],
+        lease_owner_hash=action["actorScopeHash"],
+        lease_until=lease_until,
+    )
+    if claim_plan["disposition"] == "dominated":
+        mutations = (
+            {
+                "target": "action",
+                "operation": "create",
+                "document": action,
+            },
+            *claim_plan["mutations"],
+        )
+        if len(mutations) != claim_plan["claimSet"]["plannedWrites"]:
+            raise RowAuthorityConfigError(
+                "dominated decline planned-write count drifted"
+            )
+        return {
+            "disposition": "dominated",
+            "action": action,
+            "claimSet": claim_plan["claimSet"],
+            "generations": (),
+            "settlements": (),
+            "heads": tuple(state["head"] for state in validated_states),
+            "mutations": mutations,
+        }
+    if claim_plan["disposition"] != "created":
+        raise RowAuthorityConfigError(
+            "new operator decline claim has an unsupported disposition"
+        )
+    mutations = [
+        {
+            "target": "action",
+            "operation": "create",
+            "document": action,
+        },
+        {
+            "target": "claim_set",
+            "operation": "create",
+            "document": claim_plan["claimSet"],
+        },
+    ]
+    settlements = []
+    heads = []
+    for state, generation in zip(
+        validated_states,
+        claim_plan["generations"],
+    ):
+        settlement = build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim_plan["claimSet"],
+            fencing_token=generation["firstFencingToken"],
+            outcome="human_declined",
+            settled_at=action["issuedAt"],
+            operator_action_document=action,
+        )
+        head = _build_immediate_operator_decline_head(
+            expected_head=state["head"],
+            generation_document=generation,
+            settlement_document=settlement,
+            operator_action_document=action,
+        )
+        settlements.append(settlement)
+        heads.append(head)
+        mutations.extend(
+            (
+                {
+                    "target": f"generation:{state['rowId']}",
+                    "operation": "create",
+                    "document": generation,
+                },
+                {
+                    "target": f"settlement:{state['rowId']}",
+                    "operation": "create",
+                    "document": settlement,
+                },
+                {
+                    "target": f"head:{state['rowId']}",
+                    "operation": "set",
+                    "document": head,
+                },
+            )
+        )
+    if len(mutations) != claim_plan["claimSet"]["plannedWrites"]:
+        raise RowAuthorityConfigError(
+            "accepted decline planned-write count drifted"
+        )
+    return {
+        "disposition": "declined",
+        "action": action,
+        "claimSet": claim_plan["claimSet"],
+        "generations": claim_plan["generations"],
+        "settlements": tuple(settlements),
+        "heads": tuple(heads),
+        "mutations": tuple(mutations),
+    }
 
 
 def _initialization_result(*, disposition, identity, revision, head):
@@ -5912,6 +6748,89 @@ def _claim_result(
     }
 
 
+def _operator_decline_result(
+    *,
+    disposition,
+    action,
+    claim_set,
+    generations,
+    settlements,
+    heads,
+):
+    if disposition not in {
+        "declined",
+        "dominated",
+        "already_applied",
+    }:
+        raise RowAuthorityConfigError(
+            "operator decline disposition is not approved"
+        )
+    checked_action = validate_operator_action_document(document=action)
+    checked_claim = validate_claim_set_document(document=claim_set)
+    checked_generations = [
+        validate_owner_generation_document(document=document)
+        for document in generations
+    ]
+    checked_settlements = [
+        validate_owner_settlement_document(document=document)
+        for document in settlements
+    ]
+    checked_heads = [
+        validate_row_authority_head(document=document) for document in heads
+    ]
+    if [head["rowId"] for head in checked_heads] != [
+        binding["rowId"] for binding in checked_claim["rowBindings"]
+    ]:
+        raise RowAuthorityConfigError(
+            "operator decline result heads are not canonical"
+        )
+    if disposition == "dominated" and (
+        checked_claim["outcome"] != "dominated"
+        or checked_generations
+        or checked_settlements
+    ):
+        raise RowAuthorityConfigError(
+            "dominated operator decline result is malformed"
+        )
+    if checked_claim["authorityOrigin"] == "authenticated_operator" and (
+        checked_claim["operatorActionHash"]
+        != checked_action["operatorActionHash"]
+    ):
+        raise RowAuthorityConfigError(
+            "operator decline claim differs from its action"
+        )
+    if checked_settlements:
+        if (
+            len(checked_generations) != len(checked_settlements)
+            or len(checked_heads) != len(checked_settlements)
+        ):
+            raise RowAuthorityConfigError(
+                "operator decline result cohorts are incomplete"
+            )
+        for generation, settlement in zip(
+            checked_generations,
+            checked_settlements,
+        ):
+            if (
+                settlement["generationHash"]
+                != generation["generationHash"]
+                or settlement["outcome"] != "human_declined"
+                or settlement["operatorActionHash"]
+                != checked_action["operatorActionHash"]
+            ):
+                raise RowAuthorityConfigError(
+                    "operator decline settlement differs from its generation or action"
+                )
+    return {
+        "disposition": disposition,
+        "action": checked_action,
+        "claimSet": checked_claim,
+        "generations": checked_generations,
+        "settlements": checked_settlements,
+        "heads": checked_heads,
+    }
+
+
 def _lease_takeover_result(*, disposition, generation, head):
     if disposition not in {"taken_over", "already_applied"}:
         raise RowAuthorityConfigError(
@@ -5943,6 +6862,73 @@ def _lease_takeover_result(*, disposition, generation, head):
     return {
         "disposition": disposition,
         "generation": checked_generation,
+        "head": checked_head,
+    }
+
+
+def _owner_settlement_result(
+    *,
+    disposition,
+    generation,
+    settlement,
+    head,
+    higher_generation_proven=False,
+):
+    if disposition not in {"settled", "already_applied"}:
+        raise RowAuthorityConfigError(
+            "owner settlement disposition is not approved"
+        )
+    checked_generation = validate_owner_generation_document(
+        document=generation
+    )
+    checked_settlement = validate_owner_settlement_document(
+        document=settlement
+    )
+    checked_head = validate_row_authority_head(document=head)
+    base_correlates = (
+        checked_settlement["userScopeHash"]
+        == checked_generation["userScopeHash"]
+        and checked_settlement["rowId"] == checked_generation["rowId"]
+        and checked_settlement["generation"]
+        == checked_generation["generation"]
+        and checked_settlement["generationHash"]
+        == checked_generation["generationHash"]
+        and checked_head["userScopeHash"]
+        == checked_generation["userScopeHash"]
+        and checked_head["rowId"] == checked_generation["rowId"]
+        and checked_head["updatedAt"] >= checked_settlement["settledAt"]
+    )
+    same_generation = (
+        checked_head["effectiveOwnerGeneration"]
+        == checked_generation["generation"]
+        and checked_head["effectiveOwnerGenerationHash"]
+        == checked_generation["generationHash"]
+        and checked_head["state"] == "settled"
+        and checked_head["fencingToken"]
+        == checked_settlement["fencingToken"]
+        and checked_head["latestSettlementHash"]
+        == checked_settlement["settlementHash"]
+        and checked_head["effectiveSettlementHash"]
+        == checked_settlement["settlementHash"]
+    )
+    higher_generation = (
+        higher_generation_proven is True
+        and
+        checked_head["effectiveOwnerGeneration"] is not None
+        and checked_head["effectiveOwnerGeneration"]
+        > checked_generation["generation"]
+        and checked_head["effectivePriority"] > checked_generation["priority"]
+        and checked_head["fencingToken"]
+        > checked_settlement["fencingToken"]
+    )
+    if not base_correlates or not (same_generation or higher_generation):
+        raise RowAuthorityConfigError(
+            "owner settlement result does not correlate"
+        )
+    return {
+        "disposition": disposition,
+        "generation": checked_generation,
+        "settlement": checked_settlement,
         "head": checked_head,
     }
 
@@ -7475,6 +8461,1070 @@ class RowAuthorityStore:
             disposition=disposition,
             generation=generation,
             head=result_head,
+        )
+
+    def settle_owner_generation(
+        self,
+        *,
+        verified_user_id,
+        row_id,
+        expected_head,
+        settled_at,
+    ):
+        _require_row_authority_planned_writes(2)
+        expected = validate_row_authority_head(document=expected_head)
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        checked_row_id = validate_row_id(row_id)
+        checked_settled_at = _require_timestamp(
+            settled_at,
+            field_name="settled_at",
+        )
+        if (
+            expected["userScopeHash"] != checked_scope
+            or expected["rowId"] != checked_row_id
+        ):
+            raise RowAuthorityConfigError(
+                "expected settlement head does not belong to the requested row"
+            )
+        if (
+            expected["state"] != "claimed"
+            or expected["effectiveOwnerKind"] != "terminal"
+        ):
+            raise RowAuthorityConflict(
+                "public settlement accepts only a claimed terminal generation"
+            )
+        if checked_settled_at < expected["updatedAt"]:
+            raise RowAuthorityConfigError(
+                "settlement cannot predate the expected head"
+            )
+        generation_number = expected["effectiveOwnerGeneration"]
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            generation_id = _generation_document_id(
+                row_id=checked_row_id,
+                generation=generation_number,
+            )
+            identity_ref = user_ref.collection("rowIdentities").document(
+                checked_row_id
+            )
+            head_ref = user_ref.collection("rowAuthorityHeads").document(
+                checked_row_id
+            )
+            generation_ref = user_ref.collection(
+                "rowOwnerGenerations"
+            ).document(generation_id)
+            settlement_ref = user_ref.collection(
+                "rowOwnerSettlements"
+            ).document(generation_id)
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "settlement authority cannot form exact document paths"
+            ) from exc
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "plan": None,
+            "references": {},
+            "before": {},
+            "ordered_paths": [],
+            "mutation_references": {},
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "plan": None,
+                    "references": {},
+                    "before": {},
+                    "ordered_paths": [],
+                    "mutation_references": {},
+                }
+            )
+
+            def read(reference):
+                path = reference.path
+                if path in callback_state["before"]:
+                    return callback_state["before"][path]
+                try:
+                    snapshot = reference.get(transaction=transaction)
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "settlement transaction read failed before writes"
+                    ) from exc
+                observed = (
+                    bool(snapshot.exists),
+                    snapshot.to_dict() if snapshot.exists else None,
+                )
+                callback_state["references"][path] = reference
+                callback_state["before"][path] = observed
+                callback_state["ordered_paths"].append(path)
+                return observed
+
+            identity_observed = read(identity_ref)
+            head_observed = read(head_ref)
+            generation_observed = read(generation_ref)
+            if not all(
+                observed[0]
+                for observed in (
+                    identity_observed,
+                    head_observed,
+                    generation_observed,
+                )
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "settlement is missing identity, head, or generation"
+                    )
+                )
+            try:
+                preliminary_generation = validate_owner_generation_document(
+                    document=generation_observed[1]
+                )
+                if (
+                    preliminary_generation["userScopeHash"] != checked_scope
+                    or preliminary_generation["rowId"] != checked_row_id
+                    or preliminary_generation["generation"]
+                    != generation_number
+                ):
+                    raise RowAuthorityConfigError(
+                        "generation does not occupy its expected path"
+                    )
+                claim_ref = user_ref.collection("rowClaimSets").document(
+                    preliminary_generation["requestId"]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "settlement generation is malformed or drifted"
+                    )
+                )
+            claim_observed = read(claim_ref)
+            if not claim_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "settlement is missing its immutable claim set"
+                    )
+                )
+            settlement_observed = read(settlement_ref)
+            prior_effective_settlement = None
+            if expected["effectiveSettlementHash"] is not None:
+                if generation_number <= 1:
+                    reject(
+                        RowAuthorityConflict(
+                            "first generation cannot have prior effective settlement"
+                        )
+                    )
+                prior_matches = []
+                for prior_number in range(1, generation_number):
+                    prior_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(
+                        _generation_document_id(
+                            row_id=checked_row_id,
+                            generation=prior_number,
+                        )
+                    )
+                    prior_observed = read(prior_ref)
+                    if (
+                        prior_observed[0]
+                        and type(prior_observed[1]) is dict
+                        and prior_observed[1].get("settlementHash")
+                        == expected["effectiveSettlementHash"]
+                    ):
+                        prior_matches.append(prior_observed[1])
+                if len(prior_matches) != 1:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "effective predecessor settlement is not unique"
+                        )
+                    )
+                prior_effective_settlement = prior_matches[0]
+            try:
+                preliminary_actual_head = validate_row_authority_head(
+                    document=head_observed[1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "settlement current row head is malformed"
+                    )
+                )
+            actual_owner_lineage = None
+            actual_generation_number = preliminary_actual_head[
+                "effectiveOwnerGeneration"
+            ]
+            if (
+                actual_generation_number is not None
+                and actual_generation_number > generation_number
+            ):
+                if actual_generation_number > 3:
+                    reject(
+                        RowAuthorityConflict(
+                            "settlement replay exceeds bounded priority lineage"
+                        )
+                    )
+                lineage = []
+                for lineage_number in range(1, actual_generation_number + 1):
+                    lineage_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=lineage_number,
+                    )
+                    lineage_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(lineage_id)
+                    lineage_generation_observed = read(
+                        lineage_generation_ref
+                    )
+                    if not lineage_generation_observed[0]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "settlement replay is missing later generation lineage"
+                            )
+                        )
+                    try:
+                        lineage_generation = (
+                            validate_owner_generation_document(
+                                document=lineage_generation_observed[1]
+                            )
+                        )
+                        if (
+                            lineage_generation["userScopeHash"]
+                            != checked_scope
+                            or lineage_generation["rowId"]
+                            != checked_row_id
+                            or lineage_generation["generation"]
+                            != lineage_number
+                        ):
+                            raise RowAuthorityConfigError(
+                                "later generation occupies the wrong path"
+                            )
+                        lineage_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(lineage_generation["requestId"])
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "settlement replay later generation is malformed"
+                            )
+                        )
+                    lineage_claim_observed = read(lineage_claim_ref)
+                    if not lineage_claim_observed[0]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "settlement replay is missing later claim lineage"
+                            )
+                        )
+                    lineage_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(lineage_id)
+                    lineage_settlement_observed = read(
+                        lineage_settlement_ref
+                    )
+                    lineage.append(
+                        {
+                            "generation": lineage_generation_observed[1],
+                            "claimSet": lineage_claim_observed[1],
+                            "settlement": (
+                                lineage_settlement_observed[1]
+                                if lineage_settlement_observed[0]
+                                else None
+                            ),
+                        }
+                    )
+                actual_owner_lineage = tuple(lineage)
+            try:
+                plan = _plan_owner_generation_settlement(
+                    user_scope_hash=checked_scope,
+                    row_id=checked_row_id,
+                    expected_head=expected,
+                    actual_head_document=head_observed[1],
+                    identity_document=identity_observed[1],
+                    generation_document=generation_observed[1],
+                    claim_set_document=claim_observed[1],
+                    stored_settlement_document=(
+                        settlement_observed[1]
+                        if settlement_observed[0]
+                        else None
+                    ),
+                    prior_effective_settlement_document=(
+                        prior_effective_settlement
+                    ),
+                    settled_at=checked_settled_at,
+                    operator_action_document=None,
+                    actual_owner_lineage=actual_owner_lineage,
+                )
+            except (RowAuthorityConflict, RowAuthorityAmbiguous) as exc:
+                reject(exc)
+            except RowAuthorityError as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "settlement authority is malformed or drifted"
+                    )
+                )
+            mutations = plan["mutations"]
+            expected_count = 2 if plan["disposition"] == "settled" else 0
+            if len(mutations) != expected_count:
+                reject(
+                    RowAuthorityConfigError(
+                        "settlement callback write plan is not exact"
+                    )
+                )
+            mutation_references = {
+                "settlement": settlement_ref,
+                "head": head_ref,
+            }
+            callback_state["mutation_references"] = mutation_references
+            for mutation in mutations:
+                reference = mutation_references.get(mutation["target"])
+                if reference is None:
+                    reject(
+                        RowAuthorityConfigError(
+                            "settlement mutation has no exact reference"
+                        )
+                    )
+                if mutation["operation"] == "create":
+                    transaction.create(reference, mutation["document"])
+                elif mutation["operation"] == "set":
+                    transaction.set(
+                        reference,
+                        mutation["document"],
+                        merge=False,
+                    )
+                else:
+                    reject(
+                        RowAuthorityConfigError(
+                            "settlement mutation operation is unsupported"
+                        )
+                    )
+            callback_state["prepared"] = bool(mutations)
+            callback_state["disposition"] = plan["disposition"]
+            callback_state["plan"] = plan
+            return plan["disposition"]
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "settlement transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"]:
+                raise
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "settlement transaction could not start"
+                ) from exc
+            plan = callback_state["plan"]
+            if plan is None:
+                raise RowAuthorityAmbiguous(
+                    "settlement commit has no complete prepared plan"
+                ) from exc
+            try:
+                readback = {}
+                for path in callback_state["ordered_paths"]:
+                    reference = callback_state["references"][path]
+                    snapshot = reference.get()
+                    readback[path] = (
+                        bool(snapshot.exists),
+                        snapshot.to_dict() if snapshot.exists else None,
+                    )
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "settlement commit outcome cannot be read back"
+                ) from readback_exc
+            expected_after = dict(callback_state["before"])
+            for mutation in plan["mutations"]:
+                reference = callback_state["mutation_references"][
+                    mutation["target"]
+                ]
+                expected_after[reference.path] = (
+                    True,
+                    mutation["document"],
+                )
+            exact_before = readback == callback_state["before"]
+            exact_after = readback == expected_after
+            if exact_after and callback_state["prepared"]:
+                disposition = "settled"
+            elif (
+                exact_before
+                and callback_state["disposition"] == "already_applied"
+            ):
+                disposition = "already_applied"
+            elif exact_before:
+                raise RowAuthorityRetryable(
+                    "settlement commit failed before apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "settlement commit readback is partial or drifted"
+                ) from exc
+        plan = callback_state["plan"]
+        if plan is None or disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "settlement transaction returned a mismatched disposition"
+            )
+        if disposition == "settled" and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "settlement transaction reported an unprepared write"
+            )
+        if disposition not in {"settled", "already_applied"}:
+            raise RowAuthorityRetryable(
+                "settlement transaction returned no approved disposition"
+            )
+        return _owner_settlement_result(
+            disposition=disposition,
+            generation=plan["generation"],
+            settlement=plan["settlement"],
+            head=plan["head"],
+            higher_generation_proven=plan["higherGenerationProven"],
+        )
+
+    def record_operator_decline(
+        self,
+        *,
+        verified_user_id,
+        thread_id,
+        actor_scope_hash,
+        client_request_id,
+        issued_at,
+    ):
+        _require_row_authority_planned_writes(
+            2 + (3 * MAX_ROW_BINDINGS)
+        )
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_thread_id = _require_thread_document_id(
+            thread_id,
+            field_name="thread_id",
+        )
+        checked_actor_scope = _require_sha256(
+            actor_scope_hash,
+            field_name="actor_scope_hash",
+        )
+        checked_client_request_id = _require_opaque(
+            client_request_id,
+            field_name="client_request_id",
+        )
+        checked_issued_at = _require_timestamp(
+            issued_at,
+            field_name="issued_at",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            binding_ref = user_ref.collection(
+                "threadRowBindings"
+            ).document(checked_thread_id)
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "operator decline cannot form exact document paths"
+            ) from exc
+
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "plan": None,
+            "references": {},
+            "before": {},
+            "ordered_paths": [],
+            "mutation_references": {},
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "plan": None,
+                    "references": {},
+                    "before": {},
+                    "ordered_paths": [],
+                    "mutation_references": {},
+                }
+            )
+
+            def read(reference):
+                path = reference.path
+                if path in callback_state["before"]:
+                    return callback_state["before"][path]
+                try:
+                    snapshot = reference.get(transaction=transaction)
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "operator decline transaction read failed before writes"
+                    ) from exc
+                observed = (
+                    bool(snapshot.exists),
+                    snapshot.to_dict() if snapshot.exists else None,
+                )
+                callback_state["references"][path] = reference
+                callback_state["before"][path] = observed
+                callback_state["ordered_paths"].append(path)
+                return observed
+
+            binding_exists, binding_payload = read(binding_ref)
+            if not binding_exists:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "operator decline is missing its stable thread binding"
+                    )
+                )
+            try:
+                binding = validate_thread_row_binding_document(
+                    document=binding_payload
+                )
+                if (
+                    binding["userScopeHash"] != checked_scope
+                    or binding["threadId"] != checked_thread_id
+                ):
+                    raise RowAuthorityConfigError(
+                        "thread binding occupies the wrong user or thread path"
+                    )
+                action = build_operator_action_document(
+                    user_scope_hash=checked_scope,
+                    actor_scope_hash=checked_actor_scope,
+                    row_bindings_hash=binding["rowBindingsHash"],
+                    client_request_id=checked_client_request_id,
+                    issued_at=checked_issued_at,
+                )
+                action_ref = user_ref.collection(
+                    "rowOperatorActions"
+                ).document(action["actionId"])
+                request_context = _derive_claim_request_context(
+                    user_scope_hash=checked_scope,
+                    authority_origin="authenticated_operator",
+                    authority_link=None,
+                    operator_action_document=action,
+                    fanout_id=None,
+                    thread_binding_document=binding,
+                )
+                claim_ref = user_ref.collection("rowClaimSets").document(
+                    request_context["requestId"]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "operator decline binding or request identity is malformed"
+                    )
+                )
+
+            action_exists, action_payload = read(action_ref)
+            claim_exists, claim_payload = read(claim_ref)
+            stored_claim = None
+            if claim_exists:
+                try:
+                    stored_claim = validate_claim_set_document(
+                        document=claim_payload
+                    )
+                    if (
+                        stored_claim["requestId"]
+                        != request_context["requestId"]
+                    ):
+                        raise RowAuthorityConfigError(
+                            "operator claim occupies the wrong request path"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "stored operator claim contains immutable drift"
+                        )
+                    )
+
+            basic_states = []
+            row_references = {}
+            for row_binding in binding["rowBindings"]:
+                row_id = row_binding["rowId"]
+                identity_ref = user_ref.collection(
+                    "rowIdentities"
+                ).document(row_id)
+                head_ref = user_ref.collection(
+                    "rowAuthorityHeads"
+                ).document(row_id)
+                identity_exists, identity_payload = read(identity_ref)
+                head_exists, head_payload = read(head_ref)
+                if not identity_exists or not head_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "operator decline is missing a bound identity or head"
+                        )
+                    )
+                try:
+                    preliminary_head = validate_row_authority_head(
+                        document=head_payload
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "operator decline current row head is malformed"
+                        )
+                    )
+                basic_states.append(
+                    {
+                        "rowId": row_id,
+                        "identity": identity_payload,
+                        "head": head_payload,
+                        "preliminaryHead": preliminary_head,
+                    }
+                )
+                row_references[row_id] = {
+                    "identity": identity_ref,
+                    "head": head_ref,
+                }
+
+            row_states = []
+            all_pending = all(
+                basic["preliminaryHead"]["state"] == "review_pending"
+                and basic["preliminaryHead"]["effectiveOwnerKind"]
+                == "human_decision"
+                for basic in basic_states
+            )
+            skip_candidates = (
+                (action_exists and not claim_exists)
+                or (not action_exists and not claim_exists and all_pending)
+            )
+            for basic in basic_states:
+                row_id = basic["rowId"]
+                head = basic["preliminaryHead"]
+                current_number = head["effectiveOwnerGeneration"]
+                if current_number is not None and current_number > 3:
+                    reject(
+                        RowAuthorityConflict(
+                            "operator decline exceeds bounded owner lineage"
+                        )
+                    )
+                owner_lineage = []
+                for lineage_number in range(1, (current_number or 0) + 1):
+                    lineage_id = _generation_document_id(
+                        row_id=row_id,
+                        generation=lineage_number,
+                    )
+                    lineage_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(lineage_id)
+                    generation_exists, generation_payload = read(
+                        lineage_generation_ref
+                    )
+                    if not generation_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline owner lineage is missing a generation"
+                            )
+                        )
+                    try:
+                        checked_generation = (
+                            validate_owner_generation_document(
+                                document=generation_payload
+                            )
+                        )
+                        if (
+                            checked_generation["userScopeHash"]
+                            != checked_scope
+                            or checked_generation["rowId"] != row_id
+                            or checked_generation["generation"]
+                            != lineage_number
+                        ):
+                            raise RowAuthorityConfigError(
+                                "owner generation occupies the wrong path"
+                            )
+                        lineage_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(checked_generation["requestId"])
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "operator decline owner generation is malformed"
+                            )
+                        )
+                    lineage_claim_exists, lineage_claim_payload = read(
+                        lineage_claim_ref
+                    )
+                    if not lineage_claim_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline owner lineage is missing a claim"
+                            )
+                        )
+                    try:
+                        checked_lineage_claim = validate_claim_set_document(
+                            document=lineage_claim_payload
+                        )
+                        if (
+                            checked_lineage_claim["requestId"]
+                            != checked_generation["requestId"]
+                            or checked_lineage_claim["claimSetHash"]
+                            != checked_generation["claimSetHash"]
+                        ):
+                            raise RowAuthorityConfigError(
+                                "owner claim does not match its generation"
+                            )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "operator decline owner claim is malformed"
+                            )
+                        )
+                    lineage_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(lineage_id)
+                    settlement_exists, settlement_payload = read(
+                        lineage_settlement_ref
+                    )
+                    if (
+                        not settlement_exists
+                        and (
+                            lineage_number < current_number
+                            or head["state"] == "settled"
+                        )
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline owner lineage is missing a settlement"
+                            )
+                        )
+                    if settlement_exists:
+                        try:
+                            checked_settlement = (
+                                validate_owner_settlement_document(
+                                    document=settlement_payload
+                                )
+                            )
+                            if (
+                                checked_settlement["userScopeHash"]
+                                != checked_scope
+                                or checked_settlement["rowId"] != row_id
+                                or checked_settlement["generation"]
+                                != lineage_number
+                                or checked_settlement["generationHash"]
+                                != checked_generation["generationHash"]
+                            ):
+                                raise RowAuthorityConfigError(
+                                    "owner settlement occupies the wrong path"
+                                )
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityConflict(
+                                    "operator decline owner settlement is malformed"
+                                )
+                            )
+                    owner_lineage.append(
+                        {
+                            "generation": generation_payload,
+                            "claimSet": lineage_claim_payload,
+                            "settlement": (
+                                settlement_payload
+                                if settlement_exists
+                                else None
+                            ),
+                        }
+                    )
+                current_entry = owner_lineage[-1] if owner_lineage else None
+                predecessor = (
+                    owner_lineage[-2] if len(owner_lineage) > 1 else None
+                )
+                candidate_generation = None
+                candidate_settlement = None
+                if not skip_candidates:
+                    if (
+                        stored_claim is not None
+                        and stored_claim["outcome"] == "accepted"
+                    ):
+                        decisions = [
+                            decision
+                            for decision in stored_claim["rowDecisions"]
+                            if decision["rowId"] == row_id
+                        ]
+                        if len(decisions) != 1:
+                            reject(
+                                RowAuthorityConflict(
+                                    "operator claim decisions do not cover its binding"
+                                )
+                            )
+                        candidate_number = decisions[0][
+                            "plannedGeneration"
+                        ]
+                    else:
+                        candidate_number = (
+                            1 if current_number is None else current_number + 1
+                        )
+                    candidate_id = _generation_document_id(
+                        row_id=row_id,
+                        generation=candidate_number,
+                    )
+                    candidate_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(candidate_id)
+                    candidate_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(candidate_id)
+                    candidate_generation_exists, candidate_generation_payload = read(
+                        candidate_generation_ref
+                    )
+                    candidate_settlement_exists, candidate_settlement_payload = read(
+                        candidate_settlement_ref
+                    )
+                    candidate_generation = (
+                        candidate_generation_payload
+                        if candidate_generation_exists
+                        else None
+                    )
+                    candidate_settlement = (
+                        candidate_settlement_payload
+                        if candidate_settlement_exists
+                        else None
+                    )
+                    row_references[row_id].update(
+                        {
+                            "candidate_generation": candidate_generation_ref,
+                            "candidate_settlement": candidate_settlement_ref,
+                        }
+                    )
+                row_states.append(
+                    {
+                        "rowId": row_id,
+                        "identity": basic["identity"],
+                        "head": basic["head"],
+                        "currentGeneration": (
+                            current_entry["generation"]
+                            if current_entry is not None
+                            else None
+                        ),
+                        "currentClaimSet": (
+                            current_entry["claimSet"]
+                            if current_entry is not None
+                            else None
+                        ),
+                        "currentSettlement": (
+                            current_entry["settlement"]
+                            if current_entry is not None
+                            else None
+                        ),
+                        "currentPredecessorGeneration": (
+                            predecessor["generation"]
+                            if predecessor is not None
+                            else None
+                        ),
+                        "currentPredecessorClaimSet": (
+                            predecessor["claimSet"]
+                            if predecessor is not None
+                            else None
+                        ),
+                        "currentPredecessorSettlement": (
+                            predecessor["settlement"]
+                            if predecessor is not None
+                            else None
+                        ),
+                        "ownerLineage": owner_lineage,
+                        "candidateGeneration": candidate_generation,
+                        "candidateSettlement": candidate_settlement,
+                    }
+                )
+
+            try:
+                plan = _plan_operator_decline(
+                    user_scope_hash=checked_scope,
+                    thread_binding_document=binding,
+                    operator_action_document=action,
+                    stored_operator_action_document=(
+                        action_payload if action_exists else None
+                    ),
+                    row_states=row_states,
+                    stored_claim_set_document=stored_claim,
+                )
+            except RowAuthorityError as exc:
+                reject(exc)
+            mutations = plan["mutations"]
+            exact_count = len(mutations)
+            _require_row_authority_planned_writes(exact_count)
+            expected_count = 0
+            if plan["disposition"] == "declined":
+                expected_count = (
+                    plan["claimSet"]["plannedWrites"]
+                    if plan["claimSet"]["authorityOrigin"]
+                    == "authenticated_operator"
+                    else 1 + (2 * binding["bindingCount"])
+                )
+            elif plan["disposition"] == "dominated":
+                expected_count = plan["claimSet"]["plannedWrites"]
+            if exact_count != expected_count:
+                reject(
+                    RowAuthorityConfigError(
+                        "operator decline callback write plan is not exact"
+                    )
+                )
+
+            mutation_references = {
+                "action": action_ref,
+                "claim_set": claim_ref,
+            }
+            for generation in plan["generations"]:
+                row_id = generation["rowId"]
+                generation_ref = user_ref.collection(
+                    "rowOwnerGenerations"
+                ).document(
+                    _generation_document_id(
+                        row_id=row_id,
+                        generation=generation["generation"],
+                    )
+                )
+                mutation_references[f"generation:{row_id}"] = generation_ref
+            for settlement in plan["settlements"]:
+                row_id = settlement["rowId"]
+                settlement_ref = user_ref.collection(
+                    "rowOwnerSettlements"
+                ).document(
+                    _generation_document_id(
+                        row_id=row_id,
+                        generation=settlement["generation"],
+                    )
+                )
+                mutation_references[f"settlement:{row_id}"] = settlement_ref
+            for head in plan["heads"]:
+                mutation_references[f"head:{head['rowId']}"] = row_references[
+                    head["rowId"]
+                ]["head"]
+            callback_state["mutation_references"] = mutation_references
+            for mutation in mutations:
+                reference = mutation_references.get(mutation["target"])
+                if (
+                    reference is None
+                    or reference.path not in callback_state["before"]
+                ):
+                    reject(
+                        RowAuthorityConfigError(
+                            "operator decline mutation has no preread exact reference"
+                        )
+                    )
+                if mutation["operation"] == "create":
+                    transaction.create(reference, mutation["document"])
+                elif mutation["operation"] == "set":
+                    transaction.set(
+                        reference,
+                        mutation["document"],
+                        merge=False,
+                    )
+                else:
+                    reject(
+                        RowAuthorityConfigError(
+                            "operator decline mutation operation is unsupported"
+                        )
+                    )
+            callback_state["prepared"] = bool(mutations)
+            callback_state["disposition"] = plan["disposition"]
+            callback_state["plan"] = plan
+            return plan["disposition"]
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "operator decline transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"]:
+                raise
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "operator decline transaction could not start"
+                ) from exc
+            plan = callback_state["plan"]
+            if plan is None:
+                raise RowAuthorityAmbiguous(
+                    "operator decline commit has no complete prepared plan"
+                ) from exc
+            try:
+                readback = {}
+                for path in callback_state["ordered_paths"]:
+                    reference = callback_state["references"][path]
+                    snapshot = reference.get()
+                    readback[path] = (
+                        bool(snapshot.exists),
+                        snapshot.to_dict() if snapshot.exists else None,
+                    )
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "operator decline commit outcome cannot be read back"
+                ) from readback_exc
+            expected_after = dict(callback_state["before"])
+            for mutation in plan["mutations"]:
+                reference = callback_state["mutation_references"][
+                    mutation["target"]
+                ]
+                expected_after[reference.path] = (
+                    True,
+                    mutation["document"],
+                )
+            exact_before = readback == callback_state["before"]
+            exact_after = readback == expected_after
+            if exact_after:
+                disposition = plan["disposition"]
+            elif exact_before and not plan["mutations"]:
+                disposition = plan["disposition"]
+            elif exact_before:
+                raise RowAuthorityRetryable(
+                    "operator decline commit failed before any apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "operator decline commit readback is partial or drifted"
+                ) from exc
+        plan = callback_state["plan"]
+        if plan is None or disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "operator decline transaction returned a mismatched disposition"
+            )
+        if plan["mutations"] and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "operator decline reported an unprepared mutation"
+            )
+        return _operator_decline_result(
+            disposition=disposition,
+            action=plan["action"],
+            claim_set=plan["claimSet"],
+            generations=plan["generations"],
+            settlements=plan["settlements"],
+            heads=plan["heads"],
         )
 
     def record_contact_row_association(
