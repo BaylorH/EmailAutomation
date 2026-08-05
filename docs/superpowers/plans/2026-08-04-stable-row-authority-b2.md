@@ -210,7 +210,7 @@ select a run for a different SHA.
 - [x] B2-B is green and published.
 - [x] B1 contact-identity binding amendment is independently approved and its
   child plan is published.
-- [ ] B1 contact-identity binding amendment code/evidence is green and
+- [x] B1 contact-identity binding amendment code/evidence is green and
   published.
 - [ ] B2-C is green and published.
 - [ ] B2-D code/evidence is green and published.

@@ -195,6 +195,56 @@ only after Task 3 is green.
 - Exact plan-shape GitHub proof:
   `https://github.com/BaylorH/EmailAutomation/actions/runs/31001047514`
   (`offline-verification` job `92289728426`, successful at the exact commit).
+- Plan-publication record commit:
+  `193dd6d051023a3158b25849c8ab0c4abe1ceee6`, proved by GitHub run
+  `31001220079` and job `92290298636`.
+- Task 1 code commit:
+  `74f2370140c55d831688ad4ddfd10cfc3c2ad8d2`, proved by GitHub run
+  `31002953759` and job `92295977495`.
+- Task 2/final code commit:
+  `29dc7003fc596e3aab72d3ef24b91308255ecefe`, proved by GitHub run
+  `31003133246` and job `92296561651`.
+- Final reviewed baseline-to-code binary diff SHA-256:
+  `bd3d6d99035140f5b30a8ce7eee5bc18da1ea4d91d88cd953706b3b45558969a`.
+- Final blackholed local gates passed 95 release/auth, 617 B1, 299 B2, and
+  669 retained M2 tests. Two fresh full-diff reviewers approved the exact
+  candidate with no Critical or Important findings.
+- The Task 1 executor captured this exact selected RED before changing source
+  code; the record was copied into this durable log during evidence audit:
+  `Ran 12 tests in 0.769s`, `FAILED (failures=19)`, zero errors. Failing tests
+  and subtests were:
+  - `ClassificationTests.test_contact_identity_helpers_match_frozen_b2_vectors_and_json`
+    (1 failure).
+  - `ClassificationTests.test_contact_identity_helpers_reject_source_user_and_mailbox_drift`
+    (1 failure).
+  - `ClassificationTests.test_deterministic_evidence_requires_exact_v1_or_bound_v2_shape`
+    (`v1 with v2 fields`, `v2 missing canonical`, `v2 local policy`, and
+    `v2 uppercase identity`).
+  - `ClassificationTests.test_verified_deterministic_hard_optout_skips_model_and_freezes`
+    (1 failure).
+  - `ClassificationTests.test_verified_hard_optout_rejects_wrong_source_or_sender_before_writes`
+    (`missing source`, `wrong source`, `missing sender`, `non-string sender`,
+    and `malformed sender`).
+  - `ClassificationTests.test_bound_hard_optout_apply_then_raise_uses_exact_v2_readback`
+    (1 failure).
+  - `ClassificationTests.test_two_workers_persist_one_equal_bound_hard_optout_snapshot`
+    (1 failure).
+  - `ClassificationTests.test_legacy_v1_hard_snapshot_retry_bypasses_identity_derivation`
+    (1 failure).
+  - `SourceCoordinatorAuthorityOrderTests.test_deterministic_hard_optout_skips_classifier_before_effects`
+    (1 failure).
+  - `InventoryContractTests.test_classification_private_evidence_and_orchestrator_signature_are_bounded`
+    (`_contact_identity_canonical_json_bytes`,
+    `_hard_optout_contact_identity_hashes`, and
+    `_bound_hard_optout_evidence`).
+  The two selected controls,
+  `ClassificationTests.test_local_policy_snapshot_does_not_require_contact_identity`
+  and
+  `SelectionAndLedgerTests.test_verified_hard_optout_dominates_other_transition_work`,
+  passed. A later resource-bound RED,
+  `ClassificationTests.test_contact_identity_json_matches_frozen_b2_resource_bounds`,
+  ran 1 test in 0.170s and errored exactly because
+  `_CONTACT_JSON_MAX_DEPTH` was absent.
 
 Use this interpreter for every Python command:
 
@@ -296,7 +346,7 @@ not open a PR, merge, deploy, or touch production.
 - Modify: `tests/test_source_coordinator_integration.py`
 - Modify: `tests/test_source_coordinator_inventory.py`
 
-- [ ] **Step 1: Write the failing pure hash and exact-schema tests**
+- [x] **Step 1: Write the failing pure hash and exact-schema tests**
 
 Add independent fixed expected vectors for a bare mailbox, a plus variant, a
 Unicode/case/whitespace variant, and the same mailbox in two user scopes. Prove
@@ -306,7 +356,7 @@ fail. Include a fixed non-ASCII digest, Unicode `Cf` rejection, and a 513-byte
 verified-user-ID rejection. Prove the new helper does not reuse B1's escaping
 canonical helper and no runtime import of `row_authority` supplies the result.
 
-- [ ] **Step 2: Write the failing verified-snapshot transaction tests**
+- [x] **Step 2: Write the failing verified-snapshot transaction tests**
 
 Cover new v2 persistence, exact retry, two-worker equality, missing or
 mismatched v2 `canonicalSourceId`, missing/non-string/malformed sender after
@@ -318,7 +368,7 @@ verifier returns `None` or local policy wins. Seed a self-consistent legacy v1
 hard snapshot whose historical input has no `canonicalSourceId` or `from` and
 prove exact retry neither invokes identity derivation nor upgrades it.
 
-- [ ] **Step 3: Run the RED and record discriminating failures**
+- [x] **Step 3: Run the RED and record discriminating failures**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -331,7 +381,7 @@ Expected: only the newly added v2/parity assertions fail against the unchanged
 implementation. Existing tests remain green. Record exact failing test names in
 the implementation log before changing application code.
 
-- [ ] **Step 4: Implement the minimum private derivation and v1/v2 evidence path**
+- [x] **Step 4: Implement the minimum private derivation and v1/v2 evidence path**
 
 Add the private helpers and exact evidence validators. Invoke identity
 derivation only after successful non-local hard verification. New claimed
@@ -339,14 +389,14 @@ snapshots build v2; stored v1 retry rebuilds v1; stored v2 retry re-derives v2.
 Do not add a collection, public parameter, raw persisted identity, or model/
 provider seam.
 
-- [ ] **Step 5: Run focused GREEN plus the complete B1 gate**
+- [x] **Step 5: Run focused GREEN plus the complete B1 gate**
 
 Use the blackholed environment in Task 3, then run the three focused modules
 above and the complete B1 gate listed in Task 3. Expected: all pass with zero
 skips/failures/errors and the static inventory still proves no production hard
 verifier.
 
-- [ ] **Step 6: Self-review, commit, push, and exact-SHA CI-prove Task 1**
+- [x] **Step 6: Self-review, commit, push, and exact-SHA CI-prove Task 1**
 
 ```bash
 git diff --check
@@ -373,7 +423,7 @@ success, and record the SHA/run URL before Task 2.
 - Modify: `tests/test_row_authority_contracts.py`
 - Modify: `tests/test_row_authority_ownership.py`
 
-- [ ] **Step 1: Write failing independent v1/v2 domain and schema tests**
+- [x] **Step 1: Write failing independent v1/v2 domain and schema tests**
 
 Freeze the existing v1 digest before editing code. Add an independently
 calculated v2 contact digest, domain-separation assertion, exact key sets, and
@@ -381,7 +431,7 @@ tests rejecting v1 material with v2 keys, v2 material under v1, one missing
 identity hash, non-contact v2, extra keys, cross-scope validation, and defensive
 copy drift.
 
-- [ ] **Step 2: Write failing builder and composition tests**
+- [x] **Step 2: Write failing builder and composition tests**
 
 Prove terminal/human and legacy-v1 contact fixtures still produce their exact
 old links/hashes. Prove bound-v2 contact evidence emits v2 with hashes copied
@@ -392,7 +442,7 @@ contact-fanout claim preserves the complete link. Add
 `test_contact_fanout_origin_rejects_legacy_v1_contact_link_before_planning` and
 prove it reaches neither request-ID derivation nor row-state planning.
 
-- [ ] **Step 3: Run the RED and record discriminating failures**
+- [x] **Step 3: Run the RED and record discriminating failures**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -403,7 +453,7 @@ prove it reaches neither request-ID derivation nor row-state planning.
 Expected: only new v2 tests fail because the domain/shape is absent; frozen v1
 vectors pass.
 
-- [ ] **Step 4: Implement exact discriminated link construction/validation**
+- [x] **Step 4: Implement exact discriminated link construction/validation**
 
 Retain the v1 constant and exact code path. Add the v2 domain, strict bound
 evidence validation, v2 material builder, and key-set/domain discriminator.
@@ -412,7 +462,7 @@ to the generic planner. Never infer v2 from caller data. Do not alter store
 signatures, claim priority, transaction write counts, source collections, or
 runtime imports.
 
-- [ ] **Step 5: Run focused GREEN and complete B2 discovery**
+- [x] **Step 5: Run focused GREEN and complete B2 discovery**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -425,7 +475,7 @@ runtime imports.
 Expected: all pass with zero skips/failures/errors; every frozen v1 vector is
 byte-identical.
 
-- [ ] **Step 6: Self-review, commit, push, and exact-SHA CI-prove Task 2**
+- [x] **Step 6: Self-review, commit, push, and exact-SHA CI-prove Task 2**
 
 ```bash
 git diff --check
@@ -451,7 +501,7 @@ success, and record the SHA/run URL before Task 3.
 - Modify: `docs/superpowers/plans/2026-08-04-stable-row-authority-b2.md`
 - Modify: this plan only to mark completed checkboxes
 
-- [ ] **Step 1: Run exact blackholed local verification**
+- [x] **Step 1: Run exact blackholed local verification**
 
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:9
@@ -520,7 +570,7 @@ Expected: release/auth, complete B1, complete B2, and retained M2 all pass with
 zero skips/failures/errors; compile/pip/diff pass. The `live` M2 variable changes
 only hermetic fake semantics while all provider proxies remain blackholed.
 
-- [ ] **Step 2: Obtain two fresh full-diff approvals**
+- [x] **Step 2: Obtain two fresh full-diff approvals**
 
 Reviewer A checks the exact baseline-to-code diff for B1 trust, schema/hash
 versioning, immutability, no raw identity, retry/readback, and production
@@ -529,14 +579,14 @@ contact correlation, B2-B regressions, cross-user safety, static containment,
 and test discrimination. Any Critical or Important finding requires a new RED,
 minimum fix, full gate rerun, and fresh approval.
 
-- [ ] **Step 3: Freeze code candidate and prove exact GitHub SHA**
+- [x] **Step 3: Freeze code candidate and prove exact GitHub SHA**
 
 Compute `git diff --binary BASELINE..HEAD | shasum -a 256`, give that digest to
 both reviewers, push the reviewed HEAD, prove remote branch equality, select
 only the exact `headSha` CI run, wait with `--exit-status`, and recheck success.
 No code changes are allowed after the final approvals without resetting them.
 
-- [ ] **Step 4: Write and independently audit immutable evidence**
+- [x] **Step 4: Write and independently audit immutable evidence**
 
 Record baseline, plan SHA, implementation commits, exact diff digest, test
 counts/timings, RED/GREEN discrimination, v1/v2 vectors, verifier/runtime
@@ -544,7 +594,7 @@ inventory, reviewers, exact GitHub run/job URLs, production posture, and the
 B2-C next gate. Do not record any raw mailbox, recipient, verified user ID, or
 other PII. A reviewer must read the rendered evidence against command output.
 
-- [ ] **Step 5: Mark final roadmap/plan status and publish evidence**
+- [x] **Step 5: Mark final roadmap/plan status and publish evidence**
 
 Mark only the amendment code/evidence roadmap item complete and the completed
 checkboxes in this plan. Stage exactly the evidence, roadmap, and plan; inspect
@@ -552,7 +602,7 @@ the staged diff; commit `docs: record B1 contact identity evidence`; push; and
 prove a second exact-SHA successful GitHub run. Local HEAD, remote branch, and
 workflow `headSha` must match and the worktree must be clean.
 
-- [ ] **Step 6: Stop at the B2-C plan boundary**
+- [x] **Step 6: Stop at the B2-C plan boundary**
 
 The amendment does not authorize B2-C code, production deployment, frontend
 testing, campaign execution, Jill's return, or external communication. Resume
@@ -560,13 +610,13 @@ the separately reviewed B2-C child-plan gate next.
 
 ## Completion criteria
 
-- [ ] New verified hard opt-outs persist identity-bound v2 evidence and no raw
+- [x] New verified hard opt-outs persist identity-bound v2 evidence and no raw
   mailbox.
-- [ ] Legacy v1 hard evidence and links remain immutable/readable but cannot
+- [x] Legacy v1 hard evidence and links remain immutable/readable but cannot
   authorize B2-C.
-- [ ] V1 terminal/human link and downstream document vectors are byte-exact.
-- [ ] V2 contact links are source-derived, user-scoped, domain-separated, and
+- [x] V1 terminal/human link and downstream document vectors are byte-exact.
+- [x] V2 contact links are source-derived, user-scoped, domain-separated, and
   substitution-resistant.
-- [ ] Full local and exact-SHA GitHub gates are green with two fresh approvals.
-- [ ] Evidence and roadmap are published on the owned branch; production and
+- [x] Full local and exact-SHA GitHub gates are green with two fresh approvals.
+- [x] Evidence and roadmap are published on the owned branch; production and
   Jill remain NO-GO pending B2-C/B2-D/B3/B4 and an authorized canary.
