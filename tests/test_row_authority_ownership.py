@@ -6,7 +6,9 @@ import hashlib
 import importlib
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Barrier
 from unittest.mock import patch
 
 
@@ -776,6 +778,838 @@ class ContactRowBindingContractTests(unittest.TestCase):
             validated = validator(document=document)
             validated[next(iter(validated))] = "mutated"
             self.assertEqual(original, document)
+
+
+class ThreadRowBindingStoreTests(unittest.TestCase):
+    @staticmethod
+    def _fakes():
+        return importlib.import_module("tests.row_authority_fakes")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+
+    def setUp(self):
+        self.assertTrue(
+            hasattr(self.module.RowAuthorityStore, "bind_thread_rows"),
+            "RowAuthorityStore.bind_thread_rows is missing",
+        )
+        self.user_id = "uid-1"
+        self.scope = self.module.user_scope_hash(self.user_id)
+        self.first = _row_id(1)
+        self.second = _row_id(2)
+        self.created_at = "2026-08-04T12:00:00.000000Z"
+        self.binding_at = "2026-08-04T12:00:01.000000Z"
+
+    def _store(self):
+        return self._fakes().BoundedFakeFirestore()
+
+    def _authority(self, store, *, executor=None):
+        return self.module.RowAuthorityStore(
+            store,
+            transaction_executor=(
+                executor or self._fakes().run_bounded_transaction
+            ),
+        )
+
+    def _row_references(self, store, row_id):
+        user = store.collection("users").document(self.user_id)
+        return (
+            user.collection("rowIdentities").document(row_id),
+            user.collection("rowAuthorityHeads").document(row_id),
+        )
+
+    def _binding_references(self, store, binding):
+        user = store.collection("users").document(self.user_id)
+        binding_ref = user.collection("threadRowBindings").document(
+            binding["threadId"]
+        )
+        reverse_documents = self.module.build_row_thread_binding_documents(
+            thread_binding_document=binding
+        )
+        edge_refs = tuple(
+            user.collection("rowThreadBindings").document(edge["edgeId"])
+            for edge in reverse_documents
+        )
+        return binding_ref, edge_refs
+
+    def _rehash_head(self, head):
+        payload = {
+            key: value
+            for key, value in head.items()
+            if key not in {"schemaVersion", "userScopeHash", "headHash"}
+        }
+        head["headHash"] = self.module.domain_hash(
+            "sitesift.row.authority_head.v1",
+            payload,
+            user_scope_hash=head["userScopeHash"],
+        )
+        return self.module.validate_row_authority_head(document=head)
+
+    def _seed_row(
+        self,
+        store,
+        row_id,
+        *,
+        scope=None,
+        client_id="client-1",
+        lifecycle="active",
+        created_at=None,
+    ):
+        scope = scope or self.scope
+        created_at = created_at or self.created_at
+        index = 0 if row_id == self.first else 1
+        identity = self.module.build_row_identity_document(
+            user_scope_hash=scope,
+            row_id=row_id,
+            client_id=client_id,
+            spreadsheet_id="spreadsheet-1",
+            sheet_id=0,
+            creation_kind="fresh",
+            creation_source_hash="1" * 64,
+            created_at=created_at,
+        )
+        observation = self.module.build_row_observation(
+            spreadsheet_id="spreadsheet-1",
+            marker_observation={
+                "rowId": row_id,
+                "sheetId": 0,
+                "providerRowIndex": index,
+                "displayRowNumber": index + 1,
+                "metadataId": index + 1,
+            },
+            ordered_headers=("Email",),
+            ordered_cell_values=(f"row-{index}@example.com",),
+            user_scope_hash=scope,
+        )
+        revision = self.module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=1,
+            lifecycle="active",
+            observations=(observation,),
+            previous_revision_hash=None,
+            observed_at=created_at,
+        )
+        head = self.module.build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=created_at,
+        )
+        if lifecycle == "deleted":
+            head.update(
+                {
+                    "stateRevision": 2,
+                    "currentLocationRevision": 2,
+                    "currentLocationHash": "2" * 64,
+                    "currentLocationLifecycle": "deleted",
+                    "updatedAt": self.binding_at,
+                }
+            )
+            head = self._rehash_head(head)
+        identity_ref, head_ref = self._row_references(store, row_id)
+        identity_ref.create(identity)
+        head_ref.create(head)
+        return identity, head
+
+    def _seed_two_rows(self, store, **overrides):
+        return (
+            self._seed_row(store, self.first, **overrides),
+            self._seed_row(store, self.second, **overrides),
+        )
+
+    def _bind(self, store, *, executor=None, **overrides):
+        arguments = {
+            "verified_user_id": self.user_id,
+            "thread_id": "thread-1",
+            "client_id": "client-1",
+            "row_ids": [self.second, self.first],
+            "primary_row_id": self.first,
+            "created_at": self.binding_at,
+        }
+        arguments.update(overrides)
+        return self._authority(store, executor=executor).bind_thread_rows(
+            **arguments
+        )
+
+    @staticmethod
+    def _write_events(store):
+        return [
+            event
+            for event in store.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def test_thread_binding_reads_all_binding_identity_head_and_edges_before_writes(self):
+        store = self._store()
+        self._seed_two_rows(store)
+        store.events.clear()
+        result = self._bind(store)
+        binding = result["threadBinding"]
+        binding_ref, edge_refs = self._binding_references(store, binding)
+        expected_reads = [binding_ref.path]
+        for row_id in (self.first, self.second):
+            identity_ref, head_ref = self._row_references(store, row_id)
+            expected_reads.extend((identity_ref.path, head_ref.path))
+        expected_reads.extend(reference.path for reference in edge_refs)
+        observed_reads = [
+            event[1] for event in store.events if event[0] == "get"
+        ]
+        self.assertEqual(expected_reads, observed_reads)
+        read_indexes = [
+            index
+            for index, event in enumerate(store.events)
+            if event[0] == "get"
+        ]
+        write_indexes = [
+            index
+            for index, event in enumerate(store.events)
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+        self.assertLess(max(read_indexes), min(write_indexes))
+        accessed = "\n".join(observed_reads)
+        for forbidden in (
+            "rowLocationRevisions",
+            "/threads/",
+            "provider",
+            "campaign",
+        ):
+            self.assertNotIn(forbidden, accessed)
+
+    def test_thread_binding_creates_one_plus_n_documents_atomically(self):
+        store = self._store()
+        seeded = self._seed_two_rows(store)
+        heads_before = {
+            row_id: deepcopy(store.data[self._row_references(store, row_id)[1].path])
+            for row_id in (self.first, self.second)
+        }
+        store.events.clear()
+        result = self._bind(store)
+        self.assertEqual("created", result["disposition"])
+        binding = result["threadBinding"]
+        reverse = result["reverseBindings"]
+        self.assertEqual(2, binding["bindingCount"])
+        self.assertEqual(2, len(reverse))
+        binding_ref, edge_refs = self._binding_references(store, binding)
+        self.assertEqual(binding, store.data[binding_ref.path])
+        self.assertEqual(
+            reverse,
+            [store.data[reference.path] for reference in edge_refs],
+        )
+        self.assertEqual(
+            [
+                ("create", binding_ref.path, binding, False),
+                *(
+                    ("create", reference.path, document, False)
+                    for reference, document in zip(edge_refs, reverse)
+                ),
+            ],
+            self._write_events(store),
+        )
+        self.assertIn(("commit_applied", 3), store.events)
+        for row_id, (_identity, _head) in zip(
+            (self.first, self.second), seeded
+        ):
+            self.assertEqual(
+                heads_before[row_id],
+                store.data[self._row_references(store, row_id)[1].path],
+            )
+        result["threadBinding"]["rowBindings"][0]["role"] = "related"
+        result["reverseBindings"][0]["role"] = "related"
+        self.assertEqual("primary", store.data[binding_ref.path]["rowBindings"][0]["role"])
+        self.assertEqual("primary", store.data[edge_refs[0].path]["role"])
+
+    def test_binding_rejects_missing_malformed_scope_client_identity_or_head_with_zero_writes(self):
+        cases = (
+            ("missing_identity", self.module.RowAuthorityAmbiguous),
+            ("malformed_identity", self.module.RowAuthorityAmbiguous),
+            ("wrong_scope", self.module.RowAuthorityConflict),
+            ("wrong_client", self.module.RowAuthorityConflict),
+            ("noncorrelated_head", self.module.RowAuthorityConflict),
+            ("missing_head", self.module.RowAuthorityAmbiguous),
+            ("malformed_head", self.module.RowAuthorityAmbiguous),
+        )
+        for mode, error in cases:
+            with self.subTest(mode=mode):
+                store = self._store()
+                self._seed_two_rows(store)
+                identity_ref, head_ref = self._row_references(
+                    store, self.first
+                )
+                if mode == "missing_identity":
+                    identity_ref.delete()
+                elif mode == "malformed_identity":
+                    malformed = deepcopy(store.data[identity_ref.path])
+                    malformed["unknown"] = None
+                    identity_ref.set(malformed, merge=False)
+                elif mode == "wrong_scope":
+                    identity, head = self._seed_row(
+                        self._store(),
+                        self.first,
+                        scope="f" * 64,
+                    )
+                    identity_ref.set(identity, merge=False)
+                    head_ref.set(head, merge=False)
+                elif mode == "wrong_client":
+                    identity, _head = self._seed_row(
+                        self._store(),
+                        self.first,
+                        client_id="client-2",
+                    )
+                    identity_ref.set(identity, merge=False)
+                elif mode == "noncorrelated_head":
+                    _identity, head = self._seed_row(
+                        self._store(),
+                        self.first,
+                        created_at="2026-08-04T11:59:58.000000Z",
+                    )
+                    head_ref.set(head, merge=False)
+                elif mode == "missing_head":
+                    head_ref.delete()
+                elif mode == "malformed_head":
+                    malformed = deepcopy(store.data[head_ref.path])
+                    malformed["unknown"] = None
+                    head_ref.set(malformed, merge=False)
+                before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(error):
+                    self._bind(store)
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_binding_rejects_each_isolated_scope_and_row_correlation_drift(self):
+        for mode in (
+            "identity_scope",
+            "head_scope",
+            "identity_row",
+            "head_row",
+        ):
+            with self.subTest(mode=mode):
+                store = self._store()
+                self._seed_two_rows(store)
+                identity_ref, head_ref = self._row_references(
+                    store, self.first
+                )
+                identity = deepcopy(store.data[identity_ref.path])
+                head = deepcopy(store.data[head_ref.path])
+                if mode == "identity_scope":
+                    identity = self.module.build_row_identity_document(
+                        user_scope_hash="f" * 64,
+                        row_id=identity["rowId"],
+                        client_id=identity["clientId"],
+                        spreadsheet_id=identity["spreadsheetId"],
+                        sheet_id=identity["sheetId"],
+                        creation_kind=identity["creationKind"],
+                        creation_source_hash=identity["creationSourceHash"],
+                        created_at=identity["createdAt"],
+                    )
+                    identity_ref.set(identity, merge=False)
+                elif mode == "head_scope":
+                    head["userScopeHash"] = "f" * 64
+                    head_ref.set(self._rehash_head(head), merge=False)
+                elif mode == "identity_row":
+                    identity = self.module.build_row_identity_document(
+                        user_scope_hash=identity["userScopeHash"],
+                        row_id=_row_id(3),
+                        client_id=identity["clientId"],
+                        spreadsheet_id=identity["spreadsheetId"],
+                        sheet_id=identity["sheetId"],
+                        creation_kind=identity["creationKind"],
+                        creation_source_hash=identity["creationSourceHash"],
+                        created_at=identity["createdAt"],
+                    )
+                    identity_ref.set(identity, merge=False)
+                else:
+                    head["rowId"] = _row_id(3)
+                    head_ref.set(self._rehash_head(head), merge=False)
+                before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._bind(store)
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_identical_binding_workers_yield_created_and_already_applied(self):
+        store = self._store()
+        self._seed_two_rows(store)
+        store.events.clear()
+        store.before_commit_barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self._bind, store) for _ in range(2)]
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual(
+            ["already_applied", "created"],
+            sorted(result["disposition"] for result in results),
+        )
+        self.assertEqual(
+            results[0]["threadBinding"],
+            results[1]["threadBinding"],
+        )
+        self.assertEqual(
+            results[0]["reverseBindings"],
+            results[1]["reverseBindings"],
+        )
+        self.assertEqual(1, store.events.count(("commit_applied", 3)))
+        self.assertEqual(1, store.events.count(("commit_applied", 0)))
+        self.assertTrue(
+            any(event[0] == "commit_aborted_stale_read" for event in store.events)
+        )
+
+    def test_divergent_binding_workers_preserve_first_commit(self):
+        store = self._store()
+        self._seed_two_rows(store)
+        store.events.clear()
+        store.before_commit_barrier = Barrier(2)
+
+        def first_proposal():
+            return self._bind(store)
+
+        def second_proposal():
+            return self._bind(
+                store,
+                row_ids=[self.second],
+                primary_row_id=self.second,
+            )
+
+        outcomes = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(first_proposal), pool.submit(second_proposal)]
+            for future in futures:
+                try:
+                    outcomes.append(future.result(timeout=10))
+                except Exception as exc:
+                    outcomes.append(exc)
+        results = [item for item in outcomes if type(item) is dict]
+        failures = [item for item in outcomes if isinstance(item, Exception)]
+        self.assertEqual(1, len(results))
+        self.assertEqual("created", results[0]["disposition"])
+        self.assertEqual(1, len(failures))
+        self.assertIsInstance(failures[0], self.module.RowAuthorityConflict)
+        user = store.collection("users").document(self.user_id)
+        binding_ref = user.collection("threadRowBindings").document("thread-1")
+        self.assertEqual(results[0]["threadBinding"], store.data[binding_ref.path])
+        stored_edge_paths = {
+            path
+            for path in store.data
+            if "/rowThreadBindings/" in path
+        }
+        self.assertEqual(
+            {
+                user.collection("rowThreadBindings").document(edge["edgeId"]).path
+                for edge in results[0]["reverseBindings"]
+            },
+            stored_edge_paths,
+        )
+
+    def test_binding_preapply_failure_is_retryable_with_zero_writes(self):
+        store = self._store()
+        self._seed_two_rows(store)
+        before = deepcopy(store.data)
+        store.events.clear()
+        store.fail_next_commit = RuntimeError("preapply binding failure")
+        with self.assertRaises(self.module.RowAuthorityRetryable):
+            self._bind(store)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertIn(("commit_failed_before_apply",), store.events)
+
+    def test_binding_transactional_first_or_mid_read_failure_is_retryable_without_readback(self):
+        for fail_at in (1, 4):
+            with self.subTest(fail_at=fail_at):
+                store = self._store()
+                self._seed_two_rows(store)
+                before = deepcopy(store.data)
+                store.events.clear()
+                reference_type = type(
+                    store.collection("probe").document("reference")
+                )
+                original_get = reference_type.get
+                counts = {"transactional": 0, "nontransactional": 0}
+
+                def fail_selected_read(reference, *, transaction=None):
+                    if transaction is None:
+                        counts["nontransactional"] += 1
+                    else:
+                        counts["transactional"] += 1
+                        if counts["transactional"] == fail_at:
+                            raise RuntimeError(f"transaction read {fail_at} failed")
+                    return original_get(reference, transaction=transaction)
+
+                with patch.object(
+                    reference_type,
+                    "get",
+                    new=fail_selected_read,
+                ), self.assertRaises(
+                    self.module.RowAuthorityRetryable
+                ) as raised:
+                    self._bind(store)
+                self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+                self.assertEqual(fail_at, counts["transactional"])
+                self.assertEqual(0, counts["nontransactional"])
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+                self.assertIn(("transaction_rolled_back",), store.events)
+
+    def test_binding_apply_then_raise_requires_exact_binding_and_all_edges(self):
+        for failure in (
+            RuntimeError("unknown binding commit"),
+            self.module.RowAuthorityRetryable("retryable after apply"),
+            self.module.RowAuthorityAmbiguous("ambiguous after apply"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                store = self._store()
+                self._seed_two_rows(store)
+                store.events.clear()
+                store.apply_then_raise_next_commit = failure
+                result = self._bind(store)
+                self.assertEqual("created", result["disposition"])
+                binding_ref, edge_refs = self._binding_references(
+                    store, result["threadBinding"]
+                )
+                self.assertEqual(
+                    {binding_ref.path, *(reference.path for reference in edge_refs)},
+                    {
+                        path
+                        for path in store.data
+                        if "/threadRowBindings/" in path
+                        or "/rowThreadBindings/" in path
+                    },
+                )
+                failure_index = store.events.index(
+                    ("commit_raised_after_apply",)
+                )
+                readback_paths = [
+                    event[1]
+                    for event in store.events[failure_index + 1 :]
+                    if event[0] == "get"
+                ]
+                expected_paths = [binding_ref.path]
+                for row_id in (self.first, self.second):
+                    expected_paths.extend(
+                        reference.path
+                        for reference in self._row_references(store, row_id)
+                    )
+                expected_paths.extend(reference.path for reference in edge_refs)
+                self.assertEqual(expected_paths, readback_paths)
+
+        existing_store = self._store()
+        self._seed_two_rows(existing_store)
+        self._bind(existing_store)
+
+        def observe_existing_then_raise(transaction, callback):
+            transaction._begin()
+            self.assertEqual("already_applied", callback(transaction))
+            transaction._rollback()
+            raise RuntimeError("unknown zero-write binding outcome")
+
+        existing_store.events.clear()
+        existing = self._bind(
+            existing_store,
+            executor=observe_existing_then_raise,
+        )
+        self.assertEqual("already_applied", existing["disposition"])
+        self.assertEqual([], self._write_events(existing_store))
+
+    def test_binding_partial_or_malformed_readback_is_ambiguous(self):
+        def readback_executor(store, *, mode):
+            def execute(transaction, callback):
+                transaction._begin()
+                callback(transaction)
+                operations = [
+                    (reference, deepcopy(payload))
+                    for _operation, reference, payload, _merge
+                    in transaction._operations
+                ]
+                transaction._rollback()
+                selected = operations[:1] if mode == "partial" else operations
+                for index, (reference, payload) in enumerate(selected):
+                    if mode == "malformed" and index == len(selected) - 1:
+                        payload["schemaVersion"] = 2
+                    reference.create(payload)
+                if mode == "head_drift":
+                    _identity_ref, head_ref = self._row_references(
+                        store, self.first
+                    )
+                    head = deepcopy(store.data[head_ref.path])
+                    head.update(
+                        {
+                            "stateRevision": head["stateRevision"] + 1,
+                            "currentLocationRevision": (
+                                head["currentLocationRevision"] + 1
+                            ),
+                            "currentLocationHash": "d" * 64,
+                            "updatedAt": "2026-08-04T12:00:02.000000Z",
+                        }
+                    )
+                    head_ref.set(self._rehash_head(head), merge=False)
+                raise RuntimeError(f"{mode} unknown binding commit")
+
+            return execute
+
+        for mode in ("partial", "malformed", "head_drift"):
+            with self.subTest(mode=mode):
+                store = self._store()
+                self._seed_two_rows(store)
+                store.events.clear()
+                with self.assertRaises(self.module.RowAuthorityAmbiguous):
+                    self._bind(
+                        store,
+                        executor=readback_executor(store, mode=mode),
+                    )
+
+    def test_binding_129_overflow_never_opens_transaction(self):
+        rows = [_row_id(index) for index in range(1, 130)]
+        success_store = self._store()
+        for row_id in rows[:128]:
+            self._seed_row(success_store, row_id)
+        success_store.events.clear()
+        result = self._bind(
+            success_store,
+            row_ids=rows[:128],
+            primary_row_id=rows[0],
+        )
+        self.assertEqual(128, result["threadBinding"]["bindingCount"])
+        self.assertEqual(128, len(result["reverseBindings"]))
+        binding_ref, edge_refs = self._binding_references(
+            success_store, result["threadBinding"]
+        )
+        self.assertEqual(
+            [
+                (
+                    "create",
+                    binding_ref.path,
+                    result["threadBinding"],
+                    False,
+                ),
+                *(
+                    ("create", reference.path, document, False)
+                    for reference, document in zip(
+                        edge_refs, result["reverseBindings"]
+                    )
+                ),
+            ],
+            self._write_events(success_store),
+        )
+        self.assertIn(("commit_applied", 129), success_store.events)
+
+        class NeverReferenceFirestore:
+            def __init__(self):
+                self.collection_calls = 0
+                self.transaction_calls = 0
+
+            def collection(self, _name):
+                self.collection_calls += 1
+                raise AssertionError("reference creation was reached")
+
+            def transaction(self):
+                self.transaction_calls += 1
+                raise AssertionError("transaction creation was reached")
+
+        overflow_store = NeverReferenceFirestore()
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self._authority(overflow_store).bind_thread_rows(
+                verified_user_id=self.user_id,
+                thread_id="thread-overflow",
+                client_id="client-1",
+                row_ids=rows,
+                primary_row_id=rows[0],
+                created_at=self.binding_at,
+            )
+        self.assertEqual(0, overflow_store.collection_calls)
+        self.assertEqual(0, overflow_store.transaction_calls)
+
+    def test_deleted_identity_remains_bindable_for_late_root_without_head_mutation(self):
+        store = self._store()
+        self._seed_row(store, self.first, lifecycle="deleted")
+        _identity_ref, head_ref = self._row_references(store, self.first)
+        head_before = deepcopy(store.data[head_ref.path])
+        store.events.clear()
+        result = self._bind(
+            store,
+            row_ids=[self.first],
+            primary_row_id=self.first,
+        )
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual("deleted", head_before["currentLocationLifecycle"])
+        self.assertEqual(head_before, store.data[head_ref.path])
+        binding_ref, edge_refs = self._binding_references(
+            store, result["threadBinding"]
+        )
+        self.assertEqual(
+            [
+                (
+                    "create",
+                    binding_ref.path,
+                    result["threadBinding"],
+                    False,
+                ),
+                (
+                    "create",
+                    edge_refs[0].path,
+                    result["reverseBindings"][0],
+                    False,
+                ),
+            ],
+            self._write_events(store),
+        )
+        self.assertIn(("commit_applied", 2), store.events)
+
+    def test_thread_binding_time_equal_latest_prerequisite_is_valid_and_earlier_is_rejected(self):
+        equal_store = self._store()
+        self._seed_two_rows(equal_store)
+        equal_store.events.clear()
+        result = self._bind(equal_store, created_at=self.created_at)
+        self.assertEqual("created", result["disposition"])
+
+        early_store = self._store()
+        self._seed_two_rows(early_store)
+        before = deepcopy(early_store.data)
+        early_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._bind(
+                early_store,
+                created_at="2026-08-04T11:59:59.000000Z",
+            )
+        self.assertEqual(before, early_store.data)
+        self.assertEqual([], self._write_events(early_store))
+
+        forged_store = self._store()
+        self._seed_two_rows(forged_store)
+        forged = self.module.build_thread_row_binding_document(
+            user_scope_hash=self.scope,
+            thread_id="thread-1",
+            client_id="client-1",
+            row_ids=[self.second, self.first],
+            primary_row_id=self.first,
+            created_at="2026-08-04T11:59:59.000000Z",
+        )
+        binding_ref, edge_refs = self._binding_references(
+            forged_store, forged
+        )
+        binding_ref.create(forged)
+        for reference, edge in zip(
+            edge_refs,
+            self.module.build_row_thread_binding_documents(
+                thread_binding_document=forged
+            ),
+        ):
+            reference.create(edge)
+        before = deepcopy(forged_store.data)
+        forged_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._bind(
+                forged_store,
+                created_at="2026-08-04T11:59:59.000000Z",
+            )
+        self.assertEqual(before, forged_store.data)
+        self.assertEqual([], self._write_events(forged_store))
+
+    def test_new_binding_must_not_predate_a_valid_advanced_head(self):
+        store = self._store()
+        self._seed_two_rows(store)
+        _identity_ref, head_ref = self._row_references(store, self.first)
+        head = deepcopy(store.data[head_ref.path])
+        head.update(
+            {
+                "stateRevision": head["stateRevision"] + 1,
+                "currentLocationRevision": head["currentLocationRevision"] + 1,
+                "currentLocationHash": "c" * 64,
+                "updatedAt": "2026-08-04T12:00:02.000000Z",
+            }
+        )
+        advanced = self._rehash_head(head)
+        self.assertLess(advanced["createdAt"], self.binding_at)
+        self.assertLess(self.binding_at, advanced["updatedAt"])
+        head_ref.set(advanced, merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._bind(store, created_at=self.binding_at)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_binding_ignores_legacy_row_number_rows_and_thread_order(self):
+        store = self._store()
+        self._seed_two_rows(store)
+        legacy = store.collection("users").document(self.user_id).collection(
+            "threads"
+        ).document("thread-1")
+        legacy.create(
+            {
+                "rowNumber": 999,
+                "rows": [self.second],
+                "rowBindings": [{"rowId": self.second, "role": "primary"}],
+                "primaryRowId": self.second,
+                "rowBindingsHash": "f" * 64,
+            }
+        )
+        store.events.clear()
+        result = self._bind(
+            store,
+            row_ids=[self.second, self.first, self.second],
+        )
+        self.assertEqual(
+            [self.first, self.second],
+            [item["rowId"] for item in result["threadBinding"]["rowBindings"]],
+        )
+        self.assertFalse(
+            any("/threads/" in event[1] for event in store.events if event[0] == "get")
+        )
+
+    def test_exact_binding_and_edges_retry_is_zero_write_already_applied(self):
+        store = self._store()
+        self._seed_two_rows(store)
+        created = self._bind(store)
+        _identity_ref, first_head_ref = self._row_references(store, self.first)
+        advanced_head = deepcopy(store.data[first_head_ref.path])
+        advanced_head.update(
+            {
+                "stateRevision": advanced_head["stateRevision"] + 1,
+                "currentLocationRevision": (
+                    advanced_head["currentLocationRevision"] + 1
+                ),
+                "currentLocationHash": "e" * 64,
+                "updatedAt": "2026-08-04T12:00:02.000000Z",
+            }
+        )
+        first_head_ref.set(self._rehash_head(advanced_head), merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+        replay = self._bind(store)
+        self.assertEqual("created", created["disposition"])
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertIn(("commit_applied", 0), store.events)
+
+    def test_partial_presence_is_ambiguous_and_immutable_drift_is_conflict(self):
+        for mode, error in (
+            ("missing_edge", self.module.RowAuthorityAmbiguous),
+            ("binding_drift", self.module.RowAuthorityConflict),
+            ("edge_drift", self.module.RowAuthorityConflict),
+        ):
+            with self.subTest(mode=mode):
+                store = self._store()
+                self._seed_two_rows(store)
+                created = self._bind(store)
+                binding_ref, edge_refs = self._binding_references(
+                    store, created["threadBinding"]
+                )
+                if mode == "missing_edge":
+                    edge_refs[-1].delete()
+                elif mode == "binding_drift":
+                    drift = deepcopy(store.data[binding_ref.path])
+                    drift["bindingHash"] = "f" * 64
+                    binding_ref.set(drift, merge=False)
+                else:
+                    drift = deepcopy(store.data[edge_refs[-1].path])
+                    drift["edgeHash"] = "f" * 64
+                    edge_refs[-1].set(drift, merge=False)
+                before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(error):
+                    self._bind(store)
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
 
 
 if __name__ == "__main__":

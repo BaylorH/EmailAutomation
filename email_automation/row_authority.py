@@ -2007,6 +2007,23 @@ def _location_result(*, disposition, identity, revision, head):
     }
 
 
+def _thread_binding_result(*, disposition, thread_binding, reverse_bindings):
+    if disposition not in {"created", "already_applied"}:
+        raise RowAuthorityConfigError(
+            "thread binding disposition is not approved"
+        )
+    binding = validate_thread_row_binding_document(document=thread_binding)
+    reverse = [
+        validate_row_thread_binding_document(document=document)
+        for document in reverse_bindings
+    ]
+    return {
+        "disposition": disposition,
+        "threadBinding": binding,
+        "reverseBindings": reverse,
+    }
+
+
 def _location_semantics(revision):
     return tuple(
         revision[field]
@@ -2082,6 +2099,43 @@ class RowAuthorityStore:
         except Exception as exc:
             raise RowAuthorityConfigError(
                 "verified user ID or row ID cannot form exact document paths"
+            ) from exc
+
+    def _thread_binding_references(
+        self,
+        *,
+        verified_user_id,
+        thread_binding,
+        reverse_bindings,
+    ):
+        try:
+            user_ref = self._firestore.collection("users").document(
+                verified_user_id
+            )
+            binding_ref = user_ref.collection("threadRowBindings").document(
+                thread_binding["threadId"]
+            )
+            row_references = tuple(
+                (
+                    user_ref.collection("rowIdentities").document(
+                        row_binding["rowId"]
+                    ),
+                    user_ref.collection("rowAuthorityHeads").document(
+                        row_binding["rowId"]
+                    ),
+                )
+                for row_binding in thread_binding["rowBindings"]
+            )
+            edge_references = tuple(
+                user_ref.collection("rowThreadBindings").document(
+                    reverse_binding["edgeId"]
+                )
+                for reverse_binding in reverse_bindings
+            )
+            return binding_ref, row_references, edge_references
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "thread and row bindings cannot form exact document paths"
             ) from exc
 
     @staticmethod
@@ -2266,6 +2320,305 @@ class RowAuthorityStore:
             identity=identity,
             revision=revision,
             head=head,
+        )
+
+    def bind_thread_rows(
+        self,
+        *,
+        verified_user_id,
+        thread_id,
+        client_id,
+        row_ids,
+        primary_row_id,
+        created_at,
+    ):
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        thread_binding = build_thread_row_binding_document(
+            user_scope_hash=checked_scope,
+            thread_id=thread_id,
+            client_id=client_id,
+            row_ids=row_ids,
+            primary_row_id=primary_row_id,
+            created_at=created_at,
+        )
+        reverse_bindings = build_row_thread_binding_documents(
+            thread_binding_document=thread_binding
+        )
+        planned_writes = 1 + len(reverse_bindings)
+        if planned_writes > MAX_ROW_AUTHORITY_PLANNED_WRITES:
+            raise RowAuthorityConfigError(
+                "thread binding exceeds the planned-write ceiling"
+            )
+        binding_ref, row_references, edge_references = (
+            self._thread_binding_references(
+                verified_user_id=checked_user_id,
+                thread_binding=thread_binding,
+                reverse_bindings=reverse_bindings,
+            )
+        )
+        references = (
+            binding_ref,
+            *(
+                reference
+                for identity_and_head in row_references
+                for reference in identity_and_head
+            ),
+            *edge_references,
+        )
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "observed": None,
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "observed": None,
+                }
+            )
+            try:
+                observed = self._read_reference_payloads(
+                    references,
+                    transaction=transaction,
+                )
+            except Exception as exc:
+                callback_state["read_failed"] = True
+                raise RowAuthorityRetryable(
+                    "thread binding transaction read failed before writes"
+                ) from exc
+            callback_state["observed"] = observed
+
+            row_observed_end = 1 + (2 * len(row_references))
+            prerequisite_observed = observed[1:row_observed_end]
+            edge_observed = observed[row_observed_end:]
+            validated_prerequisites = []
+            for index, row_binding in enumerate(
+                thread_binding["rowBindings"]
+            ):
+                identity_exists, identity_payload = prerequisite_observed[
+                    2 * index
+                ]
+                head_exists, head_payload = prerequisite_observed[
+                    (2 * index) + 1
+                ]
+                if not identity_exists or not head_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "thread binding is missing row identity or head"
+                        )
+                    )
+                try:
+                    identity = validate_row_identity_document(
+                        document=identity_payload
+                    )
+                    head = validate_row_authority_head(document=head_payload)
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "thread binding row identity or head is malformed"
+                        )
+                    )
+                if (
+                    identity["userScopeHash"] != checked_scope
+                    or identity["rowId"] != row_binding["rowId"]
+                    or identity["clientId"] != thread_binding["clientId"]
+                    or head["userScopeHash"] != checked_scope
+                    or head["rowId"] != row_binding["rowId"]
+                    or head["createdAt"] != identity["createdAt"]
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "thread binding row authority does not correlate"
+                        )
+                    )
+                validated_prerequisites.append((identity, head))
+
+            if any(
+                thread_binding["createdAt"] < identity["createdAt"]
+                for identity, _head in validated_prerequisites
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "thread binding predates immutable row identity"
+                    )
+                )
+
+            target_presence = (observed[0][0],) + tuple(
+                exists for exists, _payload in edge_observed
+            )
+            if all(target_presence):
+                try:
+                    stored_binding = validate_thread_row_binding_document(
+                        document=observed[0][1]
+                    )
+                    stored_edges = tuple(
+                        validate_row_thread_binding_document(document=payload)
+                        for _exists, payload in edge_observed
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "stored thread binding contains immutable drift"
+                        )
+                    )
+                if stored_binding != thread_binding or stored_edges != tuple(
+                    reverse_bindings
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "stored thread binding differs from the proposal"
+                        )
+                    )
+                callback_state["disposition"] = "already_applied"
+                return "already_applied"
+
+            if any(target_presence):
+                if observed[0][0]:
+                    try:
+                        stored_binding = validate_thread_row_binding_document(
+                            document=observed[0][1]
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "stored thread binding contains immutable drift"
+                            )
+                        )
+                    if stored_binding != thread_binding:
+                        reject(
+                            RowAuthorityConflict(
+                                "stored thread binding differs from the proposal"
+                            )
+                        )
+                for expected_edge, (exists, payload) in zip(
+                    reverse_bindings,
+                    edge_observed,
+                ):
+                    if not exists:
+                        continue
+                    try:
+                        stored_edge = validate_row_thread_binding_document(
+                            document=payload
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "stored reverse binding contains immutable drift"
+                            )
+                        )
+                    if stored_edge != expected_edge:
+                        reject(
+                            RowAuthorityConflict(
+                                "stored reverse binding differs from the proposal"
+                            )
+                        )
+                reject(
+                    RowAuthorityAmbiguous(
+                        "thread binding is only partially present"
+                    )
+                )
+
+            for _identity, head in validated_prerequisites:
+                if thread_binding["createdAt"] < head["updatedAt"]:
+                    reject(
+                        RowAuthorityConflict(
+                            "thread binding predates row authority"
+                        )
+                    )
+            callback_state["prepared"] = True
+            callback_state["disposition"] = "created"
+            transaction.create(binding_ref, thread_binding)
+            for reference, document in zip(
+                edge_references,
+                reverse_bindings,
+            ):
+                transaction.create(reference, document)
+            return "created"
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "thread binding transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"]:
+                raise
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "thread binding transaction could not start"
+                ) from exc
+            try:
+                readback = self._read_reference_payloads(references)
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "thread binding commit outcome cannot be read back"
+                ) from readback_exc
+            observed = callback_state["observed"]
+            if observed is None:
+                raise RowAuthorityAmbiguous(
+                    "thread binding commit has no complete before-image"
+                ) from exc
+            row_observed_end = 1 + (2 * len(row_references))
+            expected_after = (
+                (True, thread_binding),
+                *observed[1:row_observed_end],
+                *((True, document) for document in reverse_bindings),
+            )
+            exact_before = readback == observed
+            exact_after = readback == expected_after
+            if (
+                exact_after
+                and callback_state["disposition"] == "already_applied"
+            ):
+                disposition = "already_applied"
+            elif exact_after and callback_state["prepared"]:
+                disposition = "created"
+            elif exact_before and callback_state["prepared"]:
+                raise RowAuthorityRetryable(
+                    "thread binding commit failed before any apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "thread binding commit readback is partial or drifted"
+                ) from exc
+        if disposition not in {"created", "already_applied"}:
+            raise RowAuthorityRetryable(
+                "thread binding transaction returned no approved disposition"
+            )
+        if disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "thread binding transaction returned a mismatched disposition"
+            )
+        if disposition == "created" and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "thread binding transaction reported an unprepared create"
+            )
+        return _thread_binding_result(
+            disposition=disposition,
+            thread_binding=thread_binding,
+            reverse_bindings=reverse_bindings,
         )
 
     def advance_row_location(
