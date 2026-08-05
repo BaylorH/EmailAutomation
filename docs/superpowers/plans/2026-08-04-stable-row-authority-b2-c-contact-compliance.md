@@ -459,7 +459,7 @@ historical settlement pointer and the effective owner independent.
   tests.test_row_authority_contact_compliance.ReleaseAwareRowHistoryTests -q
 ```
 
-- [ ] **Step 7: Review, commit, push, and prove `B2-C contracts/history`**
+- [x] **Step 7: Review, commit, push, and prove `B2-C contracts/history`**
 
 Obtain an independent review of the Task 1-2 diff. Correct every Critical or
 Important finding. Run `git diff --check`, compile the production module, and
@@ -1007,11 +1007,25 @@ or merge `main`, deploy, launch a campaign, or contact a user under this plan.
   behavior before its production correction.
 - Task 2 GREEN routes direct claims, lease takeover, settlement retry, source
   linking, and operator decline through descending generation history limited
-  to two, with exact authority/release reads and query readback. The 39
-  release-aware tests, 197 retained ownership tests, and exact combined
-  236-test Task 2 command all pass. Fresh automatic B2 discovery passes 352
-  tests; compile and diff checks are clean. Independent Task 1-2 code reviews
-  and publication are pending.
+  to two, with exact authority/release reads and query readback. Adversarial
+  review then reproduced and corrected equal-time replay ordering, direct and
+  release-restored owner-at-time brackets, deep N+1/N+2 restoration exits,
+  swallowed retryable reads, Firestore ordered-field existence semantics,
+  exact-hash query invisibility, and predecessor proof path drift. Each
+  correction gained a public-store or query-fake zero-write regression.
+- The final Task 1-2 candidate passes 67 release-aware tests, 197 retained
+  ownership tests, the exact combined 264-test command, all 381 automatically
+  discovered `test_row_authority*.py` tests, and all 211 retained source
+  coordinator/fake integration tests. Production-module compilation and diff
+  checks are clean. Two independent final reviews approved the exact candidate
+  with no remaining Critical or Important findings. The staged diff SHA-256
+  was `220cad935d7ab42ce29f02a1e9e53093b250cfa4ff2f1dd301b6a61bc7ba2978`.
+- Task 2 code publication: local HEAD, owned remote branch, and workflow head
+  SHA were `a0dbc970aa5df063988faa0aa50b89f168abf6d4`;
+  [run 31031535151](https://github.com/BaylorH/EmailAutomation/actions/runs/31031535151),
+  [job 92393190332](https://github.com/BaylorH/EmailAutomation/actions/runs/31031535151/job/92393190332)
+  completed successfully. This milestone remains provider-free and
+  runtime-unwired; it did not deploy or contact a user.
 - Plan reviews, publication SHA/run, selected RED outputs, code milestone
   SHAs/runs, final diff digest, final review outcomes, and evidence SHA/run are
   appended here only after they exist and are independently verified.
