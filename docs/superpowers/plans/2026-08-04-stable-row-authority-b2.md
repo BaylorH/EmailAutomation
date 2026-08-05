@@ -193,6 +193,7 @@ select a run for a different SHA.
 - [x] B2-A0 code is green and published.
 - [x] B2-A1 child plan is independently approved and published.
 - [x] B2-A1 is green and published.
+- [x] B2-B child plan is independently approved and published.
 - [ ] B2-B is green and published.
 - [ ] B2-C is green and published.
 - [ ] B2-D code/evidence is green and published.
