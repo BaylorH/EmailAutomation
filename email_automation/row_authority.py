@@ -4038,6 +4038,187 @@ def validate_contact_head_document(*, document):
     return _defensive_copy(expected)
 
 
+def _contact_suppression_result(*, decision, reason):
+    if (decision, reason) not in {
+        ("suppress", "active"),
+        ("allow", "released"),
+        ("allow", "absent"),
+        ("suppress", "ambiguous"),
+    }:
+        raise RowAuthorityConfigError(
+            "contact suppression result is unsupported"
+        )
+    return {"decision": decision, "reason": reason}
+
+
+def _validate_contact_alias_binding(
+    *,
+    document,
+    user_scope_hash,
+    exact_identity_hash,
+    canonical_mailbox_identity_hash,
+):
+    alias = validate_contact_alias_document(document=document)
+    if (
+        alias["userScopeHash"] != user_scope_hash
+        or alias["exactIdentityHash"] != exact_identity_hash
+        or alias["canonicalMailboxIdentityHash"]
+        != canonical_mailbox_identity_hash
+    ):
+        raise RowAuthorityConfigError(
+            "contact alias does not match its exact user-scoped path"
+        )
+    return alias
+
+
+def _validate_contact_settlement_creating_receipt(
+    *,
+    settlement_document,
+    receipt_document,
+    contact_head,
+    user_scope_hash,
+    canonical_mailbox_identity_hash,
+):
+    settlement = validate_contact_settlement_document(
+        document=settlement_document
+    )
+    receipt = validate_contact_transition_request_document(
+        document=receipt_document
+    )
+    if (
+        settlement["userScopeHash"] != user_scope_hash
+        or settlement["canonicalMailboxIdentityHash"]
+        != canonical_mailbox_identity_hash
+        or settlement["generation"] != contact_head["latestGeneration"]
+        or settlement["contactSettlementHash"]
+        != contact_head["latestSettlementHash"]
+        or receipt["userScopeHash"] != user_scope_hash
+        or receipt["outcome"] != "created"
+        or receipt["contactTransitionId"]
+        != settlement["contactTransitionId"]
+        or receipt["transitionKind"] != settlement["transitionKind"]
+        or receipt["exactIdentityHash"] != settlement["exactIdentityHash"]
+        or receipt["canonicalMailboxIdentityHash"]
+        != settlement["canonicalMailboxIdentityHash"]
+        or receipt["authorityLinkHash"] != settlement["authorityLinkHash"]
+        or receipt["hardOptOutEvidenceHash"]
+        != settlement["hardOptOutEvidenceHash"]
+        or receipt["actorScopeHash"] != settlement["actorScopeHash"]
+        or receipt["reasonCode"] != settlement["reasonCode"]
+        or receipt["resultingContactGeneration"]
+        != settlement["generation"]
+        or receipt["resultingContactSettlementHash"]
+        != settlement["contactSettlementHash"]
+        or receipt["resultingFanoutId"] != contact_head["activeFanoutId"]
+        or receipt["resultingContactHeadHash"]
+        != contact_head["contactHeadHash"]
+        or receipt["requestedAt"] != settlement["settledAt"]
+        or contact_head["updatedAt"] != settlement["settledAt"]
+        or (
+            settlement["generation"] > 1
+            and contact_head["createdAt"] >= settlement["settledAt"]
+        )
+    ):
+        raise RowAuthorityConfigError(
+            "contact settlement creating receipt does not correlate"
+        )
+    if contact_head["state"] == "active":
+        if settlement["transitionKind"] != "verified_optout":
+            raise RowAuthorityConfigError(
+                "active contact head lacks verified opt-out settlement"
+            )
+    elif (
+        contact_head["state"] != "released"
+        or settlement["transitionKind"] != "authenticated_release"
+        or receipt["expectedActiveOptOutSettlementHash"]
+        != settlement["predecessorSettlementHash"]
+    ):
+        raise RowAuthorityConfigError(
+            "released contact head lacks authenticated release proof"
+        )
+    return settlement, receipt
+
+
+def _validate_contact_receipt_head_afterimage(
+    *,
+    settlement_document,
+    receipt_document,
+    canonical_self_alias_document,
+):
+    """Reconstruct and validate the immutable head frozen by a creator receipt."""
+    settlement = validate_contact_settlement_document(
+        document=settlement_document
+    )
+    receipt = validate_contact_transition_request_document(
+        document=receipt_document
+    )
+    self_alias = validate_contact_alias_document(
+        document=canonical_self_alias_document
+    )
+    canonical_hash = settlement["canonicalMailboxIdentityHash"]
+    if (
+        receipt["outcome"] != "created"
+        or receipt["userScopeHash"] != settlement["userScopeHash"]
+        or receipt["contactTransitionId"]
+        != settlement["contactTransitionId"]
+        or receipt["transitionKind"] != settlement["transitionKind"]
+        or receipt["canonicalMailboxIdentityHash"] != canonical_hash
+        or receipt["resultingContactGeneration"]
+        != settlement["generation"]
+        or receipt["resultingContactSettlementHash"]
+        != settlement["contactSettlementHash"]
+        or receipt["requestedAt"] != settlement["settledAt"]
+        or self_alias["userScopeHash"] != settlement["userScopeHash"]
+        or self_alias["exactIdentityHash"] != canonical_hash
+        or self_alias["canonicalMailboxIdentityHash"] != canonical_hash
+        or self_alias["createdAt"] > settlement["settledAt"]
+        or (
+            settlement["generation"] > 1
+            and self_alias["createdAt"] >= settlement["settledAt"]
+        )
+    ):
+        raise RowAuthorityConfigError(
+            "contact receipt head after-image inputs do not correlate"
+        )
+    if settlement["transitionKind"] == "verified_optout":
+        state = "active"
+        active_hash = settlement["contactSettlementHash"]
+    elif settlement["transitionKind"] == "authenticated_release":
+        state = "released"
+        active_hash = None
+        if (
+            receipt["expectedActiveOptOutSettlementHash"]
+            != settlement["predecessorSettlementHash"]
+        ):
+            raise RowAuthorityConfigError(
+                "release receipt head after-image crossed its predecessor"
+            )
+    else:  # pragma: no cover - settlement validator freezes the enum
+        raise RowAuthorityConfigError(
+            "contact receipt head after-image kind is unsupported"
+        )
+    expected_head = build_contact_head_document(
+        user_scope_hash=settlement["userScopeHash"],
+        canonical_mailbox_identity_hash=canonical_hash,
+        state_revision=settlement["generation"],
+        latest_generation=settlement["generation"],
+        latest_settlement_hash=settlement["contactSettlementHash"],
+        active_optout_settlement_hash=active_hash,
+        state=state,
+        active_fanout_id=receipt["resultingFanoutId"],
+        created_at=self_alias["createdAt"],
+        updated_at=settlement["settledAt"],
+    )
+    if (
+        receipt["resultingContactHeadHash"]
+        != expected_head["contactHeadHash"]
+    ):
+        raise RowAuthorityConfigError(
+            "contact receipt head hash does not match its reconstructible after-image"
+        )
+    return expected_head
+
+
 def build_contact_fanout_head_document(
     *,
     user_scope_hash,
@@ -4359,6 +4540,196 @@ def validate_contact_fanout_head_document(*, document):
             "contact fan-out head does not match canonical fields and hash"
         )
     return _defensive_copy(expected)
+
+
+def _build_contact_superseding_fanout_head(
+    *,
+    current_document,
+    superseding_contact_settlement_hash,
+    updated_at,
+):
+    current = validate_contact_fanout_head_document(
+        document=current_document
+    )
+    if current["state"] not in {"discovering", "applying"}:
+        raise RowAuthorityConfigError(
+            "only a nonterminal contact fan-out may enter superseding"
+        )
+    return build_contact_fanout_head_document(
+        user_scope_hash=current["userScopeHash"],
+        fanout_id=current["fanoutId"],
+        outcome=current["outcome"],
+        expected_contact_settlement_hash=current[
+            "expectedContactSettlementHash"
+        ],
+        state_revision=current["stateRevision"] + 1,
+        state="superseding",
+        binding_revision=current["bindingRevision"],
+        binding_head_hash=current["bindingHeadHash"],
+        binding_association_count=current["bindingAssociationCount"],
+        discovery_cursor_row_id=None,
+        obligation_count=current["obligationCount"],
+        result_count=current["resultCount"],
+        lease_owner_hash=None,
+        lease_until=None,
+        fencing_token=current["fencingToken"] + 1,
+        superseding_contact_settlement_hash=(
+            superseding_contact_settlement_hash
+        ),
+        completion_binding_revision=None,
+        completion_binding_head_hash=None,
+        completion_binding_association_count=None,
+        completion_obligation_count=None,
+        completion_result_count=None,
+        completed_at=None,
+        created_at=current["createdAt"],
+        updated_at=updated_at,
+    )
+
+
+def _verified_contact_transition_id(*, user_scope_hash, authority_link):
+    link = validate_b1_authority_link(
+        authority_link=authority_link,
+        user_scope_hash=user_scope_hash,
+    )
+    if (
+        set(link) != _B1_LINK_V2_KEYS
+        or link["ownerKind"] != "contact_optout"
+    ):
+        raise RowAuthorityConfigError(
+            "verified contact transition requires exact v2 B1 authority"
+        )
+    return domain_hash(
+        CONTACT_TRANSITION_ID_DOMAIN,
+        {
+            "transitionKind": "verified_optout",
+            "exactIdentityHash": link["exactIdentityHash"],
+            "canonicalMailboxIdentityHash": link[
+                "canonicalMailboxIdentityHash"
+            ],
+            "authorityLinkHash": link["authorityLinkHash"],
+            "hardOptOutEvidenceHash": link["hardOptOutEvidenceHash"],
+            "actorScopeHash": None,
+            "clientRequestHash": None,
+            "expectedActiveOptOutSettlementHash": None,
+            "reasonCode": None,
+        },
+        user_scope_hash=user_scope_hash,
+    )
+
+
+def _contact_transition_result(
+    *,
+    disposition,
+    transition_request,
+    settlement,
+    head,
+    fanout_head,
+    aliases,
+):
+    if disposition not in {"created", "already_active", "already_applied"}:
+        raise RowAuthorityConfigError(
+            "contact transition disposition is unsupported"
+        )
+    receipt = validate_contact_transition_request_document(
+        document=transition_request
+    )
+    checked_settlement = validate_contact_settlement_document(
+        document=settlement
+    )
+    checked_head = validate_contact_head_document(document=head)
+    checked_fanout = validate_contact_fanout_head_document(
+        document=fanout_head
+    )
+    checked_aliases = sorted(
+        (
+            validate_contact_alias_document(document=document)
+            for document in aliases
+        ),
+        key=lambda document: document["exactIdentityHash"],
+    )
+    if (
+        receipt["resultingContactSettlementHash"]
+        != checked_settlement["contactSettlementHash"]
+        or receipt["resultingFanoutId"] != checked_fanout["fanoutId"]
+        or checked_fanout["expectedContactSettlementHash"]
+        != checked_settlement["contactSettlementHash"]
+        or checked_head["userScopeHash"] != receipt["userScopeHash"]
+        or checked_settlement["userScopeHash"] != receipt["userScopeHash"]
+        or checked_fanout["userScopeHash"] != receipt["userScopeHash"]
+        or (
+            disposition in {"created", "already_active"}
+            and (
+                receipt["resultingContactHeadHash"]
+                != checked_head["contactHeadHash"]
+                or receipt["resultingFanoutHeadHash"]
+                != checked_fanout["contactFanoutHeadHash"]
+            )
+        )
+    ):
+        raise RowAuthorityConfigError(
+            "contact transition result artifacts do not correlate"
+        )
+    return {
+        "disposition": disposition,
+        "transitionRequest": receipt,
+        "settlement": checked_settlement,
+        "head": checked_head,
+        "fanoutHead": checked_fanout,
+        "aliases": checked_aliases,
+    }
+
+
+def _validate_contact_fanout_receipt_successor(
+    *,
+    current_document,
+    frozen_fanout_head_hash,
+    receipt_requested_at,
+):
+    """Require an exact receipt after-image or a structurally reachable advance."""
+    current = validate_contact_fanout_head_document(
+        document=current_document
+    )
+    frozen_hash = _require_sha256(
+        frozen_fanout_head_hash,
+        field_name="frozen_fanout_head_hash",
+    )
+    requested = _require_timestamp(
+        receipt_requested_at,
+        field_name="receipt_requested_at",
+    )
+    if current["contactFanoutHeadHash"] == frozen_hash:
+        return current
+    if (
+        current["updatedAt"] < requested
+        or current["stateRevision"] <= 1
+        or current["fencingToken"] <= 1
+    ):
+        raise RowAuthorityConfigError(
+            "contact fan-out is not a reachable receipt successor"
+        )
+    if (
+        current["state"] == "superseding"
+        and current["stateRevision"] == 2
+        and current["fencingToken"] == 2
+        and (
+            current["leaseOwnerHash"] is not None
+            or current["discoveryCursorRowId"] is not None
+        )
+    ):
+        raise RowAuthorityConfigError(
+            "minimal superseding fan-out must clear its lease and cursor"
+        )
+    if (
+        current["leaseOwnerHash"] is None
+        and current["state"]
+        in {"discovering", "applying", "complete", "superseded"}
+        and current["stateRevision"] <= current["fencingToken"]
+    ):
+        raise RowAuthorityConfigError(
+            "unleased contact fan-out skipped a reachable revision"
+        )
+    return current
 
 
 def build_contact_fanout_obligation_document(
@@ -5009,6 +5380,41 @@ def validate_contact_row_binding_head_document(*, document):
             "contact binding head does not match canonical fields and hash"
         )
     return dict(expected)
+
+
+def _validate_contact_binding_head_successor(
+    *,
+    current_document,
+    prior_fanout_document,
+):
+    """Require the live binding head to preserve a fan-out's frozen prefix."""
+    prior_fanout = validate_contact_fanout_head_document(
+        document=prior_fanout_document
+    )
+    prior_revision = prior_fanout["bindingRevision"]
+    prior_hash = prior_fanout["bindingHeadHash"]
+    prior_count = prior_fanout["bindingAssociationCount"]
+    if current_document is None:
+        if prior_revision != 0 or prior_hash is not None or prior_count != 0:
+            raise RowAuthorityConfigError(
+                "contact binding head lost a positive frozen snapshot"
+            )
+        return None
+    current = validate_contact_row_binding_head_document(
+        document=current_document
+    )
+    if (
+        current["stateRevision"] < prior_revision
+        or current["associationCount"] < prior_count
+        or (
+            current["stateRevision"] == prior_revision
+            and current["contactRowBindingHeadHash"] != prior_hash
+        )
+    ):
+        raise RowAuthorityConfigError(
+            "contact binding head is not a monotonic successor of its frozen snapshot"
+        )
+    return current
 
 
 def _plan_contact_row_association(
@@ -12029,6 +12435,2979 @@ class RowAuthorityStore:
                 snapshot.to_dict() if snapshot.exists else None,
             )
             for snapshot in snapshots
+        )
+
+    def read_contact_optout_suppression(
+        self,
+        *,
+        verified_user_id,
+        raw_mailbox,
+    ):
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        exact_mailbox, canonical_mailbox = normalize_contact_mailbox(
+            raw_mailbox
+        )
+        exact_hash = contact_identity_hash(
+            exact_mailbox,
+            user_scope_hash=checked_scope,
+        )
+        canonical_hash = contact_identity_hash(
+            canonical_mailbox,
+            user_scope_hash=checked_scope,
+        )
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            aliases = user_ref.collection("contactOptOutAliases")
+            exact_alias_ref = aliases.document(exact_hash)
+            self_alias_ref = aliases.document(canonical_hash)
+            head_ref = user_ref.collection("contactOptOutHeads").document(
+                canonical_hash
+            )
+            initial_references = []
+            for reference in (
+                exact_alias_ref,
+                self_alias_ref,
+                head_ref,
+            ):
+                if all(
+                    existing.path != reference.path
+                    for existing in initial_references
+                ):
+                    initial_references.append(reference)
+            initial_observed = self._read_reference_payloads(
+                tuple(initial_references)
+            )
+            observed_by_path = {
+                reference.path: observed
+                for reference, observed in zip(
+                    initial_references,
+                    initial_observed,
+                    strict=True,
+                )
+            }
+            exact_observed = observed_by_path[exact_alias_ref.path]
+            self_observed = observed_by_path[self_alias_ref.path]
+            head_observed = observed_by_path[head_ref.path]
+
+            exact_alias = None
+            if exact_observed[0]:
+                exact_alias = _validate_contact_alias_binding(
+                    document=exact_observed[1],
+                    user_scope_hash=checked_scope,
+                    exact_identity_hash=exact_hash,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                )
+            self_alias = None
+            if self_observed[0]:
+                self_alias = _validate_contact_alias_binding(
+                    document=self_observed[1],
+                    user_scope_hash=checked_scope,
+                    exact_identity_hash=canonical_hash,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                )
+            if exact_observed[0] and not self_observed[0]:
+                raise RowAuthorityConfigError(
+                    "contact exact alias is missing its canonical self-alias"
+                )
+            if not head_observed[0]:
+                if exact_observed[0] or self_observed[0]:
+                    raise RowAuthorityConfigError(
+                        "contact aliases exist without their canonical head"
+                    )
+                return _contact_suppression_result(
+                    decision="allow",
+                    reason="absent",
+                )
+            if not self_observed[0]:
+                raise RowAuthorityConfigError(
+                    "contact head is missing its canonical self-alias"
+                )
+            head = validate_contact_head_document(
+                document=head_observed[1]
+            )
+            if (
+                head["userScopeHash"] != checked_scope
+                or head["canonicalMailboxIdentityHash"] != canonical_hash
+                or self_alias["createdAt"] != head["createdAt"]
+            ):
+                raise RowAuthorityConfigError(
+                    "contact head does not match its exact user-scoped path "
+                    "and canonical alias"
+                )
+            settlement_id = _require_firestore_document_id(
+                f"{canonical_hash}--{head['latestGeneration']}",
+                field_name="contact settlement document ID",
+            )
+            settlement_ref = user_ref.collection(
+                "contactOptOutSettlements"
+            ).document(settlement_id)
+            settlement_observed = self._read_reference_payloads(
+                (settlement_ref,)
+            )[0]
+            if not settlement_observed[0]:
+                raise RowAuthorityConfigError(
+                    "contact head is missing its exact latest settlement"
+                )
+            settlement = validate_contact_settlement_document(
+                document=settlement_observed[1]
+            )
+            if (
+                settlement["userScopeHash"] != checked_scope
+                or settlement["canonicalMailboxIdentityHash"]
+                != canonical_hash
+                or settlement["generation"] != head["latestGeneration"]
+                or settlement["contactSettlementHash"]
+                != head["latestSettlementHash"]
+            ):
+                raise RowAuthorityConfigError(
+                    "contact latest settlement does not match its exact path"
+                )
+            receipt_ref = user_ref.collection(
+                "contactOptOutTransitionRequests"
+            ).document(settlement["contactTransitionId"])
+            receipt_observed = self._read_reference_payloads((receipt_ref,))[0]
+            if not receipt_observed[0]:
+                raise RowAuthorityConfigError(
+                    "contact settlement is missing its creating receipt"
+                )
+            _validate_contact_settlement_creating_receipt(
+                settlement_document=settlement,
+                receipt_document=receipt_observed[1],
+                contact_head=head,
+                user_scope_hash=checked_scope,
+                canonical_mailbox_identity_hash=canonical_hash,
+            )
+            if head["state"] == "active":
+                return _contact_suppression_result(
+                    decision="suppress",
+                    reason="active",
+                )
+            if (
+                exact_alias is not None
+                and exact_alias["createdAt"] > settlement["settledAt"]
+            ):
+                raise RowAuthorityConfigError(
+                    "released contact candidate alias postdates settlement"
+                )
+            return _contact_suppression_result(
+                decision="allow",
+                reason="released",
+            )
+        except Exception:
+            return _contact_suppression_result(
+                decision="suppress",
+                reason="ambiguous",
+            )
+
+    def record_verified_contact_optout(
+        self,
+        *,
+        verified_user_id,
+        canonical_source_id,
+        work_key,
+        requested_at,
+    ):
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_source_id = _require_firestore_document_id(
+            canonical_source_id,
+            field_name="canonical_source_id",
+        )
+        _require_opaque(
+            checked_source_id,
+            field_name="canonical_source_id",
+        )
+        checked_work_key = _require_sha256(work_key, field_name="work_key")
+        checked_requested_at = _require_timestamp(
+            requested_at,
+            field_name="requested_at",
+        )
+        requested_datetime = _timestamp_as_datetime(
+            checked_requested_at,
+            field_name="requested_at",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            b1_references = (
+                user_ref.collection("sourceIdentities").document(
+                    checked_source_id
+                ),
+                user_ref.collection("sourceClassifications").document(
+                    checked_source_id
+                ),
+                user_ref.collection("sourceTransitionOwners").document(
+                    checked_source_id
+                ),
+                user_ref.collection("sourceWorkLedgers").document(
+                    checked_source_id
+                ),
+            )
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "verified contact B1 authority cannot form exact paths"
+            ) from exc
+
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "plan": None,
+            "before": {},
+            "references": {},
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "plan": None,
+                    "before": {},
+                    "references": {},
+                }
+            )
+
+            def read(reference):
+                path = reference.path
+                if path in callback_state["before"]:
+                    return callback_state["before"][path]
+                try:
+                    snapshot = reference.get(transaction=transaction)
+                    exists = bool(snapshot.exists)
+                    payload = snapshot.to_dict() if exists else None
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "verified contact transition read failed before writes"
+                    ) from exc
+                observed = (exists, payload)
+                callback_state["before"][path] = observed
+                callback_state["references"][path] = reference
+                return observed
+
+            b1_observed = tuple(read(reference) for reference in b1_references)
+            if not all(exists for exists, _payload in b1_observed):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "verified contact B1 authority bundle is incomplete"
+                    )
+                )
+            (
+                identity_document,
+                classification_document,
+                owner_document,
+                ledger_document,
+            ) = tuple(payload for _exists, payload in b1_observed)
+            try:
+                authority_link = build_b1_authority_link(
+                    user_scope_hash=checked_scope,
+                    source_identity_document=identity_document,
+                    source_classification_document=classification_document,
+                    source_owner_document=owner_document,
+                    source_ledger_document=ledger_document,
+                    work_key=checked_work_key,
+                )
+                if (
+                    authority_link["canonicalSourceId"]
+                    != checked_source_id
+                    or authority_link["workKey"] != checked_work_key
+                    or set(authority_link) != _B1_LINK_V2_KEYS
+                    or authority_link["ownerKind"] != "contact_optout"
+                ):
+                    raise RowAuthorityConfigError(
+                        "verified contact transition requires v2 contact authority"
+                    )
+                readiness = (
+                    identity_document["createdAt"],
+                    classification_document["snapshotPersistedAt"],
+                    owner_document["createdAt"],
+                    ledger_document["createdAt"],
+                )
+                transition_id = _verified_contact_transition_id(
+                    user_scope_hash=checked_scope,
+                    authority_link=authority_link,
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "verified contact B1 authority is malformed or drifted"
+                    )
+                )
+
+            exact_hash = authority_link["exactIdentityHash"]
+            canonical_hash = authority_link[
+                "canonicalMailboxIdentityHash"
+            ]
+            aliases_ref = user_ref.collection("contactOptOutAliases")
+            exact_alias_ref = aliases_ref.document(exact_hash)
+            self_alias_ref = aliases_ref.document(canonical_hash)
+            receipt_ref = user_ref.collection(
+                "contactOptOutTransitionRequests"
+            ).document(transition_id)
+            head_ref = user_ref.collection("contactOptOutHeads").document(
+                canonical_hash
+            )
+            binding_head_ref = user_ref.collection(
+                "contactRowBindingHeads"
+            ).document(canonical_hash)
+            settlements_ref = user_ref.collection("contactOptOutSettlements")
+            fanouts_ref = user_ref.collection("contactOptOutFanoutHeads")
+
+            receipt_observed = read(receipt_ref)
+            alias_references = []
+            for reference in (exact_alias_ref, self_alias_ref):
+                if all(
+                    existing.path != reference.path
+                    for existing in alias_references
+                ):
+                    alias_references.append(reference)
+            alias_observed = {
+                reference.path: read(reference)
+                for reference in alias_references
+            }
+            exact_observed = alias_observed[exact_alias_ref.path]
+            self_observed = alias_observed[self_alias_ref.path]
+            head_observed = read(head_ref)
+
+            existing_aliases = {}
+            try:
+                if exact_observed[0]:
+                    existing_aliases[exact_hash] = (
+                        _validate_contact_alias_binding(
+                            document=exact_observed[1],
+                            user_scope_hash=checked_scope,
+                            exact_identity_hash=exact_hash,
+                            canonical_mailbox_identity_hash=canonical_hash,
+                        )
+                    )
+                if self_observed[0]:
+                    existing_aliases[canonical_hash] = (
+                        _validate_contact_alias_binding(
+                            document=self_observed[1],
+                            user_scope_hash=checked_scope,
+                            exact_identity_hash=canonical_hash,
+                            canonical_mailbox_identity_hash=canonical_hash,
+                        )
+                    )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "verified contact alias contains immutable drift"
+                    )
+                )
+            if exact_observed[0] and not self_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "verified contact exact alias lacks its self-alias"
+                    )
+                )
+
+            def validate_fanout(document, *, settlement, expected_outcome):
+                try:
+                    fanout = validate_contact_fanout_head_document(
+                        document=document
+                    )
+                    if (
+                        fanout["userScopeHash"] != checked_scope
+                        or fanout["outcome"] != expected_outcome
+                        or fanout["expectedContactSettlementHash"]
+                        != settlement["contactSettlementHash"]
+                        or fanout["state"] == "ambiguous"
+                        or fanout["createdAt"] != settlement["settledAt"]
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact fan-out does not correlate"
+                        )
+                    return fanout
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact fan-out is malformed or uncorrelated"
+                        )
+                    )
+
+            def validate_historical_pair(settlement, receipt):
+                try:
+                    checked_settlement = validate_contact_settlement_document(
+                        document=settlement
+                    )
+                    checked_receipt = (
+                        validate_contact_transition_request_document(
+                            document=receipt
+                        )
+                    )
+                    if (
+                        checked_settlement["userScopeHash"] != checked_scope
+                        or checked_settlement[
+                            "canonicalMailboxIdentityHash"
+                        ]
+                        != canonical_hash
+                        or checked_receipt["userScopeHash"] != checked_scope
+                        or checked_receipt["outcome"] != "created"
+                        or checked_receipt["contactTransitionId"]
+                        != checked_settlement["contactTransitionId"]
+                        or checked_receipt["transitionKind"]
+                        != checked_settlement["transitionKind"]
+                        or checked_receipt["exactIdentityHash"]
+                        != checked_settlement["exactIdentityHash"]
+                        or checked_receipt[
+                            "canonicalMailboxIdentityHash"
+                        ]
+                        != checked_settlement[
+                            "canonicalMailboxIdentityHash"
+                        ]
+                        or checked_receipt["authorityLinkHash"]
+                        != checked_settlement["authorityLinkHash"]
+                        or checked_receipt["hardOptOutEvidenceHash"]
+                        != checked_settlement["hardOptOutEvidenceHash"]
+                        or checked_receipt["actorScopeHash"]
+                        != checked_settlement["actorScopeHash"]
+                        or checked_receipt["reasonCode"]
+                        != checked_settlement["reasonCode"]
+                        or checked_receipt["resultingContactGeneration"]
+                        != checked_settlement["generation"]
+                        or checked_receipt[
+                            "resultingContactSettlementHash"
+                        ]
+                        != checked_settlement["contactSettlementHash"]
+                        or checked_receipt["requestedAt"]
+                        != checked_settlement["settledAt"]
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact settlement receipt does not correlate"
+                        )
+                    return checked_settlement, checked_receipt
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact settlement creating receipt is malformed"
+                        )
+                    )
+
+            def load_historical_generation(generation):
+                settlement_reference = settlements_ref.document(
+                    f"{canonical_hash}--{generation}"
+                )
+                settlement_observation = read(settlement_reference)
+                if not settlement_observation[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact generation chain is incomplete"
+                        )
+                    )
+                try:
+                    historical_settlement = (
+                        validate_contact_settlement_document(
+                            document=settlement_observation[1]
+                        )
+                    )
+                    if (
+                        historical_settlement["userScopeHash"]
+                        != checked_scope
+                        or historical_settlement[
+                            "canonicalMailboxIdentityHash"
+                        ]
+                        != canonical_hash
+                        or historical_settlement["generation"] != generation
+                        or settlement_reference.id
+                        != f"{canonical_hash}--{generation}"
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact generation occupies a wrong path"
+                        )
+                    historical_receipt_ref = user_ref.collection(
+                        "contactOptOutTransitionRequests"
+                    ).document(
+                        historical_settlement["contactTransitionId"]
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact generation chain is malformed"
+                        )
+                    )
+                historical_receipt_observed = read(
+                    historical_receipt_ref
+                )
+                if not historical_receipt_observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact generation lacks its creating receipt"
+                        )
+                    )
+                historical_settlement, historical_receipt = (
+                    validate_historical_pair(
+                        historical_settlement,
+                        historical_receipt_observed[1],
+                    )
+                )
+                try:
+                    _validate_contact_receipt_head_afterimage(
+                        settlement_document=historical_settlement,
+                        receipt_document=historical_receipt,
+                        canonical_self_alias_document=existing_aliases[
+                            canonical_hash
+                        ],
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "historical contact receipt head after-image is crossed"
+                        )
+                    )
+                return historical_settlement, historical_receipt
+
+            if receipt_observed[0]:
+                try:
+                    receipt = validate_contact_transition_request_document(
+                        document=receipt_observed[1]
+                    )
+                    if (
+                        receipt["contactTransitionId"] != transition_id
+                        or receipt["transitionKind"] != "verified_optout"
+                        or receipt["exactIdentityHash"] != exact_hash
+                        or receipt["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                        or receipt["authorityLinkHash"]
+                        != authority_link["authorityLinkHash"]
+                        or receipt["hardOptOutEvidenceHash"]
+                        != authority_link["hardOptOutEvidenceHash"]
+                        or receipt["actorScopeHash"] is not None
+                        or receipt["clientRequestHash"] is not None
+                        or receipt[
+                            "expectedActiveOptOutSettlementHash"
+                        ]
+                        is not None
+                        or receipt["reasonCode"] is not None
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact transition receipt semantic authority drifted"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "verified contact transition receipt is malformed"
+                        )
+                    )
+                if not exact_observed[0] or not self_observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact retry is missing exact aliases"
+                        )
+                    )
+                if not head_observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact retry is missing its current head"
+                        )
+                    )
+                settlement_id = (
+                    f"{canonical_hash}--"
+                    f"{receipt['resultingContactGeneration']}"
+                )
+                settlement_ref = settlements_ref.document(settlement_id)
+                settlement_observed = read(settlement_ref)
+                fanout_ref = fanouts_ref.document(
+                    receipt["resultingFanoutId"]
+                )
+                fanout_observed = read(fanout_ref)
+                if not settlement_observed[0] or not fanout_observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact retry after-image is incomplete"
+                        )
+                    )
+                if receipt["outcome"] == "created":
+                    settlement, creating_receipt = (
+                        validate_historical_pair(
+                            settlement_observed[1],
+                            receipt,
+                        )
+                    )
+                    if (
+                        settlement["contactTransitionId"] != transition_id
+                        or settlement["authorityLink"] != authority_link
+                        or creating_receipt != receipt
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "verified contact retry settlement authority drifted"
+                            )
+                        )
+                else:
+                    try:
+                        settlement = validate_contact_settlement_document(
+                            document=settlement_observed[1]
+                        )
+                        if (
+                            settlement["userScopeHash"] != checked_scope
+                            or settlement[
+                                "canonicalMailboxIdentityHash"
+                            ]
+                            != canonical_hash
+                            or settlement["generation"]
+                            != receipt["resultingContactGeneration"]
+                            or settlement["contactSettlementHash"]
+                            != receipt["resultingContactSettlementHash"]
+                            or settlement["transitionKind"]
+                            != "verified_optout"
+                            or settlement["contactTransitionId"]
+                            == transition_id
+                            or receipt["resultingFanoutId"]
+                            != _derive_contact_fanout_id(
+                                user_scope_hash=checked_scope,
+                                settlement_hash=settlement[
+                                    "contactSettlementHash"
+                                ],
+                                outcome="apply",
+                            )
+                            or receipt["requestedAt"]
+                            < settlement["settledAt"]
+                        ):
+                            raise RowAuthorityConfigError(
+                                "already-active receipt does not reference exact active authority"
+                            )
+                        creating_receipt_ref = user_ref.collection(
+                            "contactOptOutTransitionRequests"
+                        ).document(settlement["contactTransitionId"])
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "already-active retry settlement authority drifted"
+                            )
+                        )
+                    creating_receipt_observed = read(
+                        creating_receipt_ref
+                    )
+                    if not creating_receipt_observed[0]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "already-active retry lacks settlement creating receipt"
+                            )
+                        )
+                    settlement, creating_receipt = (
+                        validate_historical_pair(
+                            settlement,
+                            creating_receipt_observed[1],
+                        )
+                    )
+                    if (
+                        creating_receipt["resultingFanoutId"]
+                        != receipt["resultingFanoutId"]
+                        or creating_receipt[
+                            "resultingContactHeadHash"
+                        ]
+                        != receipt["resultingContactHeadHash"]
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "already-active receipt crossed its creating authority"
+                            )
+                        )
+                    creator_exact_hash = settlement["exactIdentityHash"]
+                    if creator_exact_hash not in existing_aliases:
+                        creator_alias_ref = aliases_ref.document(
+                            creator_exact_hash
+                        )
+                        creator_alias_observed = read(creator_alias_ref)
+                        if not creator_alias_observed[0]:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "already-active retry lacks creator exact alias"
+                                )
+                            )
+                        try:
+                            existing_aliases[creator_exact_hash] = (
+                                _validate_contact_alias_binding(
+                                    document=creator_alias_observed[1],
+                                    user_scope_hash=checked_scope,
+                                    exact_identity_hash=creator_exact_hash,
+                                    canonical_mailbox_identity_hash=(
+                                        canonical_hash
+                                    ),
+                                )
+                            )
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityConflict(
+                                    "already-active creator alias drifted"
+                                )
+                            )
+                    if existing_aliases[creator_exact_hash][
+                        "createdAt"
+                    ] > settlement["settledAt"]:
+                        reject(
+                            RowAuthorityConflict(
+                                "already-active creator alias postdates settlement"
+                            )
+                        )
+                    for required_hash in {exact_hash, canonical_hash}:
+                        if existing_aliases[required_hash][
+                            "createdAt"
+                        ] > receipt["requestedAt"]:
+                            reject(
+                                RowAuthorityConflict(
+                                    "already-active alias postdates its receipt"
+                                )
+                            )
+                try:
+                    _validate_contact_receipt_head_afterimage(
+                        settlement_document=settlement,
+                        receipt_document=creating_receipt,
+                        canonical_self_alias_document=existing_aliases[
+                            canonical_hash
+                        ],
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact receipt head after-image is crossed"
+                        )
+                    )
+                fanout = validate_fanout(
+                    fanout_observed[1],
+                    settlement=settlement,
+                    expected_outcome="apply",
+                )
+                if fanout["fanoutId"] != receipt["resultingFanoutId"]:
+                    reject(
+                        RowAuthorityConflict(
+                            "verified contact retry fan-out occupies a wrong path"
+                        )
+                    )
+                try:
+                    fanout = _validate_contact_fanout_receipt_successor(
+                        current_document=fanout,
+                        frozen_fanout_head_hash=receipt[
+                            "resultingFanoutHeadHash"
+                        ],
+                        receipt_requested_at=receipt["requestedAt"],
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact retry fan-out is not reachable"
+                        )
+                    )
+                try:
+                    current_head = validate_contact_head_document(
+                        document=head_observed[1]
+                    )
+                    if (
+                        current_head["userScopeHash"] != checked_scope
+                        or current_head[
+                            "canonicalMailboxIdentityHash"
+                        ]
+                        != canonical_hash
+                        or current_head["latestGeneration"]
+                        < receipt["resultingContactGeneration"]
+                    ):
+                        raise RowAuthorityConfigError(
+                            "current contact head is not a reachable successor"
+                        )
+                    if (
+                        existing_aliases[canonical_hash]["createdAt"]
+                        != current_head["createdAt"]
+                        or existing_aliases[exact_hash]["createdAt"]
+                        > receipt["requestedAt"]
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact retry alias chronology is impossible"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact retry current head or aliases "
+                            "are malformed"
+                        )
+                    )
+                if (
+                    current_head["latestGeneration"]
+                    == receipt["resultingContactGeneration"]
+                ):
+                    if fanout["state"] in {"superseding", "superseded"}:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "same-generation contact fan-out cannot be superseding"
+                            )
+                        )
+                    if (
+                        current_head["contactHeadHash"]
+                        != receipt["resultingContactHeadHash"]
+                        or current_head["latestSettlementHash"]
+                        != settlement["contactSettlementHash"]
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "verified contact retry frozen head drifted"
+                            )
+                        )
+                    _validate_contact_settlement_creating_receipt(
+                        settlement_document=settlement,
+                        receipt_document=creating_receipt,
+                        contact_head=current_head,
+                        user_scope_hash=checked_scope,
+                        canonical_mailbox_identity_hash=canonical_hash,
+                    )
+                else:
+                    if fanout["state"] in {"discovering", "applying"}:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact epoch requires completed or "
+                                "superseding verified fan-out"
+                            )
+                        )
+                    current_settlement_ref = settlements_ref.document(
+                        f"{canonical_hash}--"
+                        f"{current_head['latestGeneration']}"
+                    )
+                    current_settlement_observed = read(
+                        current_settlement_ref
+                    )
+                    if not current_settlement_observed[0]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact head lacks its settlement"
+                            )
+                        )
+                    try:
+                        current_settlement = (
+                            validate_contact_settlement_document(
+                                document=current_settlement_observed[1]
+                            )
+                        )
+                        current_receipt_ref = user_ref.collection(
+                            "contactOptOutTransitionRequests"
+                        ).document(current_settlement["contactTransitionId"])
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact settlement is malformed"
+                            )
+                        )
+                    current_receipt_observed = read(current_receipt_ref)
+                    current_fanout_ref = fanouts_ref.document(
+                        current_head["activeFanoutId"]
+                    )
+                    current_fanout_observed = read(current_fanout_ref)
+                    if (
+                        not current_receipt_observed[0]
+                        or not current_fanout_observed[0]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact authority is incomplete"
+                            )
+                        )
+                    current_settlement, current_receipt = (
+                        validate_historical_pair(
+                            current_settlement,
+                            current_receipt_observed[1],
+                        )
+                    )
+                    try:
+                        _validate_contact_receipt_head_afterimage(
+                            settlement_document=current_settlement,
+                            receipt_document=current_receipt,
+                            canonical_self_alias_document=existing_aliases[
+                                canonical_hash
+                            ],
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact receipt head after-image is crossed"
+                            )
+                        )
+                    try:
+                        _validate_contact_settlement_creating_receipt(
+                            settlement_document=current_settlement,
+                            receipt_document=current_receipt,
+                            contact_head=current_head,
+                            user_scope_hash=checked_scope,
+                            canonical_mailbox_identity_hash=canonical_hash,
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact settlement crossed its head"
+                            )
+                        )
+
+                    historical_generation = settlement["generation"]
+                    current_generation = current_settlement["generation"]
+                    immediate_generation = historical_generation + 1
+                    if immediate_generation == current_generation:
+                        immediate_settlement = current_settlement
+                    else:
+                        immediate_settlement, _immediate_receipt = (
+                            load_historical_generation(immediate_generation)
+                        )
+                    if (
+                        immediate_settlement["predecessorSettlementHash"]
+                        != settlement["contactSettlementHash"]
+                        or immediate_settlement["settledAt"]
+                        < settlement["settledAt"]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "historical contact successor chain is crossed"
+                            )
+                        )
+                    latest_predecessor_generation = current_generation - 1
+                    if latest_predecessor_generation == historical_generation:
+                        latest_predecessor = settlement
+                    elif latest_predecessor_generation == immediate_generation:
+                        latest_predecessor = immediate_settlement
+                    else:
+                        latest_predecessor, _latest_predecessor_receipt = (
+                            load_historical_generation(
+                                latest_predecessor_generation
+                            )
+                        )
+                    if (
+                        current_settlement["predecessorSettlementHash"]
+                        != latest_predecessor["contactSettlementHash"]
+                        or current_settlement["settledAt"]
+                        < latest_predecessor["settledAt"]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "latest contact predecessor chain is crossed"
+                            )
+                        )
+                    if fanout["state"] in {"superseding", "superseded"} and (
+                        fanout["supersedingContactSettlementHash"]
+                        != immediate_settlement["contactSettlementHash"]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out supersession crossed its successor"
+                            )
+                        )
+                    later_fanout = validate_fanout(
+                        current_fanout_observed[1],
+                        settlement=current_settlement,
+                        expected_outcome=(
+                            "apply"
+                            if current_head["state"] == "active"
+                            else "release"
+                        ),
+                    )
+                    if (
+                        later_fanout["fanoutId"]
+                        != current_head["activeFanoutId"]
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "later contact fan-out occupies a wrong path"
+                            )
+                        )
+                    try:
+                        _validate_contact_fanout_receipt_successor(
+                            current_document=later_fanout,
+                            frozen_fanout_head_hash=current_receipt[
+                                "resultingFanoutHeadHash"
+                            ],
+                            receipt_requested_at=current_receipt[
+                                "requestedAt"
+                            ],
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact fan-out is not reachable"
+                            )
+                        )
+                    current_exact_hash = current_settlement[
+                        "exactIdentityHash"
+                    ]
+                    if current_exact_hash not in existing_aliases:
+                        current_alias_ref = aliases_ref.document(
+                            current_exact_hash
+                        )
+                        current_alias_observed = read(current_alias_ref)
+                        if not current_alias_observed[0]:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "later contact settlement lacks its creator exact alias"
+                                )
+                            )
+                        try:
+                            existing_aliases[current_exact_hash] = (
+                                _validate_contact_alias_binding(
+                                    document=current_alias_observed[1],
+                                    user_scope_hash=checked_scope,
+                                    exact_identity_hash=current_exact_hash,
+                                    canonical_mailbox_identity_hash=(
+                                        canonical_hash
+                                    ),
+                                )
+                            )
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "later contact creator exact alias drifted"
+                                )
+                            )
+                    if existing_aliases[current_exact_hash][
+                        "createdAt"
+                    ] > current_settlement["settledAt"]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact exact alias postdates settlement"
+                            )
+                        )
+                alias_documents = list(existing_aliases.values())
+                plan = {
+                    "disposition": "already_applied",
+                    "mutations": (),
+                    "transitionRequest": receipt,
+                    "settlement": settlement,
+                    "head": current_head,
+                    "fanoutHead": fanout,
+                    "aliases": alias_documents,
+                }
+                callback_state["plan"] = plan
+                callback_state["disposition"] = "already_applied"
+                return "already_applied"
+
+            if head_observed[0] and not self_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact head cannot be repaired without its self-alias"
+                    )
+                )
+            if requested_datetime < max(
+                value.astimezone(timezone.utc) for value in readiness
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "verified contact request predates immutable B1 authority"
+                    )
+                )
+            if any(
+                alias["createdAt"] > checked_requested_at
+                for alias in existing_aliases.values()
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "verified contact request predates an existing alias"
+                    )
+                )
+
+            alias_mutations = []
+            alias_documents = dict(existing_aliases)
+            if not self_observed[0]:
+                self_alias = build_contact_alias_document(
+                    user_scope_hash=checked_scope,
+                    exact_identity_hash=canonical_hash,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                    created_at=checked_requested_at,
+                )
+                alias_documents[canonical_hash] = self_alias
+                alias_mutations.append(
+                    ("create", self_alias_ref, self_alias)
+                )
+            if not exact_observed[0] and exact_hash != canonical_hash:
+                exact_alias = build_contact_alias_document(
+                    user_scope_hash=checked_scope,
+                    exact_identity_hash=exact_hash,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                    created_at=checked_requested_at,
+                )
+                alias_documents[exact_hash] = exact_alias
+                alias_mutations.append(
+                    ("create", exact_alias_ref, exact_alias)
+                )
+
+            try:
+                latest_query = (
+                    settlements_ref.where(
+                        "canonicalMailboxIdentityHash",
+                        "==",
+                        canonical_hash,
+                    )
+                    .order_by("generation", direction="DESCENDING")
+                    .limit(2)
+                )
+                latest_snapshots = tuple(transaction.get(latest_query))
+            except Exception as exc:
+                callback_state["read_failed"] = True
+                raise RowAuthorityRetryable(
+                    "verified contact latest-settlement query failed"
+                ) from exc
+            latest_entries = []
+            for snapshot in latest_snapshots:
+                observed = read(snapshot.reference)
+                if not observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact settlement query returned a missing path"
+                        )
+                    )
+                latest_entries.append(
+                    (snapshot.reference, observed[1])
+                )
+
+            current_head = None
+            current_settlement = None
+            current_receipt = None
+            current_fanout = None
+            current_fanout_ref = None
+            if not head_observed[0]:
+                if latest_entries:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact history exists without its canonical head"
+                        )
+                    )
+            else:
+                try:
+                    current_head = validate_contact_head_document(
+                        document=head_observed[1]
+                    )
+                    if (
+                        current_head["userScopeHash"] != checked_scope
+                        or current_head[
+                            "canonicalMailboxIdentityHash"
+                        ]
+                        != canonical_hash
+                        or not latest_entries
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact head does not match its exact path/history"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "current contact head is malformed or incomplete"
+                        )
+                    )
+                validated_history = []
+                for reference, document in latest_entries:
+                    try:
+                        settlement_candidate = (
+                            validate_contact_settlement_document(
+                                document=document
+                            )
+                        )
+                        expected_id = (
+                            f"{canonical_hash}--"
+                            f"{settlement_candidate['generation']}"
+                        )
+                        if (
+                            reference.id != expected_id
+                            or settlement_candidate["userScopeHash"]
+                            != checked_scope
+                            or settlement_candidate[
+                                "canonicalMailboxIdentityHash"
+                            ]
+                            != canonical_hash
+                        ):
+                            raise RowAuthorityConfigError(
+                                "contact settlement occupies a wrong path"
+                            )
+                        creating_ref = user_ref.collection(
+                            "contactOptOutTransitionRequests"
+                        ).document(
+                            settlement_candidate["contactTransitionId"]
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "bounded contact history is malformed"
+                            )
+                        )
+                    creating_observed = read(creating_ref)
+                    if not creating_observed[0]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "bounded contact history lacks creating receipt"
+                            )
+                        )
+                    settlement_candidate, creating_receipt = (
+                        validate_historical_pair(
+                            settlement_candidate,
+                            creating_observed[1],
+                        )
+                    )
+                    try:
+                        _validate_contact_receipt_head_afterimage(
+                            settlement_document=settlement_candidate,
+                            receipt_document=creating_receipt,
+                            canonical_self_alias_document=existing_aliases[
+                                canonical_hash
+                            ],
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "bounded contact receipt head after-image is crossed"
+                            )
+                        )
+                    validated_history.append(
+                        (settlement_candidate, creating_receipt)
+                    )
+                current_settlement, current_receipt = validated_history[0]
+                if (
+                    current_settlement["generation"]
+                    != current_head["latestGeneration"]
+                    or current_settlement["contactSettlementHash"]
+                    != current_head["latestSettlementHash"]
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "contact head differs from bounded latest history"
+                        )
+                    )
+                if current_settlement["generation"] > 1:
+                    if (
+                        len(validated_history) != 2
+                        or validated_history[1][0]["generation"]
+                        != current_settlement["generation"] - 1
+                        or current_settlement[
+                            "predecessorSettlementHash"
+                        ]
+                        != validated_history[1][0][
+                            "contactSettlementHash"
+                        ]
+                        or current_settlement["settledAt"]
+                        < validated_history[1][0]["settledAt"]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact latest predecessor history is incomplete"
+                            )
+                        )
+                current_creator_exact_hash = current_settlement[
+                    "exactIdentityHash"
+                ]
+                current_creator_alias = existing_aliases.get(
+                    current_creator_exact_hash
+                )
+                if current_creator_alias is None:
+                    current_creator_alias_ref = aliases_ref.document(
+                        current_creator_exact_hash
+                    )
+                    current_creator_alias_observed = read(
+                        current_creator_alias_ref
+                    )
+                    if not current_creator_alias_observed[0]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "current contact settlement lacks its creator exact alias"
+                            )
+                        )
+                    try:
+                        current_creator_alias = (
+                            _validate_contact_alias_binding(
+                                document=current_creator_alias_observed[1],
+                                user_scope_hash=checked_scope,
+                                exact_identity_hash=(
+                                    current_creator_exact_hash
+                                ),
+                                canonical_mailbox_identity_hash=(
+                                    canonical_hash
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "current contact creator exact alias drifted"
+                            )
+                        )
+                if (
+                    current_creator_alias["createdAt"]
+                    > current_settlement["settledAt"]
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "current contact creator exact alias postdates settlement"
+                        )
+                    )
+                _validate_contact_settlement_creating_receipt(
+                    settlement_document=current_settlement,
+                    receipt_document=current_receipt,
+                    contact_head=current_head,
+                    user_scope_hash=checked_scope,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                )
+                current_fanout_ref = fanouts_ref.document(
+                    current_head["activeFanoutId"]
+                )
+                current_fanout_observed = read(current_fanout_ref)
+                if not current_fanout_observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "current contact head lacks its exact fan-out"
+                        )
+                    )
+                current_fanout = validate_fanout(
+                    current_fanout_observed[1],
+                    settlement=current_settlement,
+                    expected_outcome=(
+                        "apply"
+                        if current_head["state"] == "active"
+                        else "release"
+                    ),
+                )
+                if (
+                    current_fanout["fanoutId"]
+                    != current_head["activeFanoutId"]
+                    or current_fanout["state"]
+                    not in {"discovering", "applying", "complete"}
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "current contact fan-out state blocks transition"
+                        )
+                    )
+                try:
+                    current_fanout = (
+                        _validate_contact_fanout_receipt_successor(
+                            current_document=current_fanout,
+                            frozen_fanout_head_hash=current_receipt[
+                                "resultingFanoutHeadHash"
+                            ],
+                            receipt_requested_at=current_receipt[
+                                "requestedAt"
+                            ],
+                        )
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "current contact fan-out is not reachable from "
+                            "its creating receipt"
+                        )
+                    )
+                if (
+                    existing_aliases[canonical_hash]["createdAt"]
+                    != current_head["createdAt"]
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "canonical self-alias does not match contact "
+                            "head creation"
+                        )
+                    )
+                if (
+                    checked_requested_at < current_head["updatedAt"]
+                    or checked_requested_at < current_fanout["updatedAt"]
+                    or any(
+                        alias["createdAt"] > checked_requested_at
+                        for alias in existing_aliases.values()
+                    )
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "verified contact request predates current "
+                            "contact authority"
+                        )
+                    )
+
+            if current_head is not None and current_head["state"] == "active":
+                transition_request = (
+                    build_contact_transition_request_document(
+                        user_scope_hash=checked_scope,
+                        transition_kind="verified_optout",
+                        exact_identity_hash=exact_hash,
+                        canonical_mailbox_identity_hash=canonical_hash,
+                        authority_link_hash=authority_link[
+                            "authorityLinkHash"
+                        ],
+                        hard_optout_evidence_hash=authority_link[
+                            "hardOptOutEvidenceHash"
+                        ],
+                        actor_scope_hash=None,
+                        client_request_hash=None,
+                        expected_active_optout_settlement_hash=None,
+                        reason_code=None,
+                        outcome="already_active",
+                        resulting_contact_generation=current_settlement[
+                            "generation"
+                        ],
+                        resulting_contact_settlement_hash=current_settlement[
+                            "contactSettlementHash"
+                        ],
+                        resulting_fanout_id=current_fanout["fanoutId"],
+                        resulting_contact_head_hash=current_head[
+                            "contactHeadHash"
+                        ],
+                        resulting_fanout_head_hash=current_fanout[
+                            "contactFanoutHeadHash"
+                        ],
+                        requested_at=checked_requested_at,
+                    )
+                )
+                mutations = tuple(
+                    [*alias_mutations, ("create", receipt_ref, transition_request)]
+                )
+                if len(mutations) > 2:
+                    reject(
+                        RowAuthorityConfigError(
+                            "already-active contact transition exceeds two writes"
+                        )
+                    )
+                plan = {
+                    "disposition": "already_active",
+                    "mutations": mutations,
+                    "transitionRequest": transition_request,
+                    "settlement": current_settlement,
+                    "head": current_head,
+                    "fanoutHead": current_fanout,
+                    "aliases": list(alias_documents.values()),
+                }
+            else:
+                binding_head = None
+                binding_observed = read(binding_head_ref)
+                if binding_observed[0]:
+                    try:
+                        binding_head = (
+                            validate_contact_row_binding_head_document(
+                                document=binding_observed[1]
+                            )
+                        )
+                        if (
+                            binding_head["userScopeHash"] != checked_scope
+                            or binding_head[
+                                "canonicalMailboxIdentityHash"
+                            ]
+                            != canonical_hash
+                            or binding_head["updatedAt"]
+                            > checked_requested_at
+                        ):
+                            raise RowAuthorityConfigError(
+                                "contact binding head does not match its path or time"
+                            )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "verified contact binding snapshot is malformed"
+                            )
+                        )
+                if current_fanout is not None:
+                    try:
+                        binding_head = (
+                            _validate_contact_binding_head_successor(
+                                current_document=binding_head,
+                                prior_fanout_document=current_fanout,
+                            )
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "verified contact binding head regressed from "
+                                "its prior fan-out snapshot"
+                            )
+                        )
+                generation = (
+                    1
+                    if current_settlement is None
+                    else current_settlement["generation"] + 1
+                )
+                predecessor_hash = (
+                    None
+                    if current_settlement is None
+                    else current_settlement["contactSettlementHash"]
+                )
+                if generation % 2 != 1:
+                    reject(
+                        RowAuthorityConflict(
+                            "verified contact generation is not an active epoch"
+                        )
+                    )
+                settlement = build_contact_settlement_document(
+                    user_scope_hash=checked_scope,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                    generation=generation,
+                    predecessor_settlement_hash=predecessor_hash,
+                    transition_kind="verified_optout",
+                    contact_transition_id=transition_id,
+                    exact_identity_hash=exact_hash,
+                    authority_link=authority_link,
+                    actor_scope_hash=None,
+                    reason_code=None,
+                    settled_at=checked_requested_at,
+                )
+                fanout_id = _derive_contact_fanout_id(
+                    user_scope_hash=checked_scope,
+                    settlement_hash=settlement["contactSettlementHash"],
+                    outcome="apply",
+                )
+                fanout = build_contact_fanout_head_document(
+                    user_scope_hash=checked_scope,
+                    fanout_id=fanout_id,
+                    outcome="apply",
+                    expected_contact_settlement_hash=settlement[
+                        "contactSettlementHash"
+                    ],
+                    state_revision=1,
+                    state="discovering",
+                    binding_revision=(
+                        0
+                        if binding_head is None
+                        else binding_head["stateRevision"]
+                    ),
+                    binding_head_hash=(
+                        None
+                        if binding_head is None
+                        else binding_head["contactRowBindingHeadHash"]
+                    ),
+                    binding_association_count=(
+                        0
+                        if binding_head is None
+                        else binding_head["associationCount"]
+                    ),
+                    discovery_cursor_row_id=None,
+                    obligation_count=0,
+                    result_count=0,
+                    lease_owner_hash=None,
+                    lease_until=None,
+                    fencing_token=1,
+                    superseding_contact_settlement_hash=None,
+                    completion_binding_revision=None,
+                    completion_binding_head_hash=None,
+                    completion_binding_association_count=None,
+                    completion_obligation_count=None,
+                    completion_result_count=None,
+                    completed_at=None,
+                    created_at=checked_requested_at,
+                    updated_at=checked_requested_at,
+                )
+                head = build_contact_head_document(
+                    user_scope_hash=checked_scope,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                    state_revision=generation,
+                    latest_generation=generation,
+                    latest_settlement_hash=settlement[
+                        "contactSettlementHash"
+                    ],
+                    active_optout_settlement_hash=settlement[
+                        "contactSettlementHash"
+                    ],
+                    state="active",
+                    active_fanout_id=fanout_id,
+                    created_at=(
+                        alias_documents[canonical_hash]["createdAt"]
+                        if current_head is None
+                        else current_head["createdAt"]
+                    ),
+                    updated_at=checked_requested_at,
+                )
+                transition_request = (
+                    build_contact_transition_request_document(
+                        user_scope_hash=checked_scope,
+                        transition_kind="verified_optout",
+                        exact_identity_hash=exact_hash,
+                        canonical_mailbox_identity_hash=canonical_hash,
+                        authority_link_hash=authority_link[
+                            "authorityLinkHash"
+                        ],
+                        hard_optout_evidence_hash=authority_link[
+                            "hardOptOutEvidenceHash"
+                        ],
+                        actor_scope_hash=None,
+                        client_request_hash=None,
+                        expected_active_optout_settlement_hash=None,
+                        reason_code=None,
+                        outcome="created",
+                        resulting_contact_generation=generation,
+                        resulting_contact_settlement_hash=settlement[
+                            "contactSettlementHash"
+                        ],
+                        resulting_fanout_id=fanout_id,
+                        resulting_contact_head_hash=head["contactHeadHash"],
+                        resulting_fanout_head_hash=fanout[
+                            "contactFanoutHeadHash"
+                        ],
+                        requested_at=checked_requested_at,
+                    )
+                )
+                settlement_ref = settlements_ref.document(
+                    f"{canonical_hash}--{generation}"
+                )
+                fanout_ref = fanouts_ref.document(fanout_id)
+                candidate_settlement_observed = read(settlement_ref)
+                candidate_fanout_observed = read(fanout_ref)
+                if (
+                    candidate_settlement_observed[0]
+                    or candidate_fanout_observed[0]
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "verified contact candidate authority already exists"
+                        )
+                    )
+                mutations = [
+                    *alias_mutations,
+                    ("create", settlement_ref, settlement),
+                    (
+                        "create" if current_head is None else "set",
+                        head_ref,
+                        head,
+                    ),
+                    ("create", fanout_ref, fanout),
+                    ("create", receipt_ref, transition_request),
+                ]
+                if (
+                    current_fanout is not None
+                    and current_fanout["state"]
+                    in {"discovering", "applying"}
+                ):
+                    superseding = _build_contact_superseding_fanout_head(
+                        current_document=current_fanout,
+                        superseding_contact_settlement_hash=settlement[
+                            "contactSettlementHash"
+                        ],
+                        updated_at=checked_requested_at,
+                    )
+                    mutations.append(
+                        ("set", current_fanout_ref, superseding)
+                    )
+                if len(mutations) > 6:
+                    reject(
+                        RowAuthorityConfigError(
+                            "verified contact transition exceeds six writes"
+                        )
+                    )
+                plan = {
+                    "disposition": "created",
+                    "mutations": tuple(mutations),
+                    "transitionRequest": transition_request,
+                    "settlement": settlement,
+                    "head": head,
+                    "fanoutHead": fanout,
+                    "aliases": list(alias_documents.values()),
+                }
+
+            for _operation, reference, _document in plan["mutations"]:
+                if reference.path not in callback_state["before"]:
+                    read(reference)
+            callback_state["plan"] = plan
+            callback_state["prepared"] = bool(plan["mutations"])
+            callback_state["disposition"] = plan["disposition"]
+            for operation, reference, document in plan["mutations"]:
+                if operation == "create":
+                    transaction.create(reference, document)
+                elif operation == "set":
+                    transaction.set(reference, document, merge=False)
+                else:  # pragma: no cover - bounded internal planner
+                    raise AssertionError(
+                        "unsupported contact transition mutation"
+                    )
+            return plan["disposition"]
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "verified contact transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"] or callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "verified contact transaction could not start"
+                ) from exc
+            plan = callback_state["plan"]
+            if plan is None:
+                raise RowAuthorityAmbiguous(
+                    "verified contact transition has no bounded plan"
+                ) from exc
+            mutation_references = tuple(
+                reference
+                for _operation, reference, _document in plan["mutations"]
+            )
+            try:
+                readback = self._read_reference_payloads(
+                    mutation_references
+                )
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "verified contact commit outcome cannot be read back"
+                ) from readback_exc
+            before = tuple(
+                callback_state["before"][reference.path]
+                for reference in mutation_references
+            )
+            after = tuple(
+                (True, document)
+                for _operation, _reference, document in plan["mutations"]
+            )
+            if readback == after:
+                disposition = plan["disposition"]
+            elif readback == before and plan["mutations"]:
+                raise RowAuthorityRetryable(
+                    "verified contact commit failed before any apply"
+                ) from exc
+            elif readback == before:
+                disposition = plan["disposition"]
+            else:
+                raise RowAuthorityAmbiguous(
+                    "verified contact commit readback is partial or drifted"
+                ) from exc
+        plan = callback_state["plan"]
+        if (
+            plan is None
+            or disposition != callback_state["disposition"]
+            or disposition != plan["disposition"]
+        ):
+            raise RowAuthorityRetryable(
+                "verified contact transaction returned a mismatched disposition"
+            )
+        if plan["mutations"] and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "verified contact transaction reported unprepared writes"
+            )
+        return _contact_transition_result(
+            disposition=disposition,
+            transition_request=plan["transitionRequest"],
+            settlement=plan["settlement"],
+            head=plan["head"],
+            fanout_head=plan["fanoutHead"],
+            aliases=plan["aliases"],
+        )
+
+    def record_authenticated_contact_release(
+        self,
+        *,
+        verified_user_id,
+        canonical_mailbox_identity_hash,
+        expected_active_optout_settlement_hash,
+        actor_scope_hash,
+        client_request_id,
+        requested_at,
+    ):
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        canonical_hash = _require_sha256(
+            canonical_mailbox_identity_hash,
+            field_name="canonical_mailbox_identity_hash",
+        )
+        expected_active_hash = _require_sha256(
+            expected_active_optout_settlement_hash,
+            field_name="expected_active_optout_settlement_hash",
+        )
+        checked_actor_hash = _require_sha256(
+            actor_scope_hash,
+            field_name="actor_scope_hash",
+        )
+        checked_client_request_id = _require_opaque(
+            client_request_id,
+            field_name="client_request_id",
+        )
+        checked_requested_at = _require_timestamp(
+            requested_at,
+            field_name="requested_at",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        client_request_hash = domain_hash(
+            OPERATOR_CLIENT_REQUEST_HASH_DOMAIN,
+            {"clientRequestId": checked_client_request_id},
+            user_scope_hash=checked_scope,
+        )
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            aliases_ref = user_ref.collection("contactOptOutAliases")
+            receipts_ref = user_ref.collection(
+                "contactOptOutTransitionRequests"
+            )
+            settlements_ref = user_ref.collection(
+                "contactOptOutSettlements"
+            )
+            heads_ref = user_ref.collection("contactOptOutHeads")
+            fanouts_ref = user_ref.collection("contactOptOutFanoutHeads")
+            binding_heads_ref = user_ref.collection(
+                "contactRowBindingHeads"
+            )
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "authenticated contact release cannot form exact paths"
+            ) from exc
+
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "plan": None,
+            "before": {},
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "plan": None,
+                    "before": {},
+                }
+            )
+
+            def read(reference):
+                path = reference.path
+                if path in callback_state["before"]:
+                    return callback_state["before"][path]
+                try:
+                    snapshot = reference.get(transaction=transaction)
+                    exists = bool(snapshot.exists)
+                    payload = snapshot.to_dict() if exists else None
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "authenticated contact release read failed before writes"
+                    ) from exc
+                observed = (exists, payload)
+                callback_state["before"][path] = observed
+                return observed
+
+            def validate_settlement_receipt_pair(
+                settlement_document,
+                receipt_document,
+            ):
+                try:
+                    settlement = validate_contact_settlement_document(
+                        document=settlement_document
+                    )
+                    receipt = validate_contact_transition_request_document(
+                        document=receipt_document
+                    )
+                    if (
+                        settlement["userScopeHash"] != checked_scope
+                        or settlement["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                        or receipt["userScopeHash"] != checked_scope
+                        or receipt["outcome"] != "created"
+                        or receipt["contactTransitionId"]
+                        != settlement["contactTransitionId"]
+                        or receipt["transitionKind"]
+                        != settlement["transitionKind"]
+                        or receipt["exactIdentityHash"]
+                        != settlement["exactIdentityHash"]
+                        or receipt["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                        or receipt["authorityLinkHash"]
+                        != settlement["authorityLinkHash"]
+                        or receipt["hardOptOutEvidenceHash"]
+                        != settlement["hardOptOutEvidenceHash"]
+                        or receipt["actorScopeHash"]
+                        != settlement["actorScopeHash"]
+                        or receipt["reasonCode"]
+                        != settlement["reasonCode"]
+                        or receipt["resultingContactGeneration"]
+                        != settlement["generation"]
+                        or receipt["resultingContactSettlementHash"]
+                        != settlement["contactSettlementHash"]
+                        or receipt["requestedAt"] != settlement["settledAt"]
+                        or (
+                            settlement["transitionKind"]
+                            == "authenticated_release"
+                            and receipt[
+                                "expectedActiveOptOutSettlementHash"
+                            ]
+                            != settlement["predecessorSettlementHash"]
+                        )
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact settlement and creating receipt crossed"
+                        )
+                    return settlement, receipt
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact settlement creating receipt is malformed"
+                        )
+                    )
+
+            def load_historical_generation(generation):
+                settlement_reference = settlements_ref.document(
+                    f"{canonical_hash}--{generation}"
+                )
+                settlement_observation = read(settlement_reference)
+                if not settlement_observation[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "release retry generation chain is incomplete"
+                        )
+                    )
+                try:
+                    historical_settlement = (
+                        validate_contact_settlement_document(
+                            document=settlement_observation[1]
+                        )
+                    )
+                    if (
+                        historical_settlement["userScopeHash"]
+                        != checked_scope
+                        or historical_settlement[
+                            "canonicalMailboxIdentityHash"
+                        ]
+                        != canonical_hash
+                        or historical_settlement["generation"] != generation
+                        or settlement_reference.id
+                        != f"{canonical_hash}--{generation}"
+                    ):
+                        raise RowAuthorityConfigError(
+                            "release retry generation occupies a wrong path"
+                        )
+                    historical_receipt_ref = receipts_ref.document(
+                        historical_settlement["contactTransitionId"]
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "release retry generation chain is malformed"
+                        )
+                    )
+                historical_receipt_observed = read(
+                    historical_receipt_ref
+                )
+                if not historical_receipt_observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "release retry generation lacks its receipt"
+                        )
+                    )
+                historical_settlement, historical_receipt = (
+                    validate_settlement_receipt_pair(
+                        historical_settlement,
+                        historical_receipt_observed[1],
+                    )
+                )
+                try:
+                    _validate_contact_receipt_head_afterimage(
+                        settlement_document=historical_settlement,
+                        receipt_document=historical_receipt,
+                        canonical_self_alias_document=self_alias,
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "release retry historical receipt head after-image is crossed"
+                        )
+                    )
+                return historical_settlement, historical_receipt
+
+            def validate_alias(
+                observed,
+                *,
+                alias_hash,
+            ):
+                if not observed[0]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release requires exact aliases"
+                        )
+                    )
+                try:
+                    return _validate_contact_alias_binding(
+                        document=observed[1],
+                        user_scope_hash=checked_scope,
+                        exact_identity_hash=alias_hash,
+                        canonical_mailbox_identity_hash=canonical_hash,
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release alias is malformed or drifted"
+                        )
+                    )
+
+            def validate_fanout(
+                document,
+                *,
+                settlement,
+                expected_outcome,
+                frozen_fanout_head_hash,
+                receipt_requested_at,
+                allowed_states,
+            ):
+                try:
+                    fanout = validate_contact_fanout_head_document(
+                        document=document
+                    )
+                    if (
+                        fanout["userScopeHash"] != checked_scope
+                        or fanout["outcome"] != expected_outcome
+                        or fanout["expectedContactSettlementHash"]
+                        != settlement["contactSettlementHash"]
+                        or fanout["createdAt"] != settlement["settledAt"]
+                        or fanout["state"] not in allowed_states
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact fan-out does not correlate"
+                        )
+                    return _validate_contact_fanout_receipt_successor(
+                        current_document=fanout,
+                        frozen_fanout_head_hash=frozen_fanout_head_hash,
+                        receipt_requested_at=receipt_requested_at,
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release fan-out is malformed or unreachable"
+                        )
+                    )
+
+            try:
+                expected_query = (
+                    settlements_ref.where(
+                        "canonicalMailboxIdentityHash",
+                        "==",
+                        canonical_hash,
+                    )
+                    .where(
+                        "contactSettlementHash",
+                        "==",
+                        expected_active_hash,
+                    )
+                    .order_by("__name__")
+                    .limit(2)
+                )
+                expected_snapshots = tuple(transaction.get(expected_query))
+            except Exception as exc:
+                callback_state["read_failed"] = True
+                raise RowAuthorityRetryable(
+                    "authenticated release settlement lookup failed"
+                ) from exc
+            if len(expected_snapshots) != 1:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release settlement lookup is not unique"
+                    )
+                )
+            expected_reference = expected_snapshots[0].reference
+            expected_observed = read(expected_reference)
+            if not expected_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release settlement path disappeared"
+                    )
+                )
+            try:
+                expected_settlement = validate_contact_settlement_document(
+                    document=expected_observed[1]
+                )
+                expected_settlement_id = (
+                    f"{canonical_hash}--"
+                    f"{expected_settlement['generation']}"
+                )
+                if (
+                    expected_reference.id != expected_settlement_id
+                    or expected_settlement["userScopeHash"] != checked_scope
+                    or expected_settlement[
+                        "canonicalMailboxIdentityHash"
+                    ]
+                    != canonical_hash
+                    or expected_settlement["contactSettlementHash"]
+                    != expected_active_hash
+                ):
+                    raise RowAuthorityConfigError(
+                        "authenticated release settlement occupies a wrong path"
+                    )
+                expected_receipt_ref = receipts_ref.document(
+                    expected_settlement["contactTransitionId"]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release settlement is malformed or drifted"
+                    )
+                )
+            expected_receipt_observed = read(expected_receipt_ref)
+            if not expected_receipt_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release active settlement lacks its receipt"
+                    )
+                )
+            expected_settlement, expected_receipt = (
+                validate_settlement_receipt_pair(
+                    expected_settlement,
+                    expected_receipt_observed[1],
+                )
+            )
+            if expected_settlement["transitionKind"] != "verified_optout":
+                reject(
+                    RowAuthorityConflict(
+                        "authenticated release expected settlement is not active"
+                    )
+                )
+
+            exact_hash = expected_settlement["exactIdentityHash"]
+            exact_alias_ref = aliases_ref.document(exact_hash)
+            self_alias_ref = aliases_ref.document(canonical_hash)
+            alias_references = []
+            for reference in (exact_alias_ref, self_alias_ref):
+                if all(
+                    existing.path != reference.path
+                    for existing in alias_references
+                ):
+                    alias_references.append(reference)
+            alias_observed = {
+                reference.path: read(reference)
+                for reference in alias_references
+            }
+            alias_documents = {}
+            exact_alias = validate_alias(
+                alias_observed[exact_alias_ref.path],
+                alias_hash=exact_hash,
+            )
+            alias_documents[exact_hash] = exact_alias
+            self_alias = validate_alias(
+                alias_observed[self_alias_ref.path],
+                alias_hash=canonical_hash,
+            )
+            alias_documents[canonical_hash] = self_alias
+            if (
+                exact_alias["createdAt"] > expected_settlement["settledAt"]
+                or self_alias["createdAt"] > expected_settlement["settledAt"]
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release aliases postdate active authority"
+                    )
+                )
+            try:
+                _validate_contact_receipt_head_afterimage(
+                    settlement_document=expected_settlement,
+                    receipt_document=expected_receipt,
+                    canonical_self_alias_document=self_alias,
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release active receipt head after-image is crossed"
+                    )
+                )
+
+            transition_id = domain_hash(
+                CONTACT_TRANSITION_ID_DOMAIN,
+                {
+                    "transitionKind": "authenticated_release",
+                    "exactIdentityHash": exact_hash,
+                    "canonicalMailboxIdentityHash": canonical_hash,
+                    "authorityLinkHash": None,
+                    "hardOptOutEvidenceHash": None,
+                    "actorScopeHash": checked_actor_hash,
+                    "clientRequestHash": client_request_hash,
+                    "expectedActiveOptOutSettlementHash": expected_active_hash,
+                    "reasonCode": "authenticated_release",
+                },
+                user_scope_hash=checked_scope,
+            )
+            receipt_ref = receipts_ref.document(transition_id)
+            receipt_observed = read(receipt_ref)
+            head_ref = heads_ref.document(canonical_hash)
+
+            if receipt_observed[0]:
+                try:
+                    receipt = validate_contact_transition_request_document(
+                        document=receipt_observed[1]
+                    )
+                    if (
+                        receipt["contactTransitionId"] != transition_id
+                        or receipt["transitionKind"]
+                        != "authenticated_release"
+                        or receipt["exactIdentityHash"] != exact_hash
+                        or receipt["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                        or receipt["authorityLinkHash"] is not None
+                        or receipt["hardOptOutEvidenceHash"] is not None
+                        or receipt["actorScopeHash"] != checked_actor_hash
+                        or receipt["clientRequestHash"]
+                        != client_request_hash
+                        or receipt[
+                            "expectedActiveOptOutSettlementHash"
+                        ]
+                        != expected_active_hash
+                        or receipt["reasonCode"]
+                        != "authenticated_release"
+                        or receipt["outcome"] != "created"
+                    ):
+                        raise RowAuthorityConfigError(
+                            "authenticated release receipt authority drifted"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "authenticated release receipt is malformed or crossed"
+                        )
+                    )
+                if (
+                    exact_alias["createdAt"] > receipt["requestedAt"]
+                    or self_alias["createdAt"] > receipt["requestedAt"]
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release retry alias chronology is impossible"
+                        )
+                    )
+                result_settlement_ref = settlements_ref.document(
+                    f"{canonical_hash}--"
+                    f"{receipt['resultingContactGeneration']}"
+                )
+                result_fanout_ref = fanouts_ref.document(
+                    receipt["resultingFanoutId"]
+                )
+                result_settlement_observed = read(result_settlement_ref)
+                result_fanout_observed = read(result_fanout_ref)
+                head_observed = read(head_ref)
+                if (
+                    not result_settlement_observed[0]
+                    or not result_fanout_observed[0]
+                    or not head_observed[0]
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release retry after-image is incomplete"
+                        )
+                    )
+                result_settlement, creating_receipt = (
+                    validate_settlement_receipt_pair(
+                        result_settlement_observed[1],
+                        receipt,
+                    )
+                )
+                try:
+                    _validate_contact_receipt_head_afterimage(
+                        settlement_document=result_settlement,
+                        receipt_document=creating_receipt,
+                        canonical_self_alias_document=self_alias,
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release result receipt head after-image is crossed"
+                        )
+                    )
+                if (
+                    creating_receipt != receipt
+                    or result_settlement["transitionKind"]
+                    != "authenticated_release"
+                    or result_settlement["contactTransitionId"]
+                    != transition_id
+                    or result_settlement["generation"]
+                    != expected_settlement["generation"] + 1
+                    or result_settlement["predecessorSettlementHash"]
+                    != expected_active_hash
+                    or result_settlement["exactIdentityHash"] != exact_hash
+                    or result_settlement["actorScopeHash"]
+                    != checked_actor_hash
+                    or result_settlement["settledAt"]
+                    != receipt["requestedAt"]
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "authenticated release retry settlement authority drifted"
+                        )
+                    )
+                result_fanout = validate_fanout(
+                    result_fanout_observed[1],
+                    settlement=result_settlement,
+                    expected_outcome="release",
+                    frozen_fanout_head_hash=receipt[
+                        "resultingFanoutHeadHash"
+                    ],
+                    receipt_requested_at=receipt["requestedAt"],
+                    allowed_states={
+                        "discovering",
+                        "applying",
+                        "complete",
+                        "superseding",
+                        "superseded",
+                    },
+                )
+                if result_fanout["fanoutId"] != receipt["resultingFanoutId"]:
+                    reject(
+                        RowAuthorityConflict(
+                            "authenticated release retry fan-out crossed paths"
+                        )
+                    )
+                try:
+                    current_head = validate_contact_head_document(
+                        document=head_observed[1]
+                    )
+                    if (
+                        current_head["userScopeHash"] != checked_scope
+                        or current_head["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                        or current_head["latestGeneration"]
+                        < result_settlement["generation"]
+                        or current_head["createdAt"]
+                        != self_alias["createdAt"]
+                        or current_head["updatedAt"] < receipt["requestedAt"]
+                    ):
+                        raise RowAuthorityConfigError(
+                            "authenticated release retry head is not reachable"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release retry current head is malformed"
+                        )
+                    )
+                if (
+                    current_head["latestGeneration"]
+                    == result_settlement["generation"]
+                ):
+                    if result_fanout["state"] in {
+                        "superseding",
+                        "superseded",
+                    }:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "same-generation release fan-out cannot be superseding"
+                            )
+                        )
+                    if (
+                        current_head["contactHeadHash"]
+                        != receipt["resultingContactHeadHash"]
+                        or current_head["latestSettlementHash"]
+                        != result_settlement["contactSettlementHash"]
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "authenticated release retry frozen head drifted"
+                            )
+                        )
+                    try:
+                        _validate_contact_settlement_creating_receipt(
+                            settlement_document=result_settlement,
+                            receipt_document=receipt,
+                            contact_head=current_head,
+                            user_scope_hash=checked_scope,
+                            canonical_mailbox_identity_hash=canonical_hash,
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "authenticated release retry after-image crossed"
+                            )
+                        )
+                else:
+                    if result_fanout["state"] in {
+                        "discovering",
+                        "applying",
+                    }:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact epoch requires completed or superseding release fan-out"
+                            )
+                        )
+                    current_settlement_ref = settlements_ref.document(
+                        f"{canonical_hash}--"
+                        f"{current_head['latestGeneration']}"
+                    )
+                    current_settlement_observed = read(
+                        current_settlement_ref
+                    )
+                    if not current_settlement_observed[0]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact head lacks its settlement"
+                            )
+                        )
+                    try:
+                        current_settlement = (
+                            validate_contact_settlement_document(
+                                document=current_settlement_observed[1]
+                            )
+                        )
+                        current_receipt_ref = receipts_ref.document(
+                            current_settlement["contactTransitionId"]
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact settlement is malformed"
+                            )
+                        )
+                    current_receipt_observed = read(current_receipt_ref)
+                    current_fanout_ref = fanouts_ref.document(
+                        current_head["activeFanoutId"]
+                    )
+                    current_fanout_observed = read(current_fanout_ref)
+                    if (
+                        not current_receipt_observed[0]
+                        or not current_fanout_observed[0]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact authority is incomplete"
+                            )
+                        )
+                    current_settlement, current_receipt = (
+                        validate_settlement_receipt_pair(
+                            current_settlement,
+                            current_receipt_observed[1],
+                        )
+                    )
+                    try:
+                        _validate_contact_receipt_head_afterimage(
+                            settlement_document=current_settlement,
+                            receipt_document=current_receipt,
+                            canonical_self_alias_document=self_alias,
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later release receipt head after-image is crossed"
+                            )
+                        )
+                    try:
+                        _validate_contact_settlement_creating_receipt(
+                            settlement_document=current_settlement,
+                            receipt_document=current_receipt,
+                            contact_head=current_head,
+                            user_scope_hash=checked_scope,
+                            canonical_mailbox_identity_hash=canonical_hash,
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact settlement receipt is crossed"
+                            )
+                        )
+                    historical_generation = result_settlement["generation"]
+                    current_generation = current_settlement["generation"]
+                    immediate_generation = historical_generation + 1
+                    if immediate_generation == current_generation:
+                        immediate_settlement = current_settlement
+                    else:
+                        immediate_settlement, _immediate_receipt = (
+                            load_historical_generation(immediate_generation)
+                        )
+                    if (
+                        immediate_settlement["predecessorSettlementHash"]
+                        != result_settlement["contactSettlementHash"]
+                        or immediate_settlement["settledAt"]
+                        < result_settlement["settledAt"]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "release retry historical successor is crossed"
+                            )
+                        )
+                    latest_predecessor_generation = current_generation - 1
+                    if latest_predecessor_generation == historical_generation:
+                        latest_predecessor = result_settlement
+                    elif latest_predecessor_generation == immediate_generation:
+                        latest_predecessor = immediate_settlement
+                    else:
+                        latest_predecessor, _latest_predecessor_receipt = (
+                            load_historical_generation(
+                                latest_predecessor_generation
+                            )
+                        )
+                    if (
+                        current_settlement["predecessorSettlementHash"]
+                        != latest_predecessor["contactSettlementHash"]
+                        or current_settlement["settledAt"]
+                        < latest_predecessor["settledAt"]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "release retry latest predecessor is crossed"
+                            )
+                        )
+                    if result_fanout["state"] in {
+                        "superseding",
+                        "superseded",
+                    } and (
+                        result_fanout["supersedingContactSettlementHash"]
+                        != immediate_settlement["contactSettlementHash"]
+                    ):
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "release fan-out supersession crossed its successor"
+                            )
+                        )
+                    current_fanout = validate_fanout(
+                        current_fanout_observed[1],
+                        settlement=current_settlement,
+                        expected_outcome=(
+                            "apply"
+                            if current_head["state"] == "active"
+                            else "release"
+                        ),
+                        frozen_fanout_head_hash=current_receipt[
+                            "resultingFanoutHeadHash"
+                        ],
+                        receipt_requested_at=current_receipt["requestedAt"],
+                        allowed_states={
+                            "discovering",
+                            "applying",
+                            "complete",
+                        },
+                    )
+                    if (
+                        current_fanout["fanoutId"]
+                        != current_head["activeFanoutId"]
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "later contact fan-out crossed its head"
+                            )
+                        )
+                    current_exact_hash = current_settlement[
+                        "exactIdentityHash"
+                    ]
+                    if current_exact_hash not in alias_documents:
+                        current_alias_ref = aliases_ref.document(
+                            current_exact_hash
+                        )
+                        current_alias_observed = read(current_alias_ref)
+                        current_alias = validate_alias(
+                            current_alias_observed,
+                            alias_hash=current_exact_hash,
+                        )
+                        alias_documents[current_exact_hash] = current_alias
+                    if alias_documents[current_exact_hash][
+                        "createdAt"
+                    ] > current_settlement["settledAt"]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "later contact exact alias postdates settlement"
+                            )
+                        )
+                plan = {
+                    "disposition": "already_applied",
+                    "mutations": (),
+                    "transitionRequest": receipt,
+                    "settlement": result_settlement,
+                    "head": current_head,
+                    "fanoutHead": result_fanout,
+                    "aliases": list(alias_documents.values()),
+                }
+                callback_state["plan"] = plan
+                callback_state["disposition"] = "already_applied"
+                return "already_applied"
+
+            head_observed = read(head_ref)
+            if not head_observed[0]:
+                reject(
+                    RowAuthorityConflict(
+                        "authenticated release has no current contact authority"
+                    )
+                )
+            try:
+                current_head = validate_contact_head_document(
+                    document=head_observed[1]
+                )
+                if (
+                    current_head["userScopeHash"] != checked_scope
+                    or current_head["canonicalMailboxIdentityHash"]
+                    != canonical_hash
+                ):
+                    raise RowAuthorityConfigError(
+                        "authenticated release head occupies a wrong path"
+                    )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release current head is malformed"
+                    )
+                )
+            if (
+                current_head["state"] != "active"
+                or current_head["latestGeneration"]
+                != expected_settlement["generation"]
+                or current_head["latestSettlementHash"]
+                != expected_active_hash
+                or current_head["activeOptOutSettlementHash"]
+                != expected_active_hash
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "authenticated release request is stale or already released"
+                    )
+                )
+            try:
+                _validate_contact_settlement_creating_receipt(
+                    settlement_document=expected_settlement,
+                    receipt_document=expected_receipt,
+                    contact_head=current_head,
+                    user_scope_hash=checked_scope,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release active authority is crossed"
+                    )
+                )
+            if self_alias["createdAt"] != current_head["createdAt"]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release self-alias chronology is crossed"
+                    )
+                )
+            current_fanout_ref = fanouts_ref.document(
+                current_head["activeFanoutId"]
+            )
+            current_fanout_observed = read(current_fanout_ref)
+            if not current_fanout_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release active fan-out is missing"
+                    )
+                )
+            current_fanout = validate_fanout(
+                current_fanout_observed[1],
+                settlement=expected_settlement,
+                expected_outcome="apply",
+                frozen_fanout_head_hash=expected_receipt[
+                    "resultingFanoutHeadHash"
+                ],
+                receipt_requested_at=expected_receipt["requestedAt"],
+                allowed_states={"discovering", "applying", "complete"},
+            )
+            if current_fanout["fanoutId"] != current_head["activeFanoutId"]:
+                reject(
+                    RowAuthorityConflict(
+                        "authenticated release active fan-out crossed its head"
+                    )
+                )
+
+            binding_head_ref = binding_heads_ref.document(canonical_hash)
+            binding_observed = read(binding_head_ref)
+            binding_head = None
+            if binding_observed[0]:
+                try:
+                    binding_head = validate_contact_row_binding_head_document(
+                        document=binding_observed[1]
+                    )
+                    if (
+                        binding_head["userScopeHash"] != checked_scope
+                        or binding_head["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                    ):
+                        raise RowAuthorityConfigError(
+                            "contact binding head occupies a wrong path"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "authenticated release binding head is malformed"
+                        )
+                    )
+            elif (
+                current_fanout["bindingRevision"] != 0
+                or current_fanout["bindingHeadHash"] is not None
+                or current_fanout["bindingAssociationCount"] != 0
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release binding head is missing"
+                    )
+                )
+            try:
+                binding_head = _validate_contact_binding_head_successor(
+                    current_document=binding_head,
+                    prior_fanout_document=current_fanout,
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release binding head regressed from "
+                        "its active fan-out snapshot"
+                    )
+                )
+            chronology = [
+                current_head["updatedAt"],
+                current_fanout["updatedAt"],
+                exact_alias["createdAt"],
+                self_alias["createdAt"],
+                expected_settlement["settledAt"],
+                expected_receipt["requestedAt"],
+            ]
+            if binding_head is not None:
+                chronology.append(binding_head["updatedAt"])
+            if (
+                checked_requested_at <= current_head["createdAt"]
+                or any(value > checked_requested_at for value in chronology)
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "authenticated release request predates current authority"
+                    )
+                )
+
+            generation = expected_settlement["generation"] + 1
+            if generation % 2 != 0:
+                reject(
+                    RowAuthorityConflict(
+                        "authenticated release generation is not a released epoch"
+                    )
+                )
+            settlement = build_contact_settlement_document(
+                user_scope_hash=checked_scope,
+                canonical_mailbox_identity_hash=canonical_hash,
+                generation=generation,
+                predecessor_settlement_hash=expected_active_hash,
+                transition_kind="authenticated_release",
+                contact_transition_id=transition_id,
+                exact_identity_hash=exact_hash,
+                authority_link=None,
+                actor_scope_hash=checked_actor_hash,
+                reason_code="authenticated_release",
+                settled_at=checked_requested_at,
+            )
+            fanout_id = _derive_contact_fanout_id(
+                user_scope_hash=checked_scope,
+                settlement_hash=settlement["contactSettlementHash"],
+                outcome="release",
+            )
+            fanout = build_contact_fanout_head_document(
+                user_scope_hash=checked_scope,
+                fanout_id=fanout_id,
+                outcome="release",
+                expected_contact_settlement_hash=settlement[
+                    "contactSettlementHash"
+                ],
+                state_revision=1,
+                state="discovering",
+                binding_revision=(
+                    0
+                    if binding_head is None
+                    else binding_head["stateRevision"]
+                ),
+                binding_head_hash=(
+                    None
+                    if binding_head is None
+                    else binding_head["contactRowBindingHeadHash"]
+                ),
+                binding_association_count=(
+                    0
+                    if binding_head is None
+                    else binding_head["associationCount"]
+                ),
+                discovery_cursor_row_id=None,
+                obligation_count=0,
+                result_count=0,
+                lease_owner_hash=None,
+                lease_until=None,
+                fencing_token=1,
+                superseding_contact_settlement_hash=None,
+                completion_binding_revision=None,
+                completion_binding_head_hash=None,
+                completion_binding_association_count=None,
+                completion_obligation_count=None,
+                completion_result_count=None,
+                completed_at=None,
+                created_at=checked_requested_at,
+                updated_at=checked_requested_at,
+            )
+            head = build_contact_head_document(
+                user_scope_hash=checked_scope,
+                canonical_mailbox_identity_hash=canonical_hash,
+                state_revision=generation,
+                latest_generation=generation,
+                latest_settlement_hash=settlement[
+                    "contactSettlementHash"
+                ],
+                active_optout_settlement_hash=None,
+                state="released",
+                active_fanout_id=fanout_id,
+                created_at=current_head["createdAt"],
+                updated_at=checked_requested_at,
+            )
+            transition_request = build_contact_transition_request_document(
+                user_scope_hash=checked_scope,
+                transition_kind="authenticated_release",
+                exact_identity_hash=exact_hash,
+                canonical_mailbox_identity_hash=canonical_hash,
+                authority_link_hash=None,
+                hard_optout_evidence_hash=None,
+                actor_scope_hash=checked_actor_hash,
+                client_request_hash=client_request_hash,
+                expected_active_optout_settlement_hash=expected_active_hash,
+                reason_code="authenticated_release",
+                outcome="created",
+                resulting_contact_generation=generation,
+                resulting_contact_settlement_hash=settlement[
+                    "contactSettlementHash"
+                ],
+                resulting_fanout_id=fanout_id,
+                resulting_contact_head_hash=head["contactHeadHash"],
+                resulting_fanout_head_hash=fanout[
+                    "contactFanoutHeadHash"
+                ],
+                requested_at=checked_requested_at,
+            )
+            settlement_ref = settlements_ref.document(
+                f"{canonical_hash}--{generation}"
+            )
+            fanout_ref = fanouts_ref.document(fanout_id)
+            candidate_settlement_observed = read(settlement_ref)
+            candidate_fanout_observed = read(fanout_ref)
+            if (
+                candidate_settlement_observed[0]
+                or candidate_fanout_observed[0]
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "authenticated release candidate authority exists"
+                    )
+                )
+            mutations = [
+                ("create", settlement_ref, settlement),
+                ("set", head_ref, head),
+                ("create", fanout_ref, fanout),
+                ("create", receipt_ref, transition_request),
+            ]
+            if current_fanout["state"] in {"discovering", "applying"}:
+                superseding = _build_contact_superseding_fanout_head(
+                    current_document=current_fanout,
+                    superseding_contact_settlement_hash=settlement[
+                        "contactSettlementHash"
+                    ],
+                    updated_at=checked_requested_at,
+                )
+                mutations.append(("set", current_fanout_ref, superseding))
+            if len(mutations) > 5:
+                reject(
+                    RowAuthorityConfigError(
+                        "authenticated release exceeds five writes"
+                    )
+                )
+            plan = {
+                "disposition": "created",
+                "mutations": tuple(mutations),
+                "transitionRequest": transition_request,
+                "settlement": settlement,
+                "head": head,
+                "fanoutHead": fanout,
+                "aliases": list(alias_documents.values()),
+            }
+            for _operation, reference, _document in plan["mutations"]:
+                if reference.path not in callback_state["before"]:
+                    read(reference)
+            callback_state["plan"] = plan
+            callback_state["prepared"] = True
+            callback_state["disposition"] = "created"
+            for operation, reference, document in plan["mutations"]:
+                if operation == "create":
+                    transaction.create(reference, document)
+                elif operation == "set":
+                    transaction.set(reference, document, merge=False)
+                else:  # pragma: no cover - bounded internal planner
+                    raise AssertionError(
+                        "unsupported authenticated release mutation"
+                    )
+            return "created"
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "authenticated contact release transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"] or callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "authenticated contact release transaction could not start"
+                ) from exc
+            plan = callback_state["plan"]
+            if plan is None:
+                raise RowAuthorityAmbiguous(
+                    "authenticated contact release has no bounded plan"
+                ) from exc
+            mutation_references = tuple(
+                reference
+                for _operation, reference, _document in plan["mutations"]
+            )
+            try:
+                readback = self._read_reference_payloads(
+                    mutation_references
+                )
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "authenticated contact release cannot be read back"
+                ) from readback_exc
+            before = tuple(
+                callback_state["before"][reference.path]
+                for reference in mutation_references
+            )
+            after = tuple(
+                (True, document)
+                for _operation, _reference, document in plan["mutations"]
+            )
+            if readback == after:
+                disposition = plan["disposition"]
+            elif readback == before and plan["mutations"]:
+                raise RowAuthorityRetryable(
+                    "authenticated contact release failed before any apply"
+                ) from exc
+            elif readback == before:
+                disposition = plan["disposition"]
+            else:
+                raise RowAuthorityAmbiguous(
+                    "authenticated contact release readback is partial or drifted"
+                ) from exc
+        plan = callback_state["plan"]
+        if (
+            plan is None
+            or disposition != callback_state["disposition"]
+            or disposition != plan["disposition"]
+        ):
+            raise RowAuthorityRetryable(
+                "authenticated contact release returned a mismatched disposition"
+            )
+        if plan["mutations"] and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "authenticated contact release reported unprepared writes"
+            )
+        return _contact_transition_result(
+            disposition=disposition,
+            transition_request=plan["transitionRequest"],
+            settlement=plan["settlement"],
+            head=plan["head"],
+            fanout_head=plan["fanoutHead"],
+            aliases=plan["aliases"],
         )
 
     def initialize_row_identity(

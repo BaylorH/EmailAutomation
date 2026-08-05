@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib
+import inspect
 import json
 import unittest
 from copy import deepcopy
@@ -1929,6 +1930,731 @@ class ContactContractTests(unittest.TestCase):
             )
         ]
         self.assertEqual([], importers)
+
+
+class ContactSuppressionTests(unittest.TestCase):
+    """Immediate provider-free contact suppression reads."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+
+    def setUp(self):
+        self.user_id = "uid-contact-suppression"
+        self.raw_mailbox = "Broker+Known@Example.test"
+        self.created_at = "2026-08-04T12:00:00.000000Z"
+        self.released_at = "2026-08-04T12:00:01.000000Z"
+
+    def _context(self, raw_mailbox=None):
+        raw = self.raw_mailbox if raw_mailbox is None else raw_mailbox
+        exact, canonical = self.module.normalize_contact_mailbox(raw)
+        scope = self.module.user_scope_hash(self.user_id)
+        store = BoundedFakeFirestore()
+        return {
+            "raw": raw,
+            "exact": exact,
+            "canonical": canonical,
+            "exactHash": self.module.contact_identity_hash(
+                exact,
+                user_scope_hash=scope,
+            ),
+            "canonicalHash": self.module.contact_identity_hash(
+                canonical,
+                user_scope_hash=scope,
+            ),
+            "scope": scope,
+            "store": store,
+            "authority": self.module.RowAuthorityStore(
+                store,
+                transaction_executor=run_bounded_transaction,
+            ),
+        }
+
+    def _reference(self, context, collection, document_id):
+        return (
+            context["store"]
+            .collection("users")
+            .document(self.user_id)
+            .collection(collection)
+            .document(document_id)
+        )
+
+    def _alias(self, context, *, exact_hash=None, canonical_hash=None, scope=None):
+        return self.module.build_contact_alias_document(
+            user_scope_hash=context["scope"] if scope is None else scope,
+            exact_identity_hash=(
+                context["exactHash"] if exact_hash is None else exact_hash
+            ),
+            canonical_mailbox_identity_hash=(
+                context["canonicalHash"]
+                if canonical_hash is None
+                else canonical_hash
+            ),
+            created_at=self.created_at,
+        )
+
+    def _v2_link(self, context, *, exact_hash=None):
+        material = {
+            "canonicalSourceId": "source-contact-suppression",
+            "snapshotImmutableHash": "1" * 64,
+            "selectionHash": "2" * 64,
+            "ownerDecisionHash": "3" * 64,
+            "ledgerHash": "4" * 64,
+            "ownerKind": "contact_optout",
+            "ownerKey": context["canonicalHash"],
+            "workKey": "6" * 64,
+            "payloadHash": "7" * 64,
+            "hardOptOutEvidenceHash": "8" * 64,
+            "exactIdentityHash": (
+                context["exactHash"] if exact_hash is None else exact_hash
+            ),
+            "canonicalMailboxIdentityHash": context["canonicalHash"],
+        }
+        return {
+            **material,
+            "authorityLinkHash": self.module.domain_hash(
+                self.module.B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN,
+                material,
+                user_scope_hash=context["scope"],
+            ),
+        }
+
+    def _fanout_id(self, context, settlement_hash, outcome):
+        return self.module.domain_hash(
+            self.module.CONTACT_FANOUT_ID_DOMAIN,
+            {
+                "contactSettlementHash": settlement_hash,
+                "outcome": outcome,
+            },
+            user_scope_hash=context["scope"],
+        )
+
+    def _active_graph(self, context):
+        link = self._v2_link(context)
+        transition_material = {
+            "transitionKind": "verified_optout",
+            "exactIdentityHash": context["exactHash"],
+            "canonicalMailboxIdentityHash": context["canonicalHash"],
+            "authorityLinkHash": link["authorityLinkHash"],
+            "hardOptOutEvidenceHash": link["hardOptOutEvidenceHash"],
+            "actorScopeHash": None,
+            "clientRequestHash": None,
+            "expectedActiveOptOutSettlementHash": None,
+            "reasonCode": None,
+        }
+        transition_id = self.module.domain_hash(
+            self.module.CONTACT_TRANSITION_ID_DOMAIN,
+            transition_material,
+            user_scope_hash=context["scope"],
+        )
+        settlement = self.module.build_contact_settlement_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            generation=1,
+            predecessor_settlement_hash=None,
+            transition_kind="verified_optout",
+            contact_transition_id=transition_id,
+            exact_identity_hash=context["exactHash"],
+            authority_link=link,
+            actor_scope_hash=None,
+            reason_code=None,
+            settled_at=self.created_at,
+        )
+        fanout_id = self._fanout_id(
+            context,
+            settlement["contactSettlementHash"],
+            "apply",
+        )
+        head = self.module.build_contact_head_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            state_revision=1,
+            latest_generation=1,
+            latest_settlement_hash=settlement["contactSettlementHash"],
+            active_optout_settlement_hash=settlement[
+                "contactSettlementHash"
+            ],
+            state="active",
+            active_fanout_id=fanout_id,
+            created_at=self.created_at,
+            updated_at=self.created_at,
+        )
+        receipt = self.module.build_contact_transition_request_document(
+            user_scope_hash=context["scope"],
+            transition_kind="verified_optout",
+            exact_identity_hash=context["exactHash"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            authority_link_hash=link["authorityLinkHash"],
+            hard_optout_evidence_hash=link["hardOptOutEvidenceHash"],
+            actor_scope_hash=None,
+            client_request_hash=None,
+            expected_active_optout_settlement_hash=None,
+            reason_code=None,
+            outcome="created",
+            resulting_contact_generation=1,
+            resulting_contact_settlement_hash=settlement[
+                "contactSettlementHash"
+            ],
+            resulting_fanout_id=fanout_id,
+            resulting_contact_head_hash=head["contactHeadHash"],
+            resulting_fanout_head_hash="f" * 64,
+            requested_at=self.created_at,
+        )
+        return {
+            "exactAlias": self._alias(context),
+            "selfAlias": self._alias(
+                context,
+                exact_hash=context["canonicalHash"],
+            ),
+            "settlement": settlement,
+            "head": head,
+            "receipt": receipt,
+        }
+
+    def _release_graph(self, context, *, client_request_hash="e" * 64):
+        predecessor_hash = "9" * 64
+        actor_hash = "d" * 64
+        transition_material = {
+            "transitionKind": "authenticated_release",
+            "exactIdentityHash": context["exactHash"],
+            "canonicalMailboxIdentityHash": context["canonicalHash"],
+            "authorityLinkHash": None,
+            "hardOptOutEvidenceHash": None,
+            "actorScopeHash": actor_hash,
+            "clientRequestHash": client_request_hash,
+            "expectedActiveOptOutSettlementHash": predecessor_hash,
+            "reasonCode": "authenticated_release",
+        }
+        transition_id = self.module.domain_hash(
+            self.module.CONTACT_TRANSITION_ID_DOMAIN,
+            transition_material,
+            user_scope_hash=context["scope"],
+        )
+        settlement = self.module.build_contact_settlement_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            generation=2,
+            predecessor_settlement_hash=predecessor_hash,
+            transition_kind="authenticated_release",
+            contact_transition_id=transition_id,
+            exact_identity_hash=context["exactHash"],
+            authority_link=None,
+            actor_scope_hash=actor_hash,
+            reason_code="authenticated_release",
+            settled_at=self.released_at,
+        )
+        fanout_id = self._fanout_id(
+            context,
+            settlement["contactSettlementHash"],
+            "release",
+        )
+        head = self.module.build_contact_head_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            state_revision=2,
+            latest_generation=2,
+            latest_settlement_hash=settlement["contactSettlementHash"],
+            active_optout_settlement_hash=None,
+            state="released",
+            active_fanout_id=fanout_id,
+            created_at=self.created_at,
+            updated_at=self.released_at,
+        )
+        receipt = self.module.build_contact_transition_request_document(
+            user_scope_hash=context["scope"],
+            transition_kind="authenticated_release",
+            exact_identity_hash=context["exactHash"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            authority_link_hash=None,
+            hard_optout_evidence_hash=None,
+            actor_scope_hash=actor_hash,
+            client_request_hash=client_request_hash,
+            expected_active_optout_settlement_hash=predecessor_hash,
+            reason_code="authenticated_release",
+            outcome="created",
+            resulting_contact_generation=2,
+            resulting_contact_settlement_hash=settlement[
+                "contactSettlementHash"
+            ],
+            resulting_fanout_id=fanout_id,
+            resulting_contact_head_hash=head["contactHeadHash"],
+            resulting_fanout_head_hash="a" * 64,
+            requested_at=self.released_at,
+        )
+        return {
+            "exactAlias": self._alias(context),
+            "selfAlias": self._alias(
+                context,
+                exact_hash=context["canonicalHash"],
+            ),
+            "settlement": settlement,
+            "head": head,
+            "receipt": receipt,
+        }
+
+    def _seed_graph(
+        self,
+        context,
+        graph,
+        *,
+        exact_alias=True,
+        self_alias=True,
+        receipt=True,
+    ):
+        documents = []
+        if exact_alias:
+            documents.append(
+                (
+                    "contactOptOutAliases",
+                    context["exactHash"],
+                    graph["exactAlias"],
+                )
+            )
+        if self_alias and (
+            not exact_alias
+            or context["canonicalHash"] != context["exactHash"]
+        ):
+            documents.append(
+                (
+                    "contactOptOutAliases",
+                    context["canonicalHash"],
+                    graph["selfAlias"],
+                )
+            )
+        documents.extend(
+            (
+                (
+                    "contactOptOutHeads",
+                    context["canonicalHash"],
+                    graph["head"],
+                ),
+                (
+                    "contactOptOutSettlements",
+                    f"{context['canonicalHash']}--"
+                    f"{graph['settlement']['generation']}",
+                    graph["settlement"],
+                ),
+            )
+        )
+        if receipt:
+            documents.append(
+                (
+                    "contactOptOutTransitionRequests",
+                    graph["settlement"]["contactTransitionId"],
+                    graph["receipt"],
+                )
+            )
+        for collection, document_id, document in documents:
+            self._reference(context, collection, document_id).create(document)
+        context["store"].events.clear()
+
+    def _read(self, context, *, raw_mailbox=None):
+        method = getattr(
+            context["authority"],
+            "read_contact_optout_suppression",
+            None,
+        )
+        self.assertTrue(
+            callable(method),
+            "RowAuthorityStore.read_contact_optout_suppression is missing",
+        )
+        return method(
+            verified_user_id=self.user_id,
+            raw_mailbox=(context["raw"] if raw_mailbox is None else raw_mailbox),
+        )
+
+    def test_alias_creation_validation_and_conflict_table(self):
+        context = self._context()
+        exact_alias = self._alias(context)
+        self_alias = self._alias(
+            context,
+            exact_hash=context["canonicalHash"],
+        )
+        self.assertEqual(
+            exact_alias,
+            self.module.validate_contact_alias_document(
+                document=exact_alias
+            ),
+        )
+        self.assertEqual(
+            self_alias,
+            self.module.validate_contact_alias_document(document=self_alias),
+        )
+
+        graph = self._active_graph(context)
+        self._seed_graph(context, graph, exact_alias=False)
+        self.assertEqual(
+            {"decision": "suppress", "reason": "active"},
+            self._read(context),
+        )
+
+        for exact_alias_present, self_alias_present in ((True, False),):
+            with self.subTest(
+                exact=exact_alias_present,
+                self_alias=self_alias_present,
+            ):
+                partial = self._context()
+                partial_graph = self._active_graph(partial)
+                self._seed_graph(
+                    partial,
+                    partial_graph,
+                    exact_alias=exact_alias_present,
+                    self_alias=self_alias_present,
+                )
+                self.assertEqual(
+                    {"decision": "suppress", "reason": "ambiguous"},
+                    self._read(partial),
+                )
+
+        conflicting = self._context()
+        conflicting_graph = self._active_graph(conflicting)
+        self._seed_graph(conflicting, conflicting_graph)
+        other_canonical = "0" * 64
+        conflict_document = self._alias(
+            conflicting,
+            canonical_hash=other_canonical,
+        )
+        conflict_path = self._reference(
+            conflicting,
+            "contactOptOutAliases",
+            conflicting["exactHash"],
+        ).path
+        conflicting["store"].data[conflict_path] = conflict_document
+        self.assertEqual(
+            {"decision": "suppress", "reason": "ambiguous"},
+            self._read(conflicting),
+        )
+
+        same = self._context("Broker@Example.test")
+        same_graph = self._active_graph(same)
+        self._seed_graph(same, same_graph)
+        alias_paths = [
+            path
+            for path in same["store"].data
+            if "/contactOptOutAliases/" in path
+        ]
+        self.assertEqual(1, len(alias_paths))
+        self.assertEqual(
+            {"decision": "suppress", "reason": "active"},
+            self._read(same),
+        )
+
+    def test_active_contact_suppresses_exact_and_unseen_plus_variant(self):
+        context = self._context()
+        self._seed_graph(context, self._active_graph(context))
+        self.assertEqual(
+            {"decision": "suppress", "reason": "active"},
+            self._read(context),
+        )
+        self.assertEqual(
+            {"decision": "suppress", "reason": "active"},
+            self._read(
+                context,
+                raw_mailbox="Broker+Unseen@Example.test",
+            ),
+        )
+
+    def test_valid_released_or_absent_contact_allows(self):
+        released = self._context()
+        self._seed_graph(
+            released,
+            self._release_graph(released),
+            exact_alias=False,
+        )
+        self.assertEqual(
+            {"decision": "allow", "reason": "released"},
+            self._read(released),
+        )
+
+        absent = self._context()
+        self.assertEqual(
+            {"decision": "allow", "reason": "absent"},
+            self._read(absent),
+        )
+        self.assertEqual(
+            {"decision": "allow", "reason": "absent"},
+            self._read(
+                absent,
+                raw_mailbox="Broker+Unseen@Example.test",
+            ),
+        )
+
+    def test_every_alias_head_and_settlement_failure_is_fail_closed(self):
+        context = self._context()
+        graph = self._active_graph(context)
+        self._seed_graph(context, graph)
+        paths = (
+            self._reference(
+                context,
+                "contactOptOutAliases",
+                context["exactHash"],
+            ).path,
+            self._reference(
+                context,
+                "contactOptOutAliases",
+                context["canonicalHash"],
+            ).path,
+            self._reference(
+                context,
+                "contactOptOutHeads",
+                context["canonicalHash"],
+            ).path,
+            self._reference(
+                context,
+                "contactOptOutSettlements",
+                f"{context['canonicalHash']}--1",
+            ).path,
+            self._reference(
+                context,
+                "contactOptOutTransitionRequests",
+                graph["settlement"]["contactTransitionId"],
+            ).path,
+        )
+        reference_type = type(
+            self._reference(context, "contactOptOutHeads", "placeholder")
+        )
+        original_get = reference_type.get
+        for failed_path in paths:
+            def fail_selected(reference, *args, **kwargs):
+                if reference.path == failed_path:
+                    raise RuntimeError("configured read failure")
+                return original_get(reference, *args, **kwargs)
+
+            with self.subTest(failed_path=failed_path), patch.object(
+                reference_type,
+                "get",
+                new=fail_selected,
+            ):
+                self.assertEqual(
+                    {"decision": "suppress", "reason": "ambiguous"},
+                    self._read(context),
+                )
+
+        for malformed_path in paths:
+            with self.subTest(malformed_path=malformed_path):
+                original = deepcopy(context["store"].data[malformed_path])
+                context["store"].data[malformed_path] = {
+                    **original,
+                    "unknown": None,
+                }
+                self.assertEqual(
+                    {"decision": "suppress", "reason": "ambiguous"},
+                    self._read(context),
+                )
+                context["store"].data[malformed_path] = original
+
+        cross_scope_alias = self._alias(
+            context,
+            scope="0" * 64,
+        )
+        context["store"].data[paths[0]] = cross_scope_alias
+        self.assertEqual(
+            {"decision": "suppress", "reason": "ambiguous"},
+            self._read(context),
+        )
+
+    def test_missing_or_mismatched_creating_receipt_cannot_allow_release(self):
+        missing = self._context()
+        missing_graph = self._release_graph(missing)
+        self._seed_graph(missing, missing_graph, receipt=False)
+        self.assertEqual(
+            {"decision": "suppress", "reason": "ambiguous"},
+            self._read(missing),
+        )
+
+        mismatched = self._context()
+        release_graph = self._release_graph(mismatched)
+        self._seed_graph(mismatched, release_graph)
+        different_receipt = self._release_graph(
+            mismatched,
+            client_request_hash="7" * 64,
+        )["receipt"]
+        receipt_path = self._reference(
+            mismatched,
+            "contactOptOutTransitionRequests",
+            release_graph["settlement"]["contactTransitionId"],
+        ).path
+        mismatched["store"].data[receipt_path] = different_receipt
+        self.assertEqual(
+            {"decision": "suppress", "reason": "ambiguous"},
+            self._read(mismatched),
+        )
+
+    def test_impossible_canonical_alias_chronology_cannot_allow_release(self):
+        context = self._context()
+        graph = self._release_graph(context)
+        self._seed_graph(context, graph)
+        self_alias_path = self._reference(
+            context,
+            "contactOptOutAliases",
+            context["canonicalHash"],
+        ).path
+        context["store"].data[self_alias_path] = (
+            self.module.build_contact_alias_document(
+                user_scope_hash=context["scope"],
+                exact_identity_hash=context["canonicalHash"],
+                canonical_mailbox_identity_hash=context["canonicalHash"],
+                created_at="2026-08-04T12:00:02.000000Z",
+            )
+        )
+
+        self.assertEqual(
+            {"decision": "suppress", "reason": "ambiguous"},
+            self._read(context),
+        )
+
+    def test_impossible_exact_alias_chronology_cannot_allow_release(self):
+        context = self._context()
+        graph = self._release_graph(context)
+        self._seed_graph(context, graph)
+        self.assertNotEqual(context["exactHash"], context["canonicalHash"])
+        exact_alias_path = self._reference(
+            context,
+            "contactOptOutAliases",
+            context["exactHash"],
+        ).path
+        context["store"].data[exact_alias_path] = (
+            self.module.build_contact_alias_document(
+                user_scope_hash=context["scope"],
+                exact_identity_hash=context["exactHash"],
+                canonical_mailbox_identity_hash=context["canonicalHash"],
+                created_at="2026-08-04T12:00:02.000000Z",
+            )
+        )
+
+        self.assertEqual(
+            {"decision": "suppress", "reason": "ambiguous"},
+            self._read(context),
+        )
+
+    def test_suppression_read_bounds_cover_each_semantic_branch(self):
+        cases = []
+
+        absent = self._context()
+        cases.append(
+            (
+                "absent-distinct",
+                absent,
+                {"decision": "allow", "reason": "absent"},
+                3,
+            )
+        )
+
+        same_active = self._context("Broker@Example.test")
+        self._seed_graph(same_active, self._active_graph(same_active))
+        cases.append(
+            (
+                "active-same-hash",
+                same_active,
+                {"decision": "suppress", "reason": "active"},
+                4,
+            )
+        )
+
+        released = self._context()
+        self._seed_graph(
+            released,
+            self._release_graph(released),
+            exact_alias=False,
+        )
+        cases.append(
+            (
+                "released-distinct",
+                released,
+                {"decision": "allow", "reason": "released"},
+                5,
+            )
+        )
+
+        ambiguous = self._context()
+        ambiguous_graph = self._active_graph(ambiguous)
+        self._seed_graph(ambiguous, ambiguous_graph, receipt=False)
+        cases.append(
+            (
+                "ambiguous-missing-receipt",
+                ambiguous,
+                {"decision": "suppress", "reason": "ambiguous"},
+                5,
+            )
+        )
+
+        for label, context, expected_result, expected_reads in cases:
+            with self.subTest(label=label):
+                before = deepcopy(context["store"].data)
+                context["store"].events.clear()
+                self.assertEqual(expected_result, self._read(context))
+                self.assertEqual(before, context["store"].data)
+                self.assertEqual(
+                    expected_reads,
+                    sum(
+                        event[0] == "get"
+                        for event in context["store"].events
+                    ),
+                )
+                self.assertFalse(
+                    any(
+                        event[0]
+                        in {"create", "set", "update", "delete", "query"}
+                        for event in context["store"].events
+                    )
+                )
+
+    def test_suppression_is_zero_write_and_persists_no_raw_identity(self):
+        context = self._context()
+        self._seed_graph(context, self._active_graph(context))
+        before = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        result = self._read(context)
+
+        self.assertEqual(
+            {"decision": "suppress", "reason": "active"},
+            result,
+        )
+        signature = inspect.signature(
+            self.module.RowAuthorityStore.read_contact_optout_suppression
+        )
+        self.assertEqual(
+            ["self", "verified_user_id", "raw_mailbox"],
+            list(signature.parameters),
+        )
+        self.assertTrue(
+            all(
+                parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                for name, parameter in signature.parameters.items()
+                if name != "self"
+            )
+        )
+        self.assertEqual(before, context["store"].data)
+        self.assertFalse(
+            any(
+                event[0] in {"create", "set", "update", "delete"}
+                for event in context["store"].events
+            )
+        )
+        get_events = [
+            event
+            for event in context["store"].events
+            if event[0] == "get"
+        ]
+        self.assertEqual(5, len(get_events))
+        self.assertFalse(
+            any(event[0] == "query" for event in context["store"].events)
+        )
+        persisted = json.dumps(
+            {
+                "data": context["store"].data,
+                "events": context["store"].events,
+                "result": result,
+            },
+            sort_keys=True,
+        ).lower()
+        for raw_fragment in (
+            context["raw"].strip().lower(),
+            context["exact"],
+            context["canonical"],
+        ):
+            self.assertNotIn(raw_fragment, persisted)
 
 
 class ReleaseAwareRowHistoryTests(unittest.TestCase):
