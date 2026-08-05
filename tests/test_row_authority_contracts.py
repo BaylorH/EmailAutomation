@@ -98,10 +98,14 @@ from uuid import UUID
 
 
 ROW_AUTHORITY_PATH = REPO_ROOT / "email_automation" / "row_authority.py"
+ROW_METADATA_PATH = REPO_ROOT / "email_automation" / "row_metadata.py"
 ROW_AUTHORITY_STANDARD_LIBRARY_IMPORTS = frozenset(
     {"__future__", "hashlib", "json", "re", "unicodedata", "uuid"}
 )
-ROW_AUTHORITY_IMPORTER_ALLOWLIST = frozenset()
+ROW_AUTHORITY_IMPORTER_ALLOWLIST = frozenset(
+    {"email_automation/row_metadata.py"}
+)
+ROW_METADATA_IMPORTER_ALLOWLIST = frozenset()
 _APPLICATION_SCAN_EXCLUDED_PARTS = frozenset(
     {
         ".git",
@@ -175,6 +179,27 @@ def _tree_imports_row_authority(tree):
                 node.module == "email_automation"
                 or (node.level and node.module is None)
             ) and any(alias.name == "row_authority" for alias in node.names):
+                return True
+    return bool(_literal_dynamic_imports(tree))
+
+
+def _tree_imports_row_metadata(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            alias.name == "email_automation.row_metadata"
+            for alias in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom):
+            if node.module in {
+                "email_automation.row_metadata",
+                "row_metadata",
+            }:
+                return True
+            if (
+                node.module == "email_automation"
+                or (node.level and node.module is None)
+            ) and any(alias.name == "row_metadata" for alias in node.names):
                 return True
     return bool(_literal_dynamic_imports(tree))
 
