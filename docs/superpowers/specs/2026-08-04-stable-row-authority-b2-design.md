@@ -133,7 +133,8 @@ that `userScopeHash` itself contains neither field:
 | `bindingHash` | `sitesift.thread.row_binding.v1` | thread ID, client ID, row bindings hash, primary row ID, binding count, created time |
 | `edgeId` | `sitesift.row.thread_edge_id.v1` | row ID, thread ID |
 | `edgeHash` | `sitesift.row.thread_edge.v1` | edge ID, row ID, thread ID, role, thread binding hash, created time |
-| `authorityLinkHash` | `sitesift.row.b1_authority_link.v1` | every B1 link field listed below except `authorityLinkHash`, including nullable hard-opt-out evidence hash |
+| `authorityLinkHashV1` | `sitesift.row.b1_authority_link.v1` | every legacy/terminal/human B1 v1 link field listed below except `authorityLinkHash`, including nullable hard-opt-out evidence hash |
+| `authorityLinkHashV2` | `sitesift.row.b1_authority_link.v2` | every verified-contact B1 v2 link field listed below except `authorityLinkHash`, including hard-opt-out evidence plus exact/canonical identity hashes |
 | `operatorActionId` | `sitesift.row.operator_action_id.v1` | actor scope hash, row bindings hash, client-request hash, action kind, reason code, issued time |
 | `clientRequestHash` | `sitesift.row.operator_client_request.v1` | exact opaque client request ID |
 | `operatorActionHash` | `sitesift.row.operator_action.v1` | action ID/kind, actor scope hash, row bindings hash, client request hash, reason code, issued time |
@@ -188,15 +189,24 @@ the named keys, including `schemaVersion: 1` and `userScopeHash: h64`; its
 document ID exactly matches the path formula in the Record column. No raw
 mailbox or verified user ID is stored.
 
+The normative B1 contact-identity amendment is
+`docs/superpowers/specs/2026-08-04-b1-contact-identity-binding-amendment.md`.
+`B1LinkV1` is the existing exact shape
+`{canonicalSourceId: opaque, snapshotImmutableHash: h64, selectionHash: h64,
+ownerDecisionHash: h64, ledgerHash: h64, ownerKind:
+contact_optout|terminal|human_decision, ownerKey: opaque, workKey: opaque,
+payloadHash: h64, hardOptOutEvidenceHash: h64?, authorityLinkHash: h64}` and
+uses the v1 domain. `B1LinkV2` is contact-only, uses the v2 domain, and adds
+non-null `exactIdentityHash: h64` and
+`canonicalMailboxIdentityHash: h64`. New terminal/human links and legacy
+unbound contact links remain v1; B2-C accepts only a fully validated v2 link.
+`B1Link` means the exact discriminated union `B1LinkV1|B1LinkV2`.
+
 `RowBinding` is exactly `{rowId: rowId, role: primary|related}`. A
 `RowDecision` is exactly `{rowId: rowId, decision:
 accepted|dominated|blocked_by_claim_set, plannedGeneration: pos?,
 winnerGenerationHash: h64?, winnerSettlementHash: h64?}` with the nullability
-rules in the claim-set section. `B1Link` is exactly
-`{canonicalSourceId: opaque, snapshotImmutableHash: h64, selectionHash: h64,
-ownerDecisionHash: h64, ledgerHash: h64, ownerKind:
-contact_optout|terminal|human_decision, ownerKey: opaque, workKey: opaque,
-payloadHash: h64, hardOptOutEvidenceHash: h64?, authorityLinkHash: h64}`.
+rules in the claim-set section.
 
 Opaque row-snapshot cell and header values are provider-rendered strings,
 Unicode-NFC normalized, with CRLF and CR normalized to LF while preserving all
@@ -377,8 +387,11 @@ The exact B1 link, required by `b1_source` and `contact_fanout`, contains
 `canonicalSourceId`, `snapshotImmutableHash`,
 `selectionHash`, `ownerDecisionHash`, `ledgerHash`, `ownerKind`, `ownerKey`,
 `workKey`, `payloadHash`, conditional `hardOptOutEvidenceHash`, and
-`authorityLinkHash`. Hard opt-out evidence is required only for verified
-`contact_optout`; model text cannot mint opt-out priority.
+`authorityLinkHash`. A v2 verified-contact link additionally contains the exact
+and canonical mailbox identity hashes copied from bound version-2 B1 evidence.
+Hard opt-out evidence is required only for verified `contact_optout`; model
+text cannot mint opt-out priority. Contact fan-out and contact settlement paths
+reject legacy v1 contact links before writes.
 
 ### `users/{uid}/rowOperatorActions/{actionId}` — immutable
 

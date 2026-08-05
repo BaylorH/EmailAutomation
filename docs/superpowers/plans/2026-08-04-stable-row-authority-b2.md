@@ -83,6 +83,18 @@ read-only B1 post-settlement links.
 
 Publication checkpoint: `B2-B`.
 
+### B1/B2 bridge amendment — Verified contact identity provenance
+
+Plan path:
+`docs/superpowers/plans/2026-08-04-b1-contact-identity-binding-amendment.md`
+
+Before B2-C starts, newly verified B1 hard-opt-out evidence must bind the exact
+and plus-stripped canonical user-scoped mailbox hashes. Existing v1
+terminal/human and legacy contact links remain byte-compatible; B2-C accepts
+only the independently reviewed v2 verified-contact link.
+
+Publication checkpoint: `B1/B2 contact identity bridge`.
+
 ### B2-C — Contact-wide opt-out convergence and release
 
 Plan path:
@@ -113,6 +125,7 @@ Publication checkpoints: `B2-D code` and `B2 final evidence`.
 B2-A0 contracts/harness
   -> B2-A1 identity/location
   -> B2-B row ownership
+  -> B1/B2 verified-contact identity bridge
   -> B2-C contact compliance
   -> B2-D clearance/evidence
   -> B3 atomic pre-send/provider-effect authority
@@ -195,6 +208,10 @@ select a run for a different SHA.
 - [x] B2-A1 is green and published.
 - [x] B2-B child plan is independently approved and published.
 - [x] B2-B is green and published.
+- [ ] B1 contact-identity binding amendment is independently approved and its
+  child plan is published.
+- [ ] B1 contact-identity binding amendment code/evidence is green and
+  published.
 - [ ] B2-C is green and published.
 - [ ] B2-D code/evidence is green and published.
 - [ ] B3-B4 production clearance gates are complete.

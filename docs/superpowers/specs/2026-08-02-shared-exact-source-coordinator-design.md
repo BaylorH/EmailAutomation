@@ -216,6 +216,15 @@ to the supported human candidate `needs_user_input` with reason
 `unverified_optout_review` and remains subject to the same frozen snapshot and
 decision rules.
 
+The normative contact-identity amendment is
+`docs/superpowers/specs/2026-08-04-b1-contact-identity-binding-amendment.md`.
+After the unchanged strict verifier returns version-1 proof for a hard opt-out,
+B1 derives user-scoped exact and plus-stripped canonical mailbox hashes from the
+verifier-approved frozen `message.from` and persists exact version-2
+deterministic evidence. The snapshot retains hashes only. Legacy version-1
+unbound hard-opt-out evidence remains immutable/readable but cannot authorize a
+B2-C contact transition.
+
 The deterministic lane uses
 `persist_deterministic_classification_snapshot(...)`, which consumes the exact
 current claim plus canonical classification input in one transaction. It calls
