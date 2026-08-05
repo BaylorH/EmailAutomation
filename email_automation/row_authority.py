@@ -4624,6 +4624,40 @@ def _build_lease_takeover_head(
     return validate_row_authority_head(document=_with_head_hash(result))
 
 
+_LEASE_TAKEOVER_LOCATION_FIELDS = frozenset(
+    {
+        "headHash",
+        "stateRevision",
+        "currentLocationRevision",
+        "currentLocationHash",
+        "currentLocationLifecycle",
+        "updatedAt",
+    }
+)
+
+
+def _lease_takeover_head_is_location_only_forward(
+    *, takeover_head, current_head
+):
+    takeover = validate_row_authority_head(document=takeover_head)
+    current = validate_row_authority_head(document=current_head)
+    if current == takeover:
+        return True
+    for field in _HEAD_KEYS - _LEASE_TAKEOVER_LOCATION_FIELDS:
+        if current[field] != takeover[field]:
+            return False
+    location_delta = (
+        current["currentLocationRevision"]
+        - takeover["currentLocationRevision"]
+    )
+    state_delta = current["stateRevision"] - takeover["stateRevision"]
+    return (
+        location_delta > 0
+        and state_delta == location_delta
+        and current["updatedAt"] >= takeover["updatedAt"]
+    )
+
+
 def _build_settlement_advanced_head(
     *, expected_head, generation_document, settlement_document
 ):
@@ -5878,6 +5912,41 @@ def _claim_result(
     }
 
 
+def _lease_takeover_result(*, disposition, generation, head):
+    if disposition not in {"taken_over", "already_applied"}:
+        raise RowAuthorityConfigError(
+            "lease takeover disposition is not approved"
+        )
+    checked_generation = validate_owner_generation_document(
+        document=generation
+    )
+    checked_head = validate_row_authority_head(document=head)
+    if (
+        checked_head["userScopeHash"]
+        != checked_generation["userScopeHash"]
+        or checked_head["rowId"] != checked_generation["rowId"]
+        or checked_head["effectiveOwnerGeneration"]
+        != checked_generation["generation"]
+        or checked_head["effectiveOwnerGenerationHash"]
+        != checked_generation["generationHash"]
+        or checked_head["effectiveOwnerKind"]
+        != checked_generation["ownerKind"]
+        or checked_head["effectivePriority"]
+        != checked_generation["priority"]
+        or checked_head["state"] not in {"claimed", "review_pending"}
+        or checked_head["fencingToken"]
+        < checked_generation["firstFencingToken"]
+    ):
+        raise RowAuthorityConfigError(
+            "lease takeover result does not match its generation"
+        )
+    return {
+        "disposition": disposition,
+        "generation": checked_generation,
+        "head": checked_head,
+    }
+
+
 def _location_semantics(revision):
     return tuple(
         revision[field]
@@ -5953,6 +6022,36 @@ class RowAuthorityStore:
         except Exception as exc:
             raise RowAuthorityConfigError(
                 "verified user ID or row ID cannot form exact document paths"
+            ) from exc
+
+    def _lease_takeover_references(
+        self,
+        *,
+        verified_user_id,
+        row_id,
+        generation,
+    ):
+        try:
+            user_ref = self._firestore.collection("users").document(
+                verified_user_id
+            )
+            generation_id = _generation_document_id(
+                row_id=row_id,
+                generation=generation,
+            )
+            return (
+                user_ref.collection("rowIdentities").document(row_id),
+                user_ref.collection("rowAuthorityHeads").document(row_id),
+                user_ref.collection("rowOwnerGenerations").document(
+                    generation_id
+                ),
+                user_ref.collection("rowOwnerSettlements").document(
+                    generation_id
+                ),
+            )
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "lease authority cannot form exact document paths"
             ) from exc
 
     def _thread_binding_references(
@@ -7106,6 +7205,276 @@ class RowAuthorityStore:
             generations=plan["generations"],
             heads=plan["heads"],
             predecessor_settlements=plan["predecessorSettlements"],
+        )
+
+    def take_over_expired_lease(
+        self,
+        *,
+        verified_user_id,
+        row_id,
+        expected_head,
+        new_lease_owner_hash,
+        new_lease_until,
+        taken_at,
+    ):
+        _require_row_authority_planned_writes(1)
+        expected = validate_row_authority_head(document=expected_head)
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        checked_row_id = validate_row_id(row_id)
+        checked_new_owner = _require_sha256(
+            new_lease_owner_hash,
+            field_name="new_lease_owner_hash",
+        )
+        checked_new_deadline = _require_timestamp(
+            new_lease_until,
+            field_name="new_lease_until",
+        )
+        checked_taken_at = _require_timestamp(
+            taken_at,
+            field_name="taken_at",
+        )
+        if (
+            expected["userScopeHash"] != checked_scope
+            or expected["rowId"] != checked_row_id
+        ):
+            raise RowAuthorityConfigError(
+                "expected lease head does not belong to the requested row"
+            )
+        if expected["state"] not in {"claimed", "review_pending"}:
+            raise RowAuthorityConfigError(
+                "lease takeover requires an active claim"
+            )
+        if checked_taken_at < expected["updatedAt"]:
+            raise RowAuthorityConfigError(
+                "takeover cannot predate the expected head"
+            )
+        if expected["leaseUntil"] >= checked_taken_at:
+            raise RowAuthorityConfigError(
+                "lease must expire before takeover"
+            )
+        if checked_new_deadline <= checked_taken_at:
+            raise RowAuthorityConfigError(
+                "new lease must end after takeover"
+            )
+        generation_number = expected["effectiveOwnerGeneration"]
+        references = self._lease_takeover_references(
+            verified_user_id=checked_user_id,
+            row_id=checked_row_id,
+            generation=generation_number,
+        )
+        _identity_ref, head_ref, _generation_ref, _settlement_ref = references
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "before": None,
+            "identity": None,
+            "generation": None,
+            "takeover_head": None,
+            "result_head": None,
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "before": None,
+                    "identity": None,
+                    "generation": None,
+                    "takeover_head": None,
+                    "result_head": None,
+                }
+            )
+            try:
+                observed = self._read_reference_payloads(
+                    references,
+                    transaction=transaction,
+                )
+            except Exception as exc:
+                callback_state["read_failed"] = True
+                raise RowAuthorityRetryable(
+                    "lease takeover transaction read failed before writes"
+                ) from exc
+            callback_state["before"] = observed
+            if any(not exists for exists, _payload in observed[:3]):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "lease takeover is missing identity, head, or generation"
+                    )
+                )
+            if observed[3][0]:
+                reject(
+                    RowAuthorityConflict(
+                        "a settled generation cannot receive a lease takeover"
+                    )
+                )
+            try:
+                identity = validate_row_identity_document(
+                    document=observed[0][1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "lease takeover row identity is malformed or drifted"
+                    )
+                )
+            try:
+                actual_head = validate_row_authority_head(
+                    document=observed[1][1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "lease takeover row head is malformed"
+                    )
+                )
+            try:
+                generation = validate_owner_generation_document(
+                    document=observed[2][1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "lease takeover generation is malformed or drifted"
+                    )
+                )
+            if (
+                identity["userScopeHash"] != checked_scope
+                or identity["rowId"] != checked_row_id
+                or identity["createdAt"] != expected["createdAt"]
+                or actual_head["userScopeHash"] != checked_scope
+                or actual_head["rowId"] != checked_row_id
+                or actual_head["createdAt"] != identity["createdAt"]
+                or generation["rowId"] != checked_row_id
+                or generation["generation"] != generation_number
+                or generation["createdAt"] < identity["createdAt"]
+                or generation["createdAt"] > expected["updatedAt"]
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "lease takeover authority does not correlate"
+                    )
+                )
+            try:
+                takeover_head = _build_lease_takeover_head(
+                    expected_head=expected,
+                    generation_document=generation,
+                    new_lease_owner_hash=checked_new_owner,
+                    new_lease_until=checked_new_deadline,
+                    taken_at=checked_taken_at,
+                )
+            except RowAuthorityError as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "lease takeover generation conflicts with its head"
+                    )
+                )
+            callback_state["identity"] = identity
+            callback_state["generation"] = generation
+            callback_state["takeover_head"] = takeover_head
+            if _lease_takeover_head_is_location_only_forward(
+                takeover_head=takeover_head,
+                current_head=actual_head,
+            ):
+                callback_state["disposition"] = "already_applied"
+                callback_state["result_head"] = actual_head
+                return "already_applied"
+            if actual_head != expected:
+                reject(
+                    RowAuthorityConflict(
+                        "lease takeover expected head is stale or drifted"
+                    )
+                )
+            callback_state["prepared"] = True
+            callback_state["disposition"] = "taken_over"
+            callback_state["result_head"] = takeover_head
+            transaction.set(head_ref, takeover_head, merge=False)
+            return "taken_over"
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "lease takeover transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"]:
+                raise
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "lease takeover transaction could not start"
+                ) from exc
+            before = callback_state["before"]
+            takeover_head = callback_state["takeover_head"]
+            if before is None or takeover_head is None:
+                raise RowAuthorityAmbiguous(
+                    "lease takeover commit has no complete prepared state"
+                ) from exc
+            try:
+                readback = self._read_reference_payloads(references)
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "lease takeover commit outcome cannot be read back"
+                ) from readback_exc
+            expected_after = list(before)
+            expected_after[1] = (True, takeover_head)
+            exact_before = readback == before
+            exact_after = readback == tuple(expected_after)
+            if exact_after and callback_state["prepared"]:
+                disposition = "taken_over"
+            elif (
+                exact_before
+                and callback_state["disposition"] == "already_applied"
+            ):
+                disposition = "already_applied"
+            elif exact_before:
+                raise RowAuthorityRetryable(
+                    "lease takeover commit failed before apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "lease takeover commit readback is partial or drifted"
+                ) from exc
+        if disposition not in {"taken_over", "already_applied"}:
+            raise RowAuthorityRetryable(
+                "lease takeover returned no approved disposition"
+            )
+        if disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "lease takeover returned a mismatched disposition"
+            )
+        if disposition == "taken_over" and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "lease takeover reported an unprepared head write"
+            )
+        generation = callback_state["generation"]
+        result_head = callback_state["result_head"]
+        if generation is None or result_head is None:
+            raise RowAuthorityRetryable(
+                "lease takeover returned an incomplete result"
+            )
+        return _lease_takeover_result(
+            disposition=disposition,
+            generation=generation,
+            head=result_head,
         )
 
     def record_contact_row_association(

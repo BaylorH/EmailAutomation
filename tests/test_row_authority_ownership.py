@@ -7950,6 +7950,529 @@ class RowClaimStoreTests(unittest.TestCase):
         with self.assertRaises(self.module.RowAuthorityConflict):
             self._claim(accepted_store, bundle=accepted_bundle)
 
+class RowLeaseTakeoverTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+        RowClaimStoreTests.setUpClass()
+
+    def setUp(self):
+        self.fixture = RowClaimStoreTests("test_terminal_claim_enters_claimed")
+        self.fixture.setUp()
+        self.user_id = self.fixture.user_id
+        self.scope = self.fixture.scope
+        self.row_id = self.fixture.first
+        self.taken_at = "2026-08-04T12:05:01.000000Z"
+        self.new_lease_until = "2026-08-04T12:10:00.000000Z"
+        self.new_owner = "b" * 64
+
+    def _store(self):
+        return self.fixture._store()
+
+    def _seed_claim(self, *, owner_kind="terminal"):
+        store = self._store()
+        bundle, _binding = self.fixture._seed_prerequisites(
+            store,
+            owner_kind=owner_kind,
+        )
+        result = self.fixture._claim(store, bundle=bundle)
+        return store, result
+
+    def _takeover(self, store, expected_head, *, executor=None, **overrides):
+        arguments = {
+            "verified_user_id": self.user_id,
+            "row_id": self.row_id,
+            "expected_head": expected_head,
+            "new_lease_owner_hash": self.new_owner,
+            "new_lease_until": self.new_lease_until,
+            "taken_at": self.taken_at,
+        }
+        arguments.update(overrides)
+        return self.fixture._authority(
+            store,
+            executor=executor,
+        ).take_over_expired_lease(**arguments)
+
+    def _generation_reference(self, store, generation=1):
+        return self.fixture._generation_reference(
+            store,
+            self.row_id,
+            generation,
+        )
+
+    def _settlement_reference(self, store, generation=1):
+        return self.fixture._settlement_reference(
+            store,
+            self.row_id,
+            generation,
+        )
+
+    def _head_reference(self, store):
+        return self.fixture._row_references(store, self.row_id)[1]
+
+    @staticmethod
+    def _writes(store):
+        return RowClaimStoreTests._write_events(store)
+
+    def _location_advance(self, store, expected_head):
+        identity_ref, _head_ref = self.fixture._row_references(
+            store,
+            self.row_id,
+        )
+        identity = deepcopy(store.data[identity_ref.path])
+        observation = self.module.build_row_observation(
+            spreadsheet_id=identity["spreadsheetId"],
+            marker_observation={
+                "rowId": self.row_id,
+                "sheetId": identity["sheetId"],
+                "providerRowIndex": 3,
+                "displayRowNumber": 4,
+                "metadataId": 4,
+            },
+            ordered_headers=("Email",),
+            ordered_cell_values=("moved@example.test",),
+            user_scope_hash=self.scope,
+        )
+        revision = self.module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=expected_head["currentLocationRevision"] + 1,
+            lifecycle="active",
+            observations=(observation,),
+            previous_revision_hash=expected_head["currentLocationHash"],
+            observed_at="2026-08-04T12:05:02.000000Z",
+        )
+        return self.module.build_location_advanced_head(
+            expected_head=expected_head,
+            location_revision_document=revision,
+        )
+
+    def test_expired_claimed_lease_takeover_advances_one_head_and_same_generation(self):
+        method = self.module.RowAuthorityStore.take_over_expired_lease
+        self.assertEqual(
+            [
+                "self",
+                "verified_user_id",
+                "row_id",
+                "expected_head",
+                "new_lease_owner_hash",
+                "new_lease_until",
+                "taken_at",
+            ],
+            list(inspect.signature(method).parameters),
+        )
+        store, claimed = self._seed_claim()
+        expected = claimed["heads"][0]
+        generation_ref = self._generation_reference(store)
+        generation_before = deepcopy(store.data[generation_ref.path])
+        store.events.clear()
+
+        with patch.object(
+            self.module,
+            "_require_row_authority_planned_writes",
+            wraps=self.module._require_row_authority_planned_writes,
+        ) as write_bound:
+            result = self._takeover(store, expected)
+
+        write_bound.assert_called_once_with(1)
+        self.assertEqual("taken_over", result["disposition"])
+        self.assertEqual(generation_before, result["generation"])
+        self.assertEqual(generation_before, store.data[generation_ref.path])
+        self.assertEqual("claimed", result["head"]["state"])
+        writes = self._writes(store)
+        self.assertEqual(
+            [("set", self._head_reference(store).path, result["head"], False)],
+            writes,
+        )
+        first_write = next(
+            index
+            for index, event in enumerate(store.events)
+            if event[0] in {"create", "set", "update", "delete"}
+        )
+        self.assertTrue(all(event[0] == "get" for event in store.events[1:first_write]))
+        self.assertGreaterEqual(
+            sum(event[0] == "get" for event in store.events[:first_write]),
+            4,
+        )
+        stored_generation = deepcopy(store.data[generation_ref.path])
+        stored_head = deepcopy(store.data[self._head_reference(store).path])
+        result["generation"]["ownerKey"] = "0" * 64
+        result["head"]["leaseOwnerHash"] = "0" * 64
+        self.assertEqual(stored_generation, store.data[generation_ref.path])
+        self.assertEqual(stored_head, store.data[self._head_reference(store).path])
+
+    def test_expired_review_pending_lease_takeover_preserves_pending_state(self):
+        store, claimed = self._seed_claim(owner_kind="human_decision")
+        expected = claimed["heads"][0]
+
+        result = self._takeover(store, expected)
+
+        self.assertEqual("review_pending", expected["state"])
+        self.assertEqual("review_pending", result["head"]["state"])
+        self.assertEqual(
+            expected["effectiveOwnerGenerationHash"],
+            result["head"]["effectiveOwnerGenerationHash"],
+        )
+
+    def test_takeover_increments_fence_and_state_revision_but_not_lease_epoch(self):
+        store, claimed = self._seed_claim()
+        expected = claimed["heads"][0]
+        generation_ref = self._generation_reference(store)
+        generation_before = deepcopy(store.data[generation_ref.path])
+        settlement_path = self._settlement_reference(store).path
+
+        result = self._takeover(store, expected)
+
+        self.assertEqual(
+            expected["stateRevision"] + 1,
+            result["head"]["stateRevision"],
+        )
+        self.assertEqual(
+            expected["fencingToken"] + 1,
+            result["head"]["fencingToken"],
+        )
+        self.assertNotEqual(
+            expected["fencingToken"],
+            store.data[self._head_reference(store).path]["fencingToken"],
+        )
+        self.assertEqual(1, result["generation"]["leaseEpoch"])
+        self.assertEqual(generation_before, store.data[generation_ref.path])
+        self.assertNotIn(settlement_path, store.data)
+
+    def test_unexpired_wrong_state_settled_or_malformed_takeover_writes_nothing(self):
+        cases = []
+
+        store, claimed = self._seed_claim()
+        cases.append(("unexpired", store, claimed["heads"][0], {"taken_at": self.fixture.claimed_at}))
+
+        store = self._store()
+        _identity, clear_head = self.fixture._seed_row(store, self.row_id)
+        cases.append(("wrong_state", store, clear_head, {}))
+
+        store, claimed = self._seed_claim()
+        claim = claimed["claimSet"]
+        generation = claimed["generations"][0]
+        settlement, settled_head = self.fixture._settle_terminal_owner(
+            store,
+            claim,
+            generation,
+            claimed["heads"][0],
+        )
+        self.assertIsNotNone(settlement)
+        cases.append(("settled", store, settled_head, {}))
+
+        store, claimed = self._seed_claim()
+        malformed = deepcopy(claimed["heads"][0])
+        malformed["headHash"] = "f" * 64
+        cases.append(("malformed", store, malformed, {}))
+
+        for label, candidate_store, expected, overrides in cases:
+            with self.subTest(label=label):
+                before = deepcopy(candidate_store.data)
+                candidate_store.events.clear()
+                with self.assertRaises(self.module.RowAuthorityError):
+                    self._takeover(candidate_store, expected, **overrides)
+                self.assertEqual(before, candidate_store.data)
+                self.assertEqual([], self._writes(candidate_store))
+
+    def test_takeover_requires_exact_generation_and_absent_settlement(self):
+        missing_store, missing_claim = self._seed_claim()
+        missing_ref = self._generation_reference(missing_store)
+        del missing_store.data[missing_ref.path]
+        before = deepcopy(missing_store.data)
+        missing_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._takeover(missing_store, missing_claim["heads"][0])
+        self.assertEqual(before, missing_store.data)
+        self.assertEqual([], self._writes(missing_store))
+
+        drift_store, drift_claim = self._seed_claim()
+        drift_ref = self._generation_reference(drift_store)
+        drift_store.data[drift_ref.path]["generationHash"] = "f" * 64
+        before = deepcopy(drift_store.data)
+        drift_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._takeover(drift_store, drift_claim["heads"][0])
+        self.assertEqual(before, drift_store.data)
+        self.assertEqual([], self._writes(drift_store))
+
+        settled_store, settled_claim = self._seed_claim()
+        generation = settled_claim["generations"][0]
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=settled_claim["claimSet"],
+            fencing_token=settled_claim["heads"][0]["fencingToken"],
+            outcome="terminal",
+            settled_at="2026-08-04T12:05:00.000000Z",
+        )
+        self._settlement_reference(settled_store).create(settlement)
+        before = deepcopy(settled_store.data)
+        settled_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._takeover(settled_store, settled_claim["heads"][0])
+        self.assertEqual(before, settled_store.data)
+        self.assertEqual([], self._writes(settled_store))
+
+    def test_exact_old_head_takeover_replay_is_zero_write_already_applied(self):
+        store, claimed = self._seed_claim()
+        expected = claimed["heads"][0]
+        first = self._takeover(store, expected)
+        store.events.clear()
+
+        replay = self._takeover(store, expected)
+
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(first["generation"], replay["generation"])
+        self.assertEqual(first["head"], replay["head"])
+        self.assertEqual([], self._writes(store))
+        self.assertIn(("commit_applied", 0), store.events)
+
+        race_store, race_claimed = self._seed_claim()
+        race_expected = race_claimed["heads"][0]
+        race_store.events.clear()
+        race_store.before_commit_barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(self._takeover, race_store, race_expected)
+                for _index in range(2)
+            ]
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual(
+            ["already_applied", "taken_over"],
+            sorted(item["disposition"] for item in results),
+        )
+        self.assertEqual(1, race_store.events.count(("commit_applied", 1)))
+        self.assertEqual(1, race_store.events.count(("commit_applied", 0)))
+        self.assertTrue(
+            any(
+                event[0] == "commit_aborted_stale_read"
+                for event in race_store.events
+            )
+        )
+
+    def test_takeover_replay_after_location_only_advance_preserves_new_location(self):
+        store, claimed = self._seed_claim()
+        expected = claimed["heads"][0]
+        first = self._takeover(store, expected)
+        advanced = self._location_advance(store, first["head"])
+        self._head_reference(store).set(advanced, merge=False)
+        store.events.clear()
+
+        replay = self._takeover(store, expected)
+
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(advanced, replay["head"])
+        self.assertEqual(
+            advanced,
+            store.data[self._head_reference(store).path],
+        )
+        self.assertEqual([], self._writes(store))
+
+    def test_takeover_replay_after_different_takeover_conflicts_without_rewind(self):
+        store, claimed = self._seed_claim()
+        original = claimed["heads"][0]
+        first = self._takeover(store, original)
+        second = self._takeover(
+            store,
+            first["head"],
+            new_lease_owner_hash="c" * 64,
+            new_lease_until="2026-08-04T12:15:00.000000Z",
+            taken_at="2026-08-04T12:10:01.000000Z",
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._takeover(store, original)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual(second["head"], store.data[self._head_reference(store).path])
+        self.assertEqual([], self._writes(store))
+
+    def test_takeover_time_equal_to_head_update_is_valid_and_earlier_is_rejected(self):
+        store, claimed = self._seed_claim()
+        expected = deepcopy(claimed["heads"][0])
+        expected.update(
+            {
+                "leaseUntil": "2026-08-04T12:05:00.000000Z",
+                "updatedAt": "2026-08-04T12:05:01.000000Z",
+            }
+        )
+        expected = self.fixture._rehash_head(expected)
+        self._head_reference(store).set(expected, merge=False)
+        result = self._takeover(store, expected)
+        self.assertEqual("taken_over", result["disposition"])
+
+        earlier_store, earlier_claim = self._seed_claim()
+        earlier = deepcopy(earlier_claim["heads"][0])
+        earlier.update(
+            {
+                "leaseUntil": "2026-08-04T12:04:59.000000Z",
+                "updatedAt": "2026-08-04T12:05:01.000000Z",
+            }
+        )
+        earlier = self.fixture._rehash_head(earlier)
+        self._head_reference(earlier_store).set(earlier, merge=False)
+        before = deepcopy(earlier_store.data)
+        earlier_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self._takeover(
+                earlier_store,
+                earlier,
+                taken_at="2026-08-04T12:05:00.000000Z",
+            )
+        self.assertEqual(before, earlier_store.data)
+        self.assertEqual([], self._writes(earlier_store))
+
+    def test_other_stale_head_takeover_is_conflict(self):
+        store, claimed = self._seed_claim()
+        stale = claimed["heads"][0]
+        current = self._location_advance(store, stale)
+        self._head_reference(store).set(current, merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._takeover(store, stale)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual(current, store.data[self._head_reference(store).path])
+        self.assertEqual([], self._writes(store))
+
+        retry_store, retry_claimed = self._seed_claim()
+        retry_expected = retry_claimed["heads"][0]
+        competing_location = self._location_advance(
+            retry_store,
+            retry_expected,
+        )
+        retry_head_ref = self._head_reference(retry_store)
+        retry_store.events.clear()
+        retry_store.before_next_commit_hook = lambda: retry_head_ref.set(
+            competing_location,
+            merge=False,
+        )
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._takeover(retry_store, retry_expected)
+        self.assertEqual(competing_location, retry_store.data[retry_head_ref.path])
+        self.assertIn(("transaction_began", 0), retry_store.events)
+        self.assertIn(("transaction_began", 1), retry_store.events)
+        self.assertTrue(
+            any(
+                event[0] == "commit_aborted_stale_read"
+                for event in retry_store.events
+            )
+        )
+
+    def test_takeover_preapply_and_apply_then_raise_classification_is_exact(self):
+        preapply_store, preapply_claim = self._seed_claim()
+        before = deepcopy(preapply_store.data)
+        preapply_store.events.clear()
+        preapply_store.fail_next_commit = RuntimeError("preapply takeover failure")
+        with self.assertRaises(self.module.RowAuthorityRetryable):
+            self._takeover(preapply_store, preapply_claim["heads"][0])
+        self.assertEqual(before, preapply_store.data)
+        self.assertEqual([], self._writes(preapply_store))
+
+        applied_store, applied_claim = self._seed_claim()
+        applied_store.events.clear()
+        applied_store.apply_then_raise_next_commit = RuntimeError(
+            "unknown takeover commit outcome"
+        )
+        applied = self._takeover(applied_store, applied_claim["heads"][0])
+        self.assertEqual("taken_over", applied["disposition"])
+        self.assertIn(("commit_raised_after_apply",), applied_store.events)
+        self.assertEqual(
+            applied["head"],
+            applied_store.data[self._head_reference(applied_store).path],
+        )
+
+        drift_store, drift_claim = self._seed_claim()
+
+        def apply_then_drift(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            transaction._commit()
+            head_ref = self._head_reference(drift_store)
+            drifted = deepcopy(drift_store.data[head_ref.path])
+            drifted["projectionBacklogCount"] += 1
+            head_ref.set(self.fixture._rehash_head(drifted), merge=False)
+            raise RuntimeError("takeover after-image drifted")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._takeover(
+                drift_store,
+                drift_claim["heads"][0],
+                executor=apply_then_drift,
+            )
+
+        location_store, location_claim = self._seed_claim()
+        advanced_after_apply = {}
+
+        def apply_then_advance_location(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            transaction._commit()
+            head_ref = self._head_reference(location_store)
+            advanced = self._location_advance(
+                location_store,
+                location_store.data[head_ref.path],
+            )
+            head_ref.set(advanced, merge=False)
+            advanced_after_apply["head"] = advanced
+            raise RuntimeError("takeover head advanced after apply")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._takeover(
+                location_store,
+                location_claim["heads"][0],
+                executor=apply_then_advance_location,
+            )
+        self.assertEqual(
+            advanced_after_apply["head"],
+            location_store.data[self._head_reference(location_store).path],
+        )
+
+        fake_module = importlib.import_module("tests.source_coordinator_fakes")
+        original_get = fake_module.FakeDocumentReference.get
+        read_store, read_claim = self._seed_claim()
+        read_counts = {"transactional": 0, "nontransactional": 0}
+
+        def fail_second_transaction_read(reference, *, transaction=None):
+            if transaction is None:
+                read_counts["nontransactional"] += 1
+            else:
+                read_counts["transactional"] += 1
+                if read_counts["transactional"] == 2:
+                    raise RuntimeError("takeover transactional read failed")
+            return original_get(reference, transaction=transaction)
+
+        with patch.object(
+            fake_module.FakeDocumentReference,
+            "get",
+            new=fail_second_transaction_read,
+        ), self.assertRaises(self.module.RowAuthorityRetryable):
+            self._takeover(read_store, read_claim["heads"][0])
+        self.assertEqual(2, read_counts["transactional"])
+        self.assertEqual(0, read_counts["nontransactional"])
+
+        unreadable_store, unreadable_claim = self._seed_claim()
+        unreadable_store.apply_then_raise_next_commit = RuntimeError(
+            "takeover applied but readback is unavailable"
+        )
+
+        def fail_nontransaction_readback(reference, *, transaction=None):
+            if transaction is None:
+                raise RuntimeError("takeover readback unavailable")
+            return original_get(reference, transaction=transaction)
+
+        with patch.object(
+            fake_module.FakeDocumentReference,
+            "get",
+            new=fail_nontransaction_readback,
+        ), self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._takeover(
+                unreadable_store,
+                unreadable_claim["heads"][0],
+            )
 
 
 if __name__ == "__main__":
