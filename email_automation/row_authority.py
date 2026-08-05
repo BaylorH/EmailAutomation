@@ -1325,3 +1325,226 @@ def build_location_advanced_head(*, expected_head, location_revision_document):
     )
     advanced = _with_head_hash(result)
     return validate_row_authority_head(document=advanced)
+
+
+def _initialization_result(*, disposition, identity, revision, head):
+    if disposition not in {"created", "existing"}:
+        raise RowAuthorityConfigError(
+            "initialization disposition is not approved"
+        )
+    return {
+        "disposition": disposition,
+        "identity": dict(identity),
+        "locationRevision": dict(revision),
+        "authorityHead": dict(head),
+    }
+
+
+class RowAuthorityStore:
+    def __init__(self, firestore, *, transaction_executor):
+        if firestore is None:
+            raise RowAuthorityConfigError("firestore dependency is required")
+        if not callable(getattr(firestore, "collection", None)):
+            raise RowAuthorityConfigError(
+                "firestore dependency must expose collection"
+            )
+        if not callable(getattr(firestore, "transaction", None)):
+            raise RowAuthorityConfigError(
+                "firestore dependency must expose transaction"
+            )
+        if not callable(transaction_executor):
+            raise RowAuthorityConfigError(
+                "transaction_executor dependency must be callable"
+            )
+        self._firestore = firestore
+        self._transaction_executor = transaction_executor
+
+    def _initialization_references(self, *, verified_user_id, row_id):
+        try:
+            user_ref = self._firestore.collection("users").document(
+                verified_user_id
+            )
+            return (
+                user_ref.collection("rowIdentities").document(row_id),
+                user_ref.collection("rowLocationRevisions").document(
+                    f"{row_id}--1"
+                ),
+                user_ref.collection("rowAuthorityHeads").document(row_id),
+            )
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "verified user ID or row ID cannot form exact document paths"
+            ) from exc
+
+    @staticmethod
+    def _read_reference_payloads(references, *, transaction=None):
+        snapshots = []
+        for reference in references:
+            if transaction is None:
+                snapshots.append(reference.get())
+            else:
+                snapshots.append(reference.get(transaction=transaction))
+        return tuple(
+            (
+                bool(snapshot.exists),
+                snapshot.to_dict() if snapshot.exists else None,
+            )
+            for snapshot in snapshots
+        )
+
+    def initialize_row_identity(
+        self,
+        *,
+        verified_user_id,
+        client_id,
+        spreadsheet_id,
+        marker_observation,
+        headers,
+        cells,
+        lifecycle,
+        creation_kind,
+        creation_source_hash,
+        created_at,
+    ):
+        planned_writes = 3
+        if planned_writes > MAX_ROW_AUTHORITY_PLANNED_WRITES:
+            raise RowAuthorityConfigError(
+                "row initialization exceeds the planned-write ceiling"
+            )
+        if type(lifecycle) is not str or lifecycle not in {
+            "active",
+            "nonviable",
+        }:
+            raise RowAuthorityConfigError(
+                "initial row lifecycle must be active or nonviable"
+            )
+        checked_scope = user_scope_hash(verified_user_id)
+        marker = _require_exact_dict(
+            marker_observation,
+            keys=_MARKER_OBSERVATION_KEYS,
+            field_name="marker_observation",
+        )
+        checked_row_id = validate_row_id(marker["rowId"])
+        checked_sheet_id = _require_uint(
+            marker["sheetId"],
+            field_name="marker_observation.sheetId",
+        )
+        identity = build_row_identity_document(
+            user_scope_hash=checked_scope,
+            row_id=checked_row_id,
+            client_id=client_id,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=checked_sheet_id,
+            creation_kind=creation_kind,
+            creation_source_hash=creation_source_hash,
+            created_at=created_at,
+        )
+        observation = build_row_observation(
+            spreadsheet_id=spreadsheet_id,
+            marker_observation=marker,
+            ordered_headers=headers,
+            ordered_cell_values=cells,
+            user_scope_hash=checked_scope,
+        )
+        revision = build_row_location_revision_document(
+            identity_document=identity,
+            revision=1,
+            lifecycle=lifecycle,
+            observations=(observation,),
+            previous_revision_hash=None,
+            observed_at=created_at,
+        )
+        head = build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=created_at,
+        )
+        references = self._initialization_references(
+            verified_user_id=verified_user_id,
+            row_id=checked_row_id,
+        )
+        expected_documents = (identity, revision, head)
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "existing": False,
+        }
+
+        def prepare(transaction):
+            callback_state["entered"] = True
+            observed = self._read_reference_payloads(
+                references,
+                transaction=transaction,
+            )
+            if all(not exists for exists, _payload in observed):
+                callback_state["prepared"] = True
+                for reference, document in zip(
+                    references,
+                    expected_documents,
+                ):
+                    transaction.create(reference, document)
+                return "created"
+            if all(exists for exists, _payload in observed) and tuple(
+                payload for _exists, payload in observed
+            ) == expected_documents:
+                callback_state["existing"] = True
+                return "existing"
+            raise RowAuthorityAmbiguous(
+                "row identity initialization found partial or drifted state"
+            )
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "row identity transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except RowAuthorityAmbiguous:
+            raise
+        except RowAuthorityError:
+            raise
+        except Exception as exc:
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "row identity transaction could not start"
+                ) from exc
+            try:
+                readback = self._read_reference_payloads(references)
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "row identity commit outcome cannot be read back"
+                ) from readback_exc
+            if all(exists for exists, _payload in readback) and tuple(
+                payload for _exists, payload in readback
+            ) == expected_documents:
+                disposition = (
+                    "created" if callback_state["prepared"] else "existing"
+                )
+            elif all(not exists for exists, _payload in readback):
+                raise RowAuthorityRetryable(
+                    "row identity commit failed before any apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "row identity commit readback is partial or drifted"
+                ) from exc
+        if disposition not in {"created", "existing"}:
+            raise RowAuthorityRetryable(
+                "row identity transaction returned no approved disposition"
+            )
+        if disposition == "created" and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "row identity transaction reported an unprepared create"
+            )
+        if disposition == "existing" and not callback_state["existing"]:
+            raise RowAuthorityRetryable(
+                "row identity transaction reported an unobserved existing state"
+            )
+        return _initialization_result(
+            disposition=disposition,
+            identity=identity,
+            revision=revision,
+            head=head,
+        )

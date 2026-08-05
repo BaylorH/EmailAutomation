@@ -1575,6 +1575,294 @@ class RowIdentityDocumentSchemaTests(_RowIdentityFixtures, unittest.TestCase):
                 module.validate_row_authority_head(document=variant)
 
 
+class RowIdentityInitializationTests(_RowIdentityFixtures, unittest.TestCase):
+    @staticmethod
+    def _fakes():
+        return importlib.import_module("tests.row_authority_fakes")
+
+    @classmethod
+    def _references(cls, store):
+        user = store.collection("users").document("uid-1")
+        return (
+            user.collection("rowIdentities").document(ROW_ID),
+            user.collection("rowLocationRevisions").document(f"{ROW_ID}--1"),
+            user.collection("rowAuthorityHeads").document(ROW_ID),
+        )
+
+    @classmethod
+    def _initialize(cls, module, store, *, executor=None, **overrides):
+        if executor is None:
+            executor = cls._fakes().run_bounded_transaction
+        coordinator = module.RowAuthorityStore(
+            store,
+            transaction_executor=executor,
+        )
+        arguments = {
+            "verified_user_id": "uid-1",
+            "client_id": "client-A",
+            "spreadsheet_id": "spreadsheet-A",
+            "marker_observation": cls._marker_observation(),
+            "headers": (" Email ", "Status\r\nLine"),
+            "cells": ("USER@EXAMPLE.COM", "  Keep  \rValue"),
+            "lifecycle": "active",
+            "creation_kind": "fresh",
+            "creation_source_hash": CREATION_SOURCE_HASH,
+            "created_at": CREATED_AT,
+        }
+        arguments.update(overrides)
+        return coordinator.initialize_row_identity(**arguments)
+
+    def test_initialization_creates_exact_three_documents_atomically(self):
+        module = self._authority()
+        store = self._fakes().BoundedFakeFirestore()
+        result = self._initialize(module, store)
+        self.assertEqual(
+            {"disposition", "identity", "locationRevision", "authorityHead"},
+            set(result),
+        )
+        self.assertEqual("created", result["disposition"])
+        references = self._references(store)
+        self.assertEqual({reference.path for reference in references}, set(store.data))
+        self.assertEqual(result["identity"], store.data[references[0].path])
+        self.assertEqual(
+            result["locationRevision"],
+            store.data[references[1].path],
+        )
+        self.assertEqual(result["authorityHead"], store.data[references[2].path])
+        get_indexes = [
+            index
+            for index, event in enumerate(store.events)
+            if event[0] == "get"
+        ]
+        create_indexes = [
+            index
+            for index, event in enumerate(store.events)
+            if event[0] == "create"
+        ]
+        self.assertEqual(3, len(get_indexes))
+        self.assertEqual(3, len(create_indexes))
+        self.assertLess(max(get_indexes), min(create_indexes))
+        self.assertIn(("commit_applied", 3), store.events)
+        result["identity"]["clientId"] = "mutated"
+        self.assertEqual("client-A", store.data[references[0].path]["clientId"])
+
+    def test_initialization_supports_active_and_nonviable_only(self):
+        module = self._authority()
+        fakes = self._fakes()
+        for lifecycle in ("active", "nonviable"):
+            with self.subTest(lifecycle=lifecycle):
+                store = fakes.BoundedFakeFirestore()
+                result = self._initialize(module, store, lifecycle=lifecycle)
+                self.assertEqual(
+                    lifecycle,
+                    result["locationRevision"]["lifecycle"],
+                )
+        for lifecycle in ("deleted", "ambiguous", "unknown", None):
+            with self.subTest(lifecycle=lifecycle):
+                store = fakes.BoundedFakeFirestore()
+                with self.assertRaises(module.RowAuthorityConfigError):
+                    self._initialize(module, store, lifecycle=lifecycle)
+                self.assertEqual([], store.events)
+                self.assertEqual({}, store.data)
+
+    def test_exact_initialization_retry_is_zero_write_noop(self):
+        module = self._authority()
+        store = self._fakes().BoundedFakeFirestore()
+        created = self._initialize(module, store)
+        data_before = deepcopy(store.data)
+        store.events.clear()
+        existing = self._initialize(module, store)
+        self.assertEqual("created", created["disposition"])
+        self.assertEqual("existing", existing["disposition"])
+        self.assertEqual(data_before, store.data)
+        self.assertFalse(
+            any(event[0] in {"create", "set", "update", "delete"} for event in store.events)
+        )
+        self.assertIn(("commit_applied", 0), store.events)
+
+    def test_partial_existing_state_is_ambiguous_with_zero_writes(self):
+        module = self._authority()
+        fakes = self._fakes()
+        source_store = fakes.BoundedFakeFirestore()
+        expected = self._initialize(module, source_store)
+        store = fakes.BoundedFakeFirestore()
+        references = self._references(store)
+        references[0].create(expected["identity"])
+        data_before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(module.RowAuthorityAmbiguous):
+            self._initialize(module, store)
+        self.assertEqual(data_before, store.data)
+        self.assertFalse(
+            any(event[0] in {"create", "set", "update", "delete"} for event in store.events)
+        )
+
+    def test_any_existing_document_drift_is_ambiguous_with_zero_writes(self):
+        module = self._authority()
+        fakes = self._fakes()
+        source_store = fakes.BoundedFakeFirestore()
+        expected = self._initialize(module, source_store)
+        documents = (
+            expected["identity"],
+            expected["locationRevision"],
+            expected["authorityHead"],
+        )
+        for drift_index in range(3):
+            with self.subTest(drift_index=drift_index):
+                store = fakes.BoundedFakeFirestore()
+                references = self._references(store)
+                for index, (reference, document) in enumerate(
+                    zip(references, documents)
+                ):
+                    payload = deepcopy(document)
+                    if index == drift_index:
+                        payload["schemaVersion"] = 2
+                    reference.create(payload)
+                data_before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(module.RowAuthorityAmbiguous):
+                    self._initialize(module, store)
+                self.assertEqual(data_before, store.data)
+                self.assertFalse(
+                    any(
+                        event[0] in {"create", "set", "update", "delete"}
+                        for event in store.events
+                    )
+                )
+
+    def test_invalid_marker_snapshot_timestamp_and_scope_fail_before_transaction(self):
+        module = self._authority()
+        fakes = self._fakes()
+        invalid_overrides = (
+            {"marker_observation": {**self._marker_observation(), "unknown": True}},
+            {"headers": ("x",) * 257},
+            {"cells": ("x",) * 257},
+            {"created_at": "not-a-time"},
+            {"verified_user_id": "uid\n1"},
+            {"creation_source_hash": "short"},
+        )
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides):
+                store = fakes.BoundedFakeFirestore()
+                with self.assertRaises(module.RowAuthorityConfigError):
+                    self._initialize(module, store, **overrides)
+                self.assertEqual([], store.events)
+                self.assertEqual({}, store.data)
+
+    def test_preapply_commit_failure_has_zero_writes_and_is_retryable(self):
+        module = self._authority()
+        fakes = self._fakes()
+        store = fakes.BoundedFakeFirestore()
+        store.fail_next_commit = RuntimeError("preapply failure")
+        with self.assertRaises(module.RowAuthorityRetryable):
+            self._initialize(module, store)
+        self.assertEqual({}, store.data)
+        self.assertIn(("commit_failed_before_apply",), store.events)
+
+        start_store = fakes.BoundedFakeFirestore()
+
+        def cannot_start(_transaction, _callback):
+            raise RuntimeError("executor could not start")
+
+        with self.assertRaises(module.RowAuthorityRetryable):
+            self._initialize(module, start_store, executor=cannot_start)
+        self.assertEqual({}, start_store.data)
+        self.assertFalse(
+            any(event[0] == "transaction_began" for event in start_store.events)
+        )
+
+    def test_apply_then_raise_succeeds_only_after_exact_three_document_readback(self):
+        module = self._authority()
+        store = self._fakes().BoundedFakeFirestore()
+        store.apply_then_raise_next_commit = RuntimeError("unknown commit")
+        result = self._initialize(module, store)
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual(3, len(store.data))
+        self.assertIn(("commit_raised_after_apply",), store.events)
+        references = self._references(store)
+        self.assertEqual(
+            [
+                result["identity"],
+                result["locationRevision"],
+                result["authorityHead"],
+            ],
+            [store.data[reference.path] for reference in references],
+        )
+
+    def test_apply_then_raise_partial_or_drifted_readback_is_ambiguous(self):
+        module = self._authority()
+        fakes = self._fakes()
+
+        def executor_with_readback(store, *, mode):
+            def execute(transaction, callback):
+                transaction._begin()
+                callback(transaction)
+                operations = [
+                    (operation, reference, deepcopy(payload), merge)
+                    for operation, reference, payload, merge
+                    in transaction._operations
+                ]
+                transaction._rollback()
+                selected = operations[:1] if mode == "partial" else operations
+                for index, (_operation, reference, payload, _merge) in enumerate(
+                    selected
+                ):
+                    applied = deepcopy(payload)
+                    if mode == "drift" and index == len(selected) - 1:
+                        applied["schemaVersion"] = 2
+                    reference.create(applied)
+                raise RuntimeError(f"{mode} unknown commit")
+
+            return execute
+
+        for mode in ("partial", "drift"):
+            with self.subTest(mode=mode):
+                store = fakes.BoundedFakeFirestore()
+                with self.assertRaises(module.RowAuthorityAmbiguous):
+                    self._initialize(
+                        module,
+                        store,
+                        executor=executor_with_readback(store, mode=mode),
+                    )
+                self.assertNotEqual(3, sum(
+                    payload.get("schemaVersion") == 1
+                    for payload in store.data.values()
+                ))
+
+    def test_initialization_never_stores_raw_verified_user_or_mailbox_material(self):
+        module = self._authority()
+        store = self._fakes().BoundedFakeFirestore()
+        result = self._initialize(
+            module,
+            store,
+            headers=("Email",),
+            cells=("private@example.com",),
+        )
+        stored_payloads = json.dumps(
+            list(store.data.values()),
+            sort_keys=True,
+        )
+        result_payloads = json.dumps(result, sort_keys=True)
+        for forbidden in ("uid-1", "private@example.com"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, stored_payloads)
+                self.assertNotIn(forbidden, result_payloads)
+
+    def test_initialization_calculates_three_writes_below_the_bound(self):
+        module = self._authority()
+        fakes = self._fakes()
+        self.assertGreaterEqual(module.MAX_ROW_AUTHORITY_PLANNED_WRITES, 3)
+        store = fakes.BoundedFakeFirestore()
+        self._initialize(module, store)
+        self.assertIn(("commit_applied", 3), store.events)
+        bounded_store = fakes.BoundedFakeFirestore()
+        with patch.object(module, "MAX_ROW_AUTHORITY_PLANNED_WRITES", 2):
+            with self.assertRaises(module.RowAuthorityConfigError):
+                self._initialize(module, bounded_store)
+        self.assertEqual([], bounded_store.events)
+        self.assertEqual({}, bounded_store.data)
+
+
 class RowAuthorityA1ContainmentTests(unittest.TestCase):
     def test_only_row_metadata_may_import_row_authority(self):
         self.assertEqual(
