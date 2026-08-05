@@ -6,6 +6,8 @@
   `cdd2bdc087e46dd15233697f7a6a71bb9ced58dd`.
 - Independently reviewed code candidate:
   `4c35f941b762975c589ead4a117e98ae79470b5b`.
+- Published local-evidence candidate:
+  `a97f7bf2b8d7e7fb8d421c8bd8eb1167d8167491`.
 - Deliverable: both provider-free B2-A1 code and clearance evidence.
 - The implementation inventory from the approved-plan baseline is exactly:
   - `email_automation/row_authority.py`
@@ -31,6 +33,7 @@
 - `9417d560f70a77d25d2bbd2619f9c4fb9d96c69a` — `fix: classify row initialization retries by phase`
 - `a9e474f17343beebf1a42164adeea767248f7e66` — `feat: add row location revision CAS`
 - `4c35f941b762975c589ead4a117e98ae79470b5b` — `fix: validate row authority document paths`
+- `a97f7bf2b8d7e7fb8d421c8bd8eb1167d8167491` — `docs: freeze B2-A1 local evidence`
 
 ## DeveloperMetadata contract proof
 
@@ -154,7 +157,19 @@ or campaign was sent.
 ## GitHub exact-SHA run
 
 - Branch: `codex/sitesift-production-clearance-20260804`.
-- Status: `pending exact-SHA publication`.
+- Local HEAD, remote branch, and workflow head SHA all matched
+  `a97f7bf2b8d7e7fb8d421c8bd8eb1167d8167491`.
+- [Production Clearance CI run 30969884462](https://github.com/BaylorH/EmailAutomation/actions/runs/30969884462)
+  completed successfully for that exact push candidate.
+- [offline-verification job 92191710854](https://github.com/BaylorH/EmailAutomation/actions/runs/30969884462/job/92191710854)
+  completed successfully from `2026-08-05T02:37:22Z` through
+  `2026-08-05T02:38:53Z`.
+- Release/auth: 95/95 passed in 0.726 seconds.
+- Complete B1: 606/606 passed in 30.504 seconds.
+- Complete B2 discovery: 100/100 passed in 4.259 seconds.
+- Retained M2: 669/669 passed in 24.583 seconds.
+- Changed-Python compilation and `git diff --check 2b5e785` completed
+  successfully in the same exact-SHA job.
 
 ## Production posture and next milestone
 

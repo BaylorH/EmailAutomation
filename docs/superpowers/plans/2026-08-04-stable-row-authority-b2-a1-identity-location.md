@@ -1046,14 +1046,14 @@ git diff --cached --check
 git commit -m "docs: freeze B2-A1 local evidence"
 ```
 
-- [ ] **Step 4: Push and verify the exact B2-A candidate**
+- [x] **Step 4: Push and verify the exact B2-A candidate**
 
 Use the roadmap's exact publication protocol. Select CI only with the exact
 local head SHA, wait with `--exit-status`, prove remote/local/head SHA equality,
 prove `conclusion: success`, and extract run/job URLs plus all four test
 count/duration lines. Do not open a PR, merge, or deploy.
 
-- [ ] **Step 5: Freeze remote evidence and reverify the final evidence SHA**
+- [x] **Step 5: Freeze remote evidence and reverify the final evidence SHA**
 
 Replace the pending phrase with the exact candidate SHA, run/job URLs, test
 counts/durations, and compile/diff result. Mark roadmap `B2-A1 is green and
@@ -1072,7 +1072,7 @@ Run a second exact-SHA GitHub verification for this evidence commit. Finish
 only when local HEAD, remote branch, workflow `headSha`, and successful
 conclusion all match and the worktree is clean.
 
-- [ ] **Step 6: Stop at the B2-B boundary**
+- [x] **Step 6: Stop at the B2-B boundary**
 
 Update the working plan to make the B2-B ownership child plan the next active
 milestone. Do not implement bindings, claims, generations, settlements,
