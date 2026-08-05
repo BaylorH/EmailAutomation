@@ -1468,10 +1468,18 @@ class RowAuthorityStore:
             "entered": False,
             "prepared": False,
             "existing": False,
+            "rejected": False,
         }
 
         def prepare(transaction):
-            callback_state["entered"] = True
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "existing": False,
+                    "rejected": False,
+                }
+            )
             observed = self._read_reference_payloads(
                 references,
                 transaction=transaction,
@@ -1489,6 +1497,7 @@ class RowAuthorityStore:
             ) == expected_documents:
                 callback_state["existing"] = True
                 return "existing"
+            callback_state["rejected"] = True
             raise RowAuthorityAmbiguous(
                 "row identity initialization found partial or drifted state"
             )
@@ -1501,11 +1510,9 @@ class RowAuthorityStore:
             ) from exc
         try:
             disposition = self._transaction_executor(transaction, prepare)
-        except RowAuthorityAmbiguous:
-            raise
-        except RowAuthorityError:
-            raise
         except Exception as exc:
+            if callback_state["rejected"]:
+                raise
             if not callback_state["entered"]:
                 raise RowAuthorityRetryable(
                     "row identity transaction could not start"

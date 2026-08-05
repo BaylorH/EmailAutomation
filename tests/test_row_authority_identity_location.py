@@ -1680,6 +1680,34 @@ class RowIdentityInitializationTests(_RowIdentityFixtures, unittest.TestCase):
         )
         self.assertIn(("commit_applied", 0), store.events)
 
+        retry_store = self._fakes().BoundedFakeFirestore()
+
+        def prepare_then_observe_existing_then_raise(transaction, callback):
+            transaction._begin(retry_id=0)
+            callback(transaction)
+            operations = [
+                (reference, deepcopy(payload))
+                for _operation, reference, payload, _merge
+                in transaction._operations
+            ]
+            transaction._rollback()
+            for reference, payload in operations:
+                reference.create(payload)
+            transaction._begin(retry_id=1)
+            self.assertEqual("existing", callback(transaction))
+            transaction._rollback()
+            raise module.RowAuthorityRetryable(
+                "zero-write retry outcome was unknown"
+            )
+
+        retried = self._initialize(
+            module,
+            retry_store,
+            executor=prepare_then_observe_existing_then_raise,
+        )
+        self.assertEqual("existing", retried["disposition"])
+        self.assertEqual(3, len(retry_store.data))
+
     def test_partial_existing_state_is_ambiguous_with_zero_writes(self):
         module = self._authority()
         fakes = self._fakes()
@@ -1761,15 +1789,26 @@ class RowIdentityInitializationTests(_RowIdentityFixtures, unittest.TestCase):
 
         start_store = fakes.BoundedFakeFirestore()
 
-        def cannot_start(_transaction, _callback):
-            raise RuntimeError("executor could not start")
+        for failure in (
+            RuntimeError("executor could not start"),
+            module.RowAuthorityAmbiguous("domain ambiguity before callback"),
+            module.RowAuthorityConfigError("domain config before callback"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                start_store = fakes.BoundedFakeFirestore()
 
-        with self.assertRaises(module.RowAuthorityRetryable):
-            self._initialize(module, start_store, executor=cannot_start)
-        self.assertEqual({}, start_store.data)
-        self.assertFalse(
-            any(event[0] == "transaction_began" for event in start_store.events)
-        )
+                def cannot_start(_transaction, _callback):
+                    raise failure
+
+                with self.assertRaises(module.RowAuthorityRetryable):
+                    self._initialize(module, start_store, executor=cannot_start)
+                self.assertEqual({}, start_store.data)
+                self.assertFalse(
+                    any(
+                        event[0] == "transaction_began"
+                        for event in start_store.events
+                    )
+                )
 
     def test_apply_then_raise_succeeds_only_after_exact_three_document_readback(self):
         module = self._authority()
@@ -1788,6 +1827,16 @@ class RowIdentityInitializationTests(_RowIdentityFixtures, unittest.TestCase):
             ],
             [store.data[reference.path] for reference in references],
         )
+        for failure in (
+            module.RowAuthorityRetryable("domain retryable after apply"),
+            module.RowAuthorityAmbiguous("domain ambiguous after apply"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                domain_store = self._fakes().BoundedFakeFirestore()
+                domain_store.apply_then_raise_next_commit = failure
+                domain_result = self._initialize(module, domain_store)
+                self.assertEqual("created", domain_result["disposition"])
+                self.assertEqual(3, len(domain_store.data))
 
     def test_apply_then_raise_partial_or_drifted_readback_is_ambiguous(self):
         module = self._authority()
