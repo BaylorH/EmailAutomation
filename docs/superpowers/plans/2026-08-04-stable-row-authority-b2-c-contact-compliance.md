@@ -44,7 +44,8 @@ production-clearance findings)
 **Baseline:** `3904c79f65e54d4e146189e50845c6fb078f7c3d`
 
 **Publication checkpoints:** `B2-C plan`, `B2-C contracts/history`,
-`B2-C transitions`, and `B2-C final`.
+`B2-C transitions`, `B2-C bounded workers`, `B2-C row application`,
+`B2-C final`, and `B2-C evidence`.
 
 **Safety boundary:** No provider/API import or call, send, campaign,
 notification, reply, Sheet write, production Firestore read/write, migration,
@@ -80,9 +81,13 @@ return remain NO-GO.
    Worker mutations require exact revision/hash/owner/deadline/fence. Terminal
    fan-outs have null lease/cursor.
 7. Discovery and supersession query 129, process at most 128, and persist a
-   row-field cursor. Binding snapshot drift resets the cursor to null before a
-   rescan. Apply/release resolves one obligation per transaction; equal counts
-   start a separate bounded 32-result certification pass before completion.
+   row-field cursor plus `cursorProcessedCount`. Every page advances the count
+   by the exact number of validated obligations. Terminal transition requires
+   the prior count plus the terminal page size to equal the frozen obligation
+   cardinality, then clears both cursor and count. Binding snapshot drift
+   resets both before a rescan. Apply/release resolves one obligation per
+   transaction; equal counts start a separate bounded 32-result certification
+   pass before completion.
 8. `observedRowHeadHash` is always the row-head before-image. The result matrix
    in the amendment is exhaustive.
 9. Row allocation uses a descending `generation` query of the latest two row
@@ -132,6 +137,12 @@ return remain NO-GO.
     every application path uses create-only receipt writes. B4 must prove that
     deployed API, frontend, rules, and privileged runtime paths cannot update
     or delete receipts before production or Jill clearance.
+20. A historical release-noop result may be certified against only its exact
+    current authority or exact immediate successor. Contact-fanout successors
+    must postdate and match the newer contact settlement/receipt, including its
+    authority link, payload, fan-out, canonical owner, and causal timestamps;
+    independent B1/operator successors retain their own direct lineage and
+    result-time bounds.
 
 ## Provider-free API delta
 
@@ -182,8 +193,14 @@ return the exact updated fan-out and artifacts committed or read back.
   direction and true ordered-field cursor semantics.
 - Modify `tests/row_authority_fakes.py`: B2 query/write helpers only if the
   retained bounded wrapper needs additional observation hooks.
-- Create `tests/test_row_authority_contact_compliance.py`: all B2-C pure,
-  transaction, race, pagination, release, and late-association tests.
+- Create `tests/test_row_authority_contact_compliance.py`: B2-C pure,
+  transaction, lease, release, and late-association tests.
+- Create `tests/test_row_authority_contact_fanout_discovery.py`: bounded
+  discovery, cursor reset, immutable obligation replay, and race tests.
+- Create `tests/test_row_authority_contact_fanout_completion.py`: bounded
+  certification, exact evidence, cardinality, and retry tests.
+- Create `tests/test_row_authority_contact_fanout_supersession.py`: bounded
+  supersession, terminal linkage, historical evidence, and causal-order tests.
 - Modify `tests/test_row_authority_contracts.py`: domain/schema/public-surface,
   containment, fake capability, and CI discovery inventories.
 - Modify `tests/test_row_authority_ownership.py`: release-aware generation,
@@ -201,11 +218,12 @@ deployment file is expected to change.
 
 Task 0 reviews and publishes this exact child plan. Tasks 1-2 publish the
 contracts/history milestone. Task 3 publishes contact transitions and
-suppression. Tasks 4-6 publish the complete fan-out/release implementation.
-Task 7 performs full blackholed verification, two fresh reviews, immutable
-evidence, and exact-SHA GitHub proof. Do not start a later task while its prior
-milestone is unreviewed, locally red, unpushed, remote-SHA mismatched, or CI
-failed.
+suppression. Task 4 publishes bounded workers. Task 5 publishes one-row apply
+and active late-association convergence. Task 6 publishes the complete
+fan-out/release implementation. Task 7 performs full blackholed verification,
+two fresh reviews, immutable evidence, and exact-SHA GitHub proof. Do not start
+a later task while its prior milestone is unreviewed, locally red, unpushed,
+remote-SHA mismatched, or CI failed.
 
 Use this interpreter for every Python command:
 
@@ -614,8 +632,15 @@ Push and prove the exact SHA/run/job under the roadmap protocol.
 
 - Modify: `email_automation/row_authority.py`
 - Modify: `tests/test_row_authority_contact_compliance.py`
+- Modify: `tests/test_row_authority_contact_release_integrity.py`
+- Modify: `tests/test_row_authority_contact_releases.py`
+- Modify: `tests/test_row_authority_contact_transition_integrity.py`
+- Modify: `tests/test_row_authority_contact_transitions.py`
+- Create: `tests/test_row_authority_contact_fanout_discovery.py`
+- Create: `tests/test_row_authority_contact_fanout_completion.py`
+- Create: `tests/test_row_authority_contact_fanout_supersession.py`
 
-- [ ] **Step 1: Write failing lease/takeover state-machine tests**
+- [x] **Step 1: Write failing lease/takeover state-machine tests**
 
 Selected RED names:
 
@@ -628,14 +653,14 @@ ContactFanoutLeaseTests.test_stale_worker_cannot_write_after_takeover_or_superse
 ContactFanoutLeaseTests.test_terminal_fanout_rejects_takeover_and_has_null_lease_cursor
 ```
 
-- [ ] **Step 2: Implement fan-out lease acquisition, renewal, and takeover**
+- [x] **Step 2: Implement fan-out lease acquisition, renewal, and takeover**
 
 Reuse timestamp/fence validation conventions from row leases. A worker argument
 never selects state or outcome; state transitions are derived from stored
 documents. Superseding clears any old lease and increments the fence before a
 new worker may acquire it.
 
-- [ ] **Step 3: Write failing discovery pagination and cursor-reset tests**
+- [x] **Step 3: Write failing discovery pagination and cursor-reset tests**
 
 Cover 0, 1, 128, 129, and multiple pages; exact obligation replay; malformed
 edge/obligation; binding change before/behind/after cursor; cursor reset;
@@ -653,36 +678,45 @@ ContactFanoutDiscoveryTests.test_fanout_work_requires_contact_settlements_exact_
 ContactFanoutDiscoveryTests.test_discovery_failure_or_drift_writes_nothing
 ```
 
-- [ ] **Step 4: Implement bounded discovery planner/store method**
+- [x] **Step 4: Implement bounded discovery planner/store method**
 
 Write at most 128 obligations plus one head. Validate all query documents and
 the current contact head/settlement/creating receipt. Never start a write before
 every page read is complete.
 
-- [ ] **Step 5: Write failing completion and supersession tests**
+- [x] **Step 5: Write failing completion and supersession tests**
 
-Cover resolution counts, certification pages 0/1/32/33/128/129, no-next
-obligation, count mismatch, binding drift, missing/swapped/extra immutable
-evidence, supersession of only discovered unfinished obligations, 128/129
-pages, new-contact correlation, and terminal state matrices.
+Task 4 certification starts only after obligation and result counts are equal.
+Unequal counts return `needs_processing` without an obligation/result scan or
+write. The bounded unresolved-result locator, its equal-count cursor reset, and
+late recertification are exercised with `process_contact_fanout_obligation` and
+association composition in Tasks 5-6, where those behaviors are implemented.
+Cover certification pages 0/1/32/33/128/129, stable binding, missing/swapped/
+extra immutable evidence, supersession of only discovered unfinished
+obligations, 128/129 pages, new-contact correlation, and terminal matrices.
 
 Selected RED names:
 
 ```text
 ContactFanoutCompletionTests.test_completion_requires_no_next_obligation_equal_counts_and_stable_binding
-ContactFanoutCompletionTests.test_resolution_pages_32_with_33rd_as_sentinel_before_missing_result
-ContactFanoutCompletionTests.test_resolution_exhaustion_with_unequal_counts_is_ambiguous
-ContactFanoutCompletionTests.test_equal_counts_reset_cursor_and_start_bounded_certification
 ContactFanoutCompletionTests.test_certification_pages_32_with_33rd_as_sentinel
 ContactFanoutCompletionTests.test_certification_rejects_missing_swapped_or_extra_evidence
-ContactFanoutCompletionTests.test_first_completion_certificate_is_frozen_across_late_recertification
 ContactFanoutCompletionTests.test_completion_never_reads_unbounded_history
 ContactFanoutSupersessionTests.test_superseding_pages_only_discovered_unfinished_obligations
 ContactFanoutSupersessionTests.test_superseding_never_discovers_edges_or_mutates_rows
 ContactFanoutSupersessionTests.test_exact_exhaustion_creates_linked_terminal_superseded_head
 ```
 
-- [ ] **Step 6: Implement certification and supersession planners/store methods**
+Deferred selected tests, retained verbatim for Tasks 5-6:
+
+```text
+ContactFanoutCompletionTests.test_resolution_pages_32_with_33rd_as_sentinel_before_missing_result
+ContactFanoutCompletionTests.test_resolution_exhaustion_with_unequal_counts_is_ambiguous
+ContactFanoutCompletionTests.test_equal_counts_reset_cursor_and_start_bounded_certification
+ContactFanoutCompletionTests.test_first_completion_certificate_is_frozen_across_late_recertification
+```
+
+- [x] **Step 6: Implement certification and supersession planners/store methods**
 
 Every superseded result uses the exact obligation, before-image row head, and
 newer contact settlement. Clear lease/cursor only at exact terminal
@@ -692,14 +726,22 @@ It runs separate bounded obligation and result queries and compares their
 ordered row-ID pages locally; it does not assume a Firestore cross-collection
 union.
 
-- [ ] **Step 7: Run all Task 4 tests and retained transaction-race controls**
+Both methods take the verified user, fan-out ID, exact expected fan-out head,
+lease owner hash, and caller-frozen action timestamp. Certification returns
+`disposition`, `fanoutHead`, `obligations`, and `results`, with
+`needs_processing|page_certified|certification_complete`. Supersession returns
+`disposition`, `fanoutHead`, and `results`, with
+`page_superseded|supersession_complete`. Exact retry returns the deterministic
+original disposition and artifacts with zero writes.
+
+- [x] **Step 7: Run all Task 4 tests and retained transaction-race controls**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
   tests.test_row_authority_contact_compliance.ContactFanoutLeaseTests \
-  tests.test_row_authority_contact_compliance.ContactFanoutDiscoveryTests \
-  tests.test_row_authority_contact_compliance.ContactFanoutCompletionTests \
-  tests.test_row_authority_contact_compliance.ContactFanoutSupersessionTests -v
+  tests.test_row_authority_contact_fanout_discovery.ContactFanoutDiscoveryTests \
+  tests.test_row_authority_contact_fanout_completion.ContactFanoutCompletionTests \
+  tests.test_row_authority_contact_fanout_supersession.ContactFanoutSupersessionTests -v
 ```
 
 ## Task 5: Apply contact opt-out obligations and converge late active rows
@@ -1047,6 +1089,28 @@ or merge `main`, deploy, launch a campaign, or contact a user under this plan.
   SHA were `9531206e660779ead93ad47867b1519f447e7f58`;
   [run 31042024656](https://github.com/BaylorH/EmailAutomation/actions/runs/31042024656),
   [job 92428426959](https://github.com/BaylorH/EmailAutomation/actions/runs/31042024656/job/92428426959)
+  completed successfully. This milestone remains provider-free and
+  runtime-unwired; it did not deploy or contact a user.
+- Task 4 RED/GREEN implemented lease acquisition/takeover, bounded discovery,
+  32-pair certification, and 128-obligation supersession. A generic
+  `cursorProcessedCount` now proves exact page cardinality across discovery,
+  certification, and supersession before any terminal transition.
+- Task 4 adversarial review reproduced cardinality drift, false historical
+  release-noop evidence, future contact authority, an over-broad causal bound
+  on independent B1 successors, and crossed contact authority links. Every
+  finding received a fixture-clean RED regression and production correction.
+  The final independent review returned CLEAN with no remaining Critical or
+  Important findings.
+- The reviewed Task 4 candidate passes the 26-test focused worker gate, all
+  501 complete B2 tests, 95 release/identity/Jill tests, 617 complete B1 tests,
+  and 669 retained M2 tests under provider and Firestore blackholes (1,882
+  total). Compilation, dependency, workflow-YAML, provider-containment, staged
+  diff, and artifact checks are clean. The staged code/test diff SHA-256 is
+  `b96d9ad8e6799a4f4f3a12a7a72b650ea14549fddedb4390b42370d760732538`.
+- Task 4 code publication: local HEAD, owned remote branch, and workflow head
+  SHA were `daff8c82c5c011fb41ce6ebba6def4c583da0828`;
+  [run 31054694964](https://github.com/BaylorH/EmailAutomation/actions/runs/31054694964),
+  [job 92469544623](https://github.com/BaylorH/EmailAutomation/actions/runs/31054694964/job/92469544623)
   completed successfully. This milestone remains provider-free and
   runtime-unwired; it did not deploy or contact a user.
 - Plan reviews, publication SHA/run, selected RED outputs, code milestone
