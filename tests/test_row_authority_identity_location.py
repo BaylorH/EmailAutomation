@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
+import json
 import unittest
+import unicodedata
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +19,158 @@ from tests.source_coordinator_fakes import FakeTransactionAborted
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROW_ID = "sr1_123e4567e89b42d3a456426614174000"
 SECOND_ROW_ID = "sr1_123e4567e89b42d3a456426614174001"
+USER_SCOPE_HASH = (
+    "48fafc848b44ae7b0414309666dcb54208b7867700240a0f343ec02c53eb0cf2"
+)
+CREATION_SOURCE_HASH = "1" * 64
+CREATED_AT = "2026-08-04T12:34:56.123456Z"
+LATER_AT = "2026-08-04T12:35:57.654321Z"
+FROZEN_A1_HASHES = {
+    "markerHash": "5dae5d60c0db2f02e951c7f38e6b71f37171ad3fbe8ad9110976a42359d6447d",
+    "identityHash": "5b110eaa888cd16e17aabb34192b8c6f731cac7303f36545ba4879ee41b0349b",
+    "headerHash": "633fa62b41647ee95e2338fde9b5b1152ac5a1af5dfec4aa315d98faeec73f75",
+    "rowSnapshotHash": "de7bd24bec9be791fc9961c10ce246fb06e8585d3ae8555c194c174dbc763882",
+    "observationEvidenceHash": (
+        "2c0683283b3360378a1ba9e6db70f8a3b8631e88b090d88b97bb845b98bf27e4"
+    ),
+    "revisionHash": "c6f3b86e8a86ab03845aa985b334f1b22030c6d87f40abdae943a432595c04a9",
+    "headHash": "7d4fcae9b8b2cacb78081e96cbf455e6b3e02f036e99d7adeaff6c326b3db0c7",
+}
+
+
+def _reference_domain_hash(domain, payload, *, user_scope_hash=USER_SCOPE_HASH):
+    material = {
+        **payload,
+        "schemaVersion": 1,
+        "userScopeHash": user_scope_hash,
+    }
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(domain.encode("utf-8") + b"\0" + encoded).hexdigest()
+
+
+class _RowIdentityFixtures:
+    @staticmethod
+    def _authority():
+        return importlib.import_module("email_automation.row_authority")
+
+    @staticmethod
+    def _identity_kwargs(**overrides):
+        values = {
+            "user_scope_hash": USER_SCOPE_HASH,
+            "row_id": ROW_ID,
+            "client_id": "client-A",
+            "spreadsheet_id": "spreadsheet-A",
+            "sheet_id": 7,
+            "creation_kind": "fresh",
+            "creation_source_hash": CREATION_SOURCE_HASH,
+            "created_at": CREATED_AT,
+        }
+        values.update(overrides)
+        return values
+
+    @staticmethod
+    def _marker_observation(**overrides):
+        values = {
+            "rowId": ROW_ID,
+            "sheetId": 7,
+            "providerRowIndex": 2,
+            "displayRowNumber": 3,
+            "metadataId": 11,
+        }
+        values.update(overrides)
+        return values
+
+    @classmethod
+    def _identity(cls, module):
+        return module.build_row_identity_document(**cls._identity_kwargs())
+
+    @classmethod
+    def _observation(cls, module, **marker_overrides):
+        return module.build_row_observation(
+            spreadsheet_id="spreadsheet-A",
+            marker_observation=cls._marker_observation(**marker_overrides),
+            ordered_headers=(" Email ", "Status\r\nLine"),
+            ordered_cell_values=("USER@EXAMPLE.COM", "  Keep  \rValue"),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+
+    @classmethod
+    def _revision(cls, module, *, revision=1, lifecycle="active", **kwargs):
+        identity = kwargs.pop("identity_document", cls._identity(module))
+        observations = kwargs.pop("observations", (cls._observation(module),))
+        previous = kwargs.pop(
+            "previous_revision_hash",
+            None if revision == 1 else FROZEN_A1_HASHES["revisionHash"],
+        )
+        observed_at = kwargs.pop(
+            "observed_at",
+            CREATED_AT if revision == 1 else LATER_AT,
+        )
+        if kwargs:
+            raise AssertionError(f"unknown revision fixture fields: {kwargs}")
+        return module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=revision,
+            lifecycle=lifecycle,
+            observations=observations,
+            previous_revision_hash=previous,
+            observed_at=observed_at,
+        )
+
+    @classmethod
+    def _head(cls, module):
+        identity = cls._identity(module)
+        revision = cls._revision(module, identity_document=identity)
+        return module.build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=CREATED_AT,
+        )
+
+    @staticmethod
+    def _rehash_head(head):
+        payload = {
+            key: value
+            for key, value in head.items()
+            if key not in {"schemaVersion", "userScopeHash", "headHash"}
+        }
+        head["headHash"] = _reference_domain_hash(
+            "sitesift.row.authority_head.v1",
+            payload,
+            user_scope_hash=head["userScopeHash"],
+        )
+        return head
+
+    @staticmethod
+    def _rehash_revision(revision):
+        payload = {
+            key: revision[key]
+            for key in (
+                "rowId",
+                "revision",
+                "providerRowIndex",
+                "displayRowNumber",
+                "metadataId",
+                "rowSnapshotHash",
+                "markerHash",
+                "lifecycle",
+                "observationEvidenceHash",
+                "previousRevisionHash",
+                "observedAt",
+            )
+        }
+        revision["revisionHash"] = _reference_domain_hash(
+            "sitesift.row.location.v1",
+            payload,
+            user_scope_hash=revision["userScopeHash"],
+        )
+        return revision
 
 
 class RowMetadataContractTests(unittest.TestCase):
@@ -557,6 +712,867 @@ class RowMetadataContractTests(unittest.TestCase):
                 for item in parsed
             ],
         )
+
+
+class RowIdentityHashContractTests(_RowIdentityFixtures, unittest.TestCase):
+    def test_provider_text_normalization_is_exact_bounded_and_defensive(self):
+        module = self._authority()
+        self.assertEqual(
+            "Café\n  Keep\tCase \n",
+            module.normalize_provider_text(
+                value="Cafe\u0301\r\n  Keep\tCase \r",
+                field_name="cell",
+            ),
+        )
+        self.assertEqual(
+            unicodedata.normalize("NFC", "Cafe\u0301"),
+            module.normalize_provider_text(
+                value="Cafe\u0301",
+                field_name="header",
+            ),
+        )
+        for value in (None, 1, True, b"cell", "x" * 8193, "\ud800"):
+            with self.subTest(value=repr(value)), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.normalize_provider_text(value=value, field_name="cell")
+        self.assertEqual(
+            "é" * 4096,
+            module.normalize_provider_text(
+                value="é" * 4096,
+                field_name="cell",
+            ),
+        )
+        self.assertEqual(
+            module.header_hash(
+                ordered_headers=("x",) * 256,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.header_hash(
+                ordered_headers=["x"] * 256,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+        )
+        with self.assertRaises(module.RowAuthorityConfigError):
+            module.header_hash(
+                ordered_headers=("x",) * 257,
+                user_scope_hash=USER_SCOPE_HASH,
+            )
+        with self.assertRaises(module.RowAuthorityConfigError):
+            module.row_snapshot_hash(
+                spreadsheet_id="spreadsheet-A",
+                sheet_id=7,
+                ordered_headers=(),
+                ordered_cell_values=("x",) * 257,
+                user_scope_hash=USER_SCOPE_HASH,
+            )
+
+    def test_opaque_timestamp_and_integer_inputs_are_exact(self):
+        module = self._authority()
+
+        class IntSubclass(int):
+            pass
+
+        valid = self._identity_kwargs()
+        module.build_row_identity_document(**valid)
+        invalid_overrides = (
+            {"client_id": "Cafe\u0301"},
+            {"client_id": "x" * 513},
+            {"spreadsheet_id": "sheet\nA"},
+            {"sheet_id": True},
+            {"sheet_id": -1},
+            {"sheet_id": 9007199254740992},
+            {"sheet_id": IntSubclass(7)},
+            {"creation_kind": ["fresh"]},
+            {"created_at": "2026-8-04T12:34:56.123456Z"},
+            {"created_at": "2026-02-29T12:34:56.123456Z"},
+            {"created_at": "2026-08-04T24:00:00.000000Z"},
+            {"created_at": "2026-08-04T12:34:56.123456+00:00"},
+            {"created_at": "2026-08-04T12:34:56Z"},
+        )
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.build_row_identity_document(
+                    **self._identity_kwargs(**overrides)
+                )
+        exact_opaque = module.build_row_identity_document(
+            **self._identity_kwargs(client_id=" Client-A ")
+        )
+        self.assertEqual(" Client-A ", exact_opaque["clientId"])
+        leap = module.build_row_identity_document(
+            **self._identity_kwargs(
+                created_at="2028-02-29T23:59:59.999999Z"
+            )
+        )
+        self.assertEqual("2028-02-29T23:59:59.999999Z", leap["createdAt"])
+
+    def test_all_a1_hashes_match_frozen_independent_vectors(self):
+        module = self._authority()
+        marker = module.marker_hash(
+            row_id=ROW_ID,
+            spreadsheet_id="spreadsheet-A",
+            sheet_id=7,
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        header = module.header_hash(
+            ordered_headers=(" Email ", "Status\r\nLine"),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        snapshot = module.row_snapshot_hash(
+            spreadsheet_id="spreadsheet-A",
+            sheet_id=7,
+            ordered_headers=(" Email ", "Status\r\nLine"),
+            ordered_cell_values=("USER@EXAMPLE.COM", "  Keep  \rValue"),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        observation = self._observation(module)
+        evidence = module.observation_evidence_hash(
+            lifecycle="active",
+            observations=(observation,),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        identity = self._identity(module)
+        revision = self._revision(module, identity_document=identity)
+        head = module.build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=CREATED_AT,
+        )
+        actual = {
+            "markerHash": marker,
+            "identityHash": identity["identityHash"],
+            "headerHash": header,
+            "rowSnapshotHash": snapshot,
+            "observationEvidenceHash": evidence,
+            "revisionHash": revision["revisionHash"],
+            "headHash": head["headHash"],
+        }
+        self.assertEqual(FROZEN_A1_HASHES, actual)
+        independent = {
+            "markerHash": _reference_domain_hash(
+                "sitesift.row.marker.v1",
+                {
+                    "rowId": ROW_ID,
+                    "markerKey": "sitesift_row_id_v1",
+                    "markerValue": ROW_ID,
+                    "visibility": "DOCUMENT",
+                    "spreadsheetId": "spreadsheet-A",
+                    "sheetId": 7,
+                },
+            ),
+            "identityHash": _reference_domain_hash(
+                "sitesift.row.identity.v1",
+                {
+                    "rowId": ROW_ID,
+                    "clientId": "client-A",
+                    "spreadsheetId": "spreadsheet-A",
+                    "sheetId": 7,
+                    "markerHash": marker,
+                    "creationKind": "fresh",
+                    "creationSourceHash": CREATION_SOURCE_HASH,
+                },
+            ),
+            "headerHash": _reference_domain_hash(
+                "sitesift.row.header.v1",
+                {"orderedHeaders": [" Email ", "Status\nLine"]},
+            ),
+            "rowSnapshotHash": _reference_domain_hash(
+                "sitesift.row.snapshot.v1",
+                {
+                    "spreadsheetId": "spreadsheet-A",
+                    "sheetId": 7,
+                    "headerHash": header,
+                    "orderedCellValues": [
+                        "USER@EXAMPLE.COM",
+                        "  Keep  \nValue",
+                    ],
+                },
+            ),
+            "observationEvidenceHash": _reference_domain_hash(
+                "sitesift.row.observation_evidence.v1",
+                {
+                    "observationKind": "active",
+                    "observations": [observation],
+                },
+            ),
+        }
+        revision_payload = {
+            key: revision[key]
+            for key in (
+                "rowId",
+                "revision",
+                "providerRowIndex",
+                "displayRowNumber",
+                "metadataId",
+                "rowSnapshotHash",
+                "markerHash",
+                "lifecycle",
+                "observationEvidenceHash",
+                "previousRevisionHash",
+                "observedAt",
+            )
+        }
+        independent["revisionHash"] = _reference_domain_hash(
+            "sitesift.row.location.v1",
+            revision_payload,
+        )
+        head_payload = {
+            key: value
+            for key, value in head.items()
+            if key not in {"schemaVersion", "userScopeHash", "headHash"}
+        }
+        independent["headHash"] = _reference_domain_hash(
+            "sitesift.row.authority_head.v1",
+            head_payload,
+        )
+        self.assertEqual(FROZEN_A1_HASHES, independent)
+
+    def test_hashes_change_for_field_null_scope_order_and_domain_drift(self):
+        module = self._authority()
+        base_marker = module.marker_hash(
+            row_id=ROW_ID,
+            spreadsheet_id="spreadsheet-A",
+            sheet_id=7,
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        marker_variants = (
+            module.marker_hash(
+                row_id=SECOND_ROW_ID,
+                spreadsheet_id="spreadsheet-A",
+                sheet_id=7,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.marker_hash(
+                row_id=ROW_ID,
+                spreadsheet_id="spreadsheet-B",
+                sheet_id=7,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.marker_hash(
+                row_id=ROW_ID,
+                spreadsheet_id="spreadsheet-A",
+                sheet_id=8,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.marker_hash(
+                row_id=ROW_ID,
+                spreadsheet_id="spreadsheet-A",
+                sheet_id=7,
+                user_scope_hash="2" * 64,
+            ),
+        )
+        self.assertNotIn(base_marker, marker_variants)
+        self.assertNotEqual(
+            module.header_hash(
+                ordered_headers=("A", "B"),
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.header_hash(
+                ordered_headers=("B", "A"),
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+        )
+        payload = {"nullable": None, "value": 1}
+        self.assertNotEqual(
+            module.domain_hash(
+                "sitesift.row.location.v1",
+                payload,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.domain_hash(
+                "sitesift.row.location.v2",
+                payload,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+        )
+        self.assertNotEqual(
+            module.domain_hash(
+                "sitesift.row.location.v1",
+                payload,
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.domain_hash(
+                "sitesift.row.location.v1",
+                {"nullable": "", "value": 1},
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+        )
+
+    def test_observation_builder_derives_exact_fields_and_rejects_overrides(self):
+        module = self._authority()
+        marker = self._marker_observation()
+        observation = module.build_row_observation(
+            spreadsheet_id="spreadsheet-A",
+            marker_observation=marker,
+            ordered_headers=(" Email ", "Status\r\nLine"),
+            ordered_cell_values=("USER@EXAMPLE.COM", "  Keep  \rValue"),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        self.assertEqual(
+            {
+                "providerRowIndex",
+                "displayRowNumber",
+                "metadataId",
+                "markerHash",
+                "rowSnapshotHash",
+            },
+            set(observation),
+        )
+        self.assertEqual(FROZEN_A1_HASHES["markerHash"], observation["markerHash"])
+        self.assertEqual(
+            FROZEN_A1_HASHES["rowSnapshotHash"],
+            observation["rowSnapshotHash"],
+        )
+        marker["providerRowIndex"] = 99
+        self.assertEqual(2, observation["providerRowIndex"])
+        for mutation in (
+            {"unknown": True},
+            {"displayRowNumber": 4},
+            {"sheetId": -1},
+            {"metadataId": True},
+        ):
+            invalid = self._marker_observation()
+            invalid.update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.build_row_observation(
+                    spreadsheet_id="spreadsheet-A",
+                    marker_observation=invalid,
+                    ordered_headers=(),
+                    ordered_cell_values=(),
+                    user_scope_hash=USER_SCOPE_HASH,
+                )
+        other_sheet = module.build_row_observation(
+            spreadsheet_id="spreadsheet-A",
+            marker_observation=self._marker_observation(sheetId=8),
+            ordered_headers=(),
+            ordered_cell_values=(),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        self.assertNotEqual(observation["markerHash"], other_sheet["markerHash"])
+
+    def test_evidence_is_sorted_bounded_and_lifecycle_specific(self):
+        module = self._authority()
+        first = self._observation(module)
+        second = self._observation(
+            module,
+            providerRowIndex=4,
+            displayRowNumber=5,
+            metadataId=12,
+        )
+        forward = module.observation_evidence_hash(
+            lifecycle="ambiguous",
+            observations=(first, second),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        reverse = module.observation_evidence_hash(
+            lifecycle="ambiguous",
+            observations=(second, first),
+            user_scope_hash=USER_SCOPE_HASH,
+        )
+        self.assertEqual(forward, reverse)
+        self.assertEqual(
+            module.observation_evidence_hash(
+                lifecycle="deleted",
+                observations=(),
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+            module.observation_evidence_hash(
+                lifecycle="deleted",
+                observations=[],
+                user_scope_hash=USER_SCOPE_HASH,
+            ),
+        )
+        invalid = (
+            ("active", ()),
+            ("active", (first, second)),
+            ("deleted", (first,)),
+            ("ambiguous", (first,)),
+            ("ambiguous", (first,) * 129),
+            ("unknown", (first,)),
+            ([], (first,)),
+        )
+        for lifecycle, observations in invalid:
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.observation_evidence_hash(
+                    lifecycle=lifecycle,
+                    observations=observations,
+                    user_scope_hash=USER_SCOPE_HASH,
+                )
+
+
+class RowIdentityDocumentSchemaTests(_RowIdentityFixtures, unittest.TestCase):
+    IDENTITY_KEYS = {
+        "schemaVersion",
+        "userScopeHash",
+        "rowId",
+        "clientId",
+        "spreadsheetId",
+        "sheetId",
+        "markerKey",
+        "markerValue",
+        "creationKind",
+        "creationSourceHash",
+        "markerHash",
+        "identityHash",
+        "createdAt",
+    }
+    REVISION_KEYS = {
+        "schemaVersion",
+        "userScopeHash",
+        "rowId",
+        "revision",
+        "spreadsheetId",
+        "sheetId",
+        "providerRowIndex",
+        "displayRowNumber",
+        "metadataId",
+        "markerHash",
+        "rowSnapshotHash",
+        "lifecycle",
+        "observationEvidenceHash",
+        "previousRevisionHash",
+        "revisionHash",
+        "observedAt",
+    }
+    HEAD_KEYS = {
+        "schemaVersion",
+        "userScopeHash",
+        "rowId",
+        "stateRevision",
+        "currentLocationRevision",
+        "currentLocationHash",
+        "currentLocationLifecycle",
+        "effectiveOwnerGeneration",
+        "effectiveOwnerGenerationHash",
+        "effectiveOwnerKind",
+        "effectivePriority",
+        "state",
+        "leaseOwnerHash",
+        "leaseUntil",
+        "fencingToken",
+        "latestSettlementHash",
+        "effectiveSettlementHash",
+        "latestSourceSettlementLinkHash",
+        "latestOptOutReleaseResultHash",
+        "projectionBacklogCount",
+        "headHash",
+        "createdAt",
+        "updatedAt",
+    }
+
+    def _owned_head(self, module, *, state):
+        head = self._head(module)
+        head.update(
+            {
+                "effectiveOwnerGeneration": 1,
+                "effectiveOwnerGenerationHash": "a" * 64,
+                "effectiveOwnerKind": (
+                    "human_decision" if state == "review_pending" else "terminal"
+                ),
+                "effectivePriority": 1 if state == "review_pending" else 2,
+                "state": state,
+                "fencingToken": 1,
+            }
+        )
+        if state in {"claimed", "review_pending"}:
+            head.update(
+                {
+                    "leaseOwnerHash": "b" * 64,
+                    "leaseUntil": LATER_AT,
+                    "latestSettlementHash": None,
+                    "effectiveSettlementHash": None,
+                }
+            )
+        elif state == "settled":
+            head.update(
+                {
+                    "leaseOwnerHash": None,
+                    "leaseUntil": None,
+                    "latestSettlementHash": "c" * 64,
+                    "effectiveSettlementHash": "c" * 64,
+                }
+            )
+        else:
+            raise AssertionError(f"unsupported fixture state: {state}")
+        return self._rehash_head(head)
+
+    def test_identity_builder_and_validator_use_exact_defensive_schema(self):
+        module = self._authority()
+        identity = self._identity(module)
+        self.assertEqual(self.IDENTITY_KEYS, set(identity))
+        self.assertEqual(1, identity["schemaVersion"])
+        self.assertEqual(ROW_ID, identity["rowId"])
+        self.assertEqual(ROW_ID, identity["markerValue"])
+        self.assertEqual("sitesift_row_id_v1", identity["markerKey"])
+        self.assertEqual(FROZEN_A1_HASHES["markerHash"], identity["markerHash"])
+        self.assertEqual(FROZEN_A1_HASHES["identityHash"], identity["identityHash"])
+        validated = module.validate_row_identity_document(document=identity)
+        self.assertEqual(identity, validated)
+        self.assertIsNot(identity, validated)
+        identity["clientId"] = "mutated"
+        self.assertEqual("client-A", validated["clientId"])
+        migration = module.build_row_identity_document(
+            **self._identity_kwargs(creation_kind="migration")
+        )
+        self.assertEqual("migration", migration["creationKind"])
+
+    def test_identity_validator_rejects_missing_unknown_drift_and_bad_inputs(self):
+        module = self._authority()
+        identity = self._identity(module)
+        variants = []
+        for key in self.IDENTITY_KEYS:
+            missing = deepcopy(identity)
+            missing.pop(key)
+            variants.append(missing)
+        unknown = deepcopy(identity)
+        unknown["unknown"] = True
+        variants.append(unknown)
+        for field, value in (
+            ("schemaVersion", True),
+            ("userScopeHash", "A" * 64),
+            ("rowId", SECOND_ROW_ID),
+            ("sheetId", True),
+            ("markerKey", "legacy"),
+            ("markerValue", SECOND_ROW_ID),
+            ("creationKind", "import"),
+            ("markerHash", "2" * 64),
+            ("identityHash", "3" * 64),
+            ("createdAt", "2026-08-04T12:34:56Z"),
+        ):
+            drift = deepcopy(identity)
+            drift[field] = value
+            variants.append(drift)
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.validate_row_identity_document(document=variant)
+
+    def test_location_revision_schemas_follow_lifecycle_and_hash_rules(self):
+        module = self._authority()
+        identity = self._identity(module)
+        active = self._revision(module, identity_document=identity)
+        self.assertEqual(self.REVISION_KEYS, set(active))
+        self.assertEqual(2, active["providerRowIndex"])
+        self.assertEqual(3, active["displayRowNumber"])
+        self.assertEqual(11, active["metadataId"])
+        self.assertEqual(
+            FROZEN_A1_HASHES["rowSnapshotHash"],
+            active["rowSnapshotHash"],
+        )
+        self.assertEqual(FROZEN_A1_HASHES["revisionHash"], active["revisionHash"])
+        self.assertEqual(
+            active,
+            module.validate_row_location_revision_document(
+                document=active,
+                identity_document=identity,
+            ),
+        )
+        nonviable = self._revision(
+            module,
+            identity_document=identity,
+            lifecycle="nonviable",
+        )
+        self.assertEqual("nonviable", nonviable["lifecycle"])
+        deleted = self._revision(
+            module,
+            identity_document=identity,
+            lifecycle="deleted",
+            observations=(),
+        )
+        ambiguous = self._revision(
+            module,
+            identity_document=identity,
+            lifecycle="ambiguous",
+            observations=(
+                self._observation(module),
+                self._observation(
+                    module,
+                    providerRowIndex=4,
+                    displayRowNumber=5,
+                    metadataId=12,
+                ),
+            ),
+        )
+        for document in (deleted, ambiguous):
+            with self.subTest(lifecycle=document["lifecycle"]):
+                self.assertIsNone(document["providerRowIndex"])
+                self.assertIsNone(document["displayRowNumber"])
+                self.assertIsNone(document["metadataId"])
+                self.assertIsNone(document["rowSnapshotHash"])
+                self.assertEqual(
+                    document,
+                    module.validate_row_location_revision_document(
+                        document=document,
+                        identity_document=identity,
+                    ),
+                )
+
+    def test_revision_builder_rejects_bad_sequence_observation_and_identity(self):
+        module = self._authority()
+        identity = self._identity(module)
+        observation = self._observation(module)
+        invalid_calls = (
+            {
+                "revision": 1,
+                "previous_revision_hash": "a" * 64,
+                "lifecycle": "active",
+                "observations": (observation,),
+            },
+            {
+                "revision": 2,
+                "previous_revision_hash": None,
+                "lifecycle": "active",
+                "observations": (observation,),
+                "observed_at": LATER_AT,
+            },
+            {
+                "revision": True,
+                "previous_revision_hash": None,
+                "lifecycle": "active",
+                "observations": (observation,),
+            },
+            {
+                "revision": 1,
+                "previous_revision_hash": None,
+                "lifecycle": "deleted",
+                "observations": (observation,),
+            },
+        )
+        for values in invalid_calls:
+            with self.subTest(values=values), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.build_row_location_revision_document(
+                    identity_document=identity,
+                    observed_at=values.pop("observed_at", CREATED_AT),
+                    **values,
+                )
+        wrong_marker = deepcopy(observation)
+        wrong_marker["markerHash"] = "2" * 64
+        with self.assertRaises(module.RowAuthorityConfigError):
+            module.build_row_location_revision_document(
+                identity_document=identity,
+                revision=1,
+                lifecycle="active",
+                observations=(wrong_marker,),
+                previous_revision_hash=None,
+                observed_at=CREATED_AT,
+            )
+
+    def test_revision_validator_rejects_schema_hash_geometry_and_scope_drift(self):
+        module = self._authority()
+        identity = self._identity(module)
+        revision = self._revision(module, identity_document=identity)
+        variants = []
+        for key in self.REVISION_KEYS:
+            missing = deepcopy(revision)
+            missing.pop(key)
+            variants.append(missing)
+        unknown = deepcopy(revision)
+        unknown["unknown"] = True
+        variants.append(unknown)
+        for field, value in (
+            ("schemaVersion", True),
+            ("userScopeHash", "2" * 64),
+            ("rowId", SECOND_ROW_ID),
+            ("revision", True),
+            ("sheetId", 8),
+            ("displayRowNumber", 4),
+            ("metadataId", 0),
+            ("lifecycle", "missing"),
+            ("previousRevisionHash", "a" * 64),
+            ("revisionHash", "3" * 64),
+            ("observedAt", "not-a-time"),
+        ):
+            drift = deepcopy(revision)
+            drift[field] = value
+            variants.append(drift)
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.validate_row_location_revision_document(
+                    document=variant,
+                    identity_document=identity,
+                )
+
+    def test_initial_head_is_exact_clear_revision_one_and_defensive(self):
+        module = self._authority()
+        identity = self._identity(module)
+        revision = self._revision(module, identity_document=identity)
+        head = module.build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=CREATED_AT,
+        )
+        self.assertEqual(self.HEAD_KEYS, set(head))
+        self.assertEqual(1, head["stateRevision"])
+        self.assertEqual(1, head["currentLocationRevision"])
+        self.assertEqual("clear", head["state"])
+        self.assertEqual(0, head["projectionBacklogCount"])
+        for field in (
+            "effectiveOwnerGeneration",
+            "effectiveOwnerGenerationHash",
+            "effectiveOwnerKind",
+            "effectivePriority",
+            "leaseOwnerHash",
+            "leaseUntil",
+            "fencingToken",
+            "latestSettlementHash",
+            "effectiveSettlementHash",
+            "latestSourceSettlementLinkHash",
+            "latestOptOutReleaseResultHash",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(head[field])
+        self.assertEqual(FROZEN_A1_HASHES["headHash"], head["headHash"])
+        validated = module.validate_row_authority_head(document=head)
+        self.assertEqual(head, validated)
+        self.assertIsNot(head, validated)
+        with self.assertRaises(module.RowAuthorityConfigError):
+            module.build_initial_row_authority_head(
+                identity_document=identity,
+                location_revision_document=revision,
+                created_at=LATER_AT,
+            )
+
+    def test_claimed_pending_and_settled_heads_validate_and_location_preserves(self):
+        module = self._authority()
+        for state in ("claimed", "review_pending", "settled"):
+            with self.subTest(state=state):
+                head = self._owned_head(module, state=state)
+                self.assertEqual(
+                    head,
+                    module.validate_row_authority_head(document=head),
+                )
+        claimed = self._owned_head(module, state="claimed")
+        identity = self._identity(module)
+        next_observation = self._observation(
+            module,
+            providerRowIndex=4,
+            displayRowNumber=5,
+            metadataId=11,
+        )
+        next_revision = self._revision(
+            module,
+            revision=2,
+            identity_document=identity,
+            observations=(next_observation,),
+        )
+        advanced = module.build_location_advanced_head(
+            expected_head=claimed,
+            location_revision_document=next_revision,
+        )
+        self.assertEqual(2, advanced["stateRevision"])
+        self.assertEqual(2, advanced["currentLocationRevision"])
+        self.assertEqual(next_revision["revisionHash"], advanced["currentLocationHash"])
+        self.assertEqual(LATER_AT, advanced["updatedAt"])
+        for field in (
+            "effectiveOwnerGeneration",
+            "effectiveOwnerGenerationHash",
+            "effectiveOwnerKind",
+            "effectivePriority",
+            "state",
+            "leaseOwnerHash",
+            "leaseUntil",
+            "fencingToken",
+            "latestSettlementHash",
+            "effectiveSettlementHash",
+            "latestSourceSettlementLinkHash",
+            "latestOptOutReleaseResultHash",
+            "projectionBacklogCount",
+            "createdAt",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(claimed[field], advanced[field])
+        self.assertNotEqual(claimed["headHash"], advanced["headHash"])
+        invalid_revisions = []
+        wrong_row = deepcopy(next_revision)
+        wrong_row["rowId"] = SECOND_ROW_ID
+        invalid_revisions.append(self._rehash_revision(wrong_row))
+        wrong_scope = deepcopy(next_revision)
+        wrong_scope["userScopeHash"] = "2" * 64
+        invalid_revisions.append(self._rehash_revision(wrong_scope))
+        skipped = deepcopy(next_revision)
+        skipped["revision"] = 3
+        invalid_revisions.append(self._rehash_revision(skipped))
+        wrong_predecessor = deepcopy(next_revision)
+        wrong_predecessor["previousRevisionHash"] = "d" * 64
+        invalid_revisions.append(self._rehash_revision(wrong_predecessor))
+        for invalid_revision in invalid_revisions:
+            with self.subTest(invalid_revision=invalid_revision), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.build_location_advanced_head(
+                    expected_head=claimed,
+                    location_revision_document=invalid_revision,
+                )
+
+    def test_head_validator_rejects_exact_schema_type_hash_and_null_drift(self):
+        module = self._authority()
+        clear = self._head(module)
+        variants = []
+        for key in self.HEAD_KEYS:
+            missing = deepcopy(clear)
+            missing.pop(key)
+            variants.append(missing)
+        unknown = deepcopy(clear)
+        unknown["unknown"] = True
+        variants.append(unknown)
+        for field, value in (
+            ("schemaVersion", True),
+            ("rowId", SECOND_ROW_ID),
+            ("stateRevision", True),
+            ("currentLocationLifecycle", "missing"),
+            ("state", "pending"),
+            ("projectionBacklogCount", -1),
+            ("headHash", "2" * 64),
+            ("updatedAt", "bad-time"),
+        ):
+            drift = deepcopy(clear)
+            drift[field] = value
+            variants.append(drift)
+        clear_owner = deepcopy(clear)
+        clear_owner["effectiveOwnerGeneration"] = 1
+        self._rehash_head(clear_owner)
+        variants.append(clear_owner)
+        claimed_missing_lease = self._owned_head(module, state="claimed")
+        claimed_missing_lease["leaseOwnerHash"] = None
+        self._rehash_head(claimed_missing_lease)
+        variants.append(claimed_missing_lease)
+        settled_with_lease = self._owned_head(module, state="settled")
+        settled_with_lease["leaseOwnerHash"] = "b" * 64
+        settled_with_lease["leaseUntil"] = LATER_AT
+        self._rehash_head(settled_with_lease)
+        variants.append(settled_with_lease)
+        settled_without_effective = self._owned_head(module, state="settled")
+        settled_without_effective["effectiveSettlementHash"] = None
+        self._rehash_head(settled_without_effective)
+        variants.append(settled_without_effective)
+        boolean_priority = self._owned_head(module, state="review_pending")
+        boolean_priority["effectivePriority"] = True
+        self._rehash_head(boolean_priority)
+        variants.append(boolean_priority)
+        mistyped_state = deepcopy(clear)
+        mistyped_state["state"] = ["clear"]
+        self._rehash_head(mistyped_state)
+        variants.append(mistyped_state)
+        reversed_time = deepcopy(clear)
+        reversed_time["createdAt"] = LATER_AT
+        self._rehash_head(reversed_time)
+        variants.append(reversed_time)
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(
+                module.RowAuthorityConfigError
+            ):
+                module.validate_row_authority_head(document=variant)
 
 
 class RowAuthorityA1ContainmentTests(unittest.TestCase):
