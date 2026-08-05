@@ -9633,6 +9633,59 @@ class RowAuthorityStore:
                     )
                 )
 
+            try:
+                b1_thread_binding_ref = user_ref.collection(
+                    "threadRowBindings"
+                ).document(b1_identity["threadId"])
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "source link B1 thread cannot form an exact binding path"
+                    )
+                )
+            b1_thread_binding_observed = read(b1_thread_binding_ref)
+            if not b1_thread_binding_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link B1 thread binding is missing"
+                    )
+                )
+            try:
+                b1_thread_binding = validate_thread_row_binding_document(
+                    document=b1_thread_binding_observed[1]
+                )
+                if (
+                    b1_thread_binding["userScopeHash"] != checked_scope
+                    or b1_thread_binding["threadId"]
+                    != b1_identity["threadId"]
+                    or b1_thread_binding["createdAt"]
+                    > checked_claim["createdAt"]
+                    or (
+                        checked_claim["authorityOrigin"] == "b1_source"
+                        and (
+                            b1_thread_binding["clientId"]
+                            != row_identity["clientId"]
+                            or b1_thread_binding["rowBindings"]
+                            != checked_claim["rowBindings"]
+                            or b1_thread_binding["primaryRowId"]
+                            != checked_claim["primaryRowId"]
+                            or b1_thread_binding["bindingCount"]
+                            != checked_claim["bindingCount"]
+                            or b1_thread_binding["rowBindingsHash"]
+                            != checked_claim["rowBindingsHash"]
+                        )
+                    )
+                ):
+                    raise RowAuthorityConfigError(
+                        "B1 thread binding differs from the immutable claim"
+                    )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "source link B1 thread binding is malformed or drifted"
+                    )
+                )
+
             b1_readiness = (
                 b1_identity["createdAt"],
                 b1_classification["snapshotPersistedAt"],

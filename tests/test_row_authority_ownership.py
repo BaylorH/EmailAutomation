@@ -10172,6 +10172,10 @@ class RowSourceSettlementLinkTests(unittest.TestCase):
                     "sourceSettlements",
                 )
             ],
+            self._user_reference(store)
+            .collection("threadRowBindings")
+            .document(state["bundle"]["identity"]["threadId"])
+            .path,
         ]
         self.assertEqual(expected, reads[: len(expected)])
         first_write = next(
@@ -10287,6 +10291,131 @@ class RowSourceSettlementLinkTests(unittest.TestCase):
             self._link(wrong_work)
         self.assertEqual(before, wrong_work["store"].data)
         self.assertEqual([], self._writes(wrong_work["store"]))
+
+    def test_source_link_accepts_contact_fanout_outside_b1_thread_rows(self):
+        store = self._store()
+        bundle, source_binding = self.fixture._seed_prerequisites(
+            store,
+            owner_kind="contact_optout",
+        )
+        self.assertEqual(
+            [self.fixture.first],
+            [item["rowId"] for item in source_binding["rowBindings"]],
+        )
+        self.fixture._seed_row(store, self.fixture.second)
+        claim, generation, claimed_head = self.fixture._install_contact_owner(
+            store,
+            self.fixture.second,
+        )
+        b2_settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=claimed_head["fencingToken"],
+            outcome="contact_optout",
+            settled_at="2026-08-04T12:00:03.000000Z",
+        )
+        head = self.module._build_settlement_advanced_head(
+            expected_head=claimed_head,
+            generation_document=generation,
+            settlement_document=b2_settlement,
+        )
+        self.fixture._settlement_reference(
+            store,
+            self.fixture.second,
+            1,
+        ).create(b2_settlement)
+        self.fixture._row_references(store, self.fixture.second)[1].set(
+            head,
+            merge=False,
+        )
+        b1 = self._seed_b1_settlement(store, bundle)
+        state = {
+            "store": store,
+            "binding": source_binding,
+            "bundle": b1,
+            "claim": claim,
+            "generation": generation,
+            "b2Settlement": b2_settlement,
+            "head": head,
+        }
+        self.row_id = self.fixture.second
+        store.events.clear()
+
+        result = self._link(state)
+
+        self.assertEqual("linked", result["disposition"])
+        self.assertEqual(
+            self.fixture.second,
+            result["sourceSettlementLink"]["rowId"],
+        )
+
+    def test_source_link_rejects_rehashed_b1_thread_bound_to_different_rows(self):
+        state = self._seed_linkable()
+        store = state["store"]
+        different_thread_id = "different-thread"
+        self.fixture._seed_row(store, self.fixture.second)
+        different_binding = self.module.build_thread_row_binding_document(
+            user_scope_hash=self.scope,
+            thread_id=different_thread_id,
+            client_id="client-1",
+            row_ids=[self.fixture.second],
+            primary_row_id=self.fixture.second,
+            created_at=self.fixture.binding_at,
+        )
+        self._user_reference(store).collection(
+            "threadRowBindings"
+        ).document(different_thread_id).create(different_binding)
+
+        identity_ref = self._b1_reference(
+            store,
+            "sourceIdentities",
+        )
+        identity = deepcopy(store.data[identity_ref.path])
+        identity["threadId"] = different_thread_id
+        store.data[identity_ref.path] = identity
+
+        settlement_ref = self._b1_reference(
+            store,
+            "sourceSettlements",
+        )
+        settlement = deepcopy(store.data[settlement_ref.path])
+        settlement["identityHash"] = _independent_b1_hash(
+            {
+                "hashKind": "source-settlement-identity-v1",
+                "schemaVersion": identity["schemaVersion"],
+                "canonicalSourceId": identity["canonicalSourceId"],
+                "creationHash": identity["creationHash"],
+                "threadId": identity["threadId"],
+            }
+        )
+        thread_head = settlement["threadHeadBinding"]
+        thread_head["headHash"] = _independent_b1_hash(
+            {
+                "hashKind": "thread-transition-head-v1",
+                "schemaVersion": 1,
+                "threadId": identity["threadId"],
+                "threadHeadRevision": thread_head["threadHeadRevision"],
+                "activeOwnerKey": thread_head["ownerKey"],
+                "activeOwnerKind": thread_head["ownerKind"],
+                "activeCanonicalSourceId": thread_head[
+                    "canonicalSourceId"
+                ],
+                "activeGeneration": thread_head["generation"],
+                "activeState": "active",
+            }
+        )
+        settlement["settlementHash"] = self._independent_settlement_hash(
+            settlement
+        )
+        store.data[settlement_ref.path] = settlement
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._link(state)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._writes(store))
 
     def test_b1_canonical_source_snapshot_selection_owner_ledger_or_hard_evidence_drift_writes_nothing(self):
         cases = (
