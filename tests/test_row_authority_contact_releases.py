@@ -270,6 +270,7 @@ class ContactReleaseTransitionTests(unittest.TestCase):
         self.assertIsNone(fanout["leaseOwnerHash"])
         self.assertIsNone(fanout["leaseUntil"])
         self.assertIsNone(fanout["discoveryCursorRowId"])
+        self.assertEqual(0, fanout["cursorProcessedCount"])
         self.assertEqual(requested_at, fanout["createdAt"])
         self.assertEqual(requested_at, fanout["updatedAt"])
         for key in (
@@ -323,6 +324,9 @@ class ContactReleaseTransitionTests(unittest.TestCase):
             binding_association_count=current["bindingAssociationCount"],
             discovery_cursor_row_id=(
                 None if complete else current["discoveryCursorRowId"]
+            ),
+            cursor_processed_count=(
+                0 if complete else current["cursorProcessedCount"]
             ),
             obligation_count=current["obligationCount"],
             result_count=current["resultCount"],
@@ -470,6 +474,7 @@ class ContactReleaseTransitionTests(unittest.TestCase):
                     self.assertIsNone(updated_prior["leaseOwnerHash"])
                     self.assertIsNone(updated_prior["leaseUntil"])
                     self.assertIsNone(updated_prior["discoveryCursorRowId"])
+                    self.assertEqual(0, updated_prior["cursorProcessedCount"])
                     self.assertEqual(self.release_at, updated_prior["updatedAt"])
                     expected_writes = 5
                 self.assertEqual(expected_writes, len(self._writes(active["store"])))

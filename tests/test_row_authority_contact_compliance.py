@@ -8,7 +8,9 @@ import importlib
 import inspect
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Barrier
 from unittest.mock import patch
 
 from tests.row_authority_fakes import (
@@ -382,6 +384,7 @@ class ContactContractTests(unittest.TestCase):
                 "bindingHeadHash",
                 "bindingAssociationCount",
                 "discoveryCursorRowId",
+                "cursorProcessedCount",
                 "obligationCount",
                 "resultCount",
                 "leaseOwnerHash",
@@ -513,6 +516,7 @@ class ContactContractTests(unittest.TestCase):
             "bindingHeadHash",
             "bindingAssociationCount",
             "discoveryCursorRowId",
+            "cursorProcessedCount",
             "obligationCount",
             "resultCount",
             "leaseOwnerHash",
@@ -805,6 +809,7 @@ class ContactContractTests(unittest.TestCase):
             "binding_head_hash": None,
             "binding_association_count": 0,
             "discovery_cursor_row_id": None,
+            "cursor_processed_count": 0,
             "obligation_count": 0,
             "result_count": 0,
             "lease_owner_hash": None,
@@ -1022,7 +1027,7 @@ class ContactContractTests(unittest.TestCase):
             ),
             "transition": (
                 "contactTransitionRequestHash",
-                "e8b69797017a3c8ba1165a3a8b3fc8ceb9933322472059980b12e0fea6428121",
+                "dc25ae1c930b61c513aa35ae35f569b72eeb46819d579a813bc23067fba60073",
             ),
             "settlement": (
                 "contactSettlementHash",
@@ -1034,7 +1039,7 @@ class ContactContractTests(unittest.TestCase):
             ),
             "fanout_head": (
                 "contactFanoutHeadHash",
-                "4afa4a533c566e8a9e50112abfa8ab95a8deb8e44d8dd5177143701b30309c63",
+                "1832888e4f608c0170cbf5cdf356ca05bb772cc10a6ccad131989f58fd5b468b",
             ),
             "obligation": (
                 "contactFanoutObligationHash",
@@ -1409,6 +1414,8 @@ class ContactContractTests(unittest.TestCase):
             self._build_fanout_head(
                 state="applying",
                 discovery_cursor_row_id=self.row_id,
+                cursor_processed_count=1,
+                obligation_count=1,
                 lease_owner_hash=self.actor_hash,
                 lease_until="2026-08-04T12:05:00.000000Z",
                 **active_binding,
@@ -1416,6 +1423,8 @@ class ContactContractTests(unittest.TestCase):
             self._build_fanout_head(
                 state="superseding",
                 discovery_cursor_row_id=self.row_id,
+                cursor_processed_count=1,
+                obligation_count=1,
                 superseding_contact_settlement_hash="f" * 64,
                 **active_binding,
             ),
@@ -1490,6 +1499,12 @@ class ContactContractTests(unittest.TestCase):
             {"binding_association_count": True},
             {"fencing_token": True},
             {"discovery_cursor_row_id": "row-1"},
+            {"cursor_processed_count": True},
+            {"cursor_processed_count": 1},
+            {
+                "discovery_cursor_row_id": self.row_id,
+                "cursor_processed_count": 0,
+            },
             {"fanout_id": "f" * 64},
             {
                 "state": "superseded",
@@ -2655,6 +2670,422 @@ class ContactSuppressionTests(unittest.TestCase):
             context["canonical"],
         ):
             self.assertNotIn(raw_fragment, persisted)
+
+
+class ContactFanoutLeaseTests(unittest.TestCase):
+    """Leased contact fan-out state-machine contracts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+        transitions = importlib.import_module(
+            "tests.test_row_authority_contact_transitions"
+        )
+        cls.transition_type = transitions.ContactTransitionTests
+        cls.transition_type.setUpClass()
+
+    def setUp(self):
+        self.transition = self.transition_type(methodName="runTest")
+        self.transition.setUp()
+        self.owner_a = "a" * 64
+        self.owner_b = "b" * 64
+        self.acquired_at = "2026-08-04T12:05:00.000000Z"
+        self.lease_until = "2026-08-04T12:06:00.000000Z"
+
+    def _method(self):
+        method = getattr(
+            self.module.RowAuthorityStore,
+            "acquire_contact_fanout_lease",
+            None,
+        )
+        self.assertTrue(
+            callable(method),
+            "RowAuthorityStore.acquire_contact_fanout_lease is missing",
+        )
+        signature = inspect.signature(method)
+        self.assertEqual(
+            [
+                "self",
+                "verified_user_id",
+                "fanout_id",
+                "expected_fanout_head",
+                "lease_owner_hash",
+                "lease_until",
+                "acquired_at",
+            ],
+            list(signature.parameters),
+        )
+        self.assertTrue(
+            all(
+                parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                for name, parameter in signature.parameters.items()
+                if name != "self"
+            )
+        )
+        return method
+
+    def _user(self, store):
+        return store.collection("users").document(
+            self.transition.fixture.user_id
+        )
+
+    def _fanout_reference(self, store, fanout_id):
+        return self._user(store).collection(
+            "contactOptOutFanoutHeads"
+        ).document(fanout_id)
+
+    @staticmethod
+    def _writes(store):
+        return [
+            event
+            for event in store.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def _seed_fanout(self):
+        store = self.transition.fixture._store()
+        bundle, _link = self.transition._seed_bundle(
+            store,
+            "source-contact-fanout-lease",
+        )
+        self.transition._record(store, bundle)
+        _aliases, _receipts, _settlement, _head, fanout = (
+            self.transition._assert_one_active_epoch(store)
+        )
+        store.events.clear()
+        return store, fanout
+
+    def _acquire(
+        self,
+        store,
+        expected,
+        *,
+        owner=None,
+        lease_until=None,
+        acquired_at=None,
+    ):
+        self._method()
+        authority = self.transition._authority(store)
+        return authority.acquire_contact_fanout_lease(
+            verified_user_id=self.transition.fixture.user_id,
+            fanout_id=expected["fanoutId"],
+            expected_fanout_head=expected,
+            lease_owner_hash=owner or self.owner_a,
+            lease_until=lease_until or self.lease_until,
+            acquired_at=acquired_at or self.acquired_at,
+        )
+
+    def _replace_fanout(self, store, current, **overrides):
+        values = {
+            "user_scope_hash": current["userScopeHash"],
+            "fanout_id": current["fanoutId"],
+            "outcome": current["outcome"],
+            "expected_contact_settlement_hash": current[
+                "expectedContactSettlementHash"
+            ],
+            "state_revision": current["stateRevision"],
+            "state": current["state"],
+            "binding_revision": current["bindingRevision"],
+            "binding_head_hash": current["bindingHeadHash"],
+            "binding_association_count": current[
+                "bindingAssociationCount"
+            ],
+            "discovery_cursor_row_id": current["discoveryCursorRowId"],
+            "cursor_processed_count": current["cursorProcessedCount"],
+            "obligation_count": current["obligationCount"],
+            "result_count": current["resultCount"],
+            "lease_owner_hash": current["leaseOwnerHash"],
+            "lease_until": current["leaseUntil"],
+            "fencing_token": current["fencingToken"],
+            "superseding_contact_settlement_hash": current[
+                "supersedingContactSettlementHash"
+            ],
+            "completion_binding_revision": current[
+                "completionBindingRevision"
+            ],
+            "completion_binding_head_hash": current[
+                "completionBindingHeadHash"
+            ],
+            "completion_binding_association_count": current[
+                "completionBindingAssociationCount"
+            ],
+            "completion_obligation_count": current[
+                "completionObligationCount"
+            ],
+            "completion_result_count": current["completionResultCount"],
+            "completed_at": current["completedAt"],
+            "created_at": current["createdAt"],
+            "updated_at": current["updatedAt"],
+        }
+        values.update(overrides)
+        replacement = self.module.build_contact_fanout_head_document(**values)
+        self._fanout_reference(store, current["fanoutId"]).set(
+            replacement,
+            merge=False,
+        )
+        store.events.clear()
+        return replacement
+
+    def _assert_one_head_write(self, store, result):
+        self.assertEqual({"disposition", "fanoutHead"}, set(result))
+        writes = self._writes(store)
+        self.assertEqual(1, len(writes))
+        self.assertEqual("set", writes[0][0])
+        self.assertEqual(
+            self._fanout_reference(store, result["fanoutHead"]["fanoutId"]).path,
+            writes[0][1],
+        )
+        self.assertEqual(result["fanoutHead"], writes[0][2])
+        self.assertFalse(writes[0][3])
+
+    def _assert_rejected_without_write(self, store, operation):
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityError):
+            operation()
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._writes(store))
+
+    def test_nonterminal_mutation_requires_exact_unexpired_lease_and_fence(self):
+        store, initial = self._seed_fanout()
+        acquired = self._acquire(store, initial)
+        current = acquired["fanoutHead"]
+        self.assertEqual(self.owner_a, current["leaseOwnerHash"])
+        self.assertEqual(self.lease_until, current["leaseUntil"])
+        self.assertEqual(initial["fencingToken"] + 1, current["fencingToken"])
+
+        self._assert_rejected_without_write(
+            store,
+            lambda: self._acquire(
+                store,
+                current,
+                owner=self.owner_b,
+                lease_until="2026-08-04T12:07:00.000000Z",
+                acquired_at="2026-08-04T12:05:30.000000Z",
+            ),
+        )
+        self._assert_rejected_without_write(
+            store,
+            lambda: self._acquire(
+                store,
+                initial,
+                acquired_at="2026-08-04T12:05:30.000000Z",
+            ),
+        )
+
+    def test_new_fanout_is_unleased_at_fence_one(self):
+        self._method()
+        _store, fanout = self._seed_fanout()
+        self.assertEqual("discovering", fanout["state"])
+        self.assertEqual(1, fanout["stateRevision"])
+        self.assertEqual(1, fanout["fencingToken"])
+        self.assertIsNone(fanout["leaseOwnerHash"])
+        self.assertIsNone(fanout["leaseUntil"])
+        self.assertIsNone(fanout["discoveryCursorRowId"])
+        self.assertEqual(0, fanout["cursorProcessedCount"])
+
+    def test_acquisition_and_renewal_increment_revision_and_fence(self):
+        store, initial = self._seed_fanout()
+        acquired = self._acquire(store, initial)
+        self.assertEqual("acquired", acquired["disposition"])
+        self._assert_one_head_write(store, acquired)
+        first = acquired["fanoutHead"]
+        self.assertEqual(initial["stateRevision"] + 1, first["stateRevision"])
+        self.assertEqual(initial["fencingToken"] + 1, first["fencingToken"])
+        self.assertEqual(
+            initial["cursorProcessedCount"],
+            first["cursorProcessedCount"],
+        )
+
+        store.events.clear()
+        renewed = self._acquire(
+            store,
+            first,
+            lease_until="2026-08-04T12:07:00.000000Z",
+            acquired_at="2026-08-04T12:05:30.000000Z",
+        )
+        self.assertEqual("renewed", renewed["disposition"])
+        self._assert_one_head_write(store, renewed)
+        second = renewed["fanoutHead"]
+        self.assertEqual(first["stateRevision"] + 1, second["stateRevision"])
+        self.assertEqual(first["fencingToken"] + 1, second["fencingToken"])
+        self.assertEqual(
+            first["cursorProcessedCount"],
+            second["cursorProcessedCount"],
+        )
+
+    def test_exact_lease_request_retry_returns_same_zero_write_after_image(self):
+        store, initial = self._seed_fanout()
+        first = self._acquire(store, initial)
+        store.events.clear()
+
+        try:
+            retry = self._acquire(store, initial)
+        except self.module.RowAuthorityError as exc:
+            self.fail(
+                "exact lease request retry must return its deterministic "
+                f"after-image, not {type(exc).__name__}: {exc}"
+            )
+
+        self.assertEqual(first, retry)
+        self.assertEqual([], self._writes(store))
+        self.assertEqual(1, store.events.count(("commit_applied", 0)))
+
+    def test_two_worker_same_lease_request_race_writes_one_identical_after_image(self):
+        store, initial = self._seed_fanout()
+        store.before_commit_barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(self._acquire, store, initial)
+                for _worker in range(2)
+            ]
+            results = []
+            errors = []
+            for future in futures:
+                try:
+                    results.append(future.result(timeout=10))
+                except self.module.RowAuthorityError as exc:
+                    errors.append(exc)
+
+        self.assertEqual(1, len(self._writes(store)))
+        self.assertEqual(
+            [],
+            errors,
+            "same-request loser must read back the winning after-image",
+        )
+        self.assertEqual(2, len(results))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(1, store.events.count(("commit_applied", 1)))
+        self.assertEqual(1, store.events.count(("commit_applied", 0)))
+        self.assertTrue(
+            any(
+                event[0] == "commit_aborted_stale_read"
+                for event in store.events
+            )
+        )
+
+    def test_same_owner_request_strictly_after_expiry_is_taken_over(self):
+        store, initial = self._seed_fanout()
+        acquired = self._acquire(store, initial)["fanoutHead"]
+        store.events.clear()
+
+        takeover = self._acquire(
+            store,
+            acquired,
+            owner=self.owner_a,
+            lease_until="2026-08-04T12:07:00.000000Z",
+            acquired_at="2026-08-04T12:06:00.000001Z",
+        )
+
+        self.assertEqual("taken_over", takeover["disposition"])
+        self._assert_one_head_write(store, takeover)
+        current = takeover["fanoutHead"]
+        self.assertEqual(acquired["stateRevision"] + 1, current["stateRevision"])
+        self.assertEqual(acquired["fencingToken"] + 1, current["fencingToken"])
+        self.assertEqual(self.owner_a, current["leaseOwnerHash"])
+
+    def test_expired_takeover_increments_revision_and_fence(self):
+        store, initial = self._seed_fanout()
+        acquired = self._acquire(store, initial)["fanoutHead"]
+        self._assert_rejected_without_write(
+            store,
+            lambda: self._acquire(
+                store,
+                acquired,
+                owner=self.owner_b,
+                lease_until="2026-08-04T12:07:00.000000Z",
+                acquired_at=acquired["leaseUntil"],
+            ),
+        )
+
+        takeover = self._acquire(
+            store,
+            acquired,
+            owner=self.owner_b,
+            lease_until="2026-08-04T12:07:00.000000Z",
+            acquired_at="2026-08-04T12:06:00.000001Z",
+        )
+        self.assertEqual("taken_over", takeover["disposition"])
+        self._assert_one_head_write(store, takeover)
+        current = takeover["fanoutHead"]
+        self.assertEqual(acquired["stateRevision"] + 1, current["stateRevision"])
+        self.assertEqual(acquired["fencingToken"] + 1, current["fencingToken"])
+        self.assertEqual(self.owner_b, current["leaseOwnerHash"])
+
+    def test_stale_worker_cannot_write_after_takeover_or_superseding(self):
+        store, initial = self._seed_fanout()
+        acquired = self._acquire(store, initial)["fanoutHead"]
+        takeover = self._acquire(
+            store,
+            acquired,
+            owner=self.owner_b,
+            lease_until="2026-08-04T12:08:00.000000Z",
+            acquired_at="2026-08-04T12:06:00.000001Z",
+        )["fanoutHead"]
+        self._assert_rejected_without_write(
+            store,
+            lambda: self._acquire(
+                store,
+                acquired,
+                lease_until="2026-08-04T12:09:00.000000Z",
+                acquired_at="2026-08-04T12:07:00.000000Z",
+            ),
+        )
+
+        self._replace_fanout(
+            store,
+            takeover,
+            state_revision=takeover["stateRevision"] + 1,
+            state="superseding",
+            lease_owner_hash=None,
+            lease_until=None,
+            fencing_token=takeover["fencingToken"] + 1,
+            superseding_contact_settlement_hash="f" * 64,
+            discovery_cursor_row_id=None,
+            updated_at="2026-08-04T12:07:30.000000Z",
+        )
+        self._assert_rejected_without_write(
+            store,
+            lambda: self._acquire(
+                store,
+                takeover,
+                owner=self.owner_b,
+                lease_until="2026-08-04T12:09:00.000000Z",
+                acquired_at="2026-08-04T12:08:00.000000Z",
+            ),
+        )
+
+    def test_terminal_fanout_rejects_takeover_and_has_null_lease_cursor(self):
+        store, initial = self._seed_fanout()
+        terminal = self._replace_fanout(
+            store,
+            initial,
+            state_revision=initial["stateRevision"] + 1,
+            state="complete",
+            completion_binding_revision=initial["bindingRevision"],
+            completion_binding_head_hash=initial["bindingHeadHash"],
+            completion_binding_association_count=initial[
+                "bindingAssociationCount"
+            ],
+            completion_obligation_count=initial["obligationCount"],
+            completion_result_count=initial["resultCount"],
+            completed_at="2026-08-04T12:07:00.000000Z",
+            updated_at="2026-08-04T12:07:00.000000Z",
+        )
+        self.assertIsNone(terminal["leaseOwnerHash"])
+        self.assertIsNone(terminal["leaseUntil"])
+        self.assertIsNone(terminal["discoveryCursorRowId"])
+        self.assertEqual(0, terminal["cursorProcessedCount"])
+        self._assert_rejected_without_write(
+            store,
+            lambda: self._acquire(
+                store,
+                terminal,
+                owner=self.owner_b,
+                lease_until="2026-08-04T12:09:00.000000Z",
+                acquired_at="2026-08-04T12:08:00.000000Z",
+            ),
+        )
 
 
 class ReleaseAwareRowHistoryTests(unittest.TestCase):

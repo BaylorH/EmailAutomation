@@ -46,6 +46,7 @@ class ContactReleaseIntegrityTests(unittest.TestCase):
                 "bindingAssociationCount"
             ],
             "discovery_cursor_row_id": current["discoveryCursorRowId"],
+            "cursor_processed_count": current["cursorProcessedCount"],
             "obligation_count": current["obligationCount"],
             "result_count": current["resultCount"],
             "lease_owner_hash": current["leaseOwnerHash"],
@@ -686,8 +687,15 @@ class ContactReleaseIntegrityTests(unittest.TestCase):
                         lease_until="2026-08-04T12:30:00.000000Z",
                     )
                 else:
-                    overrides["discovery_cursor_row_id"] = (
-                        "sr1_123e4567e89b42d3a456426614174000"
+                    overrides.update(
+                        discovery_cursor_row_id=(
+                            "sr1_123e4567e89b42d3a456426614174000"
+                        ),
+                        cursor_processed_count=1,
+                        binding_revision=1,
+                        binding_head_hash="9" * 64,
+                        binding_association_count=1,
+                        obligation_count=1,
                     )
                 reference.set(
                     self._fanout_document(current, **overrides),
