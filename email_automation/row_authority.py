@@ -14,6 +14,7 @@ MAX_ROW_BINDINGS = 128
 MAX_ROW_AUTHORITY_PLANNED_WRITES = 400
 MAX_OPAQUE_BYTES = 512
 MAX_MAILBOX_BYTES = 320
+MAX_FIRESTORE_DOCUMENT_ID_BYTES = 1500
 CONTACT_NORMALIZATION_VERSION = "sitesift-mailbox-v1"
 MAX_JSON_SAFE_INTEGER = 9007199254740991
 MAX_CANONICAL_JSON_DEPTH = 64
@@ -217,6 +218,32 @@ def _contains_control(value):
         unicodedata.category(character).startswith("C")
         for character in value
     )
+
+
+def _require_firestore_document_id(value, *, field_name):
+    if type(value) is not str or not value:
+        raise RowAuthorityConfigError(
+            f"{field_name} must be a nonempty Firestore document ID"
+        )
+    if (
+        value in {".", ".."}
+        or "/" in value
+        or _contains_control(value)
+        or (
+            len(value) >= 4
+            and value.startswith("__")
+            and value.endswith("__")
+        )
+    ):
+        raise RowAuthorityConfigError(
+            f"{field_name} must be a safe Firestore document ID"
+        )
+    encoded = _utf8_bytes(value, field_name=field_name)
+    if len(encoded) > MAX_FIRESTORE_DOCUMENT_ID_BYTES:
+        raise RowAuthorityConfigError(
+            f"{field_name} exceeds the Firestore document ID byte bound"
+        )
+    return value
 
 
 def user_scope_hash(verified_user_id):
@@ -1472,7 +1499,11 @@ class RowAuthorityStore:
             raise RowAuthorityConfigError(
                 "initial row lifecycle must be active or nonviable"
             )
-        checked_scope = user_scope_hash(verified_user_id)
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
         marker = _require_exact_dict(
             marker_observation,
             keys=_MARKER_OBSERVATION_KEYS,
@@ -1514,7 +1545,7 @@ class RowAuthorityStore:
             created_at=created_at,
         )
         references = self._initialization_references(
-            verified_user_id=verified_user_id,
+            verified_user_id=checked_user_id,
             row_id=checked_row_id,
         )
         expected_documents = (identity, revision, head)
@@ -1627,7 +1658,11 @@ class RowAuthorityStore:
             )
         expected = validate_row_authority_head(document=expected_head)
         checked_row_id = validate_row_id(row_id)
-        checked_scope = user_scope_hash(verified_user_id)
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
         if expected["userScopeHash"] != checked_scope:
             raise RowAuthorityConfigError(
                 "expected head does not belong to the verified user"
@@ -1651,7 +1686,7 @@ class RowAuthorityStore:
         previous_number = expected["currentLocationRevision"]
         candidate_number = previous_number + 1
         references = self._location_references(
-            verified_user_id=verified_user_id,
+            verified_user_id=checked_user_id,
             row_id=checked_row_id,
             previous_revision=previous_number,
             candidate_revision=candidate_number,

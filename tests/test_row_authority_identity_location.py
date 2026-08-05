@@ -1778,6 +1778,35 @@ class RowIdentityInitializationTests(_RowIdentityFixtures, unittest.TestCase):
                 self.assertEqual([], store.events)
                 self.assertEqual({}, store.data)
 
+    def test_unsafe_verified_user_ids_fail_before_hash_or_firestore(self):
+        module = self._authority()
+        fakes = self._fakes()
+        unsafe_ids = (
+            "uid/escaped/path",
+            ".",
+            "..",
+            "__reserved__",
+            "uid\n1",
+            "\ud800",
+        )
+        for unsafe_id in unsafe_ids:
+            with self.subTest(unsafe_id=repr(unsafe_id)):
+                store = fakes.BoundedFakeFirestore()
+                with patch.object(
+                    module,
+                    "user_scope_hash",
+                    wraps=module.user_scope_hash,
+                ) as scope_hasher:
+                    with self.assertRaises(module.RowAuthorityConfigError):
+                        self._initialize(
+                            module,
+                            store,
+                            verified_user_id=unsafe_id,
+                        )
+                    scope_hasher.assert_not_called()
+                self.assertEqual([], store.events)
+                self.assertEqual({}, store.data)
+
     def test_preapply_commit_failure_has_zero_writes_and_is_retryable(self):
         module = self._authority()
         fakes = self._fakes()
@@ -2772,6 +2801,29 @@ class RowLocationRevisionTests(_RowIdentityFixtures, unittest.TestCase):
                     observations=(self._observation(module),),
                 )
         self.assertEqual([], bounded_store.events)
+
+    def test_location_rejects_unsafe_user_id_before_hash_or_firestore(self):
+        module = self._authority()
+        for unsafe_id in ("uid/escaped/path", ".", "..", "__reserved__"):
+            with self.subTest(unsafe_id=unsafe_id):
+                store, coordinator, initialized = self._initialized(module)
+                store.events.clear()
+                with patch.object(
+                    module,
+                    "user_scope_hash",
+                    wraps=module.user_scope_hash,
+                ) as scope_hasher:
+                    with self.assertRaises(module.RowAuthorityConfigError):
+                        coordinator.advance_row_location(
+                            verified_user_id=unsafe_id,
+                            row_id=ROW_ID,
+                            expected_head=initialized["authorityHead"],
+                            observations=(self._observation(module),),
+                            lifecycle="active",
+                            observed_at=LATER_AT,
+                        )
+                    scope_hasher.assert_not_called()
+                self.assertEqual([], store.events)
 
     def test_location_change_preserves_all_nonlocation_head_fields(self):
         module = self._authority()
