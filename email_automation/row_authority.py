@@ -12,6 +12,17 @@ from uuid import RFC_4122, UUID, uuid4
 SCHEMA_VERSION = 1
 MAX_ROW_BINDINGS = 128
 MAX_ROW_AUTHORITY_PLANNED_WRITES = 400
+ROW_BINDINGS_HASH_DOMAIN = "sitesift.row.bindings.v1"
+THREAD_ROW_BINDING_HASH_DOMAIN = "sitesift.thread.row_binding.v1"
+ROW_THREAD_EDGE_ID_DOMAIN = "sitesift.row.thread_edge_id.v1"
+ROW_THREAD_EDGE_HASH_DOMAIN = "sitesift.row.thread_edge.v1"
+CONTACT_ROW_EDGE_ID_DOMAIN = "sitesift.contact.row_edge_id.v1"
+CONTACT_ROW_EDGE_HASH_DOMAIN = "sitesift.contact.row_edge.v1"
+CONTACT_ROW_EVIDENCE_ID_DOMAIN = "sitesift.contact.row_evidence_id.v1"
+CONTACT_ROW_EVIDENCE_HASH_DOMAIN = "sitesift.contact.row_evidence.v1"
+CONTACT_ROW_BINDING_HEAD_HASH_DOMAIN = (
+    "sitesift.contact.row_binding_head.v1"
+)
 MAX_OPAQUE_BYTES = 512
 MAX_MAILBOX_BYTES = 320
 MAX_FIRESTORE_DOCUMENT_ID_BYTES = 1500
@@ -444,6 +455,622 @@ def _require_timestamp(value, *, field_name):
     ):
         raise RowAuthorityConfigError(f"{field_name} is not a valid time")
     return value
+
+
+_ROW_BINDING_KEYS = frozenset({"rowId", "role"})
+_THREAD_ROW_BINDING_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "threadId",
+        "clientId",
+        "rowBindings",
+        "primaryRowId",
+        "bindingCount",
+        "rowBindingsHash",
+        "bindingHash",
+        "createdAt",
+    }
+)
+_ROW_THREAD_BINDING_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "edgeId",
+        "rowId",
+        "threadId",
+        "role",
+        "threadBindingHash",
+        "edgeHash",
+        "createdAt",
+    }
+)
+
+
+def _require_thread_document_id(value, *, field_name):
+    checked = _require_opaque(value, field_name=field_name)
+    return _require_firestore_document_id(checked, field_name=field_name)
+
+
+def normalize_row_bindings(row_ids, primary_row_id):
+    checked_primary = validate_row_id(primary_row_id)
+    if type(row_ids) not in {list, tuple}:
+        raise RowAuthorityConfigError(
+            "row_ids must be an ordered list or tuple"
+        )
+    unique_row_ids = {validate_row_id(row_id) for row_id in row_ids}
+    if not unique_row_ids:
+        raise RowAuthorityConfigError("row bindings cannot be empty")
+    if len(unique_row_ids) > MAX_ROW_BINDINGS:
+        raise RowAuthorityConfigError("row bindings exceed the 128-row bound")
+    if checked_primary not in unique_row_ids:
+        raise RowAuthorityConfigError(
+            "primary_row_id must be present in row bindings"
+        )
+    return [
+        {
+            "rowId": row_id,
+            "role": "primary" if row_id == checked_primary else "related",
+        }
+        for row_id in sorted(unique_row_ids)
+    ]
+
+
+def _row_bindings_hash(
+    *, user_scope_hash, row_bindings, primary_row_id, binding_count
+):
+    return domain_hash(
+        ROW_BINDINGS_HASH_DOMAIN,
+        {
+            "rowBindings": [dict(binding) for binding in row_bindings],
+            "primaryRowId": primary_row_id,
+            "bindingCount": binding_count,
+        },
+        user_scope_hash=user_scope_hash,
+    )
+
+
+def build_thread_row_binding_document(
+    *,
+    user_scope_hash,
+    thread_id,
+    client_id,
+    row_ids,
+    primary_row_id,
+    created_at,
+):
+    checked_scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    checked_thread_id = _require_thread_document_id(
+        thread_id,
+        field_name="thread_id",
+    )
+    checked_client_id = _require_opaque(client_id, field_name="client_id")
+    checked_created_at = _require_timestamp(
+        created_at,
+        field_name="created_at",
+    )
+    canonical_bindings = normalize_row_bindings(row_ids, primary_row_id)
+    checked_primary = validate_row_id(primary_row_id)
+    binding_count = len(canonical_bindings)
+    row_bindings_hash = _row_bindings_hash(
+        user_scope_hash=checked_scope,
+        row_bindings=canonical_bindings,
+        primary_row_id=checked_primary,
+        binding_count=binding_count,
+    )
+    binding_hash = domain_hash(
+        THREAD_ROW_BINDING_HASH_DOMAIN,
+        {
+            "threadId": checked_thread_id,
+            "clientId": checked_client_id,
+            "rowBindingsHash": row_bindings_hash,
+            "primaryRowId": checked_primary,
+            "bindingCount": binding_count,
+            "createdAt": checked_created_at,
+        },
+        user_scope_hash=checked_scope,
+    )
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": checked_scope,
+        "threadId": checked_thread_id,
+        "clientId": checked_client_id,
+        "rowBindings": [dict(binding) for binding in canonical_bindings],
+        "primaryRowId": checked_primary,
+        "bindingCount": binding_count,
+        "rowBindingsHash": row_bindings_hash,
+        "bindingHash": binding_hash,
+        "createdAt": checked_created_at,
+    }
+
+
+def validate_thread_row_binding_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_THREAD_ROW_BINDING_KEYS,
+        field_name="thread row binding document",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != SCHEMA_VERSION
+    ):
+        raise RowAuthorityConfigError(
+            "thread row binding schemaVersion must be 1"
+        )
+    if type(checked["rowBindings"]) is not list:
+        raise RowAuthorityConfigError(
+            "persisted rowBindings must be a canonical list"
+        )
+    row_ids = []
+    for index, binding in enumerate(checked["rowBindings"]):
+        item = _require_exact_dict(
+            binding,
+            keys=_ROW_BINDING_KEYS,
+            field_name=f"rowBindings[{index}]",
+        )
+        row_ids.append(validate_row_id(item["rowId"]))
+        if type(item["role"]) is not str or item["role"] not in {
+            "primary",
+            "related",
+        }:
+            raise RowAuthorityConfigError("row binding role is not approved")
+    expected = build_thread_row_binding_document(
+        user_scope_hash=checked["userScopeHash"],
+        thread_id=checked["threadId"],
+        client_id=checked["clientId"],
+        row_ids=row_ids,
+        primary_row_id=checked["primaryRowId"],
+        created_at=checked["createdAt"],
+    )
+    _require_pos(checked["bindingCount"], field_name="bindingCount")
+    _require_sha256(
+        checked["rowBindingsHash"],
+        field_name="rowBindingsHash",
+    )
+    _require_sha256(checked["bindingHash"], field_name="bindingHash")
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "thread row binding does not match its canonical fields and hashes"
+        )
+    return {
+        **expected,
+        "rowBindings": [dict(binding) for binding in expected["rowBindings"]],
+    }
+
+
+def _build_row_thread_binding_document(
+    *,
+    user_scope_hash,
+    row_id,
+    thread_id,
+    role,
+    thread_binding_hash,
+    created_at,
+):
+    checked_scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    checked_row_id = validate_row_id(row_id)
+    checked_thread_id = _require_thread_document_id(
+        thread_id,
+        field_name="thread_id",
+    )
+    if type(role) is not str or role not in {"primary", "related"}:
+        raise RowAuthorityConfigError("row thread binding role is not approved")
+    checked_binding_hash = _require_sha256(
+        thread_binding_hash,
+        field_name="thread_binding_hash",
+    )
+    checked_created_at = _require_timestamp(
+        created_at,
+        field_name="created_at",
+    )
+    edge_id = domain_hash(
+        ROW_THREAD_EDGE_ID_DOMAIN,
+        {"rowId": checked_row_id, "threadId": checked_thread_id},
+        user_scope_hash=checked_scope,
+    )
+    edge_hash = domain_hash(
+        ROW_THREAD_EDGE_HASH_DOMAIN,
+        {
+            "edgeId": edge_id,
+            "rowId": checked_row_id,
+            "threadId": checked_thread_id,
+            "role": role,
+            "threadBindingHash": checked_binding_hash,
+            "createdAt": checked_created_at,
+        },
+        user_scope_hash=checked_scope,
+    )
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": checked_scope,
+        "edgeId": edge_id,
+        "rowId": checked_row_id,
+        "threadId": checked_thread_id,
+        "role": role,
+        "threadBindingHash": checked_binding_hash,
+        "edgeHash": edge_hash,
+        "createdAt": checked_created_at,
+    }
+
+
+def build_row_thread_binding_documents(*, thread_binding_document):
+    binding = validate_thread_row_binding_document(
+        document=thread_binding_document
+    )
+    return [
+        _build_row_thread_binding_document(
+            user_scope_hash=binding["userScopeHash"],
+            row_id=row_binding["rowId"],
+            thread_id=binding["threadId"],
+            role=row_binding["role"],
+            thread_binding_hash=binding["bindingHash"],
+            created_at=binding["createdAt"],
+        )
+        for row_binding in binding["rowBindings"]
+    ]
+
+
+def validate_row_thread_binding_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_ROW_THREAD_BINDING_KEYS,
+        field_name="row thread binding document",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != SCHEMA_VERSION
+    ):
+        raise RowAuthorityConfigError(
+            "row thread binding schemaVersion must be 1"
+        )
+    expected = _build_row_thread_binding_document(
+        user_scope_hash=checked["userScopeHash"],
+        row_id=checked["rowId"],
+        thread_id=checked["threadId"],
+        role=checked["role"],
+        thread_binding_hash=checked["threadBindingHash"],
+        created_at=checked["createdAt"],
+    )
+    _require_sha256(checked["edgeId"], field_name="edgeId")
+    _require_sha256(checked["edgeHash"], field_name="edgeHash")
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "row thread binding does not match its canonical fields and hashes"
+        )
+    return dict(expected)
+
+
+_CONTACT_ROW_BINDING_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "edgeId",
+        "canonicalMailboxIdentityHash",
+        "rowId",
+        "contactRowEdgeHash",
+        "createdAt",
+    }
+)
+_CONTACT_ROW_BINDING_EVIDENCE_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "evidenceId",
+        "edgeId",
+        "threadId",
+        "threadBindingHash",
+        "exactIdentityHash",
+        "contactRowEvidenceHash",
+        "createdAt",
+    }
+)
+_CONTACT_ROW_BINDING_HEAD_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "canonicalMailboxIdentityHash",
+        "stateRevision",
+        "associationCount",
+        "lastAssociationHash",
+        "contactRowBindingHeadHash",
+        "createdAt",
+        "updatedAt",
+    }
+)
+
+
+def build_contact_row_binding_document(
+    *,
+    user_scope_hash,
+    canonical_mailbox_identity_hash,
+    row_id,
+    created_at,
+):
+    checked_scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    checked_canonical_hash = _require_sha256(
+        canonical_mailbox_identity_hash,
+        field_name="canonical_mailbox_identity_hash",
+    )
+    checked_row_id = validate_row_id(row_id)
+    checked_created_at = _require_timestamp(
+        created_at,
+        field_name="created_at",
+    )
+    edge_id = domain_hash(
+        CONTACT_ROW_EDGE_ID_DOMAIN,
+        {
+            "canonicalMailboxIdentityHash": checked_canonical_hash,
+            "rowId": checked_row_id,
+        },
+        user_scope_hash=checked_scope,
+    )
+    edge_hash = domain_hash(
+        CONTACT_ROW_EDGE_HASH_DOMAIN,
+        {
+            "edgeId": edge_id,
+            "canonicalMailboxIdentityHash": checked_canonical_hash,
+            "rowId": checked_row_id,
+            "createdAt": checked_created_at,
+        },
+        user_scope_hash=checked_scope,
+    )
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": checked_scope,
+        "edgeId": edge_id,
+        "canonicalMailboxIdentityHash": checked_canonical_hash,
+        "rowId": checked_row_id,
+        "contactRowEdgeHash": edge_hash,
+        "createdAt": checked_created_at,
+    }
+
+
+def validate_contact_row_binding_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_CONTACT_ROW_BINDING_KEYS,
+        field_name="contact row binding document",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != SCHEMA_VERSION
+    ):
+        raise RowAuthorityConfigError(
+            "contact row binding schemaVersion must be 1"
+        )
+    expected = build_contact_row_binding_document(
+        user_scope_hash=checked["userScopeHash"],
+        canonical_mailbox_identity_hash=checked[
+            "canonicalMailboxIdentityHash"
+        ],
+        row_id=checked["rowId"],
+        created_at=checked["createdAt"],
+    )
+    _require_sha256(checked["edgeId"], field_name="edgeId")
+    _require_sha256(
+        checked["contactRowEdgeHash"],
+        field_name="contactRowEdgeHash",
+    )
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact row binding does not match its canonical fields and hashes"
+        )
+    return dict(expected)
+
+
+def build_contact_row_binding_evidence_document(
+    *,
+    user_scope_hash,
+    edge_id,
+    thread_id,
+    thread_binding_hash,
+    exact_identity_hash,
+    created_at,
+):
+    checked_scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    checked_edge_id = _require_sha256(edge_id, field_name="edge_id")
+    checked_thread_id = _require_thread_document_id(
+        thread_id,
+        field_name="thread_id",
+    )
+    checked_binding_hash = _require_sha256(
+        thread_binding_hash,
+        field_name="thread_binding_hash",
+    )
+    checked_exact_hash = _require_sha256(
+        exact_identity_hash,
+        field_name="exact_identity_hash",
+    )
+    checked_created_at = _require_timestamp(
+        created_at,
+        field_name="created_at",
+    )
+    evidence_id = domain_hash(
+        CONTACT_ROW_EVIDENCE_ID_DOMAIN,
+        {
+            "edgeId": checked_edge_id,
+            "threadBindingHash": checked_binding_hash,
+            "exactIdentityHash": checked_exact_hash,
+        },
+        user_scope_hash=checked_scope,
+    )
+    evidence_hash = domain_hash(
+        CONTACT_ROW_EVIDENCE_HASH_DOMAIN,
+        {
+            "evidenceId": evidence_id,
+            "edgeId": checked_edge_id,
+            "threadId": checked_thread_id,
+            "threadBindingHash": checked_binding_hash,
+            "exactIdentityHash": checked_exact_hash,
+            "createdAt": checked_created_at,
+        },
+        user_scope_hash=checked_scope,
+    )
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": checked_scope,
+        "evidenceId": evidence_id,
+        "edgeId": checked_edge_id,
+        "threadId": checked_thread_id,
+        "threadBindingHash": checked_binding_hash,
+        "exactIdentityHash": checked_exact_hash,
+        "contactRowEvidenceHash": evidence_hash,
+        "createdAt": checked_created_at,
+    }
+
+
+def validate_contact_row_binding_evidence_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_CONTACT_ROW_BINDING_EVIDENCE_KEYS,
+        field_name="contact row binding evidence document",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != SCHEMA_VERSION
+    ):
+        raise RowAuthorityConfigError(
+            "contact row binding evidence schemaVersion must be 1"
+        )
+    expected = build_contact_row_binding_evidence_document(
+        user_scope_hash=checked["userScopeHash"],
+        edge_id=checked["edgeId"],
+        thread_id=checked["threadId"],
+        thread_binding_hash=checked["threadBindingHash"],
+        exact_identity_hash=checked["exactIdentityHash"],
+        created_at=checked["createdAt"],
+    )
+    _require_sha256(checked["evidenceId"], field_name="evidenceId")
+    _require_sha256(
+        checked["contactRowEvidenceHash"],
+        field_name="contactRowEvidenceHash",
+    )
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact row evidence does not match its canonical fields and hashes"
+        )
+    return dict(expected)
+
+
+def build_contact_row_binding_head_document(
+    *,
+    user_scope_hash,
+    canonical_mailbox_identity_hash,
+    state_revision,
+    association_count,
+    last_association_hash,
+    created_at,
+    updated_at,
+):
+    checked_scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    checked_canonical_hash = _require_sha256(
+        canonical_mailbox_identity_hash,
+        field_name="canonical_mailbox_identity_hash",
+    )
+    checked_revision = _require_pos(
+        state_revision,
+        field_name="state_revision",
+    )
+    checked_count = _require_uint(
+        association_count,
+        field_name="association_count",
+    )
+    if checked_count == 0:
+        if last_association_hash is not None:
+            raise RowAuthorityConfigError(
+                "an empty contact binding head requires a null last hash"
+            )
+        checked_last_hash = None
+    else:
+        checked_last_hash = _require_sha256(
+            last_association_hash,
+            field_name="last_association_hash",
+        )
+    checked_created_at = _require_timestamp(
+        created_at,
+        field_name="created_at",
+    )
+    checked_updated_at = _require_timestamp(
+        updated_at,
+        field_name="updated_at",
+    )
+    if checked_updated_at < checked_created_at:
+        raise RowAuthorityConfigError(
+            "contact binding head updated_at cannot predate created_at"
+        )
+    head_hash = domain_hash(
+        CONTACT_ROW_BINDING_HEAD_HASH_DOMAIN,
+        {
+            "canonicalMailboxIdentityHash": checked_canonical_hash,
+            "stateRevision": checked_revision,
+            "associationCount": checked_count,
+            "lastAssociationHash": checked_last_hash,
+            "createdAt": checked_created_at,
+            "updatedAt": checked_updated_at,
+        },
+        user_scope_hash=checked_scope,
+    )
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": checked_scope,
+        "canonicalMailboxIdentityHash": checked_canonical_hash,
+        "stateRevision": checked_revision,
+        "associationCount": checked_count,
+        "lastAssociationHash": checked_last_hash,
+        "contactRowBindingHeadHash": head_hash,
+        "createdAt": checked_created_at,
+        "updatedAt": checked_updated_at,
+    }
+
+
+def validate_contact_row_binding_head_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_CONTACT_ROW_BINDING_HEAD_KEYS,
+        field_name="contact row binding head document",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != SCHEMA_VERSION
+    ):
+        raise RowAuthorityConfigError(
+            "contact row binding head schemaVersion must be 1"
+        )
+    expected = build_contact_row_binding_head_document(
+        user_scope_hash=checked["userScopeHash"],
+        canonical_mailbox_identity_hash=checked[
+            "canonicalMailboxIdentityHash"
+        ],
+        state_revision=checked["stateRevision"],
+        association_count=checked["associationCount"],
+        last_association_hash=checked["lastAssociationHash"],
+        created_at=checked["createdAt"],
+        updated_at=checked["updatedAt"],
+    )
+    _require_sha256(
+        checked["contactRowBindingHeadHash"],
+        field_name="contactRowBindingHeadHash",
+    )
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact binding head does not match canonical fields and hash"
+        )
+    return dict(expected)
 
 
 def normalize_provider_text(*, value, field_name):

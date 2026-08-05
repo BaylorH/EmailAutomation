@@ -111,6 +111,23 @@ ROW_AUTHORITY_IMPORTER_ALLOWLIST = frozenset(
     {"email_automation/row_metadata.py"}
 )
 ROW_METADATA_IMPORTER_ALLOWLIST = frozenset()
+B2_B_TASK_0_DOMAIN_REGISTRY = {
+    "ROW_BINDINGS_HASH_DOMAIN": "sitesift.row.bindings.v1",
+    "THREAD_ROW_BINDING_HASH_DOMAIN": "sitesift.thread.row_binding.v1",
+    "ROW_THREAD_EDGE_ID_DOMAIN": "sitesift.row.thread_edge_id.v1",
+    "ROW_THREAD_EDGE_HASH_DOMAIN": "sitesift.row.thread_edge.v1",
+    "CONTACT_ROW_EDGE_ID_DOMAIN": "sitesift.contact.row_edge_id.v1",
+    "CONTACT_ROW_EDGE_HASH_DOMAIN": "sitesift.contact.row_edge.v1",
+    "CONTACT_ROW_EVIDENCE_ID_DOMAIN": (
+        "sitesift.contact.row_evidence_id.v1"
+    ),
+    "CONTACT_ROW_EVIDENCE_HASH_DOMAIN": (
+        "sitesift.contact.row_evidence.v1"
+    ),
+    "CONTACT_ROW_BINDING_HEAD_HASH_DOMAIN": (
+        "sitesift.contact.row_binding_head.v1"
+    ),
+}
 _APPLICATION_SCAN_EXCLUDED_PARTS = frozenset(
     {
         ".git",
@@ -251,6 +268,14 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
             - ROW_AUTHORITY_STANDARD_LIBRARY_IMPORTS,
         )
         self.assertEqual([], _literal_dynamic_imports(tree))
+
+    def test_b2_b_task_0_domain_registry_is_exact(self):
+        module = self._require_module()
+        actual = {
+            name: getattr(module, name, None)
+            for name in B2_B_TASK_0_DOMAIN_REGISTRY
+        }
+        self.assertEqual(B2_B_TASK_0_DOMAIN_REGISTRY, actual)
 
     def test_row_authority_is_not_imported_by_runtime(self):
         synthetic_dynamic_imports = (
