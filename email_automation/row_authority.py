@@ -25,6 +25,9 @@ CONTACT_ROW_BINDING_HEAD_HASH_DOMAIN = (
     "sitesift.contact.row_binding_head.v1"
 )
 B1_AUTHORITY_LINK_HASH_DOMAIN = "sitesift.row.b1_authority_link.v1"
+B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN = (
+    "sitesift.row.b1_authority_link.v2"
+)
 OPERATOR_ACTION_ID_DOMAIN = "sitesift.row.operator_action_id.v1"
 OPERATOR_CLIENT_REQUEST_HASH_DOMAIN = (
     "sitesift.row.operator_client_request.v1"
@@ -623,8 +626,15 @@ _B1_ORDINARY_CANDIDATE_TYPES = frozenset(
 _B1_LOCAL_SOURCE_POLICY_EVIDENCE_KINDS = frozenset(
     {"local_ignore_auto_reply", "local_ignore_self_sender"}
 )
-_B1_HARD_OPTOUT_EVIDENCE_KEYS = frozenset(
+_B1_HARD_OPTOUT_EVIDENCE_V1_KEYS = frozenset(
     {"schemaVersion", "evidenceKind", "evidenceHash"}
+)
+_B1_HARD_OPTOUT_EVIDENCE_V2_KEYS = frozenset(
+    {
+        *_B1_HARD_OPTOUT_EVIDENCE_V1_KEYS,
+        "exactIdentityHash",
+        "canonicalMailboxIdentityHash",
+    }
 )
 _B1_SOURCE_ALIAS_TYPES = frozenset({"graph", "internet_message_id"})
 _B1_COMPLETE_PROPOSAL_KEYS = frozenset(
@@ -670,7 +680,7 @@ _B1_DOMINANCE_EVIDENCE_KEYS = frozenset(
         "dominanceOutcome",
     }
 )
-_B1_LINK_KEYS = frozenset(
+_B1_LINK_V1_KEYS = frozenset(
     {
         "canonicalSourceId",
         "snapshotImmutableHash",
@@ -683,6 +693,13 @@ _B1_LINK_KEYS = frozenset(
         "payloadHash",
         "hardOptOutEvidenceHash",
         "authorityLinkHash",
+    }
+)
+_B1_LINK_V2_KEYS = frozenset(
+    {
+        *_B1_LINK_V1_KEYS,
+        "exactIdentityHash",
+        "canonicalMailboxIdentityHash",
     }
 )
 _B1_SOURCE_SETTLEMENT_KEYS = frozenset(
@@ -1626,6 +1643,47 @@ def _validate_b1_source_settlement(
     return _defensive_copy(checked)
 
 
+def _validate_b1_hard_optout_evidence(evidence):
+    if type(evidence) is not dict:
+        raise RowAuthorityConfigError(
+            "B1 hard opt-out evidence is not verified"
+        )
+    evidence_keys = set(evidence)
+    if evidence_keys == _B1_HARD_OPTOUT_EVIDENCE_V1_KEYS:
+        evidence_version = 1
+    elif evidence_keys == _B1_HARD_OPTOUT_EVIDENCE_V2_KEYS:
+        evidence_version = 2
+    else:
+        raise RowAuthorityConfigError(
+            "B1 hard opt-out evidence is not verified"
+        )
+    if (
+        type(evidence.get("schemaVersion")) is not int
+        or evidence["schemaVersion"] != evidence_version
+        or type(evidence.get("evidenceKind")) is not str
+        or not evidence["evidenceKind"]
+        or evidence["evidenceKind"]
+        in _B1_LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
+    ):
+        raise RowAuthorityConfigError(
+            "B1 hard opt-out evidence is not verified"
+        )
+    _require_sha256(
+        evidence.get("evidenceHash"),
+        field_name="B1 evidenceHash",
+    )
+    if evidence_version == 2:
+        _require_sha256(
+            evidence.get("exactIdentityHash"),
+            field_name="B1 exactIdentityHash",
+        )
+        _require_sha256(
+            evidence.get("canonicalMailboxIdentityHash"),
+            field_name="B1 canonicalMailboxIdentityHash",
+        )
+    return evidence_version
+
+
 def build_b1_authority_link(
     *,
     user_scope_hash,
@@ -1667,20 +1725,18 @@ def build_b1_authority_link(
     ):
         raise RowAuthorityConfigError("B1 work is not selected owner authority")
     hard_optout_hash = None
+    hard_optout_evidence_version = None
+    hard_optout_evidence = None
     if owner["ownerKind"] == "contact_optout":
         evidence = classification["deterministicEvidence"]
-        if (
-            classification["modelRequestState"] != "not_applicable"
-            or type(evidence) is not dict
-            or set(evidence) != _B1_HARD_OPTOUT_EVIDENCE_KEYS
-            or type(evidence.get("schemaVersion")) is not int
-            or evidence.get("schemaVersion") != 1
-            or type(evidence.get("evidenceKind")) is not str
-            or not evidence.get("evidenceKind")
-            or evidence["evidenceKind"] in _B1_LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
-        ):
-            raise RowAuthorityConfigError("B1 hard opt-out evidence is not verified")
-        _require_sha256(evidence.get("evidenceHash"), field_name="B1 evidenceHash")
+        if classification["modelRequestState"] != "not_applicable":
+            raise RowAuthorityConfigError(
+                "B1 hard opt-out evidence is not verified"
+            )
+        hard_optout_evidence_version = _validate_b1_hard_optout_evidence(
+            evidence
+        )
+        hard_optout_evidence = evidence
         hard_optout_hash = _b1_canonical_hash(evidence)
         if (
             classification["deterministicEvidenceHash"] != hard_optout_hash
@@ -1701,10 +1757,23 @@ def build_b1_authority_link(
         "payloadHash": entry["payloadHash"],
         "hardOptOutEvidenceHash": hard_optout_hash,
     }
+    hash_domain = B1_AUTHORITY_LINK_HASH_DOMAIN
+    if hard_optout_evidence_version == 2:
+        material.update(
+            {
+                "exactIdentityHash": hard_optout_evidence[
+                    "exactIdentityHash"
+                ],
+                "canonicalMailboxIdentityHash": hard_optout_evidence[
+                    "canonicalMailboxIdentityHash"
+                ],
+            }
+        )
+        hash_domain = B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN
     result = {
         **material,
         "authorityLinkHash": domain_hash(
-            B1_AUTHORITY_LINK_HASH_DOMAIN,
+            hash_domain,
             material,
             user_scope_hash=scope,
         ),
@@ -1713,9 +1782,26 @@ def build_b1_authority_link(
 
 
 def validate_b1_authority_link(*, authority_link, user_scope_hash):
+    if type(authority_link) is not dict:
+        raise RowAuthorityConfigError(
+            "B1 authority link must contain the exact approved fields"
+        )
+    link_keys = set(authority_link)
+    if link_keys == _B1_LINK_V1_KEYS:
+        approved_keys = _B1_LINK_V1_KEYS
+        hash_domain = B1_AUTHORITY_LINK_HASH_DOMAIN
+        contact_link_v2 = False
+    elif link_keys == _B1_LINK_V2_KEYS:
+        approved_keys = _B1_LINK_V2_KEYS
+        hash_domain = B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN
+        contact_link_v2 = True
+    else:
+        raise RowAuthorityConfigError(
+            "B1 authority link must contain the exact approved fields"
+        )
     checked = _require_exact_dict(
         authority_link,
-        keys=_B1_LINK_KEYS,
+        keys=approved_keys,
         field_name="B1 authority link",
     )
     scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
@@ -1739,13 +1825,26 @@ def validate_b1_authority_link(*, authority_link, user_scope_hash):
     )
     if (checked["ownerKind"] == "contact_optout") != (hard is not None):
         raise RowAuthorityConfigError("B1 link hard opt-out evidence is miscorrelated")
+    if contact_link_v2:
+        if checked["ownerKind"] != "contact_optout":
+            raise RowAuthorityConfigError(
+                "B1 v2 link requires verified contact opt-out authority"
+            )
+        _require_sha256(
+            checked["exactIdentityHash"],
+            field_name="exactIdentityHash",
+        )
+        _require_sha256(
+            checked["canonicalMailboxIdentityHash"],
+            field_name="canonicalMailboxIdentityHash",
+        )
     material = {
         key: _defensive_copy(value)
         for key, value in checked.items()
         if key != "authorityLinkHash"
     }
     expected = domain_hash(
-        B1_AUTHORITY_LINK_HASH_DOMAIN,
+        hash_domain,
         material,
         user_scope_hash=scope,
     )
@@ -6200,6 +6299,14 @@ def _plan_operator_row_claim(**arguments):
 
 
 def _plan_contact_fanout_row_claim(**arguments):
+    link = validate_b1_authority_link(
+        authority_link=arguments.get("authority_link"),
+        user_scope_hash=arguments.get("user_scope_hash"),
+    )
+    if set(link) != _B1_LINK_V2_KEYS:
+        raise RowAuthorityConfigError(
+            "contact fan-out requires a v2 verified-contact authority link"
+        )
     return _plan_row_claim_set(
         authority_origin="contact_fanout",
         operator_action_document=None,

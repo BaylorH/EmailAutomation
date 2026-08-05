@@ -140,6 +140,9 @@ B2_B_TASK_3_DOMAIN_REGISTRY = {
     "B1_AUTHORITY_LINK_HASH_DOMAIN": (
         "sitesift.row.b1_authority_link.v1"
     ),
+    "B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN": (
+        "sitesift.row.b1_authority_link.v2"
+    ),
     "OPERATOR_ACTION_ID_DOMAIN": "sitesift.row.operator_action_id.v1",
     "OPERATOR_CLIENT_REQUEST_HASH_DOMAIN": (
         "sitesift.row.operator_client_request.v1"

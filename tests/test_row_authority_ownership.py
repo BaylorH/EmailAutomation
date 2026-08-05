@@ -801,6 +801,9 @@ class RowOwnershipContractTests(unittest.TestCase):
         "B1_AUTHORITY_LINK_HASH_DOMAIN": (
             "sitesift.row.b1_authority_link.v1"
         ),
+        "B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN": (
+            "sitesift.row.b1_authority_link.v2"
+        ),
         "OPERATOR_ACTION_ID_DOMAIN": "sitesift.row.operator_action_id.v1",
         "OPERATOR_CLIENT_REQUEST_HASH_DOMAIN": (
             "sitesift.row.operator_client_request.v1"
@@ -843,16 +846,28 @@ class RowOwnershipContractTests(unittest.TestCase):
         *,
         owner_kind="terminal",
         model_contact_optout=False,
+        contact_evidence_version=1,
         source_id="source-1",
     ):
         b1_created = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
         snapshot_at = datetime(2026, 8, 4, 11, 1, tzinfo=timezone.utc)
         if owner_kind == "contact_optout":
             deterministic_evidence = {
-                "schemaVersion": 1,
+                "schemaVersion": contact_evidence_version,
                 "evidenceKind": "header_list_unsubscribe",
                 "evidenceHash": "7" * 64,
             }
+            if contact_evidence_version == 2:
+                deterministic_evidence.update(
+                    {
+                        "exactIdentityHash": "4" * 64,
+                        "canonicalMailboxIdentityHash": "5" * 64,
+                    }
+                )
+            elif contact_evidence_version != 1:
+                raise AssertionError(
+                    "contact evidence fixture version must be 1 or 2"
+                )
             deterministic_hash = _independent_b1_hash(
                 deterministic_evidence
             )
@@ -1124,8 +1139,17 @@ class RowOwnershipContractTests(unittest.TestCase):
             "hard_optout_hash": deterministic_hash,
         }
 
-    def _link(self, owner_kind="terminal", **overrides):
-        bundle = self._b1_bundle(owner_kind=owner_kind)
+    def _link(
+        self,
+        owner_kind="terminal",
+        *,
+        contact_evidence_version=1,
+        **overrides,
+    ):
+        bundle = self._b1_bundle(
+            owner_kind=owner_kind,
+            contact_evidence_version=contact_evidence_version,
+        )
         arguments = {
             "user_scope_hash": self.scope,
             "source_identity_document": bundle["identity"],
@@ -1169,6 +1193,7 @@ class RowOwnershipContractTests(unittest.TestCase):
         origin="b1_source",
         outcome="accepted",
         planned_generation=1,
+        contact_evidence_version=1,
     ):
         if origin == "b1_source":
             link, _bundle = self._link("terminal")
@@ -1179,7 +1204,10 @@ class RowOwnershipContractTests(unittest.TestCase):
             operator = self._operator()
             fanout_id = None
         elif origin == "contact_fanout":
-            link, _bundle = self._link("contact_optout")
+            link, _bundle = self._link(
+                "contact_optout",
+                contact_evidence_version=contact_evidence_version,
+            )
             operator = None
             fanout_id = "e" * 64
         else:
@@ -1280,6 +1308,10 @@ class RowOwnershipContractTests(unittest.TestCase):
 
     def _ownership_hash_vectors(self):
         authority_link, _bundle = self._link("terminal")
+        contact_authority_link, _contact_bundle = self._link(
+            "contact_optout",
+            contact_evidence_version=2,
+        )
         action = self._operator()
         claim = self._claim()
         generation = self._generation(claim=claim)
@@ -1323,6 +1355,14 @@ class RowOwnershipContractTests(unittest.TestCase):
                     ],
                 },
                 authority_link["authorityLinkHash"],
+            ),
+            "B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN": (
+                {
+                    key: deepcopy(value)
+                    for key, value in contact_authority_link.items()
+                    if key != "authorityLinkHash"
+                },
+                contact_authority_link["authorityLinkHash"],
             ),
             "OPERATOR_ACTION_ID_DOMAIN": (
                 {
@@ -1635,6 +1675,329 @@ class RowOwnershipContractTests(unittest.TestCase):
             link,
         )
         self.assertEqual(original, returned_bundle)
+
+    def test_v1_b1_links_and_downstream_vectors_remain_byte_exact(self):
+        expected_link_hashes = {
+            "terminal": (
+                "1ac2f1ebdaeb99c59d1b3c8a7084d661"
+                "65a05fee4c91c02ca8f479379c34c1c3"
+            ),
+            "human_decision": (
+                "27583f112239d94468f657ee57fabd1b7"
+                "2f2ca97420899087a7ce1702b770fbf"
+            ),
+            "contact_optout": (
+                "051c1cda498e0a3d08c168e10f80ac5"
+                "4f0e29493a1b77e42b53895e92e1147fe"
+            ),
+        }
+        for owner_kind, expected_hash in expected_link_hashes.items():
+            with self.subTest(owner_kind=owner_kind):
+                link, _bundle = self._link(owner_kind)
+                self.assertEqual(expected_hash, link["authorityLinkHash"])
+                self.assertEqual(
+                    {
+                        "canonicalSourceId",
+                        "snapshotImmutableHash",
+                        "selectionHash",
+                        "ownerDecisionHash",
+                        "ledgerHash",
+                        "ownerKind",
+                        "ownerKey",
+                        "workKey",
+                        "payloadHash",
+                        "hardOptOutEvidenceHash",
+                        "authorityLinkHash",
+                    },
+                    set(link),
+                )
+
+        claim = self._claim(origin="b1_source")
+        generation = self._generation(claim=claim)
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=1,
+            outcome="terminal",
+            settled_at=self.later_at,
+        )
+        source_link = self.module.build_source_settlement_link_document(
+            user_scope_hash=self.scope,
+            row_id=self.first,
+            generation=1,
+            generation_hash=generation["generationHash"],
+            authority_link_hash=claim["authorityLinkHash"],
+            b1_identity_hash="6" * 64,
+            b1_final_ledger_evidence_hash="7" * 64,
+            b1_settlement_revision=1,
+            b1_settlement_hash="8" * 64,
+            b2_settlement_hash=settlement["settlementHash"],
+            linked_at=self.later_at,
+        )
+        self.assertEqual(
+            {
+                "requestId": (
+                    "e66e01f67bebfa1c78fe2ad0f68c58615"
+                    "be1dcf640f2c342a46f532882dfd125"
+                ),
+                "claimSetHash": (
+                    "02af39d11d7fcfb053dd10be309195854c"
+                    "d4419c310eefc4efaa79aa17632dd2"
+                ),
+                "generationHash": (
+                    "8cc99b817e9fa2f2165befef364ba60ba"
+                    "a83e57d09fb0e130c06c52771b09294"
+                ),
+                "settlementHash": (
+                    "c3d1874800372330d1cabfd7073e4cb41"
+                    "bb0714c0bb5d99914f979ef4c172312"
+                ),
+                "sourceSettlementLinkHash": (
+                    "407393167712d3e0bf0d476d4e0884837"
+                    "a61e6ceb2f3000784d8393630f89d4e"
+                ),
+            },
+            {
+                "requestId": claim["requestId"],
+                "claimSetHash": claim["claimSetHash"],
+                "generationHash": generation["generationHash"],
+                "settlementHash": settlement["settlementHash"],
+                "sourceSettlementLinkHash": source_link[
+                    "sourceSettlementLinkHash"
+                ],
+            },
+        )
+
+    def test_v2_contact_link_uses_exact_shape_domain_and_bound_hashes(self):
+        link, bundle = self._link(
+            "contact_optout",
+            contact_evidence_version=2,
+        )
+        evidence = bundle["classification"]["deterministicEvidence"]
+        expected_material = {
+            "canonicalSourceId": "source-1",
+            "snapshotImmutableHash": bundle["classification"][
+                "snapshotImmutableHash"
+            ],
+            "selectionHash": bundle["classification"]["selectionHash"],
+            "ownerDecisionHash": bundle["owner"]["ownerDecisionHash"],
+            "ledgerHash": bundle["ledger"]["ledgerHash"],
+            "ownerKind": "contact_optout",
+            "ownerKey": bundle["owner"]["ownerKey"],
+            "workKey": bundle["work_key"],
+            "payloadHash": bundle["payload_hash"],
+            "hardOptOutEvidenceHash": bundle["hard_optout_hash"],
+            "exactIdentityHash": evidence["exactIdentityHash"],
+            "canonicalMailboxIdentityHash": evidence[
+                "canonicalMailboxIdentityHash"
+            ],
+        }
+        self.assertEqual(
+            {
+                **expected_material,
+                "authorityLinkHash": _independent_hash(
+                    self.OWNERSHIP_DOMAINS[
+                        "B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN"
+                    ],
+                    expected_material,
+                    user_scope_hash=self.scope,
+                ),
+            },
+            link,
+        )
+        self.assertEqual(
+            "e23bbb1dafe6c155d0781c2ea90600cc"
+            "1f02ba8bb7a523f0852d97420079cb8f",
+            link["authorityLinkHash"],
+        )
+        self.assertNotEqual(
+            link["authorityLinkHash"],
+            _independent_hash(
+                self.OWNERSHIP_DOMAINS["B1_AUTHORITY_LINK_HASH_DOMAIN"],
+                expected_material,
+                user_scope_hash=self.scope,
+            ),
+        )
+        self.assertEqual(
+            link,
+            self.module.validate_b1_authority_link(
+                authority_link=link,
+                user_scope_hash=self.scope,
+            ),
+        )
+        self.assertEqual(
+            link["hardOptOutEvidenceHash"],
+            bundle["classification"]["deterministicEvidenceHash"],
+        )
+        self.assertEqual(
+            link["hardOptOutEvidenceHash"],
+            bundle["ledger"]["entries"][0]["payload"]["evidenceHash"],
+        )
+
+    def test_b1_link_shape_and_domain_discriminator_is_strict(self):
+        legacy, _legacy_bundle = self._link("contact_optout")
+        v2, _v2_bundle = self._link(
+            "contact_optout",
+            contact_evidence_version=2,
+        )
+        terminal, _terminal_bundle = self._link("terminal")
+
+        legacy_with_v2_keys = {
+            **legacy,
+            "exactIdentityHash": "4" * 64,
+            "canonicalMailboxIdentityHash": "5" * 64,
+        }
+        v2_material_under_v1 = deepcopy(v2)
+        v2_material_under_v1["authorityLinkHash"] = _independent_hash(
+            self.OWNERSHIP_DOMAINS["B1_AUTHORITY_LINK_HASH_DOMAIN"],
+            {
+                key: value
+                for key, value in v2_material_under_v1.items()
+                if key != "authorityLinkHash"
+            },
+            user_scope_hash=self.scope,
+        )
+        non_contact_v2 = {
+            **terminal,
+            "exactIdentityHash": "4" * 64,
+            "canonicalMailboxIdentityHash": "5" * 64,
+        }
+        non_contact_material = {
+            key: value
+            for key, value in non_contact_v2.items()
+            if key != "authorityLinkHash"
+        }
+        non_contact_v2["authorityLinkHash"] = _independent_hash(
+            self.OWNERSHIP_DOMAINS[
+                "B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN"
+            ],
+            non_contact_material,
+            user_scope_hash=self.scope,
+        )
+        extra = {**v2, "unknown": None}
+        invalid = [
+            legacy_with_v2_keys,
+            v2_material_under_v1,
+            non_contact_v2,
+            extra,
+        ]
+        for identity_field in (
+            "exactIdentityHash",
+            "canonicalMailboxIdentityHash",
+        ):
+            missing = deepcopy(v2)
+            del missing[identity_field]
+            invalid.append(missing)
+        for candidate in invalid:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.validate_b1_authority_link(
+                    authority_link=candidate,
+                    user_scope_hash=self.scope,
+                )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module.validate_b1_authority_link(
+                authority_link=v2,
+                user_scope_hash=self.other_scope,
+            )
+
+        validated = self.module.validate_b1_authority_link(
+            authority_link=v2,
+            user_scope_hash=self.scope,
+        )
+        validated["exactIdentityHash"] = "f" * 64
+        self.assertEqual("4" * 64, v2["exactIdentityHash"])
+
+    def test_v2_contact_builder_rejects_bound_evidence_substitution(self):
+        link, bundle = self._link(
+            "contact_optout",
+            contact_evidence_version=2,
+        )
+        evidence = bundle["classification"]["deterministicEvidence"]
+        self.assertEqual(
+            evidence["exactIdentityHash"],
+            link["exactIdentityHash"],
+        )
+        self.assertEqual(
+            evidence["canonicalMailboxIdentityHash"],
+            link["canonicalMailboxIdentityHash"],
+        )
+        for field in (
+            "exactIdentityHash",
+            "canonicalMailboxIdentityHash",
+        ):
+            forged = deepcopy(bundle["classification"])
+            forged["deterministicEvidence"][field] = "f" * 64
+            with self.subTest(field=field), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.build_b1_authority_link(
+                    user_scope_hash=self.scope,
+                    source_identity_document=bundle["identity"],
+                    source_classification_document=forged,
+                    source_owner_document=bundle["owner"],
+                    source_ledger_document=bundle["ledger"],
+                    work_key=bundle["work_key"],
+                )
+
+    def test_v2_contact_fanout_claim_preserves_complete_authority_link(self):
+        expected_link, _bundle = self._link(
+            "contact_optout",
+            contact_evidence_version=2,
+        )
+        claim = self._claim(
+            origin="contact_fanout",
+            contact_evidence_version=2,
+        )
+        self.assertEqual(expected_link, claim["authorityLink"])
+        self.assertEqual(
+            expected_link["authorityLinkHash"],
+            claim["authorityLinkHash"],
+        )
+        self.assertEqual(
+            claim,
+            self.module.validate_claim_set_document(document=claim),
+        )
+
+    def test_contact_fanout_origin_rejects_legacy_v1_contact_link_before_planning(self):
+        legacy, _bundle = self._link("contact_optout")
+        with patch.object(
+            self.module,
+            "_plan_row_claim_set",
+            side_effect=AssertionError("generic row planning was reached"),
+        ) as generic_planner:
+            with self.assertRaises(self.module.RowAuthorityConfigError):
+                self.module._plan_contact_fanout_row_claim(
+                    user_scope_hash=self.scope,
+                    authority_link=legacy,
+                )
+        generic_planner.assert_not_called()
+
+    def test_contact_fanout_origin_allows_v2_link_to_reach_generic_planning(self):
+        link, _bundle = self._link(
+            "contact_optout",
+            contact_evidence_version=2,
+        )
+        sentinel = object()
+        with patch.object(
+            self.module,
+            "_plan_row_claim_set",
+            return_value=sentinel,
+        ) as generic_planner:
+            result = self.module._plan_contact_fanout_row_claim(
+                user_scope_hash=self.scope,
+                authority_link=link,
+                fanout_id="8" * 64,
+            )
+        self.assertIs(sentinel, result)
+        generic_planner.assert_called_once_with(
+            authority_origin="contact_fanout",
+            operator_action_document=None,
+            user_scope_hash=self.scope,
+            authority_link=link,
+            fanout_id="8" * 64,
+        )
 
     def test_b1_link_exact_schema_owner_correlations_and_hard_optout_requirement(self):
         terminal, _bundle = self._link("terminal")
@@ -5562,6 +5925,7 @@ class RowClaimStoreTests(unittest.TestCase):
         bundle = RowOwnershipContractTests._b1_bundle(
             self,
             owner_kind="contact_optout",
+            contact_evidence_version=2,
             source_id="private-contact-authority",
         )
         link = self.module.build_b1_authority_link(
