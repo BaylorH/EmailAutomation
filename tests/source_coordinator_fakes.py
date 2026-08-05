@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import cmp_to_key
 from threading import RLock
 
 from google.api_core.exceptions import Aborted
@@ -88,8 +90,8 @@ class FakeCollectionReference:
     def where(self, field_path, operator, value):
         return FakeQuery(self).where(field_path, operator, value)
 
-    def order_by(self, field_path):
-        return FakeQuery(self).order_by(field_path)
+    def order_by(self, field_path, direction="ASCENDING"):
+        return FakeQuery(self).order_by(field_path, direction=direction)
 
 
 class FakeQuery:
@@ -99,14 +101,22 @@ class FakeQuery:
         *,
         filters=(),
         ordering=(),
+        directions=(),
         limit_count=None,
+        start_after_values=None,
         start_after_path=None,
     ):
         self._collection = collection
         self._store = collection._store
         self._filters = tuple(filters)
         self._ordering = tuple(ordering)
+        self._directions = tuple(directions)
         self._limit_count = limit_count
+        self._start_after_values = (
+            None
+            if start_after_values is None
+            else tuple(deepcopy(start_after_values))
+        )
         self._start_after_path = start_after_path
 
     def where(self, field_path, operator, value):
@@ -118,18 +128,33 @@ class FakeQuery:
             self._collection,
             filters=(*self._filters, (field_path, operator, deepcopy(value))),
             ordering=self._ordering,
+            directions=self._directions,
             limit_count=self._limit_count,
+            start_after_values=self._start_after_values,
             start_after_path=self._start_after_path,
         )
 
-    def order_by(self, field_path):
+    def order_by(self, field_path, direction="ASCENDING"):
         if type(field_path) is not str or not field_path:
             raise ValueError("fake query order field must be non-empty")
+        if type(direction) is not str:
+            raise TypeError("fake query direction must be a string")
+        canonical_direction = direction.upper()
+        if canonical_direction not in {"ASCENDING", "DESCENDING"}:
+            raise ValueError(
+                "fake query direction must be ASCENDING or DESCENDING"
+            )
+        if field_path in self._ordering:
+            raise ValueError("fake query cannot order by a field twice")
+        if self._start_after_values is not None:
+            raise ValueError("fake query cannot add ordering after a cursor")
         return FakeQuery(
             self._collection,
             filters=self._filters,
             ordering=(*self._ordering, field_path),
+            directions=(*self._directions, canonical_direction),
             limit_count=self._limit_count,
+            start_after_values=self._start_after_values,
             start_after_path=self._start_after_path,
         )
 
@@ -140,19 +165,112 @@ class FakeQuery:
             self._collection,
             filters=self._filters,
             ordering=self._ordering,
+            directions=self._directions,
             limit_count=count,
+            start_after_values=self._start_after_values,
             start_after_path=self._start_after_path,
         )
 
-    def start_after(self, snapshot):
-        if not isinstance(snapshot, FakeDocumentSnapshot):
-            raise TypeError("fake query cursor requires a document snapshot")
+    def start_after(self, cursor):
+        if not self._ordering:
+            raise ValueError("fake query cursor requires explicit ordering")
+        if self._start_after_values is not None:
+            raise ValueError("fake query already has a cursor")
+
+        cursor_path = None
+        if isinstance(cursor, FakeDocumentSnapshot):
+            reference = cursor.reference
+            if (
+                reference._store is not self._store
+                or reference._parts[:-1] != self._collection._parts
+            ):
+                raise TypeError(
+                    "fake query cursor snapshot belongs to another collection"
+                )
+            if not cursor.exists:
+                raise ValueError("fake query cursor snapshot must exist")
+            payload = cursor.to_dict()
+            values = []
+            for field_path in self._ordering:
+                if field_path == "__name__":
+                    values.append(reference.path)
+                elif field_path in payload:
+                    values.append(deepcopy(payload[field_path]))
+                else:
+                    raise ValueError(
+                        "fake query cursor snapshot lacks an ordered field"
+                    )
+            cursor_path = reference.path
+        elif isinstance(cursor, Mapping):
+            cursor_field_count = len(cursor)
+            expected_fields = self._ordering[:cursor_field_count]
+            if (
+                cursor_field_count < 1
+                or cursor_field_count > len(self._ordering)
+                or set(cursor.keys()) != set(expected_fields)
+            ):
+                raise ValueError(
+                    "fake query mapping cursor must name an ordered-field prefix"
+                )
+            values = [
+                cursor[field]
+                if field == "__name__"
+                and isinstance(cursor[field], FakeDocumentReference)
+                else deepcopy(cursor[field])
+                for field in expected_fields
+            ]
+        elif type(cursor) in {list, tuple}:
+            if len(cursor) < 1 or len(cursor) > len(self._ordering):
+                raise ValueError(
+                    "fake query sequence cursor must be an ordered-field prefix"
+                )
+            values = [
+                value
+                if self._ordering[index] == "__name__"
+                and isinstance(value, FakeDocumentReference)
+                else deepcopy(value)
+                for index, value in enumerate(cursor)
+            ]
+        else:
+            raise TypeError(
+                "fake query cursor requires a mapping, sequence, or snapshot"
+            )
+
+        for index, field_path in enumerate(self._ordering[: len(values)]):
+            if field_path != "__name__":
+                continue
+            name_value = values[index]
+            if isinstance(name_value, FakeDocumentReference):
+                if (
+                    name_value._store is not self._store
+                    or name_value._parts[:-1] != self._collection._parts
+                ):
+                    raise TypeError(
+                        "fake query name cursor belongs to another collection"
+                    )
+                values[index] = name_value.path
+                continue
+            if type(name_value) is not str or not name_value:
+                raise TypeError(
+                    "fake query name cursor must be a document ID, path, or reference"
+                )
+            if "/" not in name_value:
+                values[index] = self._collection.document(name_value).path
+                continue
+            parts = tuple(name_value.split("/"))
+            if parts[:-1] != self._collection._parts:
+                raise ValueError(
+                    "fake query name cursor path belongs to another collection"
+                )
+            values[index] = self._collection.document(parts[-1]).path
         return FakeQuery(
             self._collection,
             filters=self._filters,
             ordering=self._ordering,
+            directions=self._directions,
             limit_count=self._limit_count,
-            start_after_path=snapshot.reference.path,
+            start_after_values=values,
+            start_after_path=cursor_path,
         )
 
     def stream(self):
@@ -305,19 +423,105 @@ class FakeTransaction:
             if all(
                 payload.get(field_path) == expected
                 for field_path, _operator, expected in query._filters
+            ) and all(
+                field_path == "__name__" or field_path in payload
+                for field_path in query._ordering
             ):
                 matching.append((path, deepcopy(payload)))
         self._query_read_set[collection_path] = collection_state
-        self._store.events.append(
-            ("query", collection_path, query._filters, query._ordering)
+        query_event = (
+            "query",
+            collection_path,
+            query._filters,
+            query._ordering,
         )
-        matching.sort(
-            key=lambda item: tuple(item[1].get(field) for field in query._ordering)
-            + (item[0],)
-        )
-        if query._start_after_path is not None:
+        if any(
+            direction != "ASCENDING" for direction in query._directions
+        ):
+            query_event = (*query_event, query._directions)
+        self._store.events.append(query_event)
+
+        def field_value(item, field_path):
+            path, payload = item
+            if field_path == "__name__":
+                return path
+            if field_path not in payload:
+                raise ValueError(
+                    f"fake ordered document lacks field {field_path}"
+                )
+            return payload[field_path]
+
+        def compare_value(left, right, *, direction):
+            if left == right:
+                return 0
+            try:
+                comparison = -1 if left < right else 1
+            except TypeError as exc:
+                raise TypeError(
+                    "fake query cannot compare ordered values of different types"
+                ) from exc
+            if direction == "DESCENDING":
+                comparison *= -1
+            return comparison
+
+        def compare_items(left, right):
+            for field_path, direction in zip(
+                query._ordering,
+                query._directions,
+                strict=True,
+            ):
+                comparison = compare_value(
+                    field_value(left, field_path),
+                    field_value(right, field_path),
+                    direction=direction,
+                )
+                if comparison:
+                    return comparison
+            if "__name__" not in query._ordering:
+                path_direction = (
+                    query._directions[-1]
+                    if query._directions
+                    else "ASCENDING"
+                )
+                return compare_value(
+                    left[0],
+                    right[0],
+                    direction=path_direction,
+                )
+            return 0
+
+        matching.sort(key=cmp_to_key(compare_items))
+        if query._start_after_values is not None:
+            def is_after_cursor(item):
+                for index, cursor_value in enumerate(
+                    query._start_after_values
+                ):
+                    field_path = query._ordering[index]
+                    direction = query._directions[index]
+                    comparison = compare_value(
+                        field_value(item, field_path),
+                        cursor_value,
+                        direction=direction,
+                    )
+                    if comparison:
+                        return comparison > 0
+                if (
+                    query._start_after_path is not None
+                    and "__name__" not in query._ordering
+                ):
+                    path_direction = query._directions[-1]
+                    return (
+                        compare_value(
+                            item[0],
+                            query._start_after_path,
+                            direction=path_direction,
+                        )
+                        > 0
+                    )
+                return False
+
             matching = [
-                item for item in matching if item[0] > query._start_after_path
+                item for item in matching if is_after_cursor(item)
             ]
         if query._limit_count is not None:
             matching = matching[: query._limit_count]

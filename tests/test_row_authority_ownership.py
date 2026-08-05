@@ -8148,7 +8148,7 @@ class RowClaimStoreTests(unittest.TestCase):
                 binding,
                 created_at="2026-08-04T12:00:04.000000Z",
             )
-        with self.assertRaises(self.module.RowAuthorityConflict):
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
             self._claim(store, bundle=human_bundle)
         self.assertEqual(before, store.data)
         self.assertEqual([], self._write_events(store))
@@ -8389,7 +8389,7 @@ class RowLeaseTakeoverTests(unittest.TestCase):
         ) as write_bound:
             result = self._takeover(store, expected)
 
-        write_bound.assert_called_once_with(1)
+        self.assertEqual((1,), write_bound.call_args_list[0].args)
         self.assertEqual("taken_over", result["disposition"])
         self.assertEqual(generation_before, result["generation"])
         self.assertEqual(generation_before, store.data[generation_ref.path])
@@ -8404,7 +8404,12 @@ class RowLeaseTakeoverTests(unittest.TestCase):
             for index, event in enumerate(store.events)
             if event[0] in {"create", "set", "update", "delete"}
         )
-        self.assertTrue(all(event[0] == "get" for event in store.events[1:first_write]))
+        self.assertTrue(
+            all(
+                event[0] in {"get", "query"}
+                for event in store.events[1:first_write]
+            )
+        )
         self.assertGreaterEqual(
             sum(event[0] == "get" for event in store.events[:first_write]),
             4,
@@ -9061,7 +9066,10 @@ class RowSettlementStoreTests(unittest.TestCase):
             if event[0] in {"create", "set", "update", "delete"}
         )
         self.assertTrue(
-            all(event[0] == "get" for event in store.events[1:first_write])
+            all(
+                event[0] in {"get", "query"}
+                for event in store.events[1:first_write]
+            )
         )
 
     def test_private_contact_optout_settlement_freezes_prior_effective_settlement(self):
@@ -10517,14 +10525,14 @@ class RowSourceSettlementLinkTests(unittest.TestCase):
 
         reads = [event[1] for event in store.events if event[0] == "get"]
         expected = [
-            self.fixture._row_references(store, self.row_id)[0].path,
-            self._head_reference(store).path,
+            self.fixture._settlement_reference(store, self.row_id, 1).path,
             self.fixture._generation_reference(store, self.row_id, 1).path,
             self.fixture._claim_reference(
                 store,
                 state["claim"]["requestId"],
             ).path,
-            self.fixture._settlement_reference(store, self.row_id, 1).path,
+            self.fixture._row_references(store, self.row_id)[0].path,
+            self._head_reference(store).path,
             self._link_reference(store).path,
             *[
                 self._b1_reference(store, collection, source_id).path
@@ -10908,10 +10916,18 @@ class RowSourceSettlementLinkTests(unittest.TestCase):
         self.assertEqual(expected_link, result["sourceSettlementLink"])
         self.assertEqual(expected_head, result["head"])
         queries = [event for event in store.events if event[0] == "query"]
-        self.assertEqual(1, len(queries))
+        self.assertEqual(2, len(queries))
+        self.assertEqual(
+            (
+                ("rowId", "==", self.row_id),
+            ),
+            queries[0][2],
+        )
+        self.assertEqual(("generation",), queries[0][3])
+        self.assertEqual(("DESCENDING",), queries[0][4])
         self.assertEqual(
             (("sourceSettlementLinkHash", "==", older["sourceSettlementLinkHash"]),),
-            queries[0][2],
+            queries[1][2],
         )
 
     def test_existing_link_with_missing_or_invalid_head_pointer_is_ambiguous(self):
@@ -10958,6 +10974,15 @@ class RowSourceSettlementLinkTests(unittest.TestCase):
                         (
                             "query",
                             self._user_reference(store)
+                            .collection("rowOwnerSettlements")
+                            .path,
+                            (("rowId", "==", self.row_id),),
+                            ("generation",),
+                            ("DESCENDING",),
+                        ),
+                        (
+                            "query",
+                            self._user_reference(store)
                             .collection("rowSourceSettlementLinks")
                             .path,
                             (
@@ -10967,7 +10992,7 @@ class RowSourceSettlementLinkTests(unittest.TestCase):
                                     later["sourceSettlementLinkHash"],
                                 ),
                             ),
-                            (),
+                            ("__name__",),
                         )
                     ],
                     queries,
@@ -11178,7 +11203,7 @@ class RowSourceSettlementLinkTests(unittest.TestCase):
         )
         overbound_before = deepcopy(overbound_generation["store"].data)
         overbound_generation["store"].events.clear()
-        with self.assertRaises(self.module.RowAuthorityConflict):
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
             self._link(overbound_generation)
         self.assertEqual(
             overbound_before,

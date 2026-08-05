@@ -24,6 +24,21 @@ CONTACT_ROW_EVIDENCE_HASH_DOMAIN = "sitesift.contact.row_evidence.v1"
 CONTACT_ROW_BINDING_HEAD_HASH_DOMAIN = (
     "sitesift.contact.row_binding_head.v1"
 )
+CONTACT_ALIAS_HASH_DOMAIN = "sitesift.contact.optout_alias.v1"
+CONTACT_TRANSITION_ID_DOMAIN = "sitesift.contact.optout_transition_id.v1"
+CONTACT_TRANSITION_REQUEST_HASH_DOMAIN = (
+    "sitesift.contact.optout_transition_request.v1"
+)
+CONTACT_SETTLEMENT_HASH_DOMAIN = "sitesift.contact.optout_settlement.v1"
+CONTACT_HEAD_HASH_DOMAIN = "sitesift.contact.optout_head.v1"
+CONTACT_FANOUT_ID_DOMAIN = "sitesift.contact.optout_fanout_id.v1"
+CONTACT_FANOUT_HEAD_HASH_DOMAIN = "sitesift.contact.optout_fanout_head.v1"
+CONTACT_FANOUT_OBLIGATION_HASH_DOMAIN = (
+    "sitesift.contact.optout_fanout_obligation.v1"
+)
+CONTACT_FANOUT_RESULT_HASH_DOMAIN = (
+    "sitesift.contact.optout_fanout_result.v1"
+)
 B1_AUTHORITY_LINK_HASH_DOMAIN = "sitesift.row.b1_authority_link.v1"
 B1_CONTACT_AUTHORITY_LINK_HASH_DOMAIN = (
     "sitesift.row.b1_authority_link.v2"
@@ -3308,6 +3323,1367 @@ def validate_row_thread_binding_document(*, document):
     return dict(expected)
 
 
+_CONTACT_ALIAS_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "exactIdentityHash",
+        "canonicalMailboxIdentityHash",
+        "contactAliasHash",
+        "createdAt",
+    }
+)
+_CONTACT_TRANSITION_REQUEST_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "contactTransitionId",
+        "transitionKind",
+        "exactIdentityHash",
+        "canonicalMailboxIdentityHash",
+        "authorityLinkHash",
+        "hardOptOutEvidenceHash",
+        "actorScopeHash",
+        "clientRequestHash",
+        "expectedActiveOptOutSettlementHash",
+        "reasonCode",
+        "outcome",
+        "resultingContactGeneration",
+        "resultingContactSettlementHash",
+        "resultingFanoutId",
+        "resultingContactHeadHash",
+        "resultingFanoutHeadHash",
+        "requestedAt",
+        "contactTransitionRequestHash",
+    }
+)
+_CONTACT_SETTLEMENT_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "canonicalMailboxIdentityHash",
+        "generation",
+        "predecessorSettlementHash",
+        "transitionKind",
+        "contactTransitionId",
+        "exactIdentityHash",
+        "authorityLink",
+        "authorityLinkHash",
+        "hardOptOutEvidenceHash",
+        "actorScopeHash",
+        "reasonCode",
+        "contactSettlementHash",
+        "settledAt",
+    }
+)
+_CONTACT_HEAD_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "canonicalMailboxIdentityHash",
+        "stateRevision",
+        "latestGeneration",
+        "latestSettlementHash",
+        "activeOptOutSettlementHash",
+        "state",
+        "activeFanoutId",
+        "contactHeadHash",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_CONTACT_FANOUT_HEAD_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "fanoutId",
+        "outcome",
+        "expectedContactSettlementHash",
+        "stateRevision",
+        "state",
+        "bindingRevision",
+        "bindingHeadHash",
+        "bindingAssociationCount",
+        "discoveryCursorRowId",
+        "obligationCount",
+        "resultCount",
+        "leaseOwnerHash",
+        "leaseUntil",
+        "fencingToken",
+        "supersedingContactSettlementHash",
+        "completionBindingRevision",
+        "completionBindingHeadHash",
+        "completionBindingAssociationCount",
+        "completionObligationCount",
+        "completionResultCount",
+        "completedAt",
+        "contactFanoutHeadHash",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_CONTACT_FANOUT_OBLIGATION_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "fanoutId",
+        "rowId",
+        "contactRowEdgeHash",
+        "expectedContactSettlementHash",
+        "outcome",
+        "contactFanoutObligationHash",
+        "createdAt",
+    }
+)
+_CONTACT_FANOUT_RESULT_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "fanoutId",
+        "rowId",
+        "obligationHash",
+        "outcome",
+        "disposition",
+        "reasonCode",
+        "observedRowHeadHash",
+        "claimRequestId",
+        "claimSetHash",
+        "rowGeneration",
+        "rowSettlementHash",
+        "releasedRowGeneration",
+        "releasedRowSettlementHash",
+        "restoredEffectiveGeneration",
+        "restoredEffectiveSettlementHash",
+        "contactFanoutResultHash",
+        "createdAt",
+    }
+)
+
+
+def _require_contact_document(document, *, keys, field_name):
+    checked = _require_exact_dict(document, keys=keys, field_name=field_name)
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != SCHEMA_VERSION
+    ):
+        raise RowAuthorityConfigError(f"{field_name} schemaVersion must be 1")
+    return checked
+
+
+def _require_contact_fanout_outcome(value, *, field_name="outcome"):
+    if type(value) is not str or value not in {"apply", "release"}:
+        raise RowAuthorityConfigError(f"{field_name} must be apply or release")
+    return value
+
+
+def _derive_contact_fanout_id(*, user_scope_hash, settlement_hash, outcome):
+    return domain_hash(
+        CONTACT_FANOUT_ID_DOMAIN,
+        {
+            "contactSettlementHash": _require_sha256(
+                settlement_hash,
+                field_name="contact settlement hash",
+            ),
+            "outcome": _require_contact_fanout_outcome(outcome),
+        },
+        user_scope_hash=_require_sha256(
+            user_scope_hash,
+            field_name="user_scope_hash",
+        ),
+    )
+
+
+def build_contact_alias_document(
+    *,
+    user_scope_hash,
+    exact_identity_hash,
+    canonical_mailbox_identity_hash,
+    created_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    exact_hash = _require_sha256(
+        exact_identity_hash,
+        field_name="exact_identity_hash",
+    )
+    canonical_hash = _require_sha256(
+        canonical_mailbox_identity_hash,
+        field_name="canonical_mailbox_identity_hash",
+    )
+    created = _require_timestamp(created_at, field_name="created_at")
+    payload = {
+        "exactIdentityHash": exact_hash,
+        "canonicalMailboxIdentityHash": canonical_hash,
+        "createdAt": created,
+    }
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        **payload,
+        "contactAliasHash": domain_hash(
+            CONTACT_ALIAS_HASH_DOMAIN,
+            payload,
+            user_scope_hash=scope,
+        ),
+    }
+
+
+def validate_contact_alias_document(*, document):
+    checked = _require_contact_document(
+        document,
+        keys=_CONTACT_ALIAS_KEYS,
+        field_name="contact alias document",
+    )
+    expected = build_contact_alias_document(
+        user_scope_hash=checked["userScopeHash"],
+        exact_identity_hash=checked["exactIdentityHash"],
+        canonical_mailbox_identity_hash=checked[
+            "canonicalMailboxIdentityHash"
+        ],
+        created_at=checked["createdAt"],
+    )
+    _require_sha256(checked["contactAliasHash"], field_name="contactAliasHash")
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact alias does not match canonical fields and hash"
+        )
+    return _defensive_copy(expected)
+
+
+def build_contact_transition_request_document(
+    *,
+    user_scope_hash,
+    transition_kind,
+    exact_identity_hash,
+    canonical_mailbox_identity_hash,
+    authority_link_hash,
+    hard_optout_evidence_hash,
+    actor_scope_hash,
+    client_request_hash,
+    expected_active_optout_settlement_hash,
+    reason_code,
+    outcome,
+    resulting_contact_generation,
+    resulting_contact_settlement_hash,
+    resulting_fanout_id,
+    resulting_contact_head_hash,
+    resulting_fanout_head_hash,
+    requested_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    exact_hash = _require_sha256(
+        exact_identity_hash,
+        field_name="exact_identity_hash",
+    )
+    canonical_hash = _require_sha256(
+        canonical_mailbox_identity_hash,
+        field_name="canonical_mailbox_identity_hash",
+    )
+    authority_hash = _require_optional_hash(
+        authority_link_hash,
+        field_name="authority_link_hash",
+    )
+    hard_hash = _require_optional_hash(
+        hard_optout_evidence_hash,
+        field_name="hard_optout_evidence_hash",
+    )
+    actor_hash = _require_optional_hash(
+        actor_scope_hash,
+        field_name="actor_scope_hash",
+    )
+    request_hash = _require_optional_hash(
+        client_request_hash,
+        field_name="client_request_hash",
+    )
+    expected_active_hash = _require_optional_hash(
+        expected_active_optout_settlement_hash,
+        field_name="expected_active_optout_settlement_hash",
+    )
+    if transition_kind == "verified_optout":
+        if (
+            authority_hash is None
+            or hard_hash is None
+            or actor_hash is not None
+            or request_hash is not None
+            or expected_active_hash is not None
+            or reason_code is not None
+            or outcome not in {"created", "already_active"}
+        ):
+            raise RowAuthorityConfigError(
+                "verified contact transition fields are miscorrelated"
+            )
+        fanout_outcome = "apply"
+    elif transition_kind == "authenticated_release":
+        if (
+            authority_hash is not None
+            or hard_hash is not None
+            or actor_hash is None
+            or request_hash is None
+            or expected_active_hash is None
+            or reason_code != "authenticated_release"
+            or outcome != "created"
+        ):
+            raise RowAuthorityConfigError(
+                "authenticated release transition fields are miscorrelated"
+            )
+        fanout_outcome = "release"
+    else:
+        raise RowAuthorityConfigError("contact transition kind is unsupported")
+    generation = _require_pos(
+        resulting_contact_generation,
+        field_name="resulting_contact_generation",
+    )
+    if (transition_kind == "verified_optout") != (generation % 2 == 1):
+        raise RowAuthorityConfigError(
+            "contact transition kind does not match its generation epoch"
+        )
+    settlement_hash = _require_sha256(
+        resulting_contact_settlement_hash,
+        field_name="resulting_contact_settlement_hash",
+    )
+    checked_fanout_id = _require_sha256(
+        resulting_fanout_id,
+        field_name="resulting_fanout_id",
+    )
+    expected_fanout_id = _derive_contact_fanout_id(
+        user_scope_hash=scope,
+        settlement_hash=settlement_hash,
+        outcome=fanout_outcome,
+    )
+    if checked_fanout_id != expected_fanout_id:
+        raise RowAuthorityConfigError(
+            "contact transition fan-out ID does not recompute"
+        )
+    contact_head_hash = _require_sha256(
+        resulting_contact_head_hash,
+        field_name="resulting_contact_head_hash",
+    )
+    fanout_head_hash = _require_sha256(
+        resulting_fanout_head_hash,
+        field_name="resulting_fanout_head_hash",
+    )
+    requested = _require_timestamp(requested_at, field_name="requested_at")
+    id_payload = {
+        "transitionKind": transition_kind,
+        "exactIdentityHash": exact_hash,
+        "canonicalMailboxIdentityHash": canonical_hash,
+        "authorityLinkHash": authority_hash,
+        "hardOptOutEvidenceHash": hard_hash,
+        "actorScopeHash": actor_hash,
+        "clientRequestHash": request_hash,
+        "expectedActiveOptOutSettlementHash": expected_active_hash,
+        "reasonCode": reason_code,
+    }
+    transition_id = domain_hash(
+        CONTACT_TRANSITION_ID_DOMAIN,
+        id_payload,
+        user_scope_hash=scope,
+    )
+    payload = {
+        "contactTransitionId": transition_id,
+        **id_payload,
+        "outcome": outcome,
+        "resultingContactGeneration": generation,
+        "resultingContactSettlementHash": settlement_hash,
+        "resultingFanoutId": checked_fanout_id,
+        "resultingContactHeadHash": contact_head_hash,
+        "resultingFanoutHeadHash": fanout_head_hash,
+        "requestedAt": requested,
+    }
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        **payload,
+        "contactTransitionRequestHash": domain_hash(
+            CONTACT_TRANSITION_REQUEST_HASH_DOMAIN,
+            payload,
+            user_scope_hash=scope,
+        ),
+    }
+
+
+def validate_contact_transition_request_document(*, document):
+    checked = _require_contact_document(
+        document,
+        keys=_CONTACT_TRANSITION_REQUEST_KEYS,
+        field_name="contact transition request document",
+    )
+    expected = build_contact_transition_request_document(
+        user_scope_hash=checked["userScopeHash"],
+        transition_kind=checked["transitionKind"],
+        exact_identity_hash=checked["exactIdentityHash"],
+        canonical_mailbox_identity_hash=checked[
+            "canonicalMailboxIdentityHash"
+        ],
+        authority_link_hash=checked["authorityLinkHash"],
+        hard_optout_evidence_hash=checked["hardOptOutEvidenceHash"],
+        actor_scope_hash=checked["actorScopeHash"],
+        client_request_hash=checked["clientRequestHash"],
+        expected_active_optout_settlement_hash=checked[
+            "expectedActiveOptOutSettlementHash"
+        ],
+        reason_code=checked["reasonCode"],
+        outcome=checked["outcome"],
+        resulting_contact_generation=checked["resultingContactGeneration"],
+        resulting_contact_settlement_hash=checked[
+            "resultingContactSettlementHash"
+        ],
+        resulting_fanout_id=checked["resultingFanoutId"],
+        resulting_contact_head_hash=checked["resultingContactHeadHash"],
+        resulting_fanout_head_hash=checked["resultingFanoutHeadHash"],
+        requested_at=checked["requestedAt"],
+    )
+    for field in ("contactTransitionId", "contactTransitionRequestHash"):
+        _require_sha256(checked[field], field_name=field)
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact transition request does not match canonical fields and hashes"
+        )
+    return _defensive_copy(expected)
+
+
+def build_contact_settlement_document(
+    *,
+    user_scope_hash,
+    canonical_mailbox_identity_hash,
+    generation,
+    predecessor_settlement_hash,
+    transition_kind,
+    contact_transition_id,
+    exact_identity_hash,
+    authority_link,
+    actor_scope_hash,
+    reason_code,
+    settled_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    canonical_hash = _require_sha256(
+        canonical_mailbox_identity_hash,
+        field_name="canonical_mailbox_identity_hash",
+    )
+    checked_generation = _require_pos(generation, field_name="generation")
+    predecessor_hash = _require_optional_hash(
+        predecessor_settlement_hash,
+        field_name="predecessor_settlement_hash",
+    )
+    if (checked_generation == 1) != (predecessor_hash is None):
+        raise RowAuthorityConfigError(
+            "contact settlement predecessor does not match generation"
+        )
+    transition_id = _require_sha256(
+        contact_transition_id,
+        field_name="contact_transition_id",
+    )
+    exact_hash = _require_sha256(
+        exact_identity_hash,
+        field_name="exact_identity_hash",
+    )
+    actor_hash = _require_optional_hash(
+        actor_scope_hash,
+        field_name="actor_scope_hash",
+    )
+    if transition_kind == "verified_optout":
+        if type(authority_link) is not dict:
+            raise RowAuthorityConfigError(
+                "verified contact settlement requires a v2 B1 link"
+            )
+        checked_link = validate_b1_authority_link(
+            authority_link=authority_link,
+            user_scope_hash=scope,
+        )
+        if (
+            set(checked_link) != _B1_LINK_V2_KEYS
+            or checked_link["ownerKind"] != "contact_optout"
+            or checked_link["exactIdentityHash"] != exact_hash
+            or checked_link["canonicalMailboxIdentityHash"] != canonical_hash
+            or actor_hash is not None
+            or reason_code is not None
+        ):
+            raise RowAuthorityConfigError(
+                "verified contact settlement origin is miscorrelated"
+            )
+        authority_hash = checked_link["authorityLinkHash"]
+        hard_hash = checked_link["hardOptOutEvidenceHash"]
+        expected_transition_id = domain_hash(
+            CONTACT_TRANSITION_ID_DOMAIN,
+            {
+                "transitionKind": "verified_optout",
+                "exactIdentityHash": exact_hash,
+                "canonicalMailboxIdentityHash": canonical_hash,
+                "authorityLinkHash": authority_hash,
+                "hardOptOutEvidenceHash": hard_hash,
+                "actorScopeHash": None,
+                "clientRequestHash": None,
+                "expectedActiveOptOutSettlementHash": None,
+                "reasonCode": None,
+            },
+            user_scope_hash=scope,
+        )
+        if transition_id != expected_transition_id:
+            raise RowAuthorityConfigError(
+                "verified contact settlement transition ID does not recompute"
+            )
+        stored_link = _defensive_copy(checked_link)
+    elif transition_kind == "authenticated_release":
+        if (
+            authority_link is not None
+            or actor_hash is None
+            or reason_code != "authenticated_release"
+            or predecessor_hash is None
+        ):
+            raise RowAuthorityConfigError(
+                "authenticated release settlement origin is miscorrelated"
+            )
+        stored_link = None
+        authority_hash = None
+        hard_hash = None
+    else:
+        raise RowAuthorityConfigError(
+            "contact settlement transition kind is unsupported"
+        )
+    if (transition_kind == "verified_optout") != (
+        checked_generation % 2 == 1
+    ):
+        raise RowAuthorityConfigError(
+            "contact settlement kind does not match its generation epoch"
+        )
+    settled = _require_timestamp(settled_at, field_name="settled_at")
+    payload = {
+        "canonicalMailboxIdentityHash": canonical_hash,
+        "generation": checked_generation,
+        "predecessorSettlementHash": predecessor_hash,
+        "transitionKind": transition_kind,
+        "contactTransitionId": transition_id,
+        "exactIdentityHash": exact_hash,
+        "authorityLinkHash": authority_hash,
+        "hardOptOutEvidenceHash": hard_hash,
+        "actorScopeHash": actor_hash,
+        "reasonCode": reason_code,
+        "settledAt": settled,
+    }
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        "canonicalMailboxIdentityHash": canonical_hash,
+        "generation": checked_generation,
+        "predecessorSettlementHash": predecessor_hash,
+        "transitionKind": transition_kind,
+        "contactTransitionId": transition_id,
+        "exactIdentityHash": exact_hash,
+        "authorityLink": stored_link,
+        "authorityLinkHash": authority_hash,
+        "hardOptOutEvidenceHash": hard_hash,
+        "actorScopeHash": actor_hash,
+        "reasonCode": reason_code,
+        "contactSettlementHash": domain_hash(
+            CONTACT_SETTLEMENT_HASH_DOMAIN,
+            payload,
+            user_scope_hash=scope,
+        ),
+        "settledAt": settled,
+    }
+
+
+def validate_contact_settlement_document(*, document):
+    checked = _require_contact_document(
+        document,
+        keys=_CONTACT_SETTLEMENT_KEYS,
+        field_name="contact settlement document",
+    )
+    expected = build_contact_settlement_document(
+        user_scope_hash=checked["userScopeHash"],
+        canonical_mailbox_identity_hash=checked[
+            "canonicalMailboxIdentityHash"
+        ],
+        generation=checked["generation"],
+        predecessor_settlement_hash=checked["predecessorSettlementHash"],
+        transition_kind=checked["transitionKind"],
+        contact_transition_id=checked["contactTransitionId"],
+        exact_identity_hash=checked["exactIdentityHash"],
+        authority_link=checked["authorityLink"],
+        actor_scope_hash=checked["actorScopeHash"],
+        reason_code=checked["reasonCode"],
+        settled_at=checked["settledAt"],
+    )
+    for field in (
+        "contactTransitionId",
+        "authorityLinkHash",
+        "hardOptOutEvidenceHash",
+        "actorScopeHash",
+        "contactSettlementHash",
+    ):
+        _require_optional_hash(checked[field], field_name=field)
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact settlement does not match canonical fields and hash"
+        )
+    return _defensive_copy(expected)
+
+
+def build_contact_head_document(
+    *,
+    user_scope_hash,
+    canonical_mailbox_identity_hash,
+    state_revision,
+    latest_generation,
+    latest_settlement_hash,
+    active_optout_settlement_hash,
+    state,
+    active_fanout_id,
+    created_at,
+    updated_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    canonical_hash = _require_sha256(
+        canonical_mailbox_identity_hash,
+        field_name="canonical_mailbox_identity_hash",
+    )
+    revision = _require_pos(state_revision, field_name="state_revision")
+    generation = _require_pos(latest_generation, field_name="latest_generation")
+    if revision != generation:
+        raise RowAuthorityConfigError(
+            "contact head state revision must equal its latest generation"
+        )
+    settlement_hash = _require_sha256(
+        latest_settlement_hash,
+        field_name="latest_settlement_hash",
+    )
+    active_hash = _require_optional_hash(
+        active_optout_settlement_hash,
+        field_name="active_optout_settlement_hash",
+    )
+    if state == "active":
+        if active_hash != settlement_hash:
+            raise RowAuthorityConfigError(
+                "active contact head must point at its latest settlement"
+            )
+        fanout_outcome = "apply"
+    elif state == "released":
+        if active_hash is not None:
+            raise RowAuthorityConfigError(
+                "released contact head must clear active opt-out settlement"
+            )
+        fanout_outcome = "release"
+    else:
+        raise RowAuthorityConfigError("contact head state is unsupported")
+    if (state == "active") != (generation % 2 == 1):
+        raise RowAuthorityConfigError(
+            "contact head state does not match its generation epoch"
+        )
+    fanout_id = _require_sha256(active_fanout_id, field_name="active_fanout_id")
+    expected_fanout_id = _derive_contact_fanout_id(
+        user_scope_hash=scope,
+        settlement_hash=settlement_hash,
+        outcome=fanout_outcome,
+    )
+    if fanout_id != expected_fanout_id:
+        raise RowAuthorityConfigError("contact head fan-out ID does not recompute")
+    created = _require_timestamp(created_at, field_name="created_at")
+    updated = _require_timestamp(updated_at, field_name="updated_at")
+    if updated < created:
+        raise RowAuthorityConfigError("contact head update predates creation")
+    payload = {
+        "canonicalMailboxIdentityHash": canonical_hash,
+        "stateRevision": revision,
+        "latestGeneration": generation,
+        "latestSettlementHash": settlement_hash,
+        "activeOptOutSettlementHash": active_hash,
+        "state": state,
+        "activeFanoutId": fanout_id,
+        "createdAt": created,
+        "updatedAt": updated,
+    }
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        **payload,
+        "contactHeadHash": domain_hash(
+            CONTACT_HEAD_HASH_DOMAIN,
+            payload,
+            user_scope_hash=scope,
+        ),
+    }
+
+
+def validate_contact_head_document(*, document):
+    checked = _require_contact_document(
+        document,
+        keys=_CONTACT_HEAD_KEYS,
+        field_name="contact head document",
+    )
+    expected = build_contact_head_document(
+        user_scope_hash=checked["userScopeHash"],
+        canonical_mailbox_identity_hash=checked[
+            "canonicalMailboxIdentityHash"
+        ],
+        state_revision=checked["stateRevision"],
+        latest_generation=checked["latestGeneration"],
+        latest_settlement_hash=checked["latestSettlementHash"],
+        active_optout_settlement_hash=checked["activeOptOutSettlementHash"],
+        state=checked["state"],
+        active_fanout_id=checked["activeFanoutId"],
+        created_at=checked["createdAt"],
+        updated_at=checked["updatedAt"],
+    )
+    for field in (
+        "latestSettlementHash",
+        "activeOptOutSettlementHash",
+        "activeFanoutId",
+        "contactHeadHash",
+    ):
+        _require_optional_hash(checked[field], field_name=field)
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact head does not match canonical fields and hash"
+        )
+    return _defensive_copy(expected)
+
+
+def build_contact_fanout_head_document(
+    *,
+    user_scope_hash,
+    fanout_id,
+    outcome,
+    expected_contact_settlement_hash,
+    state_revision,
+    state,
+    binding_revision,
+    binding_head_hash,
+    binding_association_count,
+    discovery_cursor_row_id,
+    obligation_count,
+    result_count,
+    lease_owner_hash,
+    lease_until,
+    fencing_token,
+    superseding_contact_settlement_hash,
+    completion_binding_revision,
+    completion_binding_head_hash,
+    completion_binding_association_count,
+    completion_obligation_count,
+    completion_result_count,
+    completed_at,
+    created_at,
+    updated_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    checked_outcome = _require_contact_fanout_outcome(outcome)
+    settlement_hash = _require_sha256(
+        expected_contact_settlement_hash,
+        field_name="expected_contact_settlement_hash",
+    )
+    checked_fanout_id = _require_sha256(fanout_id, field_name="fanout_id")
+    if checked_fanout_id != _derive_contact_fanout_id(
+        user_scope_hash=scope,
+        settlement_hash=settlement_hash,
+        outcome=checked_outcome,
+    ):
+        raise RowAuthorityConfigError("contact fan-out ID does not recompute")
+    revision = _require_pos(state_revision, field_name="state_revision")
+    if type(state) is not str or state not in {
+        "discovering",
+        "applying",
+        "superseding",
+        "complete",
+        "superseded",
+        "ambiguous",
+    }:
+        raise RowAuthorityConfigError("contact fan-out state is unsupported")
+    binding_rev = _require_uint(
+        binding_revision,
+        field_name="binding_revision",
+    )
+    binding_hash = _require_optional_hash(
+        binding_head_hash,
+        field_name="binding_head_hash",
+    )
+    association_count = _require_uint(
+        binding_association_count,
+        field_name="binding_association_count",
+    )
+    if binding_rev == 0:
+        if binding_hash is not None or association_count != 0:
+            raise RowAuthorityConfigError(
+                "zero binding revision requires null hash and zero associations"
+            )
+    elif binding_hash is None:
+        raise RowAuthorityConfigError(
+            "positive binding revision requires a binding hash"
+        )
+    if discovery_cursor_row_id is None:
+        cursor = None
+    else:
+        cursor = validate_row_id(discovery_cursor_row_id)
+    obligations = _require_uint(obligation_count, field_name="obligation_count")
+    results = _require_uint(result_count, field_name="result_count")
+    if results > obligations:
+        raise RowAuthorityConfigError(
+            "contact fan-out results cannot exceed obligations"
+        )
+    lease_owner = _require_optional_hash(
+        lease_owner_hash,
+        field_name="lease_owner_hash",
+    )
+    lease_deadline = (
+        None
+        if lease_until is None
+        else _require_timestamp(lease_until, field_name="lease_until")
+    )
+    if (lease_owner is None) != (lease_deadline is None):
+        raise RowAuthorityConfigError(
+            "contact fan-out lease owner and deadline must be paired"
+        )
+    fence = _require_pos(fencing_token, field_name="fencing_token")
+    if fence > revision:
+        raise RowAuthorityConfigError(
+            "contact fan-out fence cannot exceed its state revision"
+        )
+    superseding_hash = _require_optional_hash(
+        superseding_contact_settlement_hash,
+        field_name="superseding_contact_settlement_hash",
+    )
+    if state in {"superseding", "superseded"}:
+        if superseding_hash is None:
+            raise RowAuthorityConfigError(
+                "superseding fan-out state requires a newer settlement"
+            )
+        if superseding_hash == settlement_hash:
+            raise RowAuthorityConfigError(
+                "superseding fan-out settlement must differ from its origin"
+            )
+    elif superseding_hash is not None:
+        raise RowAuthorityConfigError(
+            "non-superseding fan-out state cannot name a newer settlement"
+        )
+    if state in {"complete", "superseded", "ambiguous"}:
+        if lease_owner is not None or cursor is not None:
+            raise RowAuthorityConfigError(
+                "terminal fan-out state requires null lease and cursor"
+            )
+    if state == "superseded" and results != obligations:
+        raise RowAuthorityConfigError(
+            "superseded fan-out requires exact result and obligation counts"
+        )
+    if state != "ambiguous" and obligations > association_count:
+        raise RowAuthorityConfigError(
+            "contact fan-out obligations exceed its binding snapshot"
+        )
+
+    optional_completion_values = (
+        completion_binding_revision,
+        completion_binding_head_hash,
+        completion_binding_association_count,
+        completion_obligation_count,
+        completion_result_count,
+        completed_at,
+    )
+    if state != "complete":
+        if any(value is not None for value in optional_completion_values):
+            raise RowAuthorityConfigError(
+                "non-complete fan-out cannot carry a completion certificate"
+            )
+        completion_rev = None
+        completion_hash = None
+        completion_associations = None
+        completion_obligations = None
+        completion_results = None
+        completed = None
+    else:
+        if any(
+            value is None
+            for value in (
+                completion_binding_revision,
+                completion_binding_association_count,
+                completion_obligation_count,
+                completion_result_count,
+                completed_at,
+            )
+        ):
+            raise RowAuthorityConfigError(
+                "complete fan-out requires a complete certificate"
+            )
+        completion_rev = _require_uint(
+            completion_binding_revision,
+            field_name="completion_binding_revision",
+        )
+        completion_hash = _require_optional_hash(
+            completion_binding_head_hash,
+            field_name="completion_binding_head_hash",
+        )
+        if (completion_rev == 0) != (completion_hash is None):
+            raise RowAuthorityConfigError(
+                "completion binding revision and hash are miscorrelated"
+            )
+        completion_associations = _require_uint(
+            completion_binding_association_count,
+            field_name="completion_binding_association_count",
+        )
+        completion_obligations = _require_uint(
+            completion_obligation_count,
+            field_name="completion_obligation_count",
+        )
+        completion_results = _require_uint(
+            completion_result_count,
+            field_name="completion_result_count",
+        )
+        completed = _require_timestamp(completed_at, field_name="completed_at")
+        if not (
+            completion_obligations
+            == completion_results
+            == completion_associations
+        ):
+            raise RowAuthorityConfigError(
+                "completion certificate counts are crossed"
+            )
+        if completion_rev == 0 and completion_associations != 0:
+            raise RowAuthorityConfigError(
+                "zero completion binding revision requires zero associations"
+            )
+        if completion_rev == binding_rev and completion_hash != binding_hash:
+            raise RowAuthorityConfigError(
+                "equal binding revisions require equal binding hashes"
+            )
+        if (
+            completion_rev > binding_rev
+            or completion_associations > association_count
+            or binding_rev - completion_rev
+            != association_count - completion_associations
+        ):
+            raise RowAuthorityConfigError(
+                "completion binding revision and count deltas are crossed"
+            )
+        if checked_outcome == "apply":
+            if not (obligations == results == association_count):
+                raise RowAuthorityConfigError(
+                    "complete apply fan-out counts are inconsistent"
+                )
+        elif not (
+            obligations == results == completion_obligations
+        ):
+            raise RowAuthorityConfigError(
+                "complete release fan-out counts are inconsistent"
+            )
+
+    created = _require_timestamp(created_at, field_name="created_at")
+    updated = _require_timestamp(updated_at, field_name="updated_at")
+    if updated < created:
+        raise RowAuthorityConfigError("contact fan-out update predates creation")
+    if lease_deadline is not None and lease_deadline <= updated:
+        raise RowAuthorityConfigError(
+            "contact fan-out lease must remain unexpired at its update"
+        )
+    if completed is not None and (completed < created or completed > updated):
+        raise RowAuthorityConfigError(
+            "contact fan-out completion time is outside its lifetime"
+        )
+    payload = {
+        "fanoutId": checked_fanout_id,
+        "outcome": checked_outcome,
+        "expectedContactSettlementHash": settlement_hash,
+        "stateRevision": revision,
+        "state": state,
+        "bindingRevision": binding_rev,
+        "bindingHeadHash": binding_hash,
+        "bindingAssociationCount": association_count,
+        "discoveryCursorRowId": cursor,
+        "obligationCount": obligations,
+        "resultCount": results,
+        "leaseOwnerHash": lease_owner,
+        "leaseUntil": lease_deadline,
+        "fencingToken": fence,
+        "supersedingContactSettlementHash": superseding_hash,
+        "completionBindingRevision": completion_rev,
+        "completionBindingHeadHash": completion_hash,
+        "completionBindingAssociationCount": completion_associations,
+        "completionObligationCount": completion_obligations,
+        "completionResultCount": completion_results,
+        "completedAt": completed,
+        "createdAt": created,
+        "updatedAt": updated,
+    }
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        **payload,
+        "contactFanoutHeadHash": domain_hash(
+            CONTACT_FANOUT_HEAD_HASH_DOMAIN,
+            payload,
+            user_scope_hash=scope,
+        ),
+    }
+
+
+def validate_contact_fanout_head_document(*, document):
+    checked = _require_contact_document(
+        document,
+        keys=_CONTACT_FANOUT_HEAD_KEYS,
+        field_name="contact fan-out head document",
+    )
+    expected = build_contact_fanout_head_document(
+        user_scope_hash=checked["userScopeHash"],
+        fanout_id=checked["fanoutId"],
+        outcome=checked["outcome"],
+        expected_contact_settlement_hash=checked[
+            "expectedContactSettlementHash"
+        ],
+        state_revision=checked["stateRevision"],
+        state=checked["state"],
+        binding_revision=checked["bindingRevision"],
+        binding_head_hash=checked["bindingHeadHash"],
+        binding_association_count=checked["bindingAssociationCount"],
+        discovery_cursor_row_id=checked["discoveryCursorRowId"],
+        obligation_count=checked["obligationCount"],
+        result_count=checked["resultCount"],
+        lease_owner_hash=checked["leaseOwnerHash"],
+        lease_until=checked["leaseUntil"],
+        fencing_token=checked["fencingToken"],
+        superseding_contact_settlement_hash=checked[
+            "supersedingContactSettlementHash"
+        ],
+        completion_binding_revision=checked["completionBindingRevision"],
+        completion_binding_head_hash=checked["completionBindingHeadHash"],
+        completion_binding_association_count=checked[
+            "completionBindingAssociationCount"
+        ],
+        completion_obligation_count=checked["completionObligationCount"],
+        completion_result_count=checked["completionResultCount"],
+        completed_at=checked["completedAt"],
+        created_at=checked["createdAt"],
+        updated_at=checked["updatedAt"],
+    )
+    _require_sha256(
+        checked["contactFanoutHeadHash"],
+        field_name="contactFanoutHeadHash",
+    )
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact fan-out head does not match canonical fields and hash"
+        )
+    return _defensive_copy(expected)
+
+
+def build_contact_fanout_obligation_document(
+    *,
+    user_scope_hash,
+    fanout_id,
+    row_id,
+    contact_row_edge_hash,
+    expected_contact_settlement_hash,
+    outcome,
+    created_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    checked_fanout_id = _require_sha256(fanout_id, field_name="fanout_id")
+    checked_row_id = validate_row_id(row_id)
+    edge_hash = _require_sha256(
+        contact_row_edge_hash,
+        field_name="contact_row_edge_hash",
+    )
+    settlement_hash = _require_sha256(
+        expected_contact_settlement_hash,
+        field_name="expected_contact_settlement_hash",
+    )
+    checked_outcome = _require_contact_fanout_outcome(outcome)
+    if checked_fanout_id != _derive_contact_fanout_id(
+        user_scope_hash=scope,
+        settlement_hash=settlement_hash,
+        outcome=checked_outcome,
+    ):
+        raise RowAuthorityConfigError(
+            "contact fan-out obligation ID does not recompute"
+        )
+    created = _require_timestamp(created_at, field_name="created_at")
+    payload = {
+        "fanoutId": checked_fanout_id,
+        "rowId": checked_row_id,
+        "contactRowEdgeHash": edge_hash,
+        "expectedContactSettlementHash": settlement_hash,
+        "outcome": checked_outcome,
+    }
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        **payload,
+        "contactFanoutObligationHash": domain_hash(
+            CONTACT_FANOUT_OBLIGATION_HASH_DOMAIN,
+            payload,
+            user_scope_hash=scope,
+        ),
+        "createdAt": created,
+    }
+
+
+def validate_contact_fanout_obligation_document(*, document):
+    checked = _require_contact_document(
+        document,
+        keys=_CONTACT_FANOUT_OBLIGATION_KEYS,
+        field_name="contact fan-out obligation document",
+    )
+    expected = build_contact_fanout_obligation_document(
+        user_scope_hash=checked["userScopeHash"],
+        fanout_id=checked["fanoutId"],
+        row_id=checked["rowId"],
+        contact_row_edge_hash=checked["contactRowEdgeHash"],
+        expected_contact_settlement_hash=checked[
+            "expectedContactSettlementHash"
+        ],
+        outcome=checked["outcome"],
+        created_at=checked["createdAt"],
+    )
+    _require_sha256(
+        checked["contactFanoutObligationHash"],
+        field_name="contactFanoutObligationHash",
+    )
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact fan-out obligation does not match canonical fields and hash"
+        )
+    return _defensive_copy(expected)
+
+
+def _require_optional_contact_generation(value, *, field_name):
+    if value is None:
+        return None
+    return _require_pos(value, field_name=field_name)
+
+
+def build_contact_fanout_result_document(
+    *,
+    user_scope_hash,
+    fanout_id,
+    row_id,
+    obligation_hash,
+    outcome,
+    disposition,
+    reason_code,
+    observed_row_head_hash,
+    claim_request_id,
+    claim_set_hash,
+    row_generation,
+    row_settlement_hash,
+    released_row_generation,
+    released_row_settlement_hash,
+    restored_effective_generation,
+    restored_effective_settlement_hash,
+    created_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    checked_fanout_id = _require_sha256(fanout_id, field_name="fanout_id")
+    checked_row_id = validate_row_id(row_id)
+    checked_obligation_hash = _require_sha256(
+        obligation_hash,
+        field_name="obligation_hash",
+    )
+    checked_outcome = _require_contact_fanout_outcome(outcome)
+    observed_head_hash = _require_sha256(
+        observed_row_head_hash,
+        field_name="observed_row_head_hash",
+    )
+    claim_request = _require_optional_hash(
+        claim_request_id,
+        field_name="claim_request_id",
+    )
+    claim_hash = _require_optional_hash(
+        claim_set_hash,
+        field_name="claim_set_hash",
+    )
+    checked_row_generation = _require_optional_contact_generation(
+        row_generation,
+        field_name="row_generation",
+    )
+    row_hash = _require_optional_hash(
+        row_settlement_hash,
+        field_name="row_settlement_hash",
+    )
+    released_generation = _require_optional_contact_generation(
+        released_row_generation,
+        field_name="released_row_generation",
+    )
+    released_hash = _require_optional_hash(
+        released_row_settlement_hash,
+        field_name="released_row_settlement_hash",
+    )
+    restored_generation = _require_optional_contact_generation(
+        restored_effective_generation,
+        field_name="restored_effective_generation",
+    )
+    restored_hash = _require_optional_hash(
+        restored_effective_settlement_hash,
+        field_name="restored_effective_settlement_hash",
+    )
+
+    evidence_pairs = (
+        (claim_request, claim_hash, "claim request and claim set"),
+        (
+            checked_row_generation,
+            row_hash,
+            "row generation and settlement",
+        ),
+        (
+            released_generation,
+            released_hash,
+            "released row generation and settlement",
+        ),
+        (
+            restored_generation,
+            restored_hash,
+            "restored effective generation and settlement",
+        ),
+    )
+    for address, digest, field_name in evidence_pairs:
+        if (address is None) != (digest is None):
+            raise RowAuthorityConfigError(
+                f"contact fan-out result {field_name} must be paired"
+            )
+
+    matrix = {
+        ("apply", "applied", "claim_accepted"): (
+            True,
+            True,
+            False,
+            False,
+        ),
+        ("apply", "dominated", "claim_dominated"): (
+            True,
+            False,
+            False,
+            False,
+        ),
+        ("apply", "noop", "row_deleted"): (
+            False,
+            False,
+            False,
+            False,
+        ),
+        ("apply", "superseded", "contact_head_advanced"): (
+            False,
+            False,
+            False,
+            False,
+        ),
+        ("release", "restore", "exact_predecessor"): (
+            False,
+            False,
+            True,
+            None,
+        ),
+        ("release", "noop", "row_optout_not_applied"): (
+            False,
+            False,
+            False,
+            False,
+        ),
+        ("release", "noop", "different_effective_owner"): (
+            False,
+            False,
+            True,
+            False,
+        ),
+        ("release", "superseded", "contact_head_advanced"): (
+            False,
+            False,
+            False,
+            False,
+        ),
+    }
+    expected_presence = matrix.get(
+        (checked_outcome, disposition, reason_code)
+    )
+    if expected_presence is None:
+        raise RowAuthorityConfigError(
+            "contact fan-out result disposition and reason are unsupported"
+        )
+    actual_presence = tuple(
+        address is not None for address, _digest, _name in evidence_pairs
+    )
+    if any(
+        required is not None and present != required
+        for present, required in zip(actual_presence, expected_presence)
+    ):
+        raise RowAuthorityConfigError(
+            "contact fan-out result evidence does not match its outcome"
+        )
+    if (
+        restored_generation is not None
+        and released_generation is not None
+        and restored_generation >= released_generation
+    ):
+        raise RowAuthorityConfigError(
+            "restored row generation must predate the released generation"
+        )
+
+    created = _require_timestamp(created_at, field_name="created_at")
+    payload = {
+        "fanoutId": checked_fanout_id,
+        "rowId": checked_row_id,
+        "obligationHash": checked_obligation_hash,
+        "outcome": checked_outcome,
+        "disposition": disposition,
+        "reasonCode": reason_code,
+        "observedRowHeadHash": observed_head_hash,
+        "claimRequestId": claim_request,
+        "claimSetHash": claim_hash,
+        "rowGeneration": checked_row_generation,
+        "rowSettlementHash": row_hash,
+        "releasedRowGeneration": released_generation,
+        "releasedRowSettlementHash": released_hash,
+        "restoredEffectiveGeneration": restored_generation,
+        "restoredEffectiveSettlementHash": restored_hash,
+        "createdAt": created,
+    }
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        **payload,
+        "contactFanoutResultHash": domain_hash(
+            CONTACT_FANOUT_RESULT_HASH_DOMAIN,
+            payload,
+            user_scope_hash=scope,
+        ),
+    }
+
+
+def validate_contact_fanout_result_document(*, document):
+    checked = _require_contact_document(
+        document,
+        keys=_CONTACT_FANOUT_RESULT_KEYS,
+        field_name="contact fan-out result document",
+    )
+    expected = build_contact_fanout_result_document(
+        user_scope_hash=checked["userScopeHash"],
+        fanout_id=checked["fanoutId"],
+        row_id=checked["rowId"],
+        obligation_hash=checked["obligationHash"],
+        outcome=checked["outcome"],
+        disposition=checked["disposition"],
+        reason_code=checked["reasonCode"],
+        observed_row_head_hash=checked["observedRowHeadHash"],
+        claim_request_id=checked["claimRequestId"],
+        claim_set_hash=checked["claimSetHash"],
+        row_generation=checked["rowGeneration"],
+        row_settlement_hash=checked["rowSettlementHash"],
+        released_row_generation=checked["releasedRowGeneration"],
+        released_row_settlement_hash=checked[
+            "releasedRowSettlementHash"
+        ],
+        restored_effective_generation=checked[
+            "restoredEffectiveGeneration"
+        ],
+        restored_effective_settlement_hash=checked[
+            "restoredEffectiveSettlementHash"
+        ],
+        created_at=checked["createdAt"],
+    )
+    _require_sha256(
+        checked["contactFanoutResultHash"],
+        field_name="contactFanoutResultHash",
+    )
+    if checked != expected:
+        raise RowAuthorityConfigError(
+            "contact fan-out result does not match canonical fields and hash"
+        )
+    return _defensive_copy(expected)
+
+
 _CONTACT_ROW_BINDING_KEYS = frozenset(
     {
         "schemaVersion",
@@ -4825,6 +6201,8 @@ def _build_claim_advanced_head(
     lease_until,
     dominated_predecessor_settlement_hash,
     claimed_at,
+    expected_generation=None,
+    expected_first_fencing_token=None,
 ):
     head = validate_row_authority_head(document=expected_head)
     generation = validate_owner_generation_document(
@@ -4862,24 +6240,45 @@ def _build_claim_advanced_head(
         raise RowAuthorityConfigError("claim lease must end after claimed_at")
     current_generation = head["effectiveOwnerGeneration"]
     prior_fence = head["fencingToken"]
-    if current_generation is None:
-        expected_first_fence = 1
+    if expected_generation is None:
+        checked_expected_generation = (
+            1 if current_generation is None else current_generation + 1
+        )
     else:
-        if prior_fence is None:
+        checked_expected_generation = _require_pos(
+            expected_generation,
+            field_name="expected_generation",
+        )
+    if expected_first_fencing_token is None:
+        if current_generation is None:
+            expected_first_fence = 1
+        else:
+            if prior_fence is None:
+                raise RowAuthorityConfigError(
+                    "owned head is missing its retained fencing token"
+                )
+            expected_first_fence = prior_fence + 1
+    else:
+        expected_first_fence = _require_pos(
+            expected_first_fencing_token,
+            field_name="expected_first_fencing_token",
+        )
+        if prior_fence is not None and expected_first_fence <= prior_fence:
             raise RowAuthorityConfigError(
-                "owned head is missing its retained fencing token"
+                "bounded generation fence must advance the current head"
             )
-        expected_first_fence = prior_fence + 1
+    if generation["generation"] != checked_expected_generation:
+        raise RowAuthorityConfigError(
+            "generation does not match the bounded allocation floor"
+        )
     if generation["firstFencingToken"] != expected_first_fence:
         raise RowAuthorityConfigError(
-            "generation first fence does not immediately follow the head"
+            "generation first fence does not match the bounded allocation floor"
         )
     if current_generation is None:
         if (
             head["state"] != "clear"
-            or head["latestSettlementHash"] is not None
             or head["effectiveSettlementHash"] is not None
-            or generation["generation"] != 1
             or dominated_hash is not None
         ):
             raise RowAuthorityConfigError(
@@ -4887,7 +6286,7 @@ def _build_claim_advanced_head(
             )
     else:
         if (
-            generation["generation"] != current_generation + 1
+            generation["generation"] <= current_generation
             or generation["priority"] <= head["effectivePriority"]
         ):
             raise RowAuthorityConfigError(
@@ -5182,7 +6581,11 @@ def _build_source_link_advanced_head(
 
 
 def _source_link_head_reflects_b2_settlement(
-    *, head_document, generation_document, settlement_document
+    *,
+    head_document,
+    generation_document,
+    settlement_document,
+    historical_generation_proven=False,
 ):
     head = validate_row_authority_head(document=head_document)
     generation = validate_owner_generation_document(
@@ -5220,7 +6623,10 @@ def _source_link_head_reflects_b2_settlement(
     higher_generation = (
         current_generation is not None
         and current_generation > generation["generation"]
-        and head["effectivePriority"] > generation["priority"]
+        and (
+            head["effectivePriority"] > generation["priority"]
+            or historical_generation_proven is True
+        )
         and head["fencingToken"] > settlement["fencingToken"]
         and head["latestSettlementHash"] is not None
     )
@@ -5250,6 +6656,1209 @@ def _generation_document_id(*, row_id, generation):
         f"{checked_row}--{checked_generation}",
         field_name="owner generation document ID",
     )
+
+
+def _bounded_predecessor_release_lookup_hash(
+    *, latest_settlements, latest_authorities
+):
+    """Return the exact older settlement hash when a bounded pair skips it."""
+    if (
+        type(latest_settlements) not in {list, tuple}
+        or type(latest_authorities) not in {list, tuple}
+        or len(latest_settlements) != 2
+        or len(latest_authorities) != 2
+    ):
+        return None
+    try:
+        newer_generation = validate_owner_generation_document(
+            document=latest_authorities[0]["generation"]
+        )
+        older_settlement = validate_owner_settlement_document(
+            document=latest_settlements[1]["document"]
+        )
+    except Exception:
+        return None
+    if (
+        older_settlement["outcome"] == "dominated"
+        or newer_generation["predecessorSettlementHash"]
+        == older_settlement["settlementHash"]
+    ):
+        return None
+    return older_settlement["settlementHash"]
+
+
+def _read_bounded_release_restored_authority(
+    *, user_ref, row_id, release_document, read
+):
+    """Read the exact authority restored by one already-bounded release."""
+    try:
+        release_result = validate_contact_fanout_result_document(
+            document=release_document
+        )
+        restored_number = release_result["restoredEffectiveGeneration"]
+        if restored_number is None:
+            return None
+        restored_id = _generation_document_id(
+            row_id=row_id,
+            generation=restored_number,
+        )
+        restored_generation_ref = user_ref.collection(
+            "rowOwnerGenerations"
+        ).document(restored_id)
+        restored_generation_exists, restored_generation = read(
+            restored_generation_ref
+        )
+        restored_claim = None
+        if restored_generation_exists:
+            checked_generation = validate_owner_generation_document(
+                document=restored_generation
+            )
+            restored_claim_ref = user_ref.collection("rowClaimSets").document(
+                checked_generation["requestId"]
+            )
+            restored_claim_exists, restored_claim_payload = read(
+                restored_claim_ref
+            )
+            if restored_claim_exists:
+                restored_claim = restored_claim_payload
+        restored_settlement_ref = user_ref.collection(
+            "rowOwnerSettlements"
+        ).document(restored_id)
+        restored_settlement_exists, restored_settlement = read(
+            restored_settlement_ref
+        )
+        return {
+            "generation": (
+                restored_generation if restored_generation_exists else None
+            ),
+            "claimSet": restored_claim,
+            "settlement": (
+                restored_settlement if restored_settlement_exists else None
+            ),
+        }
+    except RowAuthorityRetryable:
+        raise
+    except Exception:
+        return {"malformed": True}
+
+
+def _read_bounded_replay_winner_successor(
+    *,
+    user_ref,
+    row_id,
+    winner_generation,
+    winner_settlement,
+    claim_created_at,
+    read,
+    transaction,
+    query_readbacks,
+):
+    """Read the exact N+1/N+2 bracket for one dominated winner."""
+    successor_id = _generation_document_id(
+        row_id=row_id,
+        generation=winner_generation["generation"] + 1,
+    )
+    successor_generation_ref = user_ref.collection(
+        "rowOwnerGenerations"
+    ).document(successor_id)
+    successor_generation_exists, successor_generation = read(
+        successor_generation_ref
+    )
+    successor_claim = None
+    checked_successor = None
+    if successor_generation_exists:
+        try:
+            checked_successor = validate_owner_generation_document(
+                document=successor_generation
+            )
+            successor_claim_ref = user_ref.collection(
+                "rowClaimSets"
+            ).document(checked_successor["requestId"])
+            successor_claim_exists, successor_claim_payload = read(
+                successor_claim_ref
+            )
+            if successor_claim_exists:
+                successor_claim = successor_claim_payload
+        except RowAuthorityRetryable:
+            raise
+        except Exception:
+            checked_successor = None
+
+    successor_settlement_ref = user_ref.collection(
+        "rowOwnerSettlements"
+    ).document(successor_id)
+    successor_settlement_exists, successor_settlement = read(
+        successor_settlement_ref
+    )
+    try:
+        checked_successor_settlement = (
+            validate_owner_settlement_document(
+                document=successor_settlement
+            )
+            if successor_settlement_exists
+            else None
+        )
+    except Exception:
+        checked_successor_settlement = None
+
+    def read_release_proof(settlement_hash):
+        matches = []
+        try:
+            release_query = (
+                user_ref.collection("contactOptOutFanoutResults")
+                .where("rowId", "==", row_id)
+                .where(
+                    "releasedRowSettlementHash",
+                    "==",
+                    settlement_hash,
+                )
+                .order_by("__name__")
+                .limit(2)
+            )
+            release_snapshots = tuple(transaction.get(release_query))
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "dominated replay winner-successor release query failed before writes"
+            ) from exc
+        for release_snapshot in release_snapshots:
+            release_exists, release_payload = read(
+                release_snapshot.reference
+            )
+            if not release_exists:
+                raise RowAuthorityAmbiguous(
+                    "dominated replay winner-successor release query returned a missing document"
+                )
+            matches.append(
+                {
+                    "path": release_snapshot.reference.path,
+                    "document": release_payload,
+                }
+            )
+        query_readbacks.append(
+            {
+                "kind": "stable",
+                "query": release_query,
+                "matches": tuple(
+                    (
+                        entry["path"],
+                        _defensive_copy(entry["document"]),
+                    )
+                    for entry in matches
+                ),
+            }
+        )
+        restored = None
+        if len(matches) == 1:
+            restored = _read_bounded_release_restored_authority(
+                user_ref=user_ref,
+                row_id=row_id,
+                release_document=matches[0]["document"],
+                read=read,
+            )
+        return matches, restored
+
+    link_release_matches = []
+    link_restored_authority = None
+    try:
+        checked_winner_settlement = validate_owner_settlement_document(
+            document=winner_settlement
+        )
+    except Exception:
+        checked_winner_settlement = None
+    release_skipped = (
+        checked_successor is not None
+        and checked_winner_settlement is not None
+        and checked_winner_settlement["outcome"] == "contact_optout"
+        and checked_successor["predecessorSettlementHash"]
+        != checked_winner_settlement["settlementHash"]
+    )
+    if release_skipped:
+        try:
+            (
+                link_release_matches,
+                link_restored_authority,
+            ) = read_release_proof(
+                checked_winner_settlement["settlementHash"]
+            )
+        except RowAuthorityError:
+            raise
+
+    restoration_release_matches = []
+    restored_winner_authority = None
+    restoration_exit_generation = None
+    restoration_exit_claim = None
+    restoration_exit_settlement = None
+    restoration_may_be_needed = (
+        checked_successor is not None
+        and checked_successor_settlement is not None
+        and checked_successor_settlement["outcome"] == "contact_optout"
+        and checked_successor["createdAt"] <= claim_created_at
+    )
+    if restoration_may_be_needed:
+        try:
+            (
+                restoration_release_matches,
+                restored_winner_authority,
+            ) = read_release_proof(
+                checked_successor_settlement["settlementHash"]
+            )
+        except RowAuthorityError:
+            raise
+        restoration_exit_id = _generation_document_id(
+            row_id=row_id,
+            generation=winner_generation["generation"] + 2,
+        )
+        restoration_exit_ref = user_ref.collection(
+            "rowOwnerGenerations"
+        ).document(restoration_exit_id)
+        (
+            restoration_exit_exists,
+            restoration_exit_payload,
+        ) = read(restoration_exit_ref)
+        if restoration_exit_exists:
+            restoration_exit_generation = restoration_exit_payload
+            try:
+                checked_restoration_exit = (
+                    validate_owner_generation_document(
+                        document=restoration_exit_payload
+                    )
+                )
+                restoration_exit_claim_ref = user_ref.collection(
+                    "rowClaimSets"
+                ).document(checked_restoration_exit["requestId"])
+                (
+                    restoration_exit_claim_exists,
+                    restoration_exit_claim_payload,
+                ) = read(restoration_exit_claim_ref)
+                if restoration_exit_claim_exists:
+                    restoration_exit_claim = (
+                        restoration_exit_claim_payload
+                    )
+            except RowAuthorityRetryable:
+                raise
+            except Exception:
+                pass
+        restoration_exit_settlement_ref = user_ref.collection(
+            "rowOwnerSettlements"
+        ).document(restoration_exit_id)
+        (
+            restoration_exit_settlement_exists,
+            restoration_exit_settlement_payload,
+        ) = read(restoration_exit_settlement_ref)
+        if restoration_exit_settlement_exists:
+            restoration_exit_settlement = (
+                restoration_exit_settlement_payload
+            )
+    return {
+        "generation": (
+            successor_generation if successor_generation_exists else None
+        ),
+        "claimSet": successor_claim,
+        "settlement": (
+            successor_settlement if successor_settlement_exists else None
+        ),
+        "linkReleaseMatches": link_release_matches,
+        "linkRestoredAuthority": link_restored_authority,
+        "restorationReleaseMatches": restoration_release_matches,
+        "restoredWinnerAuthority": restored_winner_authority,
+        "restorationExitGeneration": restoration_exit_generation,
+        "restorationExitClaimSet": restoration_exit_claim,
+        "restorationExitSettlement": restoration_exit_settlement,
+    }
+
+
+def _validate_bounded_release_restored_authority(
+    *,
+    scope,
+    row_id,
+    release_result,
+    released_generation,
+    raw_restored_authority,
+    successor_generation,
+):
+    """Validate the exact owner restored before a later successor."""
+    restored_number = release_result["restoredEffectiveGeneration"]
+    restored_hash = release_result["restoredEffectiveSettlementHash"]
+    if restored_number is None:
+        if raw_restored_authority is not None or restored_hash is not None:
+            raise RowAuthorityAmbiguous(
+                "clear predecessor release carries restored authority"
+            )
+        return None
+    if (
+        type(raw_restored_authority) is not dict
+        or set(raw_restored_authority)
+        != {"generation", "claimSet", "settlement"}
+    ):
+        raise RowAuthorityAmbiguous(
+            "predecessor release lacks exact restored authority"
+        )
+    try:
+        restored_generation = validate_owner_generation_document(
+            document=raw_restored_authority["generation"]
+        )
+        restored_claim = validate_claim_set_document(
+            document=raw_restored_authority["claimSet"]
+        )
+        restored_settlement = _validate_correlated_owner_settlement(
+            scope=scope,
+            row_id=row_id,
+            generation=restored_generation,
+            claim=restored_claim,
+            settlement_document=raw_restored_authority["settlement"],
+        )
+    except RowAuthorityError:
+        raise
+    except Exception as exc:
+        raise RowAuthorityAmbiguous(
+            "predecessor release restored authority is malformed"
+        ) from exc
+    decisions = [
+        item
+        for item in restored_claim["rowDecisions"]
+        if item["rowId"] == row_id
+    ]
+    if (
+        restored_generation["userScopeHash"] != scope
+        or restored_claim["userScopeHash"] != scope
+        or restored_generation["rowId"] != row_id
+        or restored_generation["generation"] != restored_number
+        or restored_generation["requestId"] != restored_claim["requestId"]
+        or restored_generation["claimSetHash"]
+        != restored_claim["claimSetHash"]
+        or restored_generation["ownerKind"]
+        not in {"terminal", "human_decision"}
+        or restored_generation["ownerKind"] != restored_claim["ownerKind"]
+        or restored_generation["ownerKey"] != restored_claim["ownerKey"]
+        or restored_generation["priority"] != restored_claim["derivedPriority"]
+        or restored_claim["outcome"] != "accepted"
+        or restored_generation["createdAt"] < restored_claim["createdAt"]
+        or len(decisions) != 1
+        or decisions[0]["decision"] != "accepted"
+        or decisions[0]["plannedGeneration"]
+        != restored_generation["generation"]
+        or restored_settlement["outcome"]
+        != _expected_owner_settlement_outcome(
+            restored_generation["ownerKind"]
+        )
+        or restored_settlement["settlementHash"] != restored_hash
+        or restored_settlement["settledAt"] > released_generation["createdAt"]
+        or restored_generation["generation"]
+        >= released_generation["generation"]
+        or successor_generation["priority"] <= restored_generation["priority"]
+    ):
+        raise RowAuthorityConflict(
+            "restored authority does not permit the bounded successor"
+        )
+    return {
+        "generation": restored_generation,
+        "claimSet": restored_claim,
+        "settlement": restored_settlement,
+    }
+
+
+def _validate_bounded_row_history(*, scope, row_id, head, row_state):
+    """Validate the bounded current/history proof used by B2-C allocation."""
+    checked_scope = _require_sha256(scope, field_name="scope")
+    checked_row_id = validate_row_id(row_id)
+    checked_head = validate_row_authority_head(document=head)
+    if (
+        checked_head["userScopeHash"] != checked_scope
+        or checked_head["rowId"] != checked_row_id
+    ):
+        raise RowAuthorityConflict("bounded row history head does not correlate")
+
+    raw_latest = row_state.get("latestSettlements")
+    if type(raw_latest) not in {list, tuple} or len(raw_latest) > 2:
+        raise RowAuthorityAmbiguous(
+            "bounded row history requires at most two latest settlements"
+        )
+    latest = []
+    for raw_entry in raw_latest:
+        if type(raw_entry) is not dict or set(raw_entry) != {"path", "document"}:
+            raise RowAuthorityAmbiguous(
+                "bounded row history settlement entry is malformed"
+            )
+        try:
+            settlement = validate_owner_settlement_document(
+                document=raw_entry["document"]
+            )
+            expected_id = _generation_document_id(
+                row_id=checked_row_id,
+                generation=settlement["generation"],
+            )
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "bounded row history settlement is malformed"
+            ) from exc
+        path = raw_entry["path"]
+        if (
+            type(path) is not str
+            or path.split("/")[-2:] != ["rowOwnerSettlements", expected_id]
+            or settlement["userScopeHash"] != checked_scope
+            or settlement["rowId"] != checked_row_id
+        ):
+            raise RowAuthorityAmbiguous(
+                "bounded row history settlement occupies the wrong path"
+            )
+        latest.append(settlement)
+    raw_authorities = row_state.get("latestSettlementAuthorities")
+    if (
+        type(raw_authorities) not in {list, tuple}
+        or len(raw_authorities) != len(latest)
+    ):
+        raise RowAuthorityAmbiguous(
+            "bounded row history lacks exact settlement authority"
+        )
+    latest_authorities = []
+    for settlement, raw_authority in zip(latest, raw_authorities):
+        if type(raw_authority) is not dict or set(raw_authority) != {
+            "generation",
+            "claimSet",
+        }:
+            raise RowAuthorityAmbiguous(
+                "bounded settlement authority entry is malformed"
+            )
+        try:
+            authority_generation = validate_owner_generation_document(
+                document=raw_authority["generation"]
+            )
+            authority_claim = validate_claim_set_document(
+                document=raw_authority["claimSet"]
+            )
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "bounded settlement authority is missing or malformed"
+            ) from exc
+        correlated_settlement = _validate_correlated_owner_settlement(
+            scope=checked_scope,
+            row_id=checked_row_id,
+            generation=authority_generation,
+            claim=authority_claim,
+            settlement_document=settlement,
+        )
+        matching_decisions = [
+            decision
+            for decision in authority_claim["rowDecisions"]
+            if decision["rowId"] == checked_row_id
+        ]
+        if (
+            authority_generation["userScopeHash"] != checked_scope
+            or authority_claim["userScopeHash"] != checked_scope
+            or authority_generation["rowId"] != checked_row_id
+            or authority_generation["generation"]
+            != settlement["generation"]
+            or authority_generation["requestId"]
+            != authority_claim["requestId"]
+            or authority_generation["claimSetHash"]
+            != authority_claim["claimSetHash"]
+            or authority_generation["ownerKind"] != authority_claim["ownerKind"]
+            or authority_generation["ownerKey"] != authority_claim["ownerKey"]
+            or authority_generation["priority"]
+            != authority_claim["derivedPriority"]
+            or authority_claim["outcome"] != "accepted"
+            or authority_generation["createdAt"]
+            < authority_claim["createdAt"]
+            or len(matching_decisions) != 1
+            or matching_decisions[0]["decision"] != "accepted"
+            or matching_decisions[0]["plannedGeneration"]
+            != authority_generation["generation"]
+            or correlated_settlement["outcome"]
+            not in {
+                "dominated",
+                _expected_owner_settlement_outcome(
+                    authority_generation["ownerKind"]
+                ),
+            }
+        ):
+            raise RowAuthorityConflict(
+                "bounded settlement does not match its exact owner authority"
+            )
+        latest_authorities.append(
+            {
+                "generation": authority_generation,
+                "claimSet": authority_claim,
+                "settlement": correlated_settlement,
+            }
+        )
+    for authority in latest_authorities:
+        generation = authority["generation"]
+        if generation["generation"] == 1 and (
+            generation["predecessorSettlementHash"] is not None
+            or generation["firstFencingToken"] != 1
+        ):
+            raise RowAuthorityAmbiguous(
+                "first bounded row generation has predecessor state"
+            )
+    if len(latest) == 1 and latest[0]["generation"] != 1:
+        raise RowAuthorityAmbiguous(
+            "single bounded row settlement must be generation one"
+        )
+    validated_predecessor_release_matches = ()
+    validated_predecessor_restored_authority = None
+    if len(latest) == 2:
+        newer_generation = latest_authorities[0]["generation"]
+        older_generation = latest_authorities[1]["generation"]
+        if (
+            latest[0]["generation"] != latest[1]["generation"] + 1
+            or latest[0]["fencingToken"] <= latest[1]["fencingToken"]
+            or newer_generation["firstFencingToken"]
+            != latest[1]["fencingToken"] + 1
+            or newer_generation["createdAt"] < latest[1]["settledAt"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "latest row settlements have a gap or fencing regression"
+            )
+        if latest[1]["outcome"] == "dominated":
+            if (
+                latest[1]["dominantGenerationHash"]
+                != newer_generation["generationHash"]
+                or latest[1]["settledAt"] != newer_generation["createdAt"]
+                or newer_generation["predecessorSettlementHash"]
+                != older_generation["predecessorSettlementHash"]
+                or newer_generation["priority"]
+                <= older_generation["priority"]
+            ):
+                raise RowAuthorityConflict(
+                    "latest dominated settlement does not link to its successor"
+                )
+        elif (
+            newer_generation["predecessorSettlementHash"]
+            == latest[1]["settlementHash"]
+        ):
+            if newer_generation["priority"] <= older_generation["priority"]:
+                raise RowAuthorityConflict(
+                    "direct settled successor does not have higher priority"
+                )
+        else:
+            raw_release_matches = row_state.get(
+                "latestPredecessorReleaseMatches"
+            )
+            if type(raw_release_matches) not in {list, tuple}:
+                raise RowAuthorityAmbiguous(
+                    "settled successor lacks bounded predecessor release proof"
+                )
+            if len(raw_release_matches) != 1:
+                raise RowAuthorityAmbiguous(
+                    "settled successor predecessor release is missing or duplicated"
+                )
+            raw_release = raw_release_matches[0]
+            if type(raw_release) is not dict or set(raw_release) != {
+                "path",
+                "document",
+            }:
+                raise RowAuthorityAmbiguous(
+                    "settled successor predecessor release proof is malformed"
+                )
+            try:
+                predecessor_release = validate_contact_fanout_result_document(
+                    document=raw_release["document"]
+                )
+            except Exception as exc:
+                raise RowAuthorityAmbiguous(
+                    "settled successor predecessor release proof is malformed"
+                ) from exc
+            if (
+                type(raw_release["path"]) is not str
+                or raw_release["path"].split("/")[-2:]
+                != [
+                    "contactOptOutFanoutResults",
+                    f"{predecessor_release['fanoutId']}--{checked_row_id}",
+                ]
+                or older_generation["ownerKind"] != "contact_optout"
+                or latest[1]["outcome"] != "contact_optout"
+                or predecessor_release["userScopeHash"] != checked_scope
+                or predecessor_release["rowId"] != checked_row_id
+                or predecessor_release["outcome"] != "release"
+                or predecessor_release["disposition"] != "restore"
+                or predecessor_release["reasonCode"] != "exact_predecessor"
+                or predecessor_release["releasedRowGeneration"]
+                != older_generation["generation"]
+                or predecessor_release["releasedRowSettlementHash"]
+                != latest[1]["settlementHash"]
+                or predecessor_release["restoredEffectiveSettlementHash"]
+                != newer_generation["predecessorSettlementHash"]
+                or latest[1]["supersededEffectiveSettlementHash"]
+                != newer_generation["predecessorSettlementHash"]
+                or predecessor_release["createdAt"] < latest[1]["settledAt"]
+                or predecessor_release["createdAt"]
+                > newer_generation["createdAt"]
+            ):
+                raise RowAuthorityAmbiguous(
+                    "settled successor predecessor release does not correlate"
+                )
+            validated_predecessor_restored_authority = (
+                _validate_bounded_release_restored_authority(
+                    scope=checked_scope,
+                    row_id=checked_row_id,
+                    release_result=predecessor_release,
+                    released_generation=older_generation,
+                    raw_restored_authority=row_state.get(
+                        "latestPredecessorRestoredAuthority"
+                    ),
+                    successor_generation=newer_generation,
+                )
+            )
+            validated_predecessor_release_matches = tuple(
+                raw_release_matches
+            )
+    latest_hash = latest[0]["settlementHash"] if latest else None
+    if checked_head["latestSettlementHash"] != latest_hash:
+        if not latest and checked_head["latestSettlementHash"] is not None:
+            raise RowAuthorityConflict(
+                "row head claims settlement history that does not exist"
+            )
+        raise RowAuthorityAmbiguous(
+            "row head latest settlement differs from bounded history"
+        )
+
+    current_number = checked_head["effectiveOwnerGeneration"]
+    current_generation_document = row_state.get("currentGeneration")
+    current_claim_document = row_state.get("currentClaimSet")
+    current_settlement_document = row_state.get("currentSettlement")
+    if current_number is None:
+        if any(
+            value is not None
+            for value in (
+                current_generation_document,
+                current_claim_document,
+                current_settlement_document,
+            )
+        ):
+            raise RowAuthorityAmbiguous(
+                "ownerless row has unexpected current ownership artifacts"
+            )
+        if (
+            checked_head["state"] != "clear"
+            or checked_head["effectiveSettlementHash"] is not None
+        ):
+            raise RowAuthorityConflict(
+                "ownerless bounded row history does not match a clear head"
+            )
+        generation = None
+        claim = None
+        settlement = None
+    else:
+        try:
+            generation = validate_owner_generation_document(
+                document=current_generation_document
+            )
+            claim = validate_claim_set_document(document=current_claim_document)
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "bounded row history is missing current generation authority"
+            ) from exc
+        matching_decisions = [
+            decision
+            for decision in claim["rowDecisions"]
+            if decision["rowId"] == checked_row_id
+        ]
+        if claim["authorityOrigin"] == "authenticated_operator":
+            minimum_writes = 2 + (3 * claim["bindingCount"])
+            maximum_writes = minimum_writes
+        else:
+            minimum_writes = 1 + (2 * claim["bindingCount"])
+            maximum_writes = minimum_writes + sum(
+                decision["plannedGeneration"] is not None
+                and decision["plannedGeneration"] > 1
+                for decision in claim["rowDecisions"]
+            )
+        if (
+            generation["userScopeHash"] != checked_scope
+            or claim["userScopeHash"] != checked_scope
+            or generation["rowId"] != checked_row_id
+            or generation["generation"] != current_number
+            or generation["generationHash"]
+            != checked_head["effectiveOwnerGenerationHash"]
+            or generation["requestId"] != claim["requestId"]
+            or generation["claimSetHash"] != claim["claimSetHash"]
+            or generation["ownerKind"] != claim["ownerKind"]
+            or generation["ownerKey"] != claim["ownerKey"]
+            or generation["priority"] != claim["derivedPriority"]
+            or generation["ownerKind"] != checked_head["effectiveOwnerKind"]
+            or generation["priority"] != checked_head["effectivePriority"]
+            or claim["outcome"] != "accepted"
+            or len(matching_decisions) != 1
+            or matching_decisions[0]["decision"] != "accepted"
+            or matching_decisions[0]["plannedGeneration"] != current_number
+            or not (minimum_writes <= claim["plannedWrites"] <= maximum_writes)
+            or generation["createdAt"] < claim["createdAt"]
+            or generation["createdAt"] < checked_head["createdAt"]
+            or checked_head["updatedAt"] < generation["createdAt"]
+            or checked_head["stateRevision"] < generation["generation"] + 1
+            or checked_head["stateRevision"] <= checked_head["fencingToken"]
+        ):
+            raise RowAuthorityConflict(
+                "bounded current generation and claim do not correlate"
+            )
+        if checked_head["fencingToken"] < generation["firstFencingToken"]:
+            raise RowAuthorityAmbiguous(
+                "bounded current head fence regressed below its generation"
+            )
+        if checked_head["state"] in {"claimed", "review_pending"}:
+            expected_state = (
+                "review_pending"
+                if generation["ownerKind"] == "human_decision"
+                else "claimed"
+            )
+            if current_settlement_document is not None:
+                raise RowAuthorityAmbiguous(
+                    "unsettled bounded row already has a current settlement"
+                )
+            if (
+                checked_head["state"] != expected_state
+                or checked_head["leaseUntil"] <= generation["createdAt"]
+                or generation["predecessorSettlementHash"]
+                != checked_head["effectiveSettlementHash"]
+            ):
+                raise RowAuthorityConflict(
+                    "bounded active owner does not match its row head"
+                )
+            settlement = None
+            if not latest:
+                adjacent = (
+                    generation["generation"] == 1
+                    and generation["firstFencingToken"] == 1
+                )
+            else:
+                adjacent = (
+                    generation["generation"] == latest[0]["generation"] + 1
+                    and generation["firstFencingToken"]
+                    == latest[0]["fencingToken"] + 1
+                )
+            if not adjacent:
+                raise RowAuthorityAmbiguous(
+                    "current unsettled generation is not adjacent to history"
+                )
+        elif checked_head["state"] == "settled":
+            if current_settlement_document is None:
+                raise RowAuthorityAmbiguous(
+                    "settled bounded row is missing its current settlement"
+                )
+            settlement = _validate_correlated_owner_settlement(
+                scope=checked_scope,
+                row_id=checked_row_id,
+                generation=generation,
+                claim=claim,
+                settlement_document=current_settlement_document,
+            )
+            if (
+                settlement["outcome"]
+                != _expected_owner_settlement_outcome(generation["ownerKind"])
+                or settlement["settlementHash"]
+                != checked_head["effectiveSettlementHash"]
+                or settlement["fencingToken"] != checked_head["fencingToken"]
+                or settlement["settledAt"] > checked_head["updatedAt"]
+            ):
+                raise RowAuthorityConflict(
+                    "settled bounded row does not match its effective owner"
+                )
+        else:
+            raise RowAuthorityConflict(
+                "bounded owned row has an unsupported head state"
+            )
+
+    release_result_document = row_state.get("releaseResult")
+    release_result_path = row_state.get("releaseResultPath")
+    historical_divergence = (
+        checked_head["latestSettlementHash"]
+        != checked_head["effectiveSettlementHash"]
+    )
+    current_pending = (
+        generation is not None
+        and settlement is None
+        and checked_head["state"] in {"claimed", "review_pending"}
+    )
+    active_bridge = False
+    if current_pending and latest and latest[0]["outcome"] == "dominated":
+        bridge_generation = latest_authorities[0]["generation"]
+        active_bridge = (
+            bridge_generation["generation"] + 1 == generation["generation"]
+            and latest[0]["dominantGenerationHash"]
+            == generation["generationHash"]
+            and latest[0]["settledAt"] == generation["createdAt"]
+            and generation["predecessorSettlementHash"]
+            == bridge_generation["predecessorSettlementHash"]
+            and generation["priority"] > bridge_generation["priority"]
+        )
+        if not active_bridge:
+            raise RowAuthorityConflict(
+                "active dominated settlement does not bridge to the current owner"
+            )
+    if current_pending and not historical_divergence and latest:
+        direct_generation = latest_authorities[0]["generation"]
+        if (
+            generation["priority"] <= direct_generation["priority"]
+            or (
+                latest[0]["outcome"] == "dominated"
+                and not active_bridge
+            )
+            or (
+                latest[0]["outcome"] != "dominated"
+                and generation["predecessorSettlementHash"]
+                != latest[0]["settlementHash"]
+            )
+        ):
+            raise RowAuthorityConflict(
+                "current owner does not advance its direct predecessor authority"
+            )
+    release_result = None
+    released_authority = None
+    if historical_divergence and checked_head[
+        "latestOptOutReleaseResultHash"
+    ] is not None:
+        if not latest or release_result_document is None:
+            raise RowAuthorityAmbiguous(
+                "release-restored history is missing its exact result bridge"
+            )
+        try:
+            release_result = validate_contact_fanout_result_document(
+                document=release_result_document
+            )
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "release-restored result bridge is malformed"
+            ) from exc
+        raw_released = row_state.get("releasedAuthority")
+        if type(raw_released) is not dict or set(raw_released) != {
+            "path",
+            "generation",
+            "claimSet",
+            "settlement",
+        }:
+            raise RowAuthorityAmbiguous(
+                "release-restored history lacks exact released authority"
+            )
+        try:
+            released_owner_generation = validate_owner_generation_document(
+                document=raw_released["generation"]
+            )
+            released_owner_claim = validate_claim_set_document(
+                document=raw_released["claimSet"]
+            )
+            released_settlement = _validate_correlated_owner_settlement(
+                scope=checked_scope,
+                row_id=checked_row_id,
+                generation=released_owner_generation,
+                claim=released_owner_claim,
+                settlement_document=raw_released["settlement"],
+            )
+            released_id = _generation_document_id(
+                row_id=checked_row_id,
+                generation=released_owner_generation["generation"],
+            )
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "release-restored released authority is malformed"
+            ) from exc
+        released_decisions = [
+            decision
+            for decision in released_owner_claim["rowDecisions"]
+            if decision["rowId"] == checked_row_id
+        ]
+        if (
+            type(raw_released["path"]) is not str
+            or raw_released["path"].split("/")[-2:]
+            != ["rowOwnerSettlements", released_id]
+            or released_owner_generation["userScopeHash"] != checked_scope
+            or released_owner_claim["userScopeHash"] != checked_scope
+            or released_owner_generation["rowId"] != checked_row_id
+            or released_owner_generation["requestId"]
+            != released_owner_claim["requestId"]
+            or released_owner_generation["claimSetHash"]
+            != released_owner_claim["claimSetHash"]
+            or released_owner_generation["ownerKind"] != "contact_optout"
+            or released_owner_generation["ownerKind"]
+            != released_owner_claim["ownerKind"]
+            or released_owner_generation["ownerKey"]
+            != released_owner_claim["ownerKey"]
+            or released_owner_generation["priority"]
+            != released_owner_claim["derivedPriority"]
+            or released_owner_claim["outcome"] != "accepted"
+            or released_owner_generation["createdAt"]
+            < released_owner_claim["createdAt"]
+            or len(released_decisions) != 1
+            or released_decisions[0]["decision"] != "accepted"
+            or released_decisions[0]["plannedGeneration"]
+            != released_owner_generation["generation"]
+            or released_settlement["outcome"] != "contact_optout"
+        ):
+            raise RowAuthorityAmbiguous(
+                "release-restored released authority does not correlate"
+            )
+        matching_latest = [
+            index
+            for index, settlement in enumerate(latest)
+            if settlement["generation"]
+            == released_owner_generation["generation"]
+        ]
+        if len(matching_latest) > 1:
+            raise RowAuthorityAmbiguous(
+                "release-restored released authority is duplicated"
+            )
+        if matching_latest:
+            index = matching_latest[0]
+            if (
+                latest[index] != released_settlement
+                or latest_authorities[index]["generation"]
+                != released_owner_generation
+                or latest_authorities[index]["claimSet"]
+                != released_owner_claim
+            ):
+                raise RowAuthorityAmbiguous(
+                    "release-restored bounded and exact authority differ"
+                )
+        elif (
+            not latest
+            or released_owner_generation["generation"]
+            >= latest[0]["generation"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "release-restored released authority is not historical"
+            )
+        released_authority = {
+            "generation": released_owner_generation,
+            "claimSet": released_owner_claim,
+            "settlement": released_settlement,
+        }
+        restored_generation = release_result["restoredEffectiveGeneration"]
+        restored_settlement_hash = release_result[
+            "restoredEffectiveSettlementHash"
+        ]
+        if (
+            release_result["userScopeHash"] != checked_scope
+            or release_result["rowId"] != checked_row_id
+            or type(release_result_path) is not str
+            or release_result_path.split("/")[-2:]
+            != [
+                "contactOptOutFanoutResults",
+                f"{release_result['fanoutId']}--{checked_row_id}",
+            ]
+            or release_result["contactFanoutResultHash"]
+            != checked_head["latestOptOutReleaseResultHash"]
+            or release_result["outcome"] != "release"
+            or release_result["disposition"] != "restore"
+            or release_result["reasonCode"] != "exact_predecessor"
+            or release_result["releasedRowGeneration"]
+            != released_owner_generation["generation"]
+            or release_result["releasedRowSettlementHash"]
+            != released_settlement["settlementHash"]
+            or released_settlement["outcome"] != "contact_optout"
+            or released_settlement[
+                "supersededEffectiveSettlementHash"
+            ]
+            != released_owner_generation["predecessorSettlementHash"]
+            or restored_settlement_hash
+            != released_owner_generation["predecessorSettlementHash"]
+            or release_result["createdAt"] < released_settlement["settledAt"]
+            or release_result["createdAt"] > checked_head["updatedAt"]
+            or restored_settlement_hash
+            != checked_head["effectiveSettlementHash"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "release-restored result bridge does not correlate"
+            )
+        if not active_bridge:
+            if not matching_latest or matching_latest[0] != 0:
+                raise RowAuthorityAmbiguous(
+                    "release result does not bridge the latest settlement"
+                )
+        elif matching_latest:
+            if matching_latest[0] != len(latest) - 1:
+                raise RowAuthorityAmbiguous(
+                    "combined release bridge targets the wrong settlement"
+                )
+            if (
+                matching_latest[0] > 0
+                and release_result["createdAt"]
+                > latest_authorities[matching_latest[0] - 1]["generation"][
+                    "createdAt"
+                ]
+            ):
+                raise RowAuthorityAmbiguous(
+                    "combined release bridge postdates its successor"
+                )
+        else:
+            if (
+                len(latest) != 2
+                or any(
+                    settlement["outcome"] != "dominated"
+                    for settlement in latest
+                )
+                or released_owner_generation["generation"] + 1
+                != latest_authorities[-1]["generation"]["generation"]
+                or latest_authorities[-1]["generation"][
+                    "predecessorSettlementHash"
+                ]
+                != released_settlement[
+                    "supersededEffectiveSettlementHash"
+                ]
+                or release_result["createdAt"]
+                > latest_authorities[-1]["generation"]["createdAt"]
+            ):
+                raise RowAuthorityAmbiguous(
+                    "combined row history lacks its exact release foundation"
+                )
+        raw_restored = row_state.get("restoredAuthority")
+        restored_authority = None
+        if restored_generation is None:
+            if raw_restored is not None or restored_settlement_hash is not None:
+                raise RowAuthorityAmbiguous(
+                    "clear release restoration carries owner authority"
+                )
+        else:
+            if type(raw_restored) is not dict or set(raw_restored) != {
+                "generation",
+                "claimSet",
+                "settlement",
+            }:
+                raise RowAuthorityAmbiguous(
+                    "release restoration lacks exact owner authority"
+                )
+            try:
+                restored_owner_generation = validate_owner_generation_document(
+                    document=raw_restored["generation"]
+                )
+                restored_owner_claim = validate_claim_set_document(
+                    document=raw_restored["claimSet"]
+                )
+                restored_owner_settlement = (
+                    _validate_correlated_owner_settlement(
+                        scope=checked_scope,
+                        row_id=checked_row_id,
+                        generation=restored_owner_generation,
+                        claim=restored_owner_claim,
+                        settlement_document=raw_restored["settlement"],
+                    )
+                )
+            except Exception as exc:
+                raise RowAuthorityAmbiguous(
+                    "release restored owner authority is malformed"
+                ) from exc
+            restored_decisions = [
+                decision
+                for decision in restored_owner_claim["rowDecisions"]
+                if decision["rowId"] == checked_row_id
+            ]
+            if (
+                restored_owner_generation["generation"] != restored_generation
+                or restored_owner_generation["userScopeHash"] != checked_scope
+                or restored_owner_claim["userScopeHash"] != checked_scope
+                or restored_owner_generation["rowId"] != checked_row_id
+                or restored_owner_generation["requestId"]
+                != restored_owner_claim["requestId"]
+                or restored_owner_generation["claimSetHash"]
+                != restored_owner_claim["claimSetHash"]
+                or restored_owner_generation["ownerKind"]
+                not in {"terminal", "human_decision"}
+                or restored_owner_generation["ownerKind"]
+                != restored_owner_claim["ownerKind"]
+                or restored_owner_generation["ownerKey"]
+                != restored_owner_claim["ownerKey"]
+                or restored_owner_generation["priority"]
+                != restored_owner_claim["derivedPriority"]
+                or restored_owner_claim["outcome"] != "accepted"
+                or restored_owner_generation["createdAt"]
+                < restored_owner_claim["createdAt"]
+                or len(restored_decisions) != 1
+                or restored_decisions[0]["decision"] != "accepted"
+                or restored_decisions[0]["plannedGeneration"]
+                != restored_owner_generation["generation"]
+                or restored_owner_settlement["outcome"]
+                != _expected_owner_settlement_outcome(
+                    restored_owner_generation["ownerKind"]
+                )
+                or restored_owner_settlement["settlementHash"]
+                != restored_settlement_hash
+                or restored_owner_settlement["settledAt"]
+                > released_owner_generation["createdAt"]
+                or restored_owner_generation["generation"]
+                >= released_settlement["generation"]
+            ):
+                raise RowAuthorityAmbiguous(
+                    "release restored owner authority does not correlate"
+                )
+            restored_authority = {
+                "generation": restored_owner_generation,
+                "claimSet": restored_owner_claim,
+                "settlement": restored_owner_settlement,
+            }
+        if settlement is not None:
+            restored_owner_matches = (
+                restored_generation == current_number
+                and restored_settlement_hash == settlement["settlementHash"]
+            )
+        elif generation is None:
+            restored_owner_matches = (
+                restored_generation is None
+                and restored_settlement_hash is None
+            )
+        else:
+            restored_owner_matches = (
+                generation["generation"] > latest[0]["generation"]
+                and generation["predecessorSettlementHash"]
+                == restored_settlement_hash
+                and (
+                    restored_authority is None
+                    or generation["priority"]
+                    > restored_authority["generation"]["priority"]
+                )
+                and (
+                    restored_generation is None
+                    or restored_generation < generation["generation"]
+                )
+            )
+        if not restored_owner_matches:
+            raise RowAuthorityAmbiguous(
+                "release-restored result bridge does not match the effective owner"
+            )
+    elif historical_divergence:
+        if (
+            generation is None
+            or checked_head["state"] not in {"claimed", "review_pending"}
+            or not latest
+            or not active_bridge
+            or generation["predecessorSettlementHash"]
+            != checked_head["effectiveSettlementHash"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "row settlement divergence lacks a bounded bridge"
+            )
+
+    next_generation = max(
+        [
+            current_number or 0,
+            *(settlement["generation"] for settlement in latest),
+        ]
+    ) + 1
+    next_fence = max(
+        [
+            checked_head["fencingToken"] or 0,
+            *(settlement["fencingToken"] for settlement in latest),
+        ]
+    ) + 1
+    return {
+        "currentGeneration": generation,
+        "currentClaimSet": claim,
+        "currentSettlement": settlement,
+        "latestSettlements": tuple(latest),
+        "latestSettlementAuthorities": tuple(latest_authorities),
+        "latestPredecessorReleaseMatches": (
+            validated_predecessor_release_matches
+        ),
+        "latestPredecessorRestoredAuthority": (
+            validated_predecessor_restored_authority
+        ),
+        "releaseResult": release_result,
+        "releasedAuthority": released_authority,
+        "restoredAuthority": (
+            restored_authority
+            if release_result is not None
+            else None
+        ),
+        "nextGeneration": next_generation,
+        "nextFirstFencingToken": next_fence,
+    }
 
 
 def _derive_claim_request_context(
@@ -5659,6 +8268,87 @@ def _validate_complete_accepted_claim_cohorts(*, row_states):
             )
 
 
+def _validate_bounded_current_claim_cohorts(*, row_states):
+    """Fail closed on a partial cohort using bounded direct/inductive proof."""
+    states_by_row = {state["rowId"]: state for state in row_states}
+    claims_by_request = {}
+    for state in row_states:
+        claim = state.get("currentClaimSet")
+        if claim is None:
+            continue
+        existing = claims_by_request.setdefault(claim["requestId"], claim)
+        if existing != claim:
+            raise RowAuthorityConflict(
+                "bounded current claim cohort contains divergent copies"
+            )
+    for claim in claims_by_request.values():
+        claim_row_ids = {
+            binding["rowId"] for binding in claim["rowBindings"]
+        }
+        if not claim_row_ids.issubset(states_by_row):
+            continue
+        for decision in claim["rowDecisions"]:
+            state = states_by_row[decision["rowId"]]
+            planned = decision["plannedGeneration"]
+            current = state.get("currentGeneration")
+            if decision["decision"] != "accepted" or planned is None:
+                raise RowAuthorityConflict(
+                    "accepted current claim cohort has a nonaccepted decision"
+                )
+            history = state.get("boundedHistory")
+            if history is None:
+                raise RowAuthorityAmbiguous(
+                    "accepted current claim cohort lacks bounded history"
+                )
+            known_max = history["nextGeneration"] - 1
+            if known_max < planned:
+                raise RowAuthorityConflict(
+                    "accepted current claim cohort is missing a bound generation"
+                )
+            direct_authorities = []
+            if current is not None:
+                direct_authorities.append(
+                    {
+                        "generation": current,
+                        "claimSet": state.get("currentClaimSet"),
+                    }
+                )
+            direct_authorities.extend(
+                history["latestSettlementAuthorities"]
+            )
+            for field in (
+                "releasedAuthority",
+                "restoredAuthority",
+                "latestPredecessorRestoredAuthority",
+            ):
+                authority = history.get(field)
+                if authority is not None:
+                    direct_authorities.append(authority)
+            planned_authorities = [
+                authority
+                for authority in direct_authorities
+                if authority["generation"]["generation"] == planned
+            ]
+            for authority in planned_authorities:
+                generation = authority["generation"]
+                if (
+                    authority["claimSet"] != claim
+                    or generation["requestId"] != claim["requestId"]
+                    or generation["claimSetHash"] != claim["claimSetHash"]
+                    or generation["ownerKind"] != claim["ownerKind"]
+                    or generation["ownerKey"] != claim["ownerKey"]
+                    or generation["priority"] != claim["derivedPriority"]
+                    or generation["createdAt"] < claim["createdAt"]
+                ):
+                    raise RowAuthorityConflict(
+                        "accepted current claim cohort has foreign direct authority"
+                    )
+            if known_max == planned and not planned_authorities:
+                raise RowAuthorityAmbiguous(
+                    "accepted current claim cohort lacks its direct boundary authority"
+                )
+
+
 def _claim_head_is_forward(
     *,
     head,
@@ -5666,12 +8356,13 @@ def _claim_head_is_forward(
     requested_lease_owner_hash,
     requested_lease_until,
     higher_generation_proven=False,
+    release_restoration_proven=False,
 ):
-    current_generation = head["effectiveOwnerGeneration"]
-    if current_generation is None or current_generation < generation["generation"]:
-        return False
     if head["updatedAt"] < generation["createdAt"]:
         return False
+    current_generation = head["effectiveOwnerGeneration"]
+    if current_generation is None or current_generation < generation["generation"]:
+        return bool(release_restoration_proven)
     if current_generation > generation["generation"]:
         return bool(higher_generation_proven)
     if (
@@ -5691,6 +8382,1381 @@ def _claim_head_is_forward(
     ):
         return False
     return True
+
+
+def _validate_bounded_replay_release(
+    *,
+    scope,
+    row_id,
+    matches,
+    released_generation,
+    released_settlement,
+    restored_generation,
+    restored_settlement_hash,
+    not_after,
+):
+    """Validate one exact release result used by a replay-time bracket."""
+    if type(matches) not in {list, tuple}:
+        raise RowAuthorityAmbiguous(
+            "dominated replay release proof is not bounded"
+        )
+    if len(matches) != 1:
+        raise RowAuthorityAmbiguous(
+            "dominated replay release proof is missing or duplicated"
+        )
+    entry = matches[0]
+    if type(entry) is not dict or set(entry) != {"path", "document"}:
+        raise RowAuthorityAmbiguous(
+            "dominated replay release proof is malformed"
+        )
+    try:
+        release = validate_contact_fanout_result_document(
+            document=entry["document"]
+        )
+    except Exception as exc:
+        raise RowAuthorityAmbiguous(
+            "dominated replay release proof is malformed"
+        ) from exc
+    if (
+        type(entry["path"]) is not str
+        or entry["path"].split("/")[-2:]
+        != [
+            "contactOptOutFanoutResults",
+            f"{release['fanoutId']}--{row_id}",
+        ]
+        or release["userScopeHash"] != scope
+        or release["rowId"] != row_id
+        or release["outcome"] != "release"
+        or release["disposition"] != "restore"
+        or release["reasonCode"] != "exact_predecessor"
+        or release["releasedRowGeneration"]
+        != released_generation["generation"]
+        or release["releasedRowSettlementHash"]
+        != released_settlement["settlementHash"]
+        or release["restoredEffectiveGeneration"] != restored_generation
+        or release["restoredEffectiveSettlementHash"]
+        != restored_settlement_hash
+        or release["createdAt"] < released_settlement["settledAt"]
+        or release["createdAt"] > not_after
+    ):
+        raise RowAuthorityAmbiguous(
+            "dominated replay release proof does not correlate"
+        )
+    return release
+
+
+def _bounded_blocked_owner_at_time(*, state, stored_claim):
+    """Return the owner at a blocked replay's claim time from a causal suffix."""
+    history = state["boundedHistory"]
+    claim_at = stored_claim["createdAt"]
+    current = state["currentGeneration"]
+    known_max = history["nextGeneration"] - 1
+    authorities = {}
+
+    def add_authority(authority):
+        if authority is None:
+            return
+        generation = authority["generation"]
+        generation_hash = generation["generationHash"]
+        retained = authorities.get(generation_hash)
+        if retained is None or (
+            retained.get("settlement") is None
+            and authority.get("settlement") is not None
+        ):
+            authorities[generation_hash] = authority
+
+    for authority in history["latestSettlementAuthorities"]:
+        add_authority(authority)
+    add_authority(history.get("releasedAuthority"))
+    if current is not None and current["generation"] == known_max:
+        add_authority(
+            {
+                "generation": current,
+                "claimSet": state.get("currentClaimSet"),
+                "settlement": state.get("currentSettlement"),
+            }
+        )
+
+    restored_authorities = tuple(
+        authority
+        for authority in (
+            history.get("restoredAuthority"),
+            history.get("latestPredecessorRestoredAuthority"),
+        )
+        if authority is not None
+    )
+    for restored in restored_authorities:
+        restored_generation = restored["generation"]
+        restored_settlement = restored["settlement"]
+        if any(
+            authority["generation"]["generation"]
+            == restored_generation["generation"] + 1
+            and authority["generation"]["predecessorSettlementHash"]
+            == restored_settlement["settlementHash"]
+            for authority in authorities.values()
+        ):
+            add_authority(restored)
+
+    events = []
+    for authority in authorities.values():
+        generation = authority["generation"]
+        events.append(
+            {
+                "kind": "generation",
+                "time": generation["createdAt"],
+                "position": 2 * generation["generation"],
+                "owner": generation,
+                "authority": authority,
+            }
+        )
+
+    release_events = {}
+
+    def add_release(release, released, restored):
+        if release is None or released is None:
+            return
+        release_hash = release["contactFanoutResultHash"]
+        event = {
+            "kind": "release",
+            "time": release["createdAt"],
+            "position": 2 * released["generation"]["generation"] + 1,
+            "owner": (
+                None if restored is None else restored["generation"]
+            ),
+            "authority": restored,
+            "release": release,
+            "released": released,
+        }
+        retained = release_events.get(release_hash)
+        if retained is not None and retained != event:
+            raise RowAuthorityAmbiguous(
+                "blocked claim replay release proof is inconsistent"
+            )
+        release_events[release_hash] = event
+
+    add_release(
+        history.get("releaseResult"),
+        history.get("releasedAuthority"),
+        history.get("restoredAuthority"),
+    )
+    predecessor_matches = history["latestPredecessorReleaseMatches"]
+    if predecessor_matches:
+        predecessor_release = predecessor_matches[0]["document"]
+        released_generation_number = predecessor_release[
+            "releasedRowGeneration"
+        ]
+        predecessor_released = next(
+            (
+                authority
+                for authority in history["latestSettlementAuthorities"]
+                if authority["generation"]["generation"]
+                == released_generation_number
+            ),
+            None,
+        )
+        if predecessor_released is None:
+            raise RowAuthorityAmbiguous(
+                "blocked claim replay predecessor release lacks its authority"
+            )
+        add_release(
+            predecessor_release,
+            predecessor_released,
+            history.get("latestPredecessorRestoredAuthority"),
+        )
+    events.extend(release_events.values())
+
+    if any(event["time"] == claim_at for event in events):
+        raise RowAuthorityAmbiguous(
+            "blocked claim replay transition order is ambiguous"
+        )
+    if not events:
+        if current is None and not history["latestSettlements"]:
+            return None
+        raise RowAuthorityAmbiguous(
+            "blocked claim replay lacks a bounded owner-at-time proof"
+        )
+    events.sort(
+        key=lambda event: (
+            event["time"],
+            event["position"],
+            event["kind"],
+        )
+    )
+    before = [event for event in events if event["time"] < claim_at]
+    after = [event for event in events if event["time"] > claim_at]
+    if not before:
+        first = after[0]
+        if (
+            first["kind"] == "generation"
+            and first["owner"]["generation"] == 1
+            and first["owner"]["firstFencingToken"] == 1
+            and first["owner"]["predecessorSettlementHash"] is None
+        ):
+            return None
+        raise RowAuthorityAmbiguous(
+            "blocked claim replay predates its bounded transition window"
+        )
+
+    selected = before[-1]
+    if after:
+        following = after[0]
+        if not _blocked_replay_events_are_adjacent(
+            earlier=selected,
+            later=following,
+        ):
+            raise RowAuthorityAmbiguous(
+                "blocked claim replay transition window has a gap"
+            )
+    else:
+        selected_owner = selected["owner"]
+        if (
+            (selected_owner is None and current is not None)
+            or (
+                selected_owner is not None
+                and (
+                    current is None
+                    or current["generationHash"]
+                    != selected_owner["generationHash"]
+                )
+            )
+        ):
+            raise RowAuthorityAmbiguous(
+                "blocked claim replay transition window does not reach current state"
+            )
+    return selected["owner"]
+
+
+def _blocked_replay_events_are_adjacent(*, earlier, later):
+    """Return whether two validated events directly bound one owner interval."""
+    if earlier["kind"] == "generation":
+        authority = earlier["authority"]
+        generation = authority["generation"]
+        settlement = authority.get("settlement")
+        if later["kind"] == "release":
+            return (
+                later["released"]["generation"]["generationHash"]
+                == generation["generationHash"]
+            )
+        successor = later["authority"]["generation"]
+        if (
+            settlement is None
+            or successor["generation"] != generation["generation"] + 1
+            or successor["priority"] <= generation["priority"]
+        ):
+            return False
+        if settlement["outcome"] == "dominated":
+            return (
+                settlement["dominantGenerationHash"]
+                == successor["generationHash"]
+                and settlement["settledAt"] == successor["createdAt"]
+                and successor["predecessorSettlementHash"]
+                == generation["predecessorSettlementHash"]
+            )
+        return (
+            successor["predecessorSettlementHash"]
+            == settlement["settlementHash"]
+        )
+
+    if later["kind"] != "generation":
+        return False
+    released_generation = earlier["released"]["generation"]
+    successor = later["authority"]["generation"]
+    restored = earlier["authority"]
+    restored_hash = (
+        None
+        if restored is None
+        else restored["settlement"]["settlementHash"]
+    )
+    restored_priority = (
+        None if restored is None else restored["generation"]["priority"]
+    )
+    return (
+        successor["generation"] == released_generation["generation"] + 1
+        and successor["predecessorSettlementHash"] == restored_hash
+        and (
+            restored_priority is None
+            or successor["priority"] > restored_priority
+        )
+    )
+
+
+def _validate_bounded_dominated_replay(
+    *, scope, state, decision, stored_claim
+):
+    """Validate one immutable dominated decision without replaying 1..N."""
+    if decision["decision"] == "blocked_by_claim_set":
+        owner_at_time = _bounded_blocked_owner_at_time(
+            state=state,
+            stored_claim=stored_claim,
+        )
+        if (
+            owner_at_time is not None
+            and stored_claim["derivedPriority"] <= owner_at_time["priority"]
+        ):
+            raise RowAuthorityConflict(
+                "blocked claim replay row should have been dominated"
+            )
+        return
+    if decision["decision"] != "dominated":
+        raise RowAuthorityConflict(
+            "dominated claim replay contains an unsupported decision"
+        )
+    matches = state.get("replayWinnerMatches")
+    if type(matches) not in {list, tuple}:
+        raise RowAuthorityConflict(
+            "dominated claim replay lacks a bounded winner proof"
+        )
+    if len(matches) > 1:
+        raise RowAuthorityAmbiguous(
+            "dominated claim replay winner is duplicated"
+        )
+    if len(matches) != 1:
+        raise RowAuthorityConflict(
+            "dominated claim replay lacks its immutable winner"
+        )
+    entry = matches[0]
+    if type(entry) is not dict or set(entry) != {"path", "document"}:
+        raise RowAuthorityConflict(
+            "dominated claim replay winner proof is malformed"
+        )
+    try:
+        winner = validate_owner_generation_document(document=entry["document"])
+        winner_claim = validate_claim_set_document(
+            document=state.get("replayWinnerClaimSet")
+        )
+        expected_id = _generation_document_id(
+            row_id=state["rowId"],
+            generation=winner["generation"],
+        )
+    except Exception as exc:
+        raise RowAuthorityConflict(
+            "dominated claim replay winner authority is malformed"
+        ) from exc
+    matching_decisions = [
+        item
+        for item in winner_claim["rowDecisions"]
+        if item["rowId"] == state["rowId"]
+    ]
+    if winner_claim["authorityOrigin"] == "authenticated_operator":
+        minimum_writes = 2 + (3 * winner_claim["bindingCount"])
+        maximum_writes = minimum_writes
+    else:
+        minimum_writes = 1 + (2 * winner_claim["bindingCount"])
+        maximum_writes = minimum_writes + sum(
+            item["plannedGeneration"] is not None
+            and item["plannedGeneration"] > 1
+            for item in winner_claim["rowDecisions"]
+        )
+    if (
+        type(entry["path"]) is not str
+        or entry["path"].split("/")[-2:]
+        != ["rowOwnerGenerations", expected_id]
+        or winner["userScopeHash"] != scope
+        or winner_claim["userScopeHash"] != scope
+        or winner["rowId"] != state["rowId"]
+        or winner["generationHash"] != decision["winnerGenerationHash"]
+        or winner["requestId"] != winner_claim["requestId"]
+        or winner["claimSetHash"] != winner_claim["claimSetHash"]
+        or winner["ownerKind"] != winner_claim["ownerKind"]
+        or winner["ownerKey"] != winner_claim["ownerKey"]
+        or winner["priority"] != winner_claim["derivedPriority"]
+        or winner_claim["outcome"] != "accepted"
+        or len(matching_decisions) != 1
+        or matching_decisions[0]["decision"] != "accepted"
+        or matching_decisions[0]["plannedGeneration"]
+        != winner["generation"]
+        or winner["createdAt"] < winner_claim["createdAt"]
+        or not (
+            minimum_writes
+            <= winner_claim["plannedWrites"]
+            <= maximum_writes
+        )
+        or stored_claim["derivedPriority"] > winner["priority"]
+        or winner["createdAt"] > stored_claim["createdAt"]
+    ):
+        raise RowAuthorityConflict(
+            "dominated claim replay winner does not correlate"
+        )
+    winner_settlement = None
+    if state.get("replayWinnerSettlement") is not None:
+        winner_settlement = _validate_correlated_owner_settlement(
+            scope=scope,
+            row_id=state["rowId"],
+            generation=winner,
+            claim=winner_claim,
+            settlement_document=state["replayWinnerSettlement"],
+        )
+        if winner_settlement["outcome"] not in {
+            "dominated",
+            _expected_owner_settlement_outcome(winner["ownerKind"]),
+        }:
+            raise RowAuthorityConflict(
+                "dominated replay winner settlement has an invalid outcome"
+            )
+        if (
+            winner_settlement["outcome"] == "dominated"
+            and winner_settlement["settledAt"]
+            <= stored_claim["createdAt"]
+        ):
+            if (
+                winner_settlement["settledAt"]
+                == stored_claim["createdAt"]
+            ):
+                raise RowAuthorityAmbiguous(
+                    "dominated replay winner transition order is ambiguous"
+                )
+            raise RowAuthorityConflict(
+                "dominated replay winner was superseded before the claim"
+            )
+    possible_settlement_hashes = {winner["predecessorSettlementHash"]}
+    if winner_settlement is not None and winner_settlement[
+        "outcome"
+    ] != "dominated":
+        if winner_settlement["settledAt"] < stored_claim["createdAt"]:
+            possible_settlement_hashes = {
+                winner_settlement["settlementHash"]
+            }
+        elif winner_settlement["settledAt"] == stored_claim["createdAt"]:
+            possible_settlement_hashes.add(
+                winner_settlement["settlementHash"]
+            )
+    if decision["winnerSettlementHash"] not in possible_settlement_hashes:
+        raise RowAuthorityConflict(
+            "dominated claim replay winner settlement drifted"
+        )
+
+    history = state["boundedHistory"]
+    latest = history["latestSettlements"]
+    latest_authorities = history["latestSettlementAuthorities"]
+    current = state.get("currentGeneration")
+    known_max = max(
+        current["generation"] if current is not None else 0,
+        latest[0]["generation"] if latest else 0,
+    )
+    if known_max < winner["generation"]:
+        raise RowAuthorityConflict(
+            "dominated replay winner is ahead of bounded row history"
+        )
+    winner_boundary_matches = 0
+    if current is not None and current["generation"] == winner["generation"]:
+        winner_boundary_matches += 1
+        if (
+            current != winner
+            or state.get("currentClaimSet") != winner_claim
+            or state.get("currentSettlement") != winner_settlement
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay winner differs from current authority"
+            )
+    for authority in latest_authorities:
+        if authority["generation"]["generation"] != winner["generation"]:
+            continue
+        winner_boundary_matches += 1
+        if (
+            authority["generation"] != winner
+            or authority["claimSet"] != winner_claim
+            or authority["settlement"] != winner_settlement
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay winner differs from bounded history"
+            )
+    if known_max == winner["generation"] and winner_boundary_matches == 0:
+        raise RowAuthorityAmbiguous(
+            "dominated replay winner lacks a bounded row boundary"
+        )
+
+    successor_document = state.get("replayWinnerSuccessorGeneration")
+    successor_required = known_max > winner["generation"]
+    if successor_required and successor_document is None:
+        raise RowAuthorityAmbiguous(
+            "dominated replay winner lacks its exact successor"
+        )
+    if not successor_required and successor_document is not None:
+        raise RowAuthorityAmbiguous(
+            "dominated replay winner has orphan successor state"
+        )
+    if successor_document is None:
+        current_is_winner = (
+            current is not None
+            and current["generation"] == winner["generation"]
+        )
+        if not current_is_winner:
+            release = history.get("releaseResult")
+            released = history.get("releasedAuthority")
+            if (
+                release is None
+                or released is None
+                or released.get("generation") != winner
+                or released.get("claimSet") != winner_claim
+                or released.get("settlement") != winner_settlement
+            ):
+                raise RowAuthorityAmbiguous(
+                    "dominated replay winner exit is not bounded"
+                )
+            if release["createdAt"] <= stored_claim["createdAt"]:
+                if release["createdAt"] == stored_claim["createdAt"]:
+                    raise RowAuthorityAmbiguous(
+                        "dominated replay winner release order is ambiguous"
+                    )
+                raise RowAuthorityConflict(
+                    "dominated replay winner was released before the claim"
+                )
+        return
+    try:
+        successor = validate_owner_generation_document(
+            document=successor_document
+        )
+        successor_claim = validate_claim_set_document(
+            document=state.get("replayWinnerSuccessorClaimSet")
+        )
+    except Exception as exc:
+        raise RowAuthorityConflict(
+            "dominated claim replay winner successor is malformed"
+        ) from exc
+    successor_decisions = [
+        item
+        for item in successor_claim["rowDecisions"]
+        if item["rowId"] == state["rowId"]
+    ]
+    if successor_claim["authorityOrigin"] == "authenticated_operator":
+        successor_minimum_writes = 2 + (
+            3 * successor_claim["bindingCount"]
+        )
+        successor_maximum_writes = successor_minimum_writes
+    else:
+        successor_minimum_writes = 1 + (
+            2 * successor_claim["bindingCount"]
+        )
+        successor_maximum_writes = successor_minimum_writes + sum(
+            item["plannedGeneration"] is not None
+            and item["plannedGeneration"] > 1
+            for item in successor_claim["rowDecisions"]
+        )
+    if (
+        successor["userScopeHash"] != scope
+        or successor_claim["userScopeHash"] != scope
+        or successor["rowId"] != state["rowId"]
+        or successor["generation"] != winner["generation"] + 1
+        or successor["requestId"] != successor_claim["requestId"]
+        or successor["claimSetHash"] != successor_claim["claimSetHash"]
+        or successor["ownerKind"] != successor_claim["ownerKind"]
+        or successor["ownerKey"] != successor_claim["ownerKey"]
+        or successor["priority"] != successor_claim["derivedPriority"]
+        or successor_claim["outcome"] != "accepted"
+        or successor["createdAt"] < successor_claim["createdAt"]
+        or len(successor_decisions) != 1
+        or successor_decisions[0]["decision"] != "accepted"
+        or successor_decisions[0]["plannedGeneration"]
+        != successor["generation"]
+        or not (
+            successor_minimum_writes
+            <= successor_claim["plannedWrites"]
+            <= successor_maximum_writes
+        )
+    ):
+        raise RowAuthorityConflict(
+            "dominated replay winner successor does not correlate"
+        )
+    successor_settlement = None
+    if state.get("replayWinnerSuccessorSettlement") is not None:
+        successor_settlement = _validate_correlated_owner_settlement(
+            scope=scope,
+            row_id=state["rowId"],
+            generation=successor,
+            claim=successor_claim,
+            settlement_document=state[
+                "replayWinnerSuccessorSettlement"
+            ],
+        )
+        if successor_settlement["outcome"] not in {
+            "dominated",
+            _expected_owner_settlement_outcome(successor["ownerKind"]),
+        }:
+            raise RowAuthorityConflict(
+                "dominated replay winner successor settlement is invalid"
+            )
+    successor_boundary_matches = 0
+    if current is not None and current["generation"] == successor["generation"]:
+        successor_boundary_matches += 1
+        if (
+            current != successor
+            or state.get("currentClaimSet") != successor_claim
+            or state.get("currentSettlement") != successor_settlement
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay successor differs from current authority"
+            )
+    for authority in latest_authorities:
+        if authority["generation"]["generation"] != successor["generation"]:
+            continue
+        successor_boundary_matches += 1
+        if (
+            authority["generation"] != successor
+            or authority["claimSet"] != successor_claim
+            or authority["settlement"] != successor_settlement
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay successor differs from bounded history"
+            )
+    if known_max == successor["generation"] and successor_boundary_matches == 0:
+        raise RowAuthorityAmbiguous(
+            "dominated replay successor lacks a bounded row boundary"
+        )
+    if known_max > successor["generation"] and successor_settlement is None:
+        raise RowAuthorityAmbiguous(
+            "historical dominated replay successor lacks a settlement"
+        )
+    if winner_settlement is None:
+        raise RowAuthorityAmbiguous(
+            "dominated replay winner lacks its successor settlement bridge"
+        )
+
+    forward_release = None
+    if winner_settlement["outcome"] == "dominated":
+        if (
+            winner_settlement["dominantGenerationHash"]
+            != successor["generationHash"]
+            or winner_settlement["settledAt"] != successor["createdAt"]
+            or successor["predecessorSettlementHash"]
+            != winner["predecessorSettlementHash"]
+            or successor["priority"] <= winner["priority"]
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay successor does not link its dominated winner"
+            )
+    elif (
+        successor["predecessorSettlementHash"]
+        == winner_settlement["settlementHash"]
+    ):
+        if (
+            successor["priority"] <= winner["priority"]
+            or winner_settlement["settledAt"] > successor["createdAt"]
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay direct successor regresses authority"
+            )
+    else:
+        if (
+            winner["ownerKind"] != "contact_optout"
+            or winner_settlement["outcome"] != "contact_optout"
+            or successor["predecessorSettlementHash"]
+            != winner["predecessorSettlementHash"]
+            or winner_settlement["supersededEffectiveSettlementHash"]
+            != winner["predecessorSettlementHash"]
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay successor does not link forward"
+            )
+        raw_link_restored = state.get(
+            "replayWinnerSuccessorRestoredAuthority"
+        )
+        raw_link_generation = (
+            raw_link_restored.get("generation")
+            if type(raw_link_restored) is dict
+            else None
+        )
+        restored_generation_number = (
+            raw_link_generation.get("generation")
+            if type(raw_link_generation) is dict
+            else None
+        )
+        forward_release = _validate_bounded_replay_release(
+            scope=scope,
+            row_id=state["rowId"],
+            matches=state.get(
+                "replayWinnerSuccessorReleaseMatches"
+            ),
+            released_generation=winner,
+            released_settlement=winner_settlement,
+            restored_generation=restored_generation_number,
+            restored_settlement_hash=successor[
+                "predecessorSettlementHash"
+            ],
+            not_after=successor["createdAt"],
+        )
+        _validate_bounded_release_restored_authority(
+            scope=scope,
+            row_id=state["rowId"],
+            release_result=forward_release,
+            released_generation=winner,
+            raw_restored_authority=raw_link_restored,
+            successor_generation=successor,
+        )
+
+    if successor["createdAt"] > stored_claim["createdAt"]:
+        if (
+            forward_release is not None
+            and forward_release["createdAt"]
+            <= stored_claim["createdAt"]
+        ):
+            if (
+                forward_release["createdAt"]
+                == stored_claim["createdAt"]
+            ):
+                raise RowAuthorityAmbiguous(
+                    "dominated replay winner release order is ambiguous"
+                )
+            raise RowAuthorityConflict(
+                "dominated replay winner was released before the claim"
+            )
+        return
+    if successor["createdAt"] == stored_claim["createdAt"]:
+        raise RowAuthorityAmbiguous(
+            "dominated replay winner successor order is ambiguous"
+        )
+    if (
+        successor["ownerKind"] != "contact_optout"
+        or successor_settlement is None
+        or successor_settlement["outcome"] != "contact_optout"
+        or successor["predecessorSettlementHash"]
+        != winner_settlement["settlementHash"]
+        or winner["ownerKind"] not in {"terminal", "human_decision"}
+        or winner_settlement["outcome"]
+        != _expected_owner_settlement_outcome(winner["ownerKind"])
+    ):
+        raise RowAuthorityConflict(
+            "dominated replay winner was not restored by its successor"
+        )
+
+    exact_release_not_after = stored_claim["createdAt"]
+    raw_exact_release_matches = state.get(
+        "replayWinnerRestorationReleaseMatches"
+    )
+    if (
+        type(raw_exact_release_matches) in {list, tuple}
+        and len(raw_exact_release_matches) == 1
+        and type(raw_exact_release_matches[0]) is dict
+    ):
+        try:
+            raw_exact_release = validate_contact_fanout_result_document(
+                document=raw_exact_release_matches[0].get("document")
+            )
+            if raw_exact_release["createdAt"] > exact_release_not_after:
+                exact_release_not_after = raw_exact_release["createdAt"]
+        except Exception:
+            pass
+    exact_restoration_release = _validate_bounded_replay_release(
+        scope=scope,
+        row_id=state["rowId"],
+        matches=raw_exact_release_matches,
+        released_generation=successor,
+        released_settlement=successor_settlement,
+        restored_generation=winner["generation"],
+        restored_settlement_hash=winner_settlement["settlementHash"],
+        not_after=exact_release_not_after,
+    )
+    if exact_restoration_release["createdAt"] == stored_claim["createdAt"]:
+        raise RowAuthorityAmbiguous(
+            "dominated replay winner restoration order is ambiguous"
+        )
+    exact_restored_winner = _validate_bounded_release_restored_authority(
+        scope=scope,
+        row_id=state["rowId"],
+        release_result=exact_restoration_release,
+        released_generation=successor,
+        raw_restored_authority=state.get(
+            "replayWinnerRestoredAuthority"
+        ),
+        successor_generation=successor,
+    )
+    if (
+        exact_restored_winner is None
+        or exact_restored_winner["generation"] != winner
+        or exact_restored_winner["claimSet"] != winner_claim
+        or exact_restored_winner["settlement"] != winner_settlement
+    ):
+        raise RowAuthorityConflict(
+            "dominated replay exact successor restored another winner"
+        )
+
+    restoration_exit_document = state.get(
+        "replayWinnerRestorationExitGeneration"
+    )
+    restoration_exit_claim_document = state.get(
+        "replayWinnerRestorationExitClaimSet"
+    )
+    restoration_exit_settlement_document = state.get(
+        "replayWinnerRestorationExitSettlement"
+    )
+    restoration_exit_authority = None
+    if restoration_exit_document is None:
+        if (
+            restoration_exit_claim_document is not None
+            or restoration_exit_settlement_document is not None
+        ):
+            raise RowAuthorityAmbiguous(
+                "dominated replay restoration exit is orphaned"
+            )
+        if known_max > successor["generation"]:
+            raise RowAuthorityAmbiguous(
+                "dominated replay restored winner lacks its exact exit"
+            )
+    else:
+        try:
+            restoration_exit = validate_owner_generation_document(
+                document=restoration_exit_document
+            )
+            restoration_exit_claim = validate_claim_set_document(
+                document=restoration_exit_claim_document
+            )
+        except Exception as exc:
+            raise RowAuthorityConflict(
+                "dominated replay restoration exit is malformed"
+            ) from exc
+        restoration_exit_decisions = [
+            item
+            for item in restoration_exit_claim["rowDecisions"]
+            if item["rowId"] == state["rowId"]
+        ]
+        if restoration_exit_claim["authorityOrigin"] == (
+            "authenticated_operator"
+        ):
+            restoration_exit_minimum_writes = 2 + (
+                3 * restoration_exit_claim["bindingCount"]
+            )
+            restoration_exit_maximum_writes = (
+                restoration_exit_minimum_writes
+            )
+        else:
+            restoration_exit_minimum_writes = 1 + (
+                2 * restoration_exit_claim["bindingCount"]
+            )
+            restoration_exit_maximum_writes = (
+                restoration_exit_minimum_writes
+                + sum(
+                    item["plannedGeneration"] is not None
+                    and item["plannedGeneration"] > 1
+                    for item in restoration_exit_claim["rowDecisions"]
+                )
+            )
+        if (
+            restoration_exit["userScopeHash"] != scope
+            or restoration_exit_claim["userScopeHash"] != scope
+            or restoration_exit["rowId"] != state["rowId"]
+            or restoration_exit["generation"]
+            != successor["generation"] + 1
+            or restoration_exit["requestId"]
+            != restoration_exit_claim["requestId"]
+            or restoration_exit["claimSetHash"]
+            != restoration_exit_claim["claimSetHash"]
+            or restoration_exit["ownerKind"]
+            != restoration_exit_claim["ownerKind"]
+            or restoration_exit["ownerKey"]
+            != restoration_exit_claim["ownerKey"]
+            or restoration_exit["priority"]
+            != restoration_exit_claim["derivedPriority"]
+            or restoration_exit_claim["outcome"] != "accepted"
+            or restoration_exit["createdAt"]
+            < restoration_exit_claim["createdAt"]
+            or len(restoration_exit_decisions) != 1
+            or restoration_exit_decisions[0]["decision"] != "accepted"
+            or restoration_exit_decisions[0]["plannedGeneration"]
+            != restoration_exit["generation"]
+            or not (
+                restoration_exit_minimum_writes
+                <= restoration_exit_claim["plannedWrites"]
+                <= restoration_exit_maximum_writes
+            )
+            or restoration_exit["predecessorSettlementHash"]
+            != winner_settlement["settlementHash"]
+            or restoration_exit["priority"] <= winner["priority"]
+            or restoration_exit["createdAt"]
+            < exact_restoration_release["createdAt"]
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay restoration exit does not correlate"
+            )
+        restoration_exit_settlement = None
+        if restoration_exit_settlement_document is not None:
+            restoration_exit_settlement = (
+                _validate_correlated_owner_settlement(
+                    scope=scope,
+                    row_id=state["rowId"],
+                    generation=restoration_exit,
+                    claim=restoration_exit_claim,
+                    settlement_document=(
+                        restoration_exit_settlement_document
+                    ),
+                )
+            )
+            if restoration_exit_settlement["outcome"] not in {
+                "dominated",
+                _expected_owner_settlement_outcome(
+                    restoration_exit["ownerKind"]
+                ),
+            }:
+                raise RowAuthorityConflict(
+                    "dominated replay restoration exit settlement is invalid"
+                )
+        if known_max < restoration_exit["generation"]:
+            raise RowAuthorityAmbiguous(
+                "dominated replay restoration exit is ahead of history"
+            )
+        restoration_exit_boundary_matches = 0
+        if (
+            current is not None
+            and current["generation"] == restoration_exit["generation"]
+        ):
+            restoration_exit_boundary_matches += 1
+            if (
+                current != restoration_exit
+                or state.get("currentClaimSet")
+                != restoration_exit_claim
+                or state.get("currentSettlement")
+                != restoration_exit_settlement
+            ):
+                raise RowAuthorityConflict(
+                    "dominated replay restoration exit differs from current authority"
+                )
+        for authority in latest_authorities:
+            if authority["generation"]["generation"] != (
+                restoration_exit["generation"]
+            ):
+                continue
+            restoration_exit_boundary_matches += 1
+            if (
+                authority["generation"] != restoration_exit
+                or authority["claimSet"] != restoration_exit_claim
+                or authority["settlement"]
+                != restoration_exit_settlement
+            ):
+                raise RowAuthorityConflict(
+                    "dominated replay restoration exit differs from bounded history"
+                )
+        if (
+            known_max == restoration_exit["generation"]
+            and restoration_exit_boundary_matches == 0
+        ):
+            raise RowAuthorityAmbiguous(
+                "dominated replay restoration exit lacks a bounded boundary"
+            )
+        if (
+            known_max > restoration_exit["generation"]
+            and restoration_exit_settlement is None
+        ):
+            raise RowAuthorityAmbiguous(
+                "historical dominated replay restoration exit lacks a settlement"
+            )
+        restoration_exit_authority = {
+            "generation": restoration_exit,
+            "claimSet": restoration_exit_claim,
+            "settlement": restoration_exit_settlement,
+        }
+
+    restoration_candidates = []
+    restoration_candidates.append(
+        {
+            "release": exact_restoration_release,
+            "released": {
+                "generation": successor,
+                "claimSet": successor_claim,
+                "settlement": successor_settlement,
+            },
+            "restored": exact_restored_winner,
+        }
+    )
+    if history.get("releaseResult") is not None:
+        restoration_candidates.append(
+            {
+                "release": history["releaseResult"],
+                "released": history.get("releasedAuthority"),
+                "restored": history.get("restoredAuthority"),
+            }
+        )
+    predecessor_releases = history.get(
+        "latestPredecessorReleaseMatches"
+    )
+    if (
+        type(predecessor_releases) in {list, tuple}
+        and len(predecessor_releases) == 1
+        and len(latest_authorities) == 2
+    ):
+        restoration_candidates.append(
+            {
+                "release": predecessor_releases[0]["document"],
+                "released": latest_authorities[1],
+                "restored": history.get(
+                    "latestPredecessorRestoredAuthority"
+                ),
+            }
+        )
+    valid_restorations = []
+    seen_release_hashes = set()
+    for candidate in restoration_candidates:
+        release = candidate["release"]
+        released = candidate["released"]
+        restored = candidate["restored"]
+        if (
+            type(released) is not dict
+            or type(restored) is not dict
+            or restored.get("generation") != winner
+            or restored.get("claimSet") != winner_claim
+            or restored.get("settlement") != winner_settlement
+            or release["restoredEffectiveGeneration"]
+            != winner["generation"]
+            or release["restoredEffectiveSettlementHash"]
+            != winner_settlement["settlementHash"]
+            or released["generation"]["ownerKind"]
+            != "contact_optout"
+            or released["generation"]["predecessorSettlementHash"]
+            != winner_settlement["settlementHash"]
+            or released["settlement"]["outcome"] != "contact_optout"
+            or released["settlement"][
+                "supersededEffectiveSettlementHash"
+            ]
+            != winner_settlement["settlementHash"]
+            or released["generation"]["priority"] <= winner["priority"]
+            or released["generation"]["generation"]
+            < successor["generation"]
+        ):
+            continue
+        release_hash = release["contactFanoutResultHash"]
+        if release_hash not in seen_release_hashes:
+            seen_release_hashes.add(release_hash)
+            valid_restorations.append(candidate)
+    if any(
+        candidate["release"]["createdAt"]
+        == stored_claim["createdAt"]
+        for candidate in valid_restorations
+    ):
+        raise RowAuthorityAmbiguous(
+            "dominated replay winner restoration order is ambiguous"
+        )
+    prior_restorations = [
+        candidate
+        for candidate in valid_restorations
+        if candidate["release"]["createdAt"]
+        < stored_claim["createdAt"]
+    ]
+    if not prior_restorations:
+        raise RowAuthorityConflict(
+            "dominated replay winner lacks a prior restoration"
+        )
+    prior_restorations.sort(
+        key=lambda candidate: (
+            candidate["release"]["createdAt"],
+            candidate["released"]["generation"]["generation"],
+            candidate["release"]["contactFanoutResultHash"],
+        ),
+        reverse=True,
+    )
+    restoration = prior_restorations[0]
+    restoration_release = restoration["release"]
+    released_restoration = restoration["released"]
+    restoration_generation = released_restoration["generation"][
+        "generation"
+    ]
+    if known_max < restoration_generation:
+        raise RowAuthorityConflict(
+            "dominated replay restoration is ahead of bounded history"
+        )
+    if known_max == restoration_generation:
+        if (
+            current != winner
+            or state.get("currentClaimSet") != winner_claim
+            or state.get("currentSettlement") != winner_settlement
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay restored winner is not current"
+            )
+        return
+    exit_generation_number = restoration_generation + 1
+    exit_authorities = []
+    if (
+        restoration_generation == successor["generation"]
+        and restoration_exit_authority is not None
+    ):
+        exit_authorities.append(restoration_exit_authority)
+    if (
+        current is not None
+        and current["generation"] == exit_generation_number
+    ):
+        exit_authorities.append(
+            {
+                "generation": current,
+                "claimSet": state.get("currentClaimSet"),
+                "settlement": state.get("currentSettlement"),
+            }
+        )
+    exit_authorities.extend(
+        authority
+        for authority in latest_authorities
+        if authority["generation"]["generation"]
+        == exit_generation_number
+    )
+    if not exit_authorities:
+        raise RowAuthorityAmbiguous(
+            "dominated replay restored-winner exit is not bounded"
+        )
+    for authority in exit_authorities:
+        exit_generation = authority["generation"]
+        if exit_generation["createdAt"] <= stored_claim["createdAt"]:
+            if exit_generation["createdAt"] == stored_claim["createdAt"]:
+                raise RowAuthorityAmbiguous(
+                    "dominated replay restored-winner exit order is ambiguous"
+                )
+            raise RowAuthorityConflict(
+                "dominated replay restored winner exited before the claim"
+            )
+        if (
+            exit_generation["predecessorSettlementHash"]
+            != winner_settlement["settlementHash"]
+            or exit_generation["priority"] <= winner["priority"]
+            or exit_generation["createdAt"]
+            < restoration_release["createdAt"]
+        ):
+            raise RowAuthorityConflict(
+                "dominated replay restored-winner exit does not correlate"
+            )
+
+
+def _validate_bounded_accepted_replay(
+    *, scope, state, decision, stored_claim, lease_owner, deadline
+):
+    """Validate one accepted generation and its direct historical bracket."""
+    candidate = state.get("candidateGeneration")
+    if candidate is None:
+        raise RowAuthorityAmbiguous(
+            "accepted claim replay is missing its generation"
+        )
+    try:
+        generation = validate_owner_generation_document(document=candidate)
+    except Exception as exc:
+        raise RowAuthorityConflict(
+            "accepted claim generation contains immutable drift"
+        ) from exc
+    if (
+        generation["userScopeHash"] != scope
+        or generation["rowId"] != decision["rowId"]
+        or generation["generation"] != decision["plannedGeneration"]
+        or generation["requestId"] != stored_claim["requestId"]
+        or generation["claimSetHash"] != stored_claim["claimSetHash"]
+        or generation["ownerKind"] != stored_claim["ownerKind"]
+        or generation["ownerKey"] != stored_claim["ownerKey"]
+        or generation["priority"] != stored_claim["derivedPriority"]
+        or generation["createdAt"] < stored_claim["createdAt"]
+    ):
+        raise RowAuthorityConflict(
+            "accepted claim generation does not correlate"
+        )
+    candidate_settlement = state.get("candidateSettlement")
+    checked_candidate_settlement = None
+    if candidate_settlement is not None:
+        checked_candidate_settlement = _validate_correlated_owner_settlement(
+            scope=scope,
+            row_id=state["rowId"],
+            generation=generation,
+            claim=stored_claim,
+            settlement_document=candidate_settlement,
+        )
+        if checked_candidate_settlement["settledAt"] > state["head"][
+            "updatedAt"
+        ]:
+            raise RowAuthorityConflict(
+                "accepted claim settlement postdates the current row head"
+            )
+    current_number = state["head"]["effectiveOwnerGeneration"]
+    bounded_history = state["boundedHistory"]
+    latest_settlements = bounded_history["latestSettlements"]
+    historical_settlement_proven = (
+        checked_candidate_settlement is not None
+        and bool(latest_settlements)
+        and generation["generation"]
+        <= latest_settlements[0]["generation"]
+    )
+    if not _claim_head_is_forward(
+        head=state["head"],
+        generation=generation,
+        requested_lease_owner_hash=lease_owner,
+        requested_lease_until=deadline,
+        higher_generation_proven=(
+            current_number is not None
+            and current_number > generation["generation"]
+        ),
+        release_restoration_proven=historical_settlement_proven,
+    ):
+        raise RowAuthorityConflict(
+            "accepted claim replay found a regressed row head"
+        )
+
+    if generation["generation"] == 1:
+        if (
+            generation["predecessorSettlementHash"] is not None
+            or generation["firstFencingToken"] != 1
+            or any(
+                state.get(field) is not None
+                for field in (
+                    "candidatePredecessorGeneration",
+                    "candidatePredecessorClaimSet",
+                    "candidatePredecessorSettlement",
+                )
+            )
+        ):
+            raise RowAuthorityConflict(
+                "first accepted replay has predecessor ownership state"
+            )
+        return generation, None
+
+    try:
+        predecessor_generation = validate_owner_generation_document(
+            document=state.get("candidatePredecessorGeneration")
+        )
+        predecessor_claim = validate_claim_set_document(
+            document=state.get("candidatePredecessorClaimSet")
+        )
+        predecessor_settlement = _validate_correlated_owner_settlement(
+            scope=scope,
+            row_id=state["rowId"],
+            generation=predecessor_generation,
+            claim=predecessor_claim,
+            settlement_document=state.get("candidatePredecessorSettlement"),
+        )
+    except RowAuthorityError:
+        raise
+    except Exception as exc:
+        raise RowAuthorityConflict(
+            "accepted replay lacks its exact predecessor proof"
+        ) from exc
+    predecessor_decisions = [
+        item
+        for item in predecessor_claim["rowDecisions"]
+        if item["rowId"] == state["rowId"]
+    ]
+    if (
+        predecessor_generation["userScopeHash"] != scope
+        or predecessor_claim["userScopeHash"] != scope
+        or predecessor_generation["rowId"] != state["rowId"]
+        or predecessor_generation["generation"]
+        != generation["generation"] - 1
+        or predecessor_generation["requestId"]
+        != predecessor_claim["requestId"]
+        or predecessor_generation["claimSetHash"]
+        != predecessor_claim["claimSetHash"]
+        or predecessor_generation["ownerKind"]
+        != predecessor_claim["ownerKind"]
+        or predecessor_generation["ownerKey"]
+        != predecessor_claim["ownerKey"]
+        or predecessor_generation["priority"]
+        != predecessor_claim["derivedPriority"]
+        or predecessor_claim["outcome"] != "accepted"
+        or predecessor_generation["createdAt"]
+        < predecessor_claim["createdAt"]
+        or len(predecessor_decisions) != 1
+        or predecessor_decisions[0]["decision"] != "accepted"
+        or predecessor_decisions[0]["plannedGeneration"]
+        != predecessor_generation["generation"]
+        or predecessor_settlement["outcome"]
+        not in {
+            "dominated",
+            _expected_owner_settlement_outcome(
+                predecessor_generation["ownerKind"]
+            ),
+        }
+        or generation["firstFencingToken"]
+        != predecessor_settlement["fencingToken"] + 1
+        or predecessor_settlement["settledAt"] > generation["createdAt"]
+    ):
+        raise RowAuthorityConflict(
+            "accepted replay predecessor bracket does not correlate"
+        )
+    if predecessor_settlement["outcome"] == "dominated":
+        if (
+            predecessor_settlement["dominantGenerationHash"]
+            != generation["generationHash"]
+            or predecessor_settlement["settledAt"] != generation["createdAt"]
+            or generation["predecessorSettlementHash"]
+            != predecessor_generation["predecessorSettlementHash"]
+            or generation["priority"] <= predecessor_generation["priority"]
+        ):
+            raise RowAuthorityConflict(
+                "accepted replay dominated predecessor does not link forward"
+            )
+        return generation, predecessor_settlement
+    if (
+        generation["predecessorSettlementHash"]
+        == predecessor_settlement["settlementHash"]
+    ):
+        if generation["priority"] <= predecessor_generation["priority"]:
+            raise RowAuthorityConflict(
+                "accepted replay direct predecessor has equal or higher priority"
+            )
+        return generation, None
+    if (
+        predecessor_generation["ownerKind"] != "contact_optout"
+        or predecessor_settlement["outcome"] != "contact_optout"
+        or generation["predecessorSettlementHash"]
+        != predecessor_settlement["supersededEffectiveSettlementHash"]
+        or predecessor_generation["predecessorSettlementHash"]
+        != predecessor_settlement["supersededEffectiveSettlementHash"]
+    ):
+        raise RowAuthorityConflict(
+            "accepted replay predecessor settlement does not link forward"
+        )
+    release_matches = state.get("candidatePredecessorReleaseMatches")
+    if type(release_matches) not in {list, tuple}:
+        raise RowAuthorityAmbiguous(
+            "accepted replay lacks a bounded predecessor release proof"
+        )
+    if len(release_matches) > 1:
+        raise RowAuthorityAmbiguous(
+            "accepted replay predecessor release proof is duplicated"
+        )
+    if len(release_matches) != 1:
+        raise RowAuthorityAmbiguous(
+            "accepted replay predecessor release proof is missing"
+        )
+    release_entry = release_matches[0]
+    if type(release_entry) is not dict or set(release_entry) != {
+        "path",
+        "document",
+    }:
+        raise RowAuthorityAmbiguous(
+            "accepted replay predecessor release proof is malformed"
+        )
+    try:
+        predecessor_release = validate_contact_fanout_result_document(
+            document=release_entry["document"]
+        )
+    except Exception as exc:
+        raise RowAuthorityAmbiguous(
+            "accepted replay predecessor release proof is malformed"
+        ) from exc
+    if (
+        type(release_entry["path"]) is not str
+        or release_entry["path"].split("/")[-2:]
+        != [
+            "contactOptOutFanoutResults",
+            f"{predecessor_release['fanoutId']}--{state['rowId']}",
+        ]
+        or predecessor_release["userScopeHash"] != scope
+        or predecessor_release["rowId"] != state["rowId"]
+        or predecessor_release["outcome"] != "release"
+        or predecessor_release["disposition"] != "restore"
+        or predecessor_release["reasonCode"] != "exact_predecessor"
+        or predecessor_release["releasedRowGeneration"]
+        != predecessor_generation["generation"]
+        or predecessor_release["releasedRowSettlementHash"]
+        != predecessor_settlement["settlementHash"]
+        or predecessor_release["restoredEffectiveSettlementHash"]
+        != generation["predecessorSettlementHash"]
+        or predecessor_release["createdAt"]
+        < predecessor_settlement["settledAt"]
+        or predecessor_release["createdAt"] > generation["createdAt"]
+    ):
+        raise RowAuthorityAmbiguous(
+            "accepted replay predecessor release proof does not correlate"
+        )
+    _validate_bounded_release_restored_authority(
+        scope=scope,
+        row_id=state["rowId"],
+        release_result=predecessor_release,
+        released_generation=predecessor_generation,
+        raw_restored_authority=state.get(
+            "candidatePredecessorRestoredAuthority"
+        ),
+        successor_generation=generation,
+    )
+    return generation, None
 
 
 def _plan_row_claim_set(
@@ -5787,17 +9853,30 @@ def _plan_row_claim_set(
             raise RowAuthorityConflict(
                 "claim event predates binding or row authority readiness"
             )
-        (
-            current_generation,
-            current_claim,
-            current_settlement,
-            owner_lineage,
-        ) = _validate_current_owner_state(
-            scope=scope,
-            row_id=row_id,
-            head=head,
-            row_state=state,
-        )
+        bounded_history = None
+        if "latestSettlements" in state:
+            bounded_history = _validate_bounded_row_history(
+                scope=scope,
+                row_id=row_id,
+                head=head,
+                row_state=state,
+            )
+            current_generation = bounded_history["currentGeneration"]
+            current_claim = bounded_history["currentClaimSet"]
+            current_settlement = bounded_history["currentSettlement"]
+            owner_lineage = None
+        else:
+            (
+                current_generation,
+                current_claim,
+                current_settlement,
+                owner_lineage,
+            ) = _validate_current_owner_state(
+                scope=scope,
+                row_id=row_id,
+                head=head,
+                row_state=state,
+            )
         validated_states.append(
             {
                 **state,
@@ -5807,10 +9886,16 @@ def _plan_row_claim_set(
                 "currentClaimSet": current_claim,
                 "currentSettlement": current_settlement,
                 "ownerLineage": owner_lineage,
+                "boundedHistory": bounded_history,
             }
         )
 
-    _validate_complete_accepted_claim_cohorts(row_states=validated_states)
+    if all(state["boundedHistory"] is None for state in validated_states):
+        _validate_complete_accepted_claim_cohorts(row_states=validated_states)
+    elif all(
+        state["boundedHistory"] is not None for state in validated_states
+    ):
+        _validate_bounded_current_claim_cohorts(row_states=validated_states)
 
     if stored_claim_set_document is not None:
         try:
@@ -5865,6 +9950,34 @@ def _plan_row_claim_set(
                 raise RowAuthorityAmbiguous(
                     "dominated claim replay found partial future ownership state"
                 )
+            if all(
+                state["boundedHistory"] is not None
+                for state in validated_states
+            ):
+                for state, decision in zip(
+                    validated_states,
+                    stored_claim["rowDecisions"],
+                ):
+                    if decision["rowId"] != state["rowId"]:
+                        raise RowAuthorityConflict(
+                            "dominated claim replay decisions are not canonical"
+                        )
+                    _validate_bounded_dominated_replay(
+                        scope=scope,
+                        state=state,
+                        decision=decision,
+                        stored_claim=stored_claim,
+                    )
+                return {
+                    "disposition": "already_applied",
+                    "claimSet": stored_claim,
+                    "generations": (),
+                    "heads": tuple(
+                        state["head"] for state in validated_states
+                    ),
+                    "predecessorSettlements": (),
+                    "mutations": (),
+                }
             for state, decision in zip(
                 validated_states,
                 stored_claim["rowDecisions"],
@@ -5963,6 +10076,55 @@ def _plan_row_claim_set(
                 "generations": (),
                 "heads": tuple(state["head"] for state in validated_states),
                 "predecessorSettlements": (),
+                "mutations": (),
+            }
+        if all(
+            state["boundedHistory"] is not None
+            for state in validated_states
+        ):
+            generations = []
+            predecessor_settlements = []
+            for state, decision in zip(
+                validated_states,
+                stored_claim["rowDecisions"],
+            ):
+                if (
+                    decision["rowId"] != state["rowId"]
+                    or decision["decision"] != "accepted"
+                ):
+                    raise RowAuthorityConflict(
+                        "accepted claim replay decisions are not canonical"
+                    )
+                generation, predecessor = (
+                    _validate_bounded_accepted_replay(
+                        scope=scope,
+                        state=state,
+                        decision=decision,
+                        stored_claim=stored_claim,
+                        lease_owner=lease_owner,
+                        deadline=deadline,
+                    )
+                )
+                generations.append(generation)
+                if predecessor is not None:
+                    predecessor_settlements.append(predecessor)
+            expected_replay_writes = (
+                2 + (3 * binding["bindingCount"])
+                if combined_operator_decline
+                else 1
+                + (2 * binding["bindingCount"])
+                + len(predecessor_settlements)
+            )
+            if stored_claim["plannedWrites"] != expected_replay_writes:
+                raise RowAuthorityConflict(
+                    "accepted claim replay has a nonsemantic write count"
+                )
+            return {
+                "disposition": "already_applied",
+                "claimSet": stored_claim,
+                "generations": tuple(generations),
+                "heads": tuple(state["head"] for state in validated_states),
+                "predecessorSettlements": tuple(predecessor_settlements),
                 "mutations": (),
             }
         generations = []
@@ -6068,8 +10230,11 @@ def _plan_row_claim_set(
             )
         if state["head"]["effectiveOwnerGeneration"] is None and (
             state["head"]["state"] != "clear"
-            or state["head"]["latestSettlementHash"] is not None
             or state["head"]["effectiveSettlementHash"] is not None
+            or (
+                state["boundedHistory"] is None
+                and state["head"]["latestSettlementHash"] is not None
+            )
         ):
             raise RowAuthorityConflict(
                 "ownerless historical row cannot allocate a generation"
@@ -6164,10 +10329,15 @@ def _plan_row_claim_set(
     decisions = []
     for state in validated_states:
         head = state["head"]
+        history = state["boundedHistory"]
         generation_number = (
-            1
-            if head["effectiveOwnerGeneration"] is None
-            else head["effectiveOwnerGeneration"] + 1
+            history["nextGeneration"]
+            if history is not None
+            else (
+                1
+                if head["effectiveOwnerGeneration"] is None
+                else head["effectiveOwnerGeneration"] + 1
+            )
         )
         decisions.append(
             {
@@ -6217,9 +10387,13 @@ def _plan_row_claim_set(
             ],
             lease_epoch=1,
             first_fencing_token=(
-                1
-                if predecessor_head["fencingToken"] is None
-                else predecessor_head["fencingToken"] + 1
+                state["boundedHistory"]["nextFirstFencingToken"]
+                if state["boundedHistory"] is not None
+                else (
+                    1
+                    if predecessor_head["fencingToken"] is None
+                    else predecessor_head["fencingToken"] + 1
+                )
             ),
             created_at=created,
         )
@@ -6260,6 +10434,16 @@ def _plan_row_claim_set(
                 else None
             ),
             claimed_at=created,
+            expected_generation=(
+                state["boundedHistory"]["nextGeneration"]
+                if state["boundedHistory"] is not None
+                else None
+            ),
+            expected_first_fencing_token=(
+                state["boundedHistory"]["nextFirstFencingToken"]
+                if state["boundedHistory"] is not None
+                else None
+            ),
         )
         heads.append(head)
         mutations.append(
@@ -6328,6 +10512,7 @@ def _plan_owner_generation_settlement(
     settled_at,
     operator_action_document,
     actual_owner_lineage=None,
+    actual_bounded_history=None,
 ):
     scope = _require_sha256(
         user_scope_hash,
@@ -6456,6 +10641,51 @@ def _plan_owner_generation_settlement(
             raise RowAuthorityAmbiguous(
                 "settlement exists without its settled head"
             )
+        if actual_bounded_history is not None:
+            bounded = actual_bounded_history
+            historical_matches = [
+                item
+                for item in bounded["latestSettlements"]
+                if item["generation"] == generation["generation"]
+                and item["settlementHash"] == stored["settlementHash"]
+            ]
+            restored = bounded.get("restoredAuthority")
+            restored_matches = (
+                restored is not None
+                and restored["generation"] == generation
+                and restored["claimSet"] == claim
+                and restored["settlement"] == stored
+            )
+            historical_max_proven = (
+                bool(bounded["latestSettlements"])
+                and generation["generation"]
+                <= bounded["latestSettlements"][0]["generation"]
+            )
+            if (
+                len(historical_matches) != 1
+                and not restored_matches
+                and not historical_max_proven
+            ):
+                raise RowAuthorityConflict(
+                    "settlement replay target lacks bounded historical proof"
+                )
+            if actual["updatedAt"] < stored["settledAt"]:
+                raise RowAuthorityConflict(
+                    "settlement replay current head predates its target"
+                )
+            return {
+                "disposition": "already_applied",
+                "generation": generation,
+                "settlement": stored,
+                "head": actual,
+                "mutations": (),
+                "higherGenerationProven": (
+                    actual["effectiveOwnerGeneration"] is not None
+                    and actual["effectiveOwnerGeneration"]
+                    > generation["generation"]
+                ),
+                "releaseRestorationProven": restored_matches,
+            }
         higher_generation_proven = False
         if (
             actual["effectiveOwnerGeneration"] is not None
@@ -6544,6 +10774,7 @@ def _plan_owner_generation_settlement(
             "head": actual,
             "mutations": (),
             "higherGenerationProven": higher_generation_proven,
+            "releaseRestorationProven": False,
         }
     if actual != expected:
         raise RowAuthorityConflict(
@@ -6555,6 +10786,7 @@ def _plan_owner_generation_settlement(
         "settlement": candidate,
         "head": immediate_head,
         "higherGenerationProven": False,
+        "releaseRestorationProven": False,
         "mutations": (
             {
                 "target": "settlement",
@@ -6586,6 +10818,8 @@ def _build_immediate_operator_decline_head(
     generation_document,
     settlement_document,
     operator_action_document,
+    expected_generation=None,
+    expected_first_fencing_token=None,
 ):
     expected = validate_row_authority_head(document=expected_head)
     generation = validate_owner_generation_document(
@@ -6604,11 +10838,9 @@ def _build_immediate_operator_decline_head(
         or expected["effectiveOwnerKind"] is not None
         or expected["effectivePriority"] is not None
         or expected["fencingToken"] is not None
-        or expected["latestSettlementHash"] is not None
         or expected["effectiveSettlementHash"] is not None
         or generation["predecessorHeadHash"] != expected["headHash"]
         or generation["predecessorSettlementHash"] is not None
-        or generation["firstFencingToken"] != 1
         or generation["ownerKind"] != "human_decision"
         or settlement["generationHash"] != generation["generationHash"]
         or settlement["fencingToken"]
@@ -6621,6 +10853,29 @@ def _build_immediate_operator_decline_head(
         raise RowAuthorityConfigError(
             "immediate operator decline does not correlate to a clear row"
         )
+    checked_generation = (
+        1
+        if expected_generation is None
+        else _require_pos(
+            expected_generation,
+            field_name="expected_generation",
+        )
+    )
+    checked_fence = (
+        1
+        if expected_first_fencing_token is None
+        else _require_pos(
+            expected_first_fencing_token,
+            field_name="expected_first_fencing_token",
+        )
+    )
+    if (
+        generation["generation"] != checked_generation
+        or generation["firstFencingToken"] != checked_fence
+    ):
+        raise RowAuthorityConfigError(
+            "immediate operator decline does not use bounded generation floors"
+        )
     transient_claimed = _build_claim_advanced_head(
         expected_head=expected,
         generation_document=generation,
@@ -6628,6 +10883,8 @@ def _build_immediate_operator_decline_head(
         lease_until=_operator_decline_lease_until(action["issuedAt"]),
         dominated_predecessor_settlement_hash=None,
         claimed_at=action["issuedAt"],
+        expected_generation=checked_generation,
+        expected_first_fencing_token=checked_fence,
     )
     settled = _build_settlement_advanced_head(
         expected_head=transient_claimed,
@@ -6639,6 +10896,91 @@ def _build_immediate_operator_decline_head(
     }
     material["stateRevision"] = expected["stateRevision"] + 1
     return validate_row_authority_head(document=_with_head_hash(material))
+
+
+def _validate_bounded_operator_action_matches(
+    *, scope, row_id, action, row_state
+):
+    """Validate the exact settlement matched by one immutable action."""
+    raw_matches = row_state.get("actionSettlementMatches")
+    if type(raw_matches) not in {list, tuple} or len(raw_matches) > 2:
+        raise RowAuthorityAmbiguous(
+            "operator decline action settlement proof is not bounded"
+        )
+    if len(raw_matches) > 1:
+        raise RowAuthorityAmbiguous(
+            "operator decline action settlement is duplicated"
+        )
+    matches = []
+    for raw in raw_matches:
+        if type(raw) is not dict or set(raw) != {
+            "path",
+            "generation",
+            "claimSet",
+            "settlement",
+        }:
+            raise RowAuthorityAmbiguous(
+                "operator decline action settlement proof is malformed"
+            )
+        try:
+            generation = validate_owner_generation_document(
+                document=raw["generation"]
+            )
+            claim = validate_claim_set_document(document=raw["claimSet"])
+            settlement = _validate_correlated_owner_settlement(
+                scope=scope,
+                row_id=row_id,
+                generation=generation,
+                claim=claim,
+                settlement_document=raw["settlement"],
+            )
+            expected_id = _generation_document_id(
+                row_id=row_id,
+                generation=generation["generation"],
+            )
+        except RowAuthorityError:
+            raise
+        except Exception as exc:
+            raise RowAuthorityConflict(
+                "operator decline action settlement authority is malformed"
+            ) from exc
+        decisions = [
+            decision
+            for decision in claim["rowDecisions"]
+            if decision["rowId"] == row_id
+        ]
+        if (
+            type(raw["path"]) is not str
+            or raw["path"].split("/")[-2:]
+            != ["rowOwnerSettlements", expected_id]
+            or generation["userScopeHash"] != scope
+            or generation["rowId"] != row_id
+            or generation["requestId"] != claim["requestId"]
+            or generation["claimSetHash"] != claim["claimSetHash"]
+            or generation["ownerKind"] != "human_decision"
+            or generation["ownerKind"] != claim["ownerKind"]
+            or generation["ownerKey"] != claim["ownerKey"]
+            or generation["priority"] != claim["derivedPriority"]
+            or claim["outcome"] != "accepted"
+            or len(decisions) != 1
+            or decisions[0]["decision"] != "accepted"
+            or decisions[0]["plannedGeneration"]
+            != generation["generation"]
+            or settlement["operatorActionHash"]
+            != action["operatorActionHash"]
+            or settlement["outcome"] != "human_declined"
+        ):
+            raise RowAuthorityConflict(
+                "operator decline action settlement does not correlate"
+            )
+        matches.append(
+            {
+                "generation": generation,
+                "claimSet": claim,
+                "settlement": settlement,
+            }
+        )
+    return tuple(matches)
 
 
 def _plan_operator_decline(
@@ -6737,17 +11079,43 @@ def _plan_operator_decline(
             raise RowAuthorityConflict(
                 "operator action predates a current row head"
             )
-        (
-            current_generation,
-            current_claim,
-            current_settlement,
-            owner_lineage,
-        ) = _validate_current_owner_state(
-            scope=scope,
-            row_id=row_id,
-            head=head,
-            row_state=state,
-        )
+        bounded_history = None
+        if "latestSettlements" in state:
+            bounded_history = _validate_bounded_row_history(
+                scope=scope,
+                row_id=row_id,
+                head=head,
+                row_state=state,
+            )
+            current_generation = bounded_history["currentGeneration"]
+            current_claim = bounded_history["currentClaimSet"]
+            current_settlement = bounded_history["currentSettlement"]
+            owner_lineage = None
+            action_matches = _validate_bounded_operator_action_matches(
+                scope=scope,
+                row_id=row_id,
+                action=action,
+                row_state=state,
+            )
+        else:
+            (
+                current_generation,
+                current_claim,
+                current_settlement,
+                owner_lineage,
+            ) = _validate_current_owner_state(
+                scope=scope,
+                row_id=row_id,
+                head=head,
+                row_state=state,
+            )
+            action_matches = tuple(
+                entry
+                for entry in owner_lineage
+                if entry["settlement"] is not None
+                and entry["settlement"]["operatorActionHash"]
+                == action["operatorActionHash"]
+            )
         validated_states.append(
             {
                 **state,
@@ -6757,22 +11125,28 @@ def _plan_operator_decline(
                 "currentClaimSet": current_claim,
                 "currentSettlement": current_settlement,
                 "ownerLineage": owner_lineage,
+                "boundedHistory": bounded_history,
+                "actionSettlementMatches": action_matches,
             }
         )
-    _validate_complete_accepted_claim_cohorts(
-        row_states=validated_states
-    )
+    if all(state["boundedHistory"] is None for state in validated_states):
+        _validate_complete_accepted_claim_cohorts(
+            row_states=validated_states
+        )
+    elif all(
+        state["boundedHistory"] is not None for state in validated_states
+    ):
+        _validate_bounded_current_claim_cohorts(
+            row_states=validated_states
+        )
+    else:
+        raise RowAuthorityAmbiguous(
+            "operator decline mixes bounded and legacy row history"
+        )
 
-    matching_action_settlements = []
-    for state in validated_states:
-        matches = [
-            entry
-            for entry in state["ownerLineage"]
-            if entry["settlement"] is not None
-            and entry["settlement"]["operatorActionHash"]
-            == action["operatorActionHash"]
-        ]
-        matching_action_settlements.append(matches)
+    matching_action_settlements = [
+        state["actionSettlementMatches"] for state in validated_states
+    ]
     if stored_action is None and any(matching_action_settlements):
         raise RowAuthorityAmbiguous(
             "operator decline artifacts exist without their immutable action"
@@ -6805,10 +11179,26 @@ def _plan_operator_decline(
                     validated_states,
                     claim_plan["generations"],
                 ):
-                    entry = state["ownerLineage"][
-                        generation["generation"] - 1
-                    ]
-                    settlement = entry["settlement"]
+                    if state["boundedHistory"] is None:
+                        entry = state["ownerLineage"][
+                            generation["generation"] - 1
+                        ]
+                        settlement = entry["settlement"]
+                    else:
+                        settlement_document = state.get(
+                            "candidateSettlement"
+                        )
+                        if settlement_document is None:
+                            raise RowAuthorityAmbiguous(
+                                "accepted operator decline lacks its settlement"
+                            )
+                        settlement = _validate_correlated_owner_settlement(
+                            scope=scope,
+                            row_id=state["rowId"],
+                            generation=generation,
+                            claim=claim_plan["claimSet"],
+                            settlement_document=settlement_document,
+                        )
                     if settlement is None:
                         raise RowAuthorityAmbiguous(
                             "accepted operator decline lacks its settlement"
@@ -6907,6 +11297,52 @@ def _plan_operator_decline(
             }
         ]
         for state in validated_states:
+            prior_effective_settlement = None
+            predecessor_hash = state["currentGeneration"][
+                "predecessorSettlementHash"
+            ]
+            if predecessor_hash is not None:
+                if state["boundedHistory"] is None:
+                    candidates = [
+                        entry["settlement"]
+                        for entry in state["ownerLineage"]
+                        if entry["settlement"] is not None
+                        and entry["settlement"]["settlementHash"]
+                        == predecessor_hash
+                    ]
+                else:
+                    candidates = [
+                        entry["settlement"]
+                        for entry in state["boundedHistory"][
+                            "latestSettlementAuthorities"
+                        ]
+                        if entry["settlement"]["settlementHash"]
+                        == predecessor_hash
+                    ]
+                    restored = state["boundedHistory"].get(
+                        "restoredAuthority"
+                    )
+                    if (
+                        restored is not None
+                        and restored["settlement"]["settlementHash"]
+                        == predecessor_hash
+                    ):
+                        candidates.append(restored["settlement"])
+                unique_candidates = {}
+                for candidate in candidates:
+                    candidate_hash = candidate["settlementHash"]
+                    existing = unique_candidates.get(candidate_hash)
+                    if existing is not None and existing != candidate:
+                        raise RowAuthorityConflict(
+                            "pending operator predecessor settlement copies diverge"
+                        )
+                    unique_candidates[candidate_hash] = candidate
+                candidates = list(unique_candidates.values())
+                if len(candidates) != 1:
+                    raise RowAuthorityAmbiguous(
+                        "pending operator decline lacks its exact predecessor settlement"
+                    )
+                prior_effective_settlement = candidates[0]
             settlement_plan = _plan_owner_generation_settlement(
                 user_scope_hash=scope,
                 row_id=state["rowId"],
@@ -6916,9 +11352,13 @@ def _plan_operator_decline(
                 generation_document=state["currentGeneration"],
                 claim_set_document=state["currentClaimSet"],
                 stored_settlement_document=None,
-                prior_effective_settlement_document=None,
+                prior_effective_settlement_document=(
+                    prior_effective_settlement
+                ),
                 settled_at=action["issuedAt"],
                 operator_action_document=action,
+                actual_owner_lineage=state["ownerLineage"],
+                actual_bounded_history=state["boundedHistory"],
             )
             generations.append(settlement_plan["generation"])
             settlements.append(settlement_plan["settlement"])
@@ -7018,6 +11458,16 @@ def _plan_operator_decline(
             generation_document=generation,
             settlement_document=settlement,
             operator_action_document=action,
+            expected_generation=(
+                state["boundedHistory"]["nextGeneration"]
+                if state["boundedHistory"] is not None
+                else None
+            ),
+            expected_first_fencing_token=(
+                state["boundedHistory"]["nextFirstFencingToken"]
+                if state["boundedHistory"] is not None
+                else None
+            ),
         )
         settlements.append(settlement)
         heads.append(head)
@@ -7298,6 +11748,7 @@ def _owner_settlement_result(
     settlement,
     head,
     higher_generation_proven=False,
+    release_restoration_proven=False,
 ):
     if disposition not in {"settled", "already_applied"}:
         raise RowAuthorityConfigError(
@@ -7346,7 +11797,24 @@ def _owner_settlement_result(
         and checked_head["fencingToken"]
         > checked_settlement["fencingToken"]
     )
-    if not base_correlates or not (same_generation or higher_generation):
+    release_restored = (
+        release_restoration_proven is True
+        and checked_head["effectiveOwnerGeneration"]
+        == checked_generation["generation"]
+        and checked_head["effectiveOwnerGenerationHash"]
+        == checked_generation["generationHash"]
+        and checked_head["state"] == "settled"
+        and checked_head["fencingToken"]
+        == checked_settlement["fencingToken"]
+        and checked_head["effectiveSettlementHash"]
+        == checked_settlement["settlementHash"]
+        and checked_head["latestSettlementHash"]
+        != checked_settlement["settlementHash"]
+        and checked_head["latestOptOutReleaseResultHash"] is not None
+    )
+    if not base_correlates or not (
+        same_generation or higher_generation or release_restored
+    ):
         raise RowAuthorityConfigError(
             "owner settlement result does not correlate"
         )
@@ -8111,6 +12579,7 @@ class RowAuthorityStore:
             "before": {},
             "ordered_paths": [],
             "mutation_references": {},
+            "query_readbacks": [],
         }
 
         def reject(error):
@@ -8130,6 +12599,7 @@ class RowAuthorityStore:
                     "before": {},
                     "ordered_paths": [],
                     "mutation_references": {},
+                    "query_readbacks": [],
                 }
             )
 
@@ -8342,101 +12812,435 @@ class RowAuthorityStore:
                             "claim row head is malformed"
                         )
                     )
+                try:
+                    settlements_query = (
+                        user_ref.collection("rowOwnerSettlements")
+                        .where("rowId", "==", row_id)
+                        .order_by("generation", direction="DESCENDING")
+                        .limit(2)
+                    )
+                    settlement_snapshots = tuple(
+                        transaction.get(settlements_query)
+                    )
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "claim bounded settlement query failed before writes"
+                    ) from exc
+                latest_settlements = []
+                latest_settlement_authorities = []
+                for settlement_snapshot in settlement_snapshots:
+                    settlement_exists, settlement_payload = read(
+                        settlement_snapshot.reference
+                    )
+                    if not settlement_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "claim bounded settlement query returned a missing document"
+                            )
+                        )
+                    latest_settlements.append(
+                        {
+                            "path": settlement_snapshot.reference.path,
+                            "document": settlement_payload,
+                        }
+                    )
+                    settlement_generation = None
+                    settlement_claim = None
+                    try:
+                        checked_settlement = (
+                            validate_owner_settlement_document(
+                                document=settlement_payload
+                            )
+                        )
+                        settlement_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(
+                            _generation_document_id(
+                                row_id=row_id,
+                                generation=checked_settlement["generation"],
+                            )
+                        )
+                        (
+                            settlement_generation_exists,
+                            settlement_generation_payload,
+                        ) = read(settlement_generation_ref)
+                        if settlement_generation_exists:
+                            settlement_generation = (
+                                settlement_generation_payload
+                            )
+                            checked_settlement_generation = (
+                                validate_owner_generation_document(
+                                    document=settlement_generation_payload
+                                )
+                            )
+                            settlement_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_settlement_generation["requestId"]
+                            )
+                            settlement_claim_exists, settlement_claim_payload = read(
+                                settlement_claim_ref
+                            )
+                            if settlement_claim_exists:
+                                settlement_claim = settlement_claim_payload
+                    except RowAuthorityRetryable:
+                        raise
+                    except Exception:
+                        pass
+                    latest_settlement_authorities.append(
+                        {
+                            "generation": settlement_generation,
+                            "claimSet": settlement_claim,
+                        }
+                    )
+                callback_state["query_readbacks"].append(
+                    {
+                        "kind": "settlement_history",
+                        "rowId": row_id,
+                        "query": settlements_query,
+                        "matches": tuple(
+                            (
+                                entry["path"],
+                                _defensive_copy(entry["document"]),
+                            )
+                            for entry in latest_settlements
+                        ),
+                    }
+                )
+                latest_predecessor_release_matches = []
+                latest_predecessor_restored_authority = None
+                predecessor_release_hash = (
+                    _bounded_predecessor_release_lookup_hash(
+                        latest_settlements=latest_settlements,
+                        latest_authorities=latest_settlement_authorities,
+                    )
+                )
+                if predecessor_release_hash is not None:
+                    try:
+                        history_release_query = (
+                            user_ref.collection(
+                                "contactOptOutFanoutResults"
+                            )
+                            .where("rowId", "==", row_id)
+                            .where(
+                                "releasedRowSettlementHash",
+                                "==",
+                                predecessor_release_hash,
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                        history_release_snapshots = tuple(
+                            transaction.get(history_release_query)
+                        )
+                    except Exception as exc:
+                        callback_state["read_failed"] = True
+                        raise RowAuthorityRetryable(
+                            "claim predecessor-history release query failed before writes"
+                        ) from exc
+                    for release_snapshot in history_release_snapshots:
+                        release_exists, release_payload = read(
+                            release_snapshot.reference
+                        )
+                        if not release_exists:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "claim predecessor-history release query returned a missing document"
+                                )
+                            )
+                        latest_predecessor_release_matches.append(
+                            {
+                                "path": release_snapshot.reference.path,
+                                "document": release_payload,
+                            }
+                        )
+                    callback_state["query_readbacks"].append(
+                        {
+                            "kind": "stable",
+                            "query": history_release_query,
+                            "matches": tuple(
+                                (
+                                    entry["path"],
+                                    _defensive_copy(entry["document"]),
+                                )
+                                for entry in (
+                                    latest_predecessor_release_matches
+                                )
+                            ),
+                        }
+                    )
+                    if len(latest_predecessor_release_matches) == 1:
+                        latest_predecessor_restored_authority = (
+                            _read_bounded_release_restored_authority(
+                                user_ref=user_ref,
+                                row_id=row_id,
+                                release_document=(
+                                    latest_predecessor_release_matches[0][
+                                        "document"
+                                    ]
+                                ),
+                                read=read,
+                            )
+                        )
+
                 current_generation = None
                 current_claim = None
                 current_settlement = None
-                current_predecessor_generation = None
-                current_predecessor_claim = None
-                current_predecessor_settlement = None
-                owner_lineage = []
                 current_number = preliminary_head[
                     "effectiveOwnerGeneration"
                 ]
                 if current_number is not None:
-                    if current_number > 3:
+                    current_id = _generation_document_id(
+                        row_id=row_id,
+                        generation=current_number,
+                    )
+                    current_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(current_id)
+                    current_generation_exists, current_generation_payload = read(
+                        current_generation_ref
+                    )
+                    if current_generation_exists:
+                        current_generation = current_generation_payload
+                        try:
+                            checked_current_generation = (
+                                validate_owner_generation_document(
+                                    document=current_generation
+                                )
+                            )
+                            current_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(checked_current_generation["requestId"])
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "current bounded owner generation is malformed"
+                                )
+                            )
+                        current_claim_exists, current_claim_payload = read(
+                            current_claim_ref
+                        )
+                        if current_claim_exists:
+                            current_claim = current_claim_payload
+                    current_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(current_id)
+                    current_settlement_exists, current_settlement_payload = read(
+                        current_settlement_ref
+                    )
+                    if current_settlement_exists:
+                        current_settlement = current_settlement_payload
+                else:
+                    current_settlement_ref = None
+
+                release_result = None
+                release_result_path = None
+                released_authority = None
+                restored_authority = None
+                if (
+                    preliminary_head["latestSettlementHash"]
+                    != preliminary_head["effectiveSettlementHash"]
+                    and preliminary_head["latestOptOutReleaseResultHash"]
+                    is not None
+                ):
+                    try:
+                        release_query = (
+                            user_ref.collection("contactOptOutFanoutResults")
+                            .where("rowId", "==", row_id)
+                            .where(
+                                "contactFanoutResultHash",
+                                "==",
+                                preliminary_head[
+                                    "latestOptOutReleaseResultHash"
+                                ],
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                        release_snapshots = tuple(transaction.get(release_query))
+                    except Exception as exc:
+                        callback_state["read_failed"] = True
+                        raise RowAuthorityRetryable(
+                            "claim release-result query failed before writes"
+                        ) from exc
+                    if len(release_snapshots) != 1:
                         reject(
-                            RowAuthorityConflict(
-                                "row authority generation exceeds bounded priority depth"
+                            RowAuthorityAmbiguous(
+                                "claim release-result bridge is missing or duplicated"
                             )
                         )
-                    for lineage_number in range(1, current_number + 1):
-                        lineage_id = _generation_document_id(
+                    release_snapshot = release_snapshots[0]
+                    release_exists, release_payload = read(
+                        release_snapshot.reference
+                    )
+                    if not release_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "claim release-result query returned a missing document"
+                            )
+                        )
+                    release_result = release_payload
+                    release_result_path = release_snapshot.reference.path
+                    callback_state["query_readbacks"].append(
+                        {
+                            "kind": "stable",
+                            "query": release_query,
+                            "matches": (
+                                (
+                                    release_result_path,
+                                    _defensive_copy(release_payload),
+                                ),
+                            ),
+                        }
+                    )
+                    try:
+                        checked_release_result = (
+                            validate_contact_fanout_result_document(
+                                document=release_payload
+                            )
+                        )
+                        released_number = checked_release_result[
+                            "releasedRowGeneration"
+                        ]
+                        released_id = _generation_document_id(
                             row_id=row_id,
-                            generation=lineage_number,
+                            generation=released_number,
                         )
-                        lineage_generation_ref = user_ref.collection(
+                        released_generation_ref = user_ref.collection(
                             "rowOwnerGenerations"
-                        ).document(lineage_id)
+                        ).document(released_id)
                         (
-                            lineage_generation_exists,
-                            lineage_generation_payload,
-                        ) = read(lineage_generation_ref)
-                        lineage_generation = (
-                            lineage_generation_payload
-                            if lineage_generation_exists
-                            else None
-                        )
-                        lineage_claim = None
-                        if lineage_generation is not None:
-                            try:
-                                checked_lineage_generation = (
-                                    validate_owner_generation_document(
-                                        document=lineage_generation
-                                    )
+                            released_generation_exists,
+                            released_generation_payload,
+                        ) = read(released_generation_ref)
+                        released_claim_payload = None
+                        if released_generation_exists:
+                            checked_released_generation = (
+                                validate_owner_generation_document(
+                                    document=released_generation_payload
                                 )
-                                lineage_claim_ref = (
-                                    user_ref.collection("rowClaimSets").document(
-                                        checked_lineage_generation["requestId"]
-                                    )
-                                )
-                            except Exception as exc:
-                                reject(
-                                    RowAuthorityConflict(
-                                        "owner lineage generation contains immutable drift"
-                                    )
-                                )
+                            )
+                            released_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_released_generation["requestId"]
+                            )
                             (
-                                lineage_claim_exists,
-                                lineage_claim_payload,
-                            ) = read(lineage_claim_ref)
-                            if lineage_claim_exists:
-                                lineage_claim = lineage_claim_payload
-                        lineage_settlement_ref = user_ref.collection(
+                                released_claim_exists,
+                                observed_released_claim,
+                            ) = read(released_claim_ref)
+                            if released_claim_exists:
+                                released_claim_payload = observed_released_claim
+                        released_settlement_ref = user_ref.collection(
                             "rowOwnerSettlements"
-                        ).document(lineage_id)
+                        ).document(released_id)
                         (
-                            lineage_settlement_exists,
-                            lineage_settlement_payload,
-                        ) = read(lineage_settlement_ref)
-                        owner_lineage.append(
-                            {
-                                "generation": lineage_generation,
-                                "claimSet": lineage_claim,
+                            released_settlement_exists,
+                            released_settlement_payload,
+                        ) = read(released_settlement_ref)
+                        released_authority = {
+                            "path": released_settlement_ref.path,
+                            "generation": (
+                                released_generation_payload
+                                if released_generation_exists
+                                else None
+                            ),
+                            "claimSet": released_claim_payload,
+                            "settlement": (
+                                released_settlement_payload
+                                if released_settlement_exists
+                                else None
+                            ),
+                        }
+                        restored_number = checked_release_result[
+                            "restoredEffectiveGeneration"
+                        ]
+                        if restored_number is not None:
+                            restored_id = _generation_document_id(
+                                row_id=row_id,
+                                generation=restored_number,
+                            )
+                            restored_generation_ref = user_ref.collection(
+                                "rowOwnerGenerations"
+                            ).document(restored_id)
+                            restored_generation_exists, restored_generation_payload = read(
+                                restored_generation_ref
+                            )
+                            restored_claim_payload = None
+                            if restored_generation_exists:
+                                checked_restored_generation = (
+                                    validate_owner_generation_document(
+                                        document=restored_generation_payload
+                                    )
+                                )
+                                restored_claim_ref = user_ref.collection(
+                                    "rowClaimSets"
+                                ).document(
+                                    checked_restored_generation["requestId"]
+                                )
+                                restored_claim_exists, observed_restored_claim = read(
+                                    restored_claim_ref
+                                )
+                                if restored_claim_exists:
+                                    restored_claim_payload = observed_restored_claim
+                            restored_settlement_ref = user_ref.collection(
+                                "rowOwnerSettlements"
+                            ).document(restored_id)
+                            (
+                                restored_settlement_exists,
+                                restored_settlement_payload,
+                            ) = read(restored_settlement_ref)
+                            restored_authority = {
+                                "generation": (
+                                    restored_generation_payload
+                                    if restored_generation_exists
+                                    else None
+                                ),
+                                "claimSet": restored_claim_payload,
                                 "settlement": (
-                                    lineage_settlement_payload
-                                    if lineage_settlement_exists
+                                    restored_settlement_payload
+                                    if restored_settlement_exists
                                     else None
                                 ),
                             }
-                        )
-                    current_entry = owner_lineage[-1]
-                    current_generation = current_entry["generation"]
-                    current_claim = current_entry["claimSet"]
-                    current_settlement = current_entry["settlement"]
-                    if current_number > 1:
-                        predecessor_entry = owner_lineage[-2]
-                        current_predecessor_generation = predecessor_entry[
-                            "generation"
-                        ]
-                        current_predecessor_claim = predecessor_entry[
-                            "claimSet"
-                        ]
-                        current_predecessor_settlement = predecessor_entry[
-                            "settlement"
-                        ]
-                if stored_claim is not None and stored_claim[
-                    "outcome"
-                ] == "accepted":
+                    except RowAuthorityRetryable:
+                        raise
+                    except Exception:
+                        released_authority = {"malformed": True}
+                        restored_authority = {"malformed": True}
+
+                provisional_state = {
+                    **basic,
+                    "currentGeneration": current_generation,
+                    "currentClaimSet": current_claim,
+                    "currentSettlement": current_settlement,
+                    "latestSettlements": latest_settlements,
+                    "latestSettlementAuthorities": (
+                        latest_settlement_authorities
+                    ),
+                    "latestPredecessorReleaseMatches": (
+                        latest_predecessor_release_matches
+                    ),
+                    "latestPredecessorRestoredAuthority": (
+                        latest_predecessor_restored_authority
+                    ),
+                    "releaseResult": release_result,
+                    "releaseResultPath": release_result_path,
+                    "releasedAuthority": released_authority,
+                    "restoredAuthority": restored_authority,
+                }
+                try:
+                    bounded_history = _validate_bounded_row_history(
+                        scope=checked_scope,
+                        row_id=row_id,
+                        head=preliminary_head,
+                        row_state=provisional_state,
+                    )
+                except RowAuthorityError as exc:
+                    reject(exc)
+                stored_decision = None
+                if stored_claim is not None:
                     matching = [
                         decision
                         for decision in stored_claim["rowDecisions"]
@@ -8448,11 +13252,14 @@ class RowAuthorityStore:
                                 "stored claim decisions do not cover the bound row"
                             )
                         )
-                    candidate_number = matching[0]["plannedGeneration"]
+                    stored_decision = matching[0]
+                if (
+                    stored_claim is not None
+                    and stored_claim["outcome"] == "accepted"
+                ):
+                    candidate_number = stored_decision["plannedGeneration"]
                 else:
-                    candidate_number = (
-                        1 if current_number is None else current_number + 1
-                    )
+                    candidate_number = bounded_history["nextGeneration"]
                 candidate_id = _generation_document_id(
                     row_id=row_id,
                     generation=candidate_number,
@@ -8469,38 +13276,290 @@ class RowAuthorityStore:
                 candidate_settlement_exists, candidate_settlement_payload = (
                     read(candidate_settlement_ref)
                 )
+                candidate_predecessor_generation = None
+                candidate_predecessor_claim = None
+                candidate_predecessor_settlement = None
+                candidate_predecessor_release_matches = []
+                candidate_predecessor_restored_authority = None
+                if (
+                    stored_claim is not None
+                    and stored_claim["outcome"] == "accepted"
+                    and candidate_number > 1
+                ):
+                    predecessor_id = _generation_document_id(
+                        row_id=row_id,
+                        generation=candidate_number - 1,
+                    )
+                    predecessor_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(predecessor_id)
+                    (
+                        predecessor_generation_exists,
+                        predecessor_generation_payload,
+                    ) = read(predecessor_generation_ref)
+                    if predecessor_generation_exists:
+                        candidate_predecessor_generation = (
+                            predecessor_generation_payload
+                        )
+                        try:
+                            checked_predecessor_generation = (
+                                validate_owner_generation_document(
+                                    document=predecessor_generation_payload
+                                )
+                            )
+                            predecessor_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_predecessor_generation["requestId"]
+                            )
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityConflict(
+                                    "claim replay predecessor generation is malformed"
+                                )
+                            )
+                        predecessor_claim_exists, predecessor_claim_payload = read(
+                            predecessor_claim_ref
+                        )
+                        if predecessor_claim_exists:
+                            candidate_predecessor_claim = predecessor_claim_payload
+                    predecessor_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(predecessor_id)
+                    (
+                        predecessor_settlement_exists,
+                        predecessor_settlement_payload,
+                    ) = read(predecessor_settlement_ref)
+                    if predecessor_settlement_exists:
+                        candidate_predecessor_settlement = (
+                            predecessor_settlement_payload
+                        )
+                    try:
+                        checked_candidate_generation = (
+                            validate_owner_generation_document(
+                                document=(
+                                    candidate_payload
+                                    if candidate_exists
+                                    else None
+                                )
+                            )
+                        )
+                        checked_predecessor_settlement = (
+                            validate_owner_settlement_document(
+                                document=candidate_predecessor_settlement
+                            )
+                        )
+                    except Exception:
+                        checked_candidate_generation = None
+                        checked_predecessor_settlement = None
+                    if (
+                        checked_candidate_generation is not None
+                        and checked_candidate_generation["rowId"] == row_id
+                        and checked_candidate_generation["generation"]
+                        == candidate_number
+                        and checked_predecessor_settlement["rowId"] == row_id
+                        and checked_predecessor_settlement["generation"]
+                        == candidate_number - 1
+                        and checked_predecessor_settlement["outcome"]
+                        == "contact_optout"
+                        and checked_candidate_generation[
+                            "predecessorSettlementHash"
+                        ]
+                        != checked_predecessor_settlement["settlementHash"]
+                    ):
+                        try:
+                            predecessor_release_query = (
+                                user_ref.collection(
+                                    "contactOptOutFanoutResults"
+                                )
+                                .where("rowId", "==", row_id)
+                                .where(
+                                    "releasedRowSettlementHash",
+                                    "==",
+                                    checked_predecessor_settlement[
+                                        "settlementHash"
+                                    ],
+                                )
+                                .order_by("__name__")
+                                .limit(2)
+                            )
+                            predecessor_release_snapshots = tuple(
+                                transaction.get(predecessor_release_query)
+                            )
+                        except Exception as exc:
+                            callback_state["read_failed"] = True
+                            raise RowAuthorityRetryable(
+                                "claim predecessor-release query failed before writes"
+                            ) from exc
+                        for release_snapshot in predecessor_release_snapshots:
+                            release_exists, release_payload = read(
+                                release_snapshot.reference
+                            )
+                            if not release_exists:
+                                reject(
+                                    RowAuthorityAmbiguous(
+                                        "claim predecessor-release query returned a missing document"
+                                    )
+                                )
+                            candidate_predecessor_release_matches.append(
+                                {
+                                    "path": release_snapshot.reference.path,
+                                    "document": release_payload,
+                                }
+                            )
+                        callback_state["query_readbacks"].append(
+                            {
+                                "kind": "stable",
+                                "query": predecessor_release_query,
+                                "matches": tuple(
+                                    (
+                                        entry["path"],
+                                        _defensive_copy(entry["document"]),
+                                    )
+                                    for entry in (
+                                        candidate_predecessor_release_matches
+                                    )
+                                ),
+                            }
+                        )
+                        if len(candidate_predecessor_release_matches) == 1:
+                            candidate_predecessor_restored_authority = (
+                                _read_bounded_release_restored_authority(
+                                    user_ref=user_ref,
+                                    row_id=row_id,
+                                    release_document=(
+                                        candidate_predecessor_release_matches[
+                                            0
+                                        ]["document"]
+                                    ),
+                                    read=read,
+                                )
+                            )
+
+                replay_winner_matches = []
+                replay_winner_claim = None
+                replay_winner_settlement = None
+                replay_winner_successor = {
+                    "generation": None,
+                    "claimSet": None,
+                    "settlement": None,
+                    "linkReleaseMatches": [],
+                    "linkRestoredAuthority": None,
+                    "restorationReleaseMatches": [],
+                    "restoredWinnerAuthority": None,
+                    "restorationExitGeneration": None,
+                    "restorationExitClaimSet": None,
+                    "restorationExitSettlement": None,
+                }
+                if (
+                    stored_claim is not None
+                    and stored_claim["outcome"] == "dominated"
+                    and stored_decision["decision"] == "dominated"
+                ):
+                    try:
+                        winner_query = (
+                            user_ref.collection("rowOwnerGenerations")
+                            .where("rowId", "==", row_id)
+                            .where(
+                                "generationHash",
+                                "==",
+                                stored_decision["winnerGenerationHash"],
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                        winner_snapshots = tuple(transaction.get(winner_query))
+                    except Exception as exc:
+                        callback_state["read_failed"] = True
+                        raise RowAuthorityRetryable(
+                            "claim replay winner query failed before writes"
+                        ) from exc
+                    for winner_snapshot in winner_snapshots:
+                        winner_exists, winner_payload = read(
+                            winner_snapshot.reference
+                        )
+                        if winner_exists:
+                            replay_winner_matches.append(
+                                {
+                                    "path": winner_snapshot.reference.path,
+                                    "document": winner_payload,
+                                }
+                            )
+                    callback_state["query_readbacks"].append(
+                        {
+                            "kind": "stable",
+                            "query": winner_query,
+                            "matches": tuple(
+                                (
+                                    entry["path"],
+                                    _defensive_copy(entry["document"]),
+                                )
+                                for entry in replay_winner_matches
+                            ),
+                        }
+                    )
+                    if len(replay_winner_matches) == 1:
+                        try:
+                            winner_generation = (
+                                validate_owner_generation_document(
+                                    document=replay_winner_matches[0]["document"]
+                                )
+                            )
+                            winner_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(winner_generation["requestId"])
+                            winner_id = _generation_document_id(
+                                row_id=row_id,
+                                generation=winner_generation["generation"],
+                            )
+                            winner_settlement_ref = user_ref.collection(
+                                "rowOwnerSettlements"
+                            ).document(winner_id)
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityConflict(
+                                    "claim replay winner generation is malformed"
+                                )
+                            )
+                        winner_claim_exists, winner_claim_payload = read(
+                            winner_claim_ref
+                        )
+                        if winner_claim_exists:
+                            replay_winner_claim = winner_claim_payload
+                        winner_settlement_exists, winner_settlement_payload = read(
+                            winner_settlement_ref
+                        )
+                        if winner_settlement_exists:
+                            replay_winner_settlement = winner_settlement_payload
+                        try:
+                            replay_winner_successor = (
+                                _read_bounded_replay_winner_successor(
+                                    user_ref=user_ref,
+                                    row_id=row_id,
+                                    winner_generation=winner_generation,
+                                    winner_settlement=(
+                                        replay_winner_settlement
+                                    ),
+                                    claim_created_at=stored_claim["createdAt"],
+                                    read=read,
+                                    transaction=transaction,
+                                    query_readbacks=callback_state[
+                                        "query_readbacks"
+                                    ],
+                                )
+                            )
+                        except RowAuthorityError as exc:
+                            reject(exc)
                 row_references[row_id].update(
                     {
                         "candidate_generation": candidate_generation_ref,
                         "candidate_settlement": candidate_settlement_ref,
-                        "current_settlement": (
-                            user_ref.collection("rowOwnerSettlements").document(
-                                _generation_document_id(
-                                    row_id=row_id,
-                                    generation=current_number,
-                                )
-                            )
-                            if current_number is not None
-                            else None
-                        ),
+                        "current_settlement": current_settlement_ref,
                     }
                 )
                 row_states.append(
                     {
-                        **basic,
-                        "currentGeneration": current_generation,
-                        "currentClaimSet": current_claim,
-                        "currentSettlement": current_settlement,
-                        "currentPredecessorGeneration": (
-                            current_predecessor_generation
-                        ),
-                        "currentPredecessorClaimSet": (
-                            current_predecessor_claim
-                        ),
-                        "currentPredecessorSettlement": (
-                            current_predecessor_settlement
-                        ),
-                        "ownerLineage": owner_lineage,
+                        **provisional_state,
                         "candidateGeneration": (
                             candidate_payload if candidate_exists else None
                         ),
@@ -8508,6 +13567,66 @@ class RowAuthorityStore:
                             candidate_settlement_payload
                             if candidate_settlement_exists
                             else None
+                        ),
+                        "candidatePredecessorGeneration": (
+                            candidate_predecessor_generation
+                        ),
+                        "candidatePredecessorClaimSet": candidate_predecessor_claim,
+                        "candidatePredecessorSettlement": (
+                            candidate_predecessor_settlement
+                        ),
+                        "candidatePredecessorReleaseMatches": (
+                            candidate_predecessor_release_matches
+                        ),
+                        "candidatePredecessorRestoredAuthority": (
+                            candidate_predecessor_restored_authority
+                        ),
+                        "replayWinnerMatches": replay_winner_matches,
+                        "replayWinnerClaimSet": replay_winner_claim,
+                        "replayWinnerSettlement": replay_winner_settlement,
+                        "replayWinnerSuccessorGeneration": (
+                            replay_winner_successor["generation"]
+                        ),
+                        "replayWinnerSuccessorClaimSet": (
+                            replay_winner_successor["claimSet"]
+                        ),
+                        "replayWinnerSuccessorSettlement": (
+                            replay_winner_successor["settlement"]
+                        ),
+                        "replayWinnerSuccessorReleaseMatches": (
+                            replay_winner_successor[
+                                "linkReleaseMatches"
+                            ]
+                        ),
+                        "replayWinnerSuccessorRestoredAuthority": (
+                            replay_winner_successor[
+                                "linkRestoredAuthority"
+                            ]
+                        ),
+                        "replayWinnerRestorationReleaseMatches": (
+                            replay_winner_successor[
+                                "restorationReleaseMatches"
+                            ]
+                        ),
+                        "replayWinnerRestoredAuthority": (
+                            replay_winner_successor[
+                                "restoredWinnerAuthority"
+                            ]
+                        ),
+                        "replayWinnerRestorationExitGeneration": (
+                            replay_winner_successor[
+                                "restorationExitGeneration"
+                            ]
+                        ),
+                        "replayWinnerRestorationExitClaimSet": (
+                            replay_winner_successor[
+                                "restorationExitClaimSet"
+                            ]
+                        ),
+                        "replayWinnerRestorationExitSettlement": (
+                            replay_winner_successor[
+                                "restorationExitSettlement"
+                            ]
                         ),
                     }
                 )
@@ -8619,6 +13738,29 @@ class RowAuthorityStore:
                         bool(snapshot.exists),
                         snapshot.to_dict() if snapshot.exists else None,
                     )
+                query_observed = []
+                for query_readback in callback_state["query_readbacks"]:
+                    query = query_readback["query"]
+                    stream = getattr(query, "stream", None)
+                    if callable(stream):
+                        query_snapshots = tuple(stream())
+                    else:
+                        get = getattr(query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "claim bounded query cannot be read back"
+                            )
+                        query_snapshots = tuple(get())
+                    query_observed.append(
+                        tuple(
+                            (
+                                snapshot.reference.path,
+                                snapshot.to_dict(),
+                            )
+                            for snapshot in query_snapshots
+                            if snapshot.exists
+                        )
+                    )
             except Exception as readback_exc:
                 raise RowAuthorityAmbiguous(
                     "claim commit outcome cannot be read back"
@@ -8634,11 +13776,62 @@ class RowAuthorityStore:
                 )
             exact_before = readback == callback_state["before"]
             exact_after = readback == expected_after
-            if exact_after:
+            query_before_ok = all(
+                observed == query_readback["matches"]
+                for observed, query_readback in zip(
+                    query_observed,
+                    callback_state["query_readbacks"],
+                    strict=True,
+                )
+            )
+            query_after_expectations = []
+            for query_readback in callback_state["query_readbacks"]:
+                expected_matches = query_readback["matches"]
+                if query_readback["kind"] == "settlement_history":
+                    by_path = {
+                        path: _defensive_copy(document)
+                        for path, document in expected_matches
+                    }
+                    for mutation in plan["mutations"]:
+                        if not mutation["target"].startswith(
+                            "predecessor_settlement:"
+                        ):
+                            continue
+                        document = mutation["document"]
+                        if document["rowId"] != query_readback["rowId"]:
+                            continue
+                        reference = callback_state[
+                            "mutation_references"
+                        ][mutation["target"]]
+                        by_path[reference.path] = _defensive_copy(document)
+                    expected_matches = tuple(
+                        sorted(
+                            by_path.items(),
+                            key=lambda item: (
+                                item[1]["generation"],
+                                item[0],
+                            ),
+                            reverse=True,
+                        )[:2]
+                    )
+                query_after_expectations.append(expected_matches)
+            query_after_ok = all(
+                observed == expected_matches
+                for observed, expected_matches in zip(
+                    query_observed,
+                    query_after_expectations,
+                    strict=True,
+                )
+            )
+            if exact_after and query_after_ok:
                 disposition = plan["disposition"]
-            elif exact_before and not plan["mutations"]:
+            elif (
+                exact_before
+                and query_before_ok
+                and not plan["mutations"]
+            ):
                 disposition = plan["disposition"]
-            elif exact_before:
+            elif exact_before and query_before_ok:
                 raise RowAuthorityRetryable(
                     "claim commit failed before any apply"
                 ) from exc
@@ -8717,6 +13910,9 @@ class RowAuthorityStore:
                 "new lease must end after takeover"
             )
         generation_number = expected["effectiveOwnerGeneration"]
+        user_ref = self._firestore.collection("users").document(
+            checked_user_id
+        )
         references = self._lease_takeover_references(
             verified_user_id=checked_user_id,
             row_id=checked_row_id,
@@ -8734,6 +13930,9 @@ class RowAuthorityStore:
             "generation": None,
             "takeover_head": None,
             "result_head": None,
+            "extra_references": {},
+            "extra_before": {},
+            "query_readbacks": [],
         }
 
         def reject(error):
@@ -8753,8 +13952,30 @@ class RowAuthorityStore:
                     "generation": None,
                     "takeover_head": None,
                     "result_head": None,
+                    "extra_references": {},
+                    "extra_before": {},
+                    "query_readbacks": [],
                 }
             )
+
+            def read_extra(reference):
+                path = reference.path
+                if path in callback_state["extra_before"]:
+                    return callback_state["extra_before"][path]
+                try:
+                    snapshot = reference.get(transaction=transaction)
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "lease takeover bounded read failed before writes"
+                    ) from exc
+                observed_extra = (
+                    bool(snapshot.exists),
+                    snapshot.to_dict() if snapshot.exists else None,
+                )
+                callback_state["extra_references"][path] = reference
+                callback_state["extra_before"][path] = observed_extra
+                return observed_extra
             try:
                 observed = self._read_reference_payloads(
                     references,
@@ -8826,6 +14047,381 @@ class RowAuthorityStore:
                     )
                 )
             try:
+                current_claim_ref = user_ref.collection(
+                    "rowClaimSets"
+                ).document(generation["requestId"])
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "lease takeover claim cannot form an exact path"
+                    )
+                )
+            current_claim_exists, current_claim_payload = read_extra(
+                current_claim_ref
+            )
+            if not current_claim_exists:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "lease takeover is missing its current claim"
+                    )
+                )
+            try:
+                history_query = (
+                    user_ref.collection("rowOwnerSettlements")
+                    .where("rowId", "==", checked_row_id)
+                    .order_by("generation", direction="DESCENDING")
+                    .limit(2)
+                )
+                history_snapshots = tuple(transaction.get(history_query))
+            except Exception as exc:
+                callback_state["read_failed"] = True
+                raise RowAuthorityRetryable(
+                    "lease takeover bounded history query failed before writes"
+                ) from exc
+            latest_settlements = []
+            latest_authorities = []
+            history_matches = []
+            for history_snapshot in history_snapshots:
+                history_exists, history_payload = read_extra(
+                    history_snapshot.reference
+                )
+                if not history_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "lease takeover history query returned a missing document"
+                        )
+                    )
+                history_matches.append(
+                    (
+                        history_snapshot.reference.path,
+                        _defensive_copy(history_payload),
+                    )
+                )
+                try:
+                    checked_history_settlement = (
+                        validate_owner_settlement_document(
+                            document=history_payload
+                        )
+                    )
+                    history_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=checked_history_settlement["generation"],
+                    )
+                    history_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(history_id)
+                    (
+                        history_generation_exists,
+                        history_generation_payload,
+                    ) = read_extra(history_generation_ref)
+                    if not history_generation_exists:
+                        raise RowAuthorityAmbiguous(
+                            "lease takeover history lacks its generation"
+                        )
+                    checked_history_generation = (
+                        validate_owner_generation_document(
+                            document=history_generation_payload
+                        )
+                    )
+                    history_claim_ref = user_ref.collection(
+                        "rowClaimSets"
+                    ).document(checked_history_generation["requestId"])
+                    history_claim_exists, history_claim_payload = read_extra(
+                        history_claim_ref
+                    )
+                    if not history_claim_exists:
+                        raise RowAuthorityAmbiguous(
+                            "lease takeover history lacks its claim"
+                        )
+                except RowAuthorityError as exc:
+                    reject(exc)
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "lease takeover history authority is malformed"
+                        )
+                    )
+                latest_settlements.append(
+                    {
+                        "path": history_snapshot.reference.path,
+                        "document": history_payload,
+                    }
+                )
+                latest_authorities.append(
+                    {
+                        "generation": history_generation_payload,
+                        "claimSet": history_claim_payload,
+                    }
+                )
+            callback_state["query_readbacks"].append(
+                {
+                    "query": history_query,
+                    "matches": tuple(history_matches),
+                }
+            )
+            latest_predecessor_release_matches = []
+            latest_predecessor_restored_authority = None
+            predecessor_release_hash = (
+                _bounded_predecessor_release_lookup_hash(
+                    latest_settlements=latest_settlements,
+                    latest_authorities=latest_authorities,
+                )
+            )
+            if predecessor_release_hash is not None:
+                try:
+                    history_release_query = (
+                        user_ref.collection("contactOptOutFanoutResults")
+                        .where("rowId", "==", checked_row_id)
+                        .where(
+                            "releasedRowSettlementHash",
+                            "==",
+                            predecessor_release_hash,
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    history_release_snapshots = tuple(
+                        transaction.get(history_release_query)
+                    )
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "lease takeover predecessor-history release query failed before writes"
+                    ) from exc
+                history_release_matches = []
+                for release_snapshot in history_release_snapshots:
+                    release_exists, release_payload = read_extra(
+                        release_snapshot.reference
+                    )
+                    if not release_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "lease takeover predecessor-history release query returned a missing document"
+                            )
+                        )
+                    latest_predecessor_release_matches.append(
+                        {
+                            "path": release_snapshot.reference.path,
+                            "document": release_payload,
+                        }
+                    )
+                    history_release_matches.append(
+                        (
+                            release_snapshot.reference.path,
+                            _defensive_copy(release_payload),
+                        )
+                    )
+                callback_state["query_readbacks"].append(
+                    {
+                        "query": history_release_query,
+                        "matches": tuple(history_release_matches),
+                    }
+                )
+                if len(latest_predecessor_release_matches) == 1:
+                    latest_predecessor_restored_authority = (
+                        _read_bounded_release_restored_authority(
+                            user_ref=user_ref,
+                            row_id=checked_row_id,
+                            release_document=(
+                                latest_predecessor_release_matches[0][
+                                    "document"
+                                ]
+                            ),
+                            read=read_extra,
+                        )
+                    )
+            release_result = None
+            release_result_path = None
+            released_authority = None
+            restored_authority = None
+            if (
+                actual_head["latestSettlementHash"]
+                != actual_head["effectiveSettlementHash"]
+                and actual_head["latestOptOutReleaseResultHash"] is not None
+            ):
+                try:
+                    release_query = (
+                        user_ref.collection("contactOptOutFanoutResults")
+                        .where("rowId", "==", checked_row_id)
+                        .where(
+                            "contactFanoutResultHash",
+                            "==",
+                            actual_head["latestOptOutReleaseResultHash"],
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    release_snapshots = tuple(transaction.get(release_query))
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "lease takeover release-result query failed before writes"
+                    ) from exc
+                if len(release_snapshots) != 1:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "lease takeover release-result bridge is missing or duplicated"
+                        )
+                    )
+                release_snapshot = release_snapshots[0]
+                release_exists, release_payload = read_extra(
+                    release_snapshot.reference
+                )
+                if not release_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "lease takeover release-result bridge is missing"
+                        )
+                    )
+                release_result = release_payload
+                release_result_path = release_snapshot.reference.path
+                callback_state["query_readbacks"].append(
+                    {
+                        "query": release_query,
+                        "matches": (
+                            (
+                                release_result_path,
+                                _defensive_copy(release_payload),
+                            ),
+                        ),
+                    }
+                )
+                try:
+                    checked_release = validate_contact_fanout_result_document(
+                        document=release_payload
+                    )
+                    released_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=checked_release["releasedRowGeneration"],
+                    )
+                    released_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(released_id)
+                    (
+                        released_generation_exists,
+                        released_generation_payload,
+                    ) = read_extra(released_generation_ref)
+                    released_claim_payload = None
+                    if released_generation_exists:
+                        checked_released_generation = (
+                            validate_owner_generation_document(
+                                document=released_generation_payload
+                            )
+                        )
+                        released_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(checked_released_generation["requestId"])
+                        (
+                            released_claim_exists,
+                            observed_released_claim,
+                        ) = read_extra(released_claim_ref)
+                        if released_claim_exists:
+                            released_claim_payload = observed_released_claim
+                    released_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(released_id)
+                    (
+                        released_settlement_exists,
+                        released_settlement_payload,
+                    ) = read_extra(released_settlement_ref)
+                    released_authority = {
+                        "path": released_settlement_ref.path,
+                        "generation": (
+                            released_generation_payload
+                            if released_generation_exists
+                            else None
+                        ),
+                        "claimSet": released_claim_payload,
+                        "settlement": (
+                            released_settlement_payload
+                            if released_settlement_exists
+                            else None
+                        ),
+                    }
+                    restored_number = checked_release[
+                        "restoredEffectiveGeneration"
+                    ]
+                    if restored_number is not None:
+                        restored_id = _generation_document_id(
+                            row_id=checked_row_id,
+                            generation=restored_number,
+                        )
+                        restored_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(restored_id)
+                        (
+                            restored_generation_exists,
+                            restored_generation_payload,
+                        ) = read_extra(restored_generation_ref)
+                        restored_claim_payload = None
+                        if restored_generation_exists:
+                            checked_restored_generation = (
+                                validate_owner_generation_document(
+                                    document=restored_generation_payload
+                                )
+                            )
+                            restored_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_restored_generation["requestId"]
+                            )
+                            (
+                                restored_claim_exists,
+                                observed_restored_claim,
+                            ) = read_extra(restored_claim_ref)
+                            if restored_claim_exists:
+                                restored_claim_payload = observed_restored_claim
+                        restored_settlement_ref = user_ref.collection(
+                            "rowOwnerSettlements"
+                        ).document(restored_id)
+                        (
+                            restored_settlement_exists,
+                            restored_settlement_payload,
+                        ) = read_extra(restored_settlement_ref)
+                        restored_authority = {
+                            "generation": (
+                                restored_generation_payload
+                                if restored_generation_exists
+                                else None
+                            ),
+                            "claimSet": restored_claim_payload,
+                            "settlement": (
+                                restored_settlement_payload
+                                if restored_settlement_exists
+                                else None
+                            ),
+                        }
+                except RowAuthorityRetryable:
+                    raise
+                except Exception:
+                    released_authority = {"malformed": True}
+                    restored_authority = {"malformed": True}
+            try:
+                _validate_bounded_row_history(
+                    scope=checked_scope,
+                    row_id=checked_row_id,
+                    head=actual_head,
+                    row_state={
+                        "currentGeneration": generation,
+                        "currentClaimSet": current_claim_payload,
+                        "currentSettlement": None,
+                        "latestSettlements": latest_settlements,
+                        "latestSettlementAuthorities": latest_authorities,
+                        "latestPredecessorReleaseMatches": (
+                            latest_predecessor_release_matches
+                        ),
+                        "latestPredecessorRestoredAuthority": (
+                            latest_predecessor_restored_authority
+                        ),
+                        "releaseResult": release_result,
+                        "releaseResultPath": release_result_path,
+                        "releasedAuthority": released_authority,
+                        "restoredAuthority": restored_authority,
+                    },
+                )
+            except RowAuthorityError as exc:
+                reject(exc)
+            try:
                 takeover_head = _build_lease_takeover_head(
                     expected_head=expected,
                     generation_document=generation,
@@ -8886,6 +14482,38 @@ class RowAuthorityStore:
                 ) from exc
             try:
                 readback = self._read_reference_payloads(references)
+                extra_readback = {}
+                for path, reference in callback_state[
+                    "extra_references"
+                ].items():
+                    snapshot = reference.get()
+                    extra_readback[path] = (
+                        bool(snapshot.exists),
+                        snapshot.to_dict() if snapshot.exists else None,
+                    )
+                query_observed = []
+                for query_readback in callback_state["query_readbacks"]:
+                    query = query_readback["query"]
+                    stream = getattr(query, "stream", None)
+                    if callable(stream):
+                        query_snapshots = tuple(stream())
+                    else:
+                        get = getattr(query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "lease takeover bounded query cannot be read back"
+                            )
+                        query_snapshots = tuple(get())
+                    query_observed.append(
+                        tuple(
+                            (
+                                snapshot.reference.path,
+                                snapshot.to_dict(),
+                            )
+                            for snapshot in query_snapshots
+                            if snapshot.exists
+                        )
+                    )
             except Exception as readback_exc:
                 raise RowAuthorityAmbiguous(
                     "lease takeover commit outcome cannot be read back"
@@ -8894,14 +14522,32 @@ class RowAuthorityStore:
             expected_after[1] = (True, takeover_head)
             exact_before = readback == before
             exact_after = readback == tuple(expected_after)
-            if exact_after and callback_state["prepared"]:
+            extra_unchanged = extra_readback == callback_state[
+                "extra_before"
+            ]
+            queries_unchanged = all(
+                observed == query_readback["matches"]
+                for observed, query_readback in zip(
+                    query_observed,
+                    callback_state["query_readbacks"],
+                    strict=True,
+                )
+            )
+            if (
+                exact_after
+                and callback_state["prepared"]
+                and extra_unchanged
+                and queries_unchanged
+            ):
                 disposition = "taken_over"
             elif (
                 exact_before
                 and callback_state["disposition"] == "already_applied"
+                and extra_unchanged
+                and queries_unchanged
             ):
                 disposition = "already_applied"
-            elif exact_before:
+            elif exact_before and extra_unchanged and queries_unchanged:
                 raise RowAuthorityRetryable(
                     "lease takeover commit failed before apply"
                 ) from exc
@@ -9007,6 +14653,7 @@ class RowAuthorityStore:
             "before": {},
             "ordered_paths": [],
             "mutation_references": {},
+            "query_readbacks": [],
         }
 
         def reject(error):
@@ -9026,6 +14673,7 @@ class RowAuthorityStore:
                     "before": {},
                     "ordered_paths": [],
                     "mutation_references": {},
+                    "query_readbacks": [],
                 }
             )
 
@@ -9095,39 +14743,6 @@ class RowAuthorityStore:
                     )
                 )
             settlement_observed = read(settlement_ref)
-            prior_effective_settlement = None
-            if expected["effectiveSettlementHash"] is not None:
-                if generation_number <= 1:
-                    reject(
-                        RowAuthorityConflict(
-                            "first generation cannot have prior effective settlement"
-                        )
-                    )
-                prior_matches = []
-                for prior_number in range(1, generation_number):
-                    prior_ref = user_ref.collection(
-                        "rowOwnerSettlements"
-                    ).document(
-                        _generation_document_id(
-                            row_id=checked_row_id,
-                            generation=prior_number,
-                        )
-                    )
-                    prior_observed = read(prior_ref)
-                    if (
-                        prior_observed[0]
-                        and type(prior_observed[1]) is dict
-                        and prior_observed[1].get("settlementHash")
-                        == expected["effectiveSettlementHash"]
-                    ):
-                        prior_matches.append(prior_observed[1])
-                if len(prior_matches) != 1:
-                    reject(
-                        RowAuthorityAmbiguous(
-                            "effective predecessor settlement is not unique"
-                        )
-                    )
-                prior_effective_settlement = prior_matches[0]
             try:
                 preliminary_actual_head = validate_row_authority_head(
                     document=head_observed[1]
@@ -9138,89 +14753,512 @@ class RowAuthorityStore:
                         "settlement current row head is malformed"
                     )
                 )
-            actual_owner_lineage = None
+            try:
+                history_query = (
+                    user_ref.collection("rowOwnerSettlements")
+                    .where("rowId", "==", checked_row_id)
+                    .order_by("generation", direction="DESCENDING")
+                    .limit(2)
+                )
+                history_snapshots = tuple(transaction.get(history_query))
+            except Exception as exc:
+                callback_state["read_failed"] = True
+                raise RowAuthorityRetryable(
+                    "settlement bounded history query failed before writes"
+                ) from exc
+            latest_settlements = []
+            latest_authorities = []
+            for history_snapshot in history_snapshots:
+                history_exists, history_payload = read(
+                    history_snapshot.reference
+                )
+                if not history_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "settlement history query returned a missing document"
+                        )
+                    )
+                latest_settlements.append(
+                    {
+                        "path": history_snapshot.reference.path,
+                        "document": history_payload,
+                    }
+                )
+                history_generation = None
+                history_claim = None
+                try:
+                    checked_history_settlement = (
+                        validate_owner_settlement_document(
+                            document=history_payload
+                        )
+                    )
+                    history_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(
+                        _generation_document_id(
+                            row_id=checked_row_id,
+                            generation=checked_history_settlement[
+                                "generation"
+                            ],
+                        )
+                    )
+                    history_generation_exists, history_generation_payload = read(
+                        history_generation_ref
+                    )
+                    if history_generation_exists:
+                        history_generation = history_generation_payload
+                        checked_history_generation = (
+                            validate_owner_generation_document(
+                                document=history_generation_payload
+                            )
+                        )
+                        history_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(checked_history_generation["requestId"])
+                        history_claim_exists, history_claim_payload = read(
+                            history_claim_ref
+                        )
+                        if history_claim_exists:
+                            history_claim = history_claim_payload
+                except RowAuthorityRetryable:
+                    raise
+                except Exception:
+                    pass
+                latest_authorities.append(
+                    {
+                        "generation": history_generation,
+                        "claimSet": history_claim,
+                    }
+                )
+            callback_state["query_readbacks"].append(
+                {
+                    "kind": "settlement_history",
+                    "rowId": checked_row_id,
+                    "query": history_query,
+                    "matches": tuple(
+                        (
+                            entry["path"],
+                            _defensive_copy(entry["document"]),
+                        )
+                        for entry in latest_settlements
+                    ),
+                }
+            )
+            latest_predecessor_release_matches = []
+            latest_predecessor_restored_authority = None
+            predecessor_release_hash = (
+                _bounded_predecessor_release_lookup_hash(
+                    latest_settlements=latest_settlements,
+                    latest_authorities=latest_authorities,
+                )
+            )
+            if predecessor_release_hash is not None:
+                try:
+                    history_release_query = (
+                        user_ref.collection("contactOptOutFanoutResults")
+                        .where("rowId", "==", checked_row_id)
+                        .where(
+                            "releasedRowSettlementHash",
+                            "==",
+                            predecessor_release_hash,
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    history_release_snapshots = tuple(
+                        transaction.get(history_release_query)
+                    )
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "settlement predecessor-history release query failed before writes"
+                    ) from exc
+                for release_snapshot in history_release_snapshots:
+                    release_exists, release_payload = read(
+                        release_snapshot.reference
+                    )
+                    if not release_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "settlement predecessor-history release query returned a missing document"
+                            )
+                        )
+                    latest_predecessor_release_matches.append(
+                        {
+                            "path": release_snapshot.reference.path,
+                            "document": release_payload,
+                        }
+                    )
+                callback_state["query_readbacks"].append(
+                    {
+                        "kind": "stable",
+                        "query": history_release_query,
+                        "matches": tuple(
+                            (
+                                entry["path"],
+                                _defensive_copy(entry["document"]),
+                            )
+                            for entry in (
+                                latest_predecessor_release_matches
+                            )
+                        ),
+                    }
+                )
+                if len(latest_predecessor_release_matches) == 1:
+                    latest_predecessor_restored_authority = (
+                        _read_bounded_release_restored_authority(
+                            user_ref=user_ref,
+                            row_id=checked_row_id,
+                            release_document=(
+                                latest_predecessor_release_matches[0][
+                                    "document"
+                                ]
+                            ),
+                            read=read,
+                        )
+                    )
+
             actual_generation_number = preliminary_actual_head[
                 "effectiveOwnerGeneration"
             ]
-            if (
-                actual_generation_number is not None
-                and actual_generation_number > generation_number
-            ):
-                if actual_generation_number > 3:
-                    reject(
-                        RowAuthorityConflict(
-                            "settlement replay exceeds bounded priority lineage"
-                        )
-                    )
-                lineage = []
-                for lineage_number in range(1, actual_generation_number + 1):
-                    lineage_id = _generation_document_id(
-                        row_id=checked_row_id,
-                        generation=lineage_number,
-                    )
-                    lineage_generation_ref = user_ref.collection(
-                        "rowOwnerGenerations"
-                    ).document(lineage_id)
-                    lineage_generation_observed = read(
-                        lineage_generation_ref
-                    )
-                    if not lineage_generation_observed[0]:
-                        reject(
-                            RowAuthorityAmbiguous(
-                                "settlement replay is missing later generation lineage"
-                            )
-                        )
+            actual_generation = None
+            actual_claim = None
+            actual_settlement = None
+            if actual_generation_number is not None:
+                actual_id = _generation_document_id(
+                    row_id=checked_row_id,
+                    generation=actual_generation_number,
+                )
+                actual_generation_ref = user_ref.collection(
+                    "rowOwnerGenerations"
+                ).document(actual_id)
+                actual_generation_exists, actual_generation_payload = read(
+                    actual_generation_ref
+                )
+                if actual_generation_exists:
+                    actual_generation = actual_generation_payload
                     try:
-                        lineage_generation = (
+                        checked_actual_generation = (
                             validate_owner_generation_document(
-                                document=lineage_generation_observed[1]
+                                document=actual_generation_payload
                             )
                         )
-                        if (
-                            lineage_generation["userScopeHash"]
-                            != checked_scope
-                            or lineage_generation["rowId"]
-                            != checked_row_id
-                            or lineage_generation["generation"]
-                            != lineage_number
-                        ):
-                            raise RowAuthorityConfigError(
-                                "later generation occupies the wrong path"
-                            )
-                        lineage_claim_ref = user_ref.collection(
+                        actual_claim_ref = user_ref.collection(
                             "rowClaimSets"
-                        ).document(lineage_generation["requestId"])
+                        ).document(checked_actual_generation["requestId"])
                     except Exception as exc:
                         reject(
                             RowAuthorityConflict(
-                                "settlement replay later generation is malformed"
+                                "settlement current generation is malformed"
                             )
                         )
-                    lineage_claim_observed = read(lineage_claim_ref)
-                    if not lineage_claim_observed[0]:
-                        reject(
-                            RowAuthorityAmbiguous(
-                                "settlement replay is missing later claim lineage"
-                            )
-                        )
-                    lineage_settlement_ref = user_ref.collection(
-                        "rowOwnerSettlements"
-                    ).document(lineage_id)
-                    lineage_settlement_observed = read(
-                        lineage_settlement_ref
+                    actual_claim_exists, actual_claim_payload = read(
+                        actual_claim_ref
                     )
-                    lineage.append(
-                        {
-                            "generation": lineage_generation_observed[1],
-                            "claimSet": lineage_claim_observed[1],
+                    if actual_claim_exists:
+                        actual_claim = actual_claim_payload
+                actual_settlement_ref = user_ref.collection(
+                    "rowOwnerSettlements"
+                ).document(actual_id)
+                actual_settlement_exists, actual_settlement_payload = read(
+                    actual_settlement_ref
+                )
+                if actual_settlement_exists:
+                    actual_settlement = actual_settlement_payload
+
+            release_result = None
+            release_result_path = None
+            released_authority = None
+            restored_authority = None
+            if (
+                preliminary_actual_head["latestSettlementHash"]
+                != preliminary_actual_head["effectiveSettlementHash"]
+                and preliminary_actual_head["latestOptOutReleaseResultHash"]
+                is not None
+            ):
+                try:
+                    release_query = (
+                        user_ref.collection("contactOptOutFanoutResults")
+                        .where("rowId", "==", checked_row_id)
+                        .where(
+                            "contactFanoutResultHash",
+                            "==",
+                            preliminary_actual_head[
+                                "latestOptOutReleaseResultHash"
+                            ],
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    release_snapshots = tuple(transaction.get(release_query))
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "settlement release-result query failed before writes"
+                    ) from exc
+                if len(release_snapshots) != 1:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "settlement release-result bridge is not unique"
+                        )
+                    )
+                release_snapshot = release_snapshots[0]
+                release_exists, release_payload = read(
+                    release_snapshot.reference
+                )
+                if not release_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "settlement release-result bridge is missing"
+                        )
+                    )
+                release_result = release_payload
+                release_result_path = release_snapshot.reference.path
+                callback_state["query_readbacks"].append(
+                    {
+                        "kind": "stable",
+                        "query": release_query,
+                        "matches": (
+                            (
+                                release_result_path,
+                                _defensive_copy(release_payload),
+                            ),
+                        ),
+                    }
+                )
+                try:
+                    checked_release = validate_contact_fanout_result_document(
+                        document=release_payload
+                    )
+                    released_number = checked_release[
+                        "releasedRowGeneration"
+                    ]
+                    released_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=released_number,
+                    )
+                    released_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(released_id)
+                    (
+                        released_generation_exists,
+                        released_generation_payload,
+                    ) = read(released_generation_ref)
+                    released_claim_payload = None
+                    if released_generation_exists:
+                        checked_released_generation = (
+                            validate_owner_generation_document(
+                                document=released_generation_payload
+                            )
+                        )
+                        released_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(checked_released_generation["requestId"])
+                        (
+                            released_claim_exists,
+                            observed_released_claim,
+                        ) = read(released_claim_ref)
+                        if released_claim_exists:
+                            released_claim_payload = observed_released_claim
+                    released_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(released_id)
+                    (
+                        released_settlement_exists,
+                        released_settlement_payload,
+                    ) = read(released_settlement_ref)
+                    released_authority = {
+                        "path": released_settlement_ref.path,
+                        "generation": (
+                            released_generation_payload
+                            if released_generation_exists
+                            else None
+                        ),
+                        "claimSet": released_claim_payload,
+                        "settlement": (
+                            released_settlement_payload
+                            if released_settlement_exists
+                            else None
+                        ),
+                    }
+                    restored_number = checked_release[
+                        "restoredEffectiveGeneration"
+                    ]
+                    if restored_number is not None:
+                        restored_id = _generation_document_id(
+                            row_id=checked_row_id,
+                            generation=restored_number,
+                        )
+                        restored_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(restored_id)
+                        restored_generation_exists, restored_generation_payload = read(
+                            restored_generation_ref
+                        )
+                        restored_claim_payload = None
+                        if restored_generation_exists:
+                            checked_restored_generation = (
+                                validate_owner_generation_document(
+                                    document=restored_generation_payload
+                                )
+                            )
+                            restored_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_restored_generation["requestId"]
+                            )
+                            restored_claim_exists, observed_restored_claim = read(
+                                restored_claim_ref
+                            )
+                            if restored_claim_exists:
+                                restored_claim_payload = observed_restored_claim
+                        restored_settlement_ref = user_ref.collection(
+                            "rowOwnerSettlements"
+                        ).document(restored_id)
+                        restored_settlement_exists, restored_settlement_payload = read(
+                            restored_settlement_ref
+                        )
+                        restored_authority = {
+                            "generation": (
+                                restored_generation_payload
+                                if restored_generation_exists
+                                else None
+                            ),
+                            "claimSet": restored_claim_payload,
                             "settlement": (
-                                lineage_settlement_observed[1]
-                                if lineage_settlement_observed[0]
+                                restored_settlement_payload
+                                if restored_settlement_exists
                                 else None
                             ),
                         }
+                except RowAuthorityRetryable:
+                    raise
+                except Exception:
+                    released_authority = {"malformed": True}
+                    restored_authority = {"malformed": True}
+
+            try:
+                actual_bounded_history = _validate_bounded_row_history(
+                    scope=checked_scope,
+                    row_id=checked_row_id,
+                    head=preliminary_actual_head,
+                    row_state={
+                        "currentGeneration": actual_generation,
+                        "currentClaimSet": actual_claim,
+                        "currentSettlement": actual_settlement,
+                        "latestSettlements": latest_settlements,
+                        "latestSettlementAuthorities": latest_authorities,
+                        "latestPredecessorReleaseMatches": (
+                            latest_predecessor_release_matches
+                        ),
+                        "latestPredecessorRestoredAuthority": (
+                            latest_predecessor_restored_authority
+                        ),
+                        "releaseResult": release_result,
+                        "releaseResultPath": release_result_path,
+                        "releasedAuthority": released_authority,
+                        "restoredAuthority": restored_authority,
+                    },
+                )
+            except RowAuthorityError as exc:
+                reject(exc)
+
+            prior_effective_settlement = None
+            predecessor_hash = expected["effectiveSettlementHash"]
+            if predecessor_hash is not None:
+                if generation_number <= 1:
+                    reject(
+                        RowAuthorityConflict(
+                            "first generation cannot have prior effective settlement"
+                        )
                     )
-                actual_owner_lineage = tuple(lineage)
+                prior_matches = [
+                    entry
+                    for entry in latest_settlements
+                    if entry["document"].get("settlementHash")
+                    == predecessor_hash
+                ]
+                if not prior_matches:
+                    try:
+                        predecessor_query = (
+                            user_ref.collection("rowOwnerSettlements")
+                            .where("rowId", "==", checked_row_id)
+                            .where(
+                                "settlementHash",
+                                "==",
+                                predecessor_hash,
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                        predecessor_snapshots = tuple(
+                            transaction.get(predecessor_query)
+                        )
+                    except Exception as exc:
+                        callback_state["read_failed"] = True
+                        raise RowAuthorityRetryable(
+                            "settlement predecessor query failed before writes"
+                        ) from exc
+                    prior_matches = []
+                    predecessor_query_matches = []
+                    for predecessor_snapshot in predecessor_snapshots:
+                        predecessor_exists, predecessor_payload = read(
+                            predecessor_snapshot.reference
+                        )
+                        if predecessor_exists:
+                            prior_matches.append(
+                                {
+                                    "path": predecessor_snapshot.reference.path,
+                                    "document": predecessor_payload,
+                                }
+                            )
+                            predecessor_query_matches.append(
+                                (
+                                    predecessor_snapshot.reference.path,
+                                    _defensive_copy(predecessor_payload),
+                                )
+                            )
+                    callback_state["query_readbacks"].append(
+                        {
+                            "kind": "stable",
+                            "query": predecessor_query,
+                            "matches": tuple(predecessor_query_matches),
+                        }
+                    )
+                if len(prior_matches) != 1:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "effective predecessor settlement is not unique"
+                        )
+                    )
+                prior_match = prior_matches[0]
+                try:
+                    checked_prior_settlement = (
+                        validate_owner_settlement_document(
+                            document=prior_match["document"]
+                        )
+                    )
+                    prior_settlement_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=checked_prior_settlement["generation"],
+                    )
+                except Exception:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "effective predecessor settlement is malformed"
+                        )
+                    )
+                if (
+                    type(prior_match["path"]) is not str
+                    or prior_match["path"].split("/")[-2:]
+                    != ["rowOwnerSettlements", prior_settlement_id]
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "effective predecessor settlement occupies the wrong path"
+                        )
+                    )
+                prior_effective_settlement = prior_match["document"]
             try:
                 plan = _plan_owner_generation_settlement(
                     user_scope_hash=checked_scope,
@@ -9240,7 +15278,7 @@ class RowAuthorityStore:
                     ),
                     settled_at=checked_settled_at,
                     operator_action_document=None,
-                    actual_owner_lineage=actual_owner_lineage,
+                    actual_bounded_history=actual_bounded_history,
                 )
             except (RowAuthorityConflict, RowAuthorityAmbiguous) as exc:
                 reject(exc)
@@ -9321,6 +15359,29 @@ class RowAuthorityStore:
                         bool(snapshot.exists),
                         snapshot.to_dict() if snapshot.exists else None,
                     )
+                query_observed = []
+                for query_readback in callback_state["query_readbacks"]:
+                    query = query_readback["query"]
+                    stream = getattr(query, "stream", None)
+                    if callable(stream):
+                        query_snapshots = tuple(stream())
+                    else:
+                        get = getattr(query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "settlement bounded query cannot be read back"
+                            )
+                        query_snapshots = tuple(get())
+                    query_observed.append(
+                        tuple(
+                            (
+                                snapshot.reference.path,
+                                snapshot.to_dict(),
+                            )
+                            for snapshot in query_snapshots
+                            if snapshot.exists
+                        )
+                    )
             except Exception as readback_exc:
                 raise RowAuthorityAmbiguous(
                     "settlement commit outcome cannot be read back"
@@ -9336,14 +15397,60 @@ class RowAuthorityStore:
                 )
             exact_before = readback == callback_state["before"]
             exact_after = readback == expected_after
-            if exact_after and callback_state["prepared"]:
+            query_before_ok = all(
+                observed == query_readback["matches"]
+                for observed, query_readback in zip(
+                    query_observed,
+                    callback_state["query_readbacks"],
+                    strict=True,
+                )
+            )
+            query_after_expectations = []
+            for query_readback in callback_state["query_readbacks"]:
+                expected_matches = query_readback["matches"]
+                if query_readback["kind"] == "settlement_history":
+                    by_path = {
+                        path: _defensive_copy(document)
+                        for path, document in expected_matches
+                    }
+                    for mutation in plan["mutations"]:
+                        if mutation["target"] != "settlement":
+                            continue
+                        document = mutation["document"]
+                        if document["rowId"] != query_readback["rowId"]:
+                            continue
+                        reference = callback_state[
+                            "mutation_references"
+                        ][mutation["target"]]
+                        by_path[reference.path] = _defensive_copy(document)
+                    expected_matches = tuple(
+                        sorted(
+                            by_path.items(),
+                            key=lambda item: (
+                                item[1]["generation"],
+                                item[0],
+                            ),
+                            reverse=True,
+                        )[:2]
+                    )
+                query_after_expectations.append(expected_matches)
+            query_after_ok = all(
+                observed == expected_matches
+                for observed, expected_matches in zip(
+                    query_observed,
+                    query_after_expectations,
+                    strict=True,
+                )
+            )
+            if exact_after and callback_state["prepared"] and query_after_ok:
                 disposition = "settled"
             elif (
                 exact_before
                 and callback_state["disposition"] == "already_applied"
+                and query_before_ok
             ):
                 disposition = "already_applied"
-            elif exact_before:
+            elif exact_before and query_before_ok:
                 raise RowAuthorityRetryable(
                     "settlement commit failed before apply"
                 ) from exc
@@ -9370,6 +15477,9 @@ class RowAuthorityStore:
             settlement=plan["settlement"],
             head=plan["head"],
             higher_generation_proven=plan["higherGenerationProven"],
+            release_restoration_proven=plan[
+                "releaseRestorationProven"
+            ],
         )
 
     def link_b1_source_settlement(
@@ -9416,9 +15526,10 @@ class RowAuthorityStore:
             generation_ref = user_ref.collection(
                 "rowOwnerGenerations"
             ).document(generation_id)
-            b2_settlement_ref = user_ref.collection(
+            owner_settlements_ref = user_ref.collection(
                 "rowOwnerSettlements"
-            ).document(generation_id)
+            )
+            b2_settlement_ref = owner_settlements_ref.document(generation_id)
             source_links_ref = user_ref.collection(
                 "rowSourceSettlementLinks"
             )
@@ -9439,6 +15550,8 @@ class RowAuthorityStore:
             "before": {},
             "ordered_paths": [],
             "mutation_references": {},
+            "settlement_query_readback": None,
+            "history_query_readbacks": [],
             "query_readback": None,
         }
 
@@ -9459,6 +15572,8 @@ class RowAuthorityStore:
                     "before": {},
                     "ordered_paths": [],
                     "mutation_references": {},
+                    "settlement_query_readback": None,
+                    "history_query_readbacks": [],
                     "query_readback": None,
                 }
             )
@@ -9488,6 +15603,219 @@ class RowAuthorityStore:
                         bool(snapshot.exists),
                         snapshot.to_dict() if snapshot.exists else None,
                     ),
+                )
+
+            try:
+                settlement_query = (
+                    owner_settlements_ref.where(
+                        "rowId",
+                        "==",
+                        checked_row_id,
+                    )
+                    .order_by("generation", direction="DESCENDING")
+                    .limit(2)
+                )
+                settlement_snapshots = tuple(
+                    transaction.get(settlement_query)
+                )
+            except Exception as exc:
+                callback_state["read_failed"] = True
+                raise RowAuthorityRetryable(
+                    "source link bounded settlement query failed before writes"
+                ) from exc
+            latest_settlements = []
+            latest_settlement_entries = []
+            latest_settlement_authorities = []
+            settlement_query_matches = []
+            for settlement_snapshot in settlement_snapshots:
+                settlement_exists, settlement_payload = read(
+                    settlement_snapshot.reference
+                )
+                if not settlement_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link bounded settlement query returned a missing document"
+                        )
+                    )
+                settlement_query_matches.append(
+                    (
+                        settlement_snapshot.reference.path,
+                        _defensive_copy(settlement_payload),
+                    )
+                )
+                try:
+                    checked_latest_settlement = (
+                        validate_owner_settlement_document(
+                            document=settlement_payload
+                        )
+                    )
+                    expected_latest_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=checked_latest_settlement["generation"],
+                    )
+                    expected_latest_ref = owner_settlements_ref.document(
+                        expected_latest_id
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link bounded settlement proof is malformed"
+                        )
+                    )
+                if (
+                    settlement_snapshot.reference.path
+                    != expected_latest_ref.path
+                    or checked_latest_settlement["userScopeHash"]
+                    != checked_scope
+                    or checked_latest_settlement["rowId"] != checked_row_id
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link bounded settlement occupies the wrong path"
+                        )
+                    )
+                try:
+                    latest_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(expected_latest_id)
+                    (
+                        latest_generation_exists,
+                        latest_generation_payload,
+                    ) = read(latest_generation_ref)
+                    if not latest_generation_exists:
+                        raise RowAuthorityAmbiguous(
+                            "source link bounded settlement lacks its generation"
+                        )
+                    checked_latest_generation = (
+                        validate_owner_generation_document(
+                            document=latest_generation_payload
+                        )
+                    )
+                    latest_claim_ref = user_ref.collection(
+                        "rowClaimSets"
+                    ).document(checked_latest_generation["requestId"])
+                    latest_claim_exists, latest_claim_payload = read(
+                        latest_claim_ref
+                    )
+                    if not latest_claim_exists:
+                        raise RowAuthorityAmbiguous(
+                            "source link bounded settlement lacks its claim"
+                        )
+                except RowAuthorityError as exc:
+                    reject(exc)
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link bounded settlement authority is malformed"
+                        )
+                    )
+                latest_settlements.append(checked_latest_settlement)
+                latest_settlement_entries.append(
+                    {
+                        "path": settlement_snapshot.reference.path,
+                        "document": settlement_payload,
+                    }
+                )
+                latest_settlement_authorities.append(
+                    {
+                        "generation": latest_generation_payload,
+                        "claimSet": latest_claim_payload,
+                    }
+                )
+            callback_state["settlement_query_readback"] = {
+                "rowId": checked_row_id,
+                "matches": tuple(settlement_query_matches),
+            }
+            latest_predecessor_release_matches = []
+            latest_predecessor_restored_authority = None
+            predecessor_release_hash = (
+                _bounded_predecessor_release_lookup_hash(
+                    latest_settlements=latest_settlement_entries,
+                    latest_authorities=latest_settlement_authorities,
+                )
+            )
+            if predecessor_release_hash is not None:
+                try:
+                    history_release_query = (
+                        user_ref.collection("contactOptOutFanoutResults")
+                        .where("rowId", "==", checked_row_id)
+                        .where(
+                            "releasedRowSettlementHash",
+                            "==",
+                            predecessor_release_hash,
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    history_release_snapshots = tuple(
+                        transaction.get(history_release_query)
+                    )
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "source link predecessor-history release query failed before writes"
+                    ) from exc
+                for release_snapshot in history_release_snapshots:
+                    release_exists, release_payload = read(
+                        release_snapshot.reference
+                    )
+                    if not release_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "source link predecessor-history release query returned a missing document"
+                            )
+                        )
+                    latest_predecessor_release_matches.append(
+                        {
+                            "path": release_snapshot.reference.path,
+                            "document": release_payload,
+                        }
+                    )
+                callback_state["history_query_readbacks"].append(
+                    {
+                        "query": history_release_query,
+                        "matches": tuple(
+                            (
+                                entry["path"],
+                                _defensive_copy(entry["document"]),
+                            )
+                            for entry in (
+                                latest_predecessor_release_matches
+                            )
+                        ),
+                    }
+                )
+                if len(latest_predecessor_release_matches) == 1:
+                    latest_predecessor_restored_authority = (
+                        _read_bounded_release_restored_authority(
+                            user_ref=user_ref,
+                            row_id=checked_row_id,
+                            release_document=(
+                                latest_predecessor_release_matches[0][
+                                    "document"
+                                ]
+                            ),
+                            read=read,
+                        )
+                    )
+            if len(latest_settlements) == 1 and (
+                latest_settlements[0]["generation"] != 1
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link single bounded settlement is not generation one"
+                    )
+                )
+            if len(latest_settlements) == 2 and (
+                latest_settlements[0]["generation"]
+                != latest_settlements[1]["generation"] + 1
+                or latest_settlements[0]["fencingToken"]
+                <= latest_settlements[1]["fencingToken"]
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link latest settlements have a gap or fencing regression"
+                    )
                 )
 
             row_identity_observed = read(row_identity_ref)
@@ -9585,6 +15913,269 @@ class RowAuthorityStore:
                         "source link row authority does not correlate"
                     )
                 )
+            current_generation = None
+            current_claim = None
+            current_settlement = None
+            current_number = current_head["effectiveOwnerGeneration"]
+            if current_number is not None:
+                current_id = _generation_document_id(
+                    row_id=checked_row_id,
+                    generation=current_number,
+                )
+                current_generation_ref = user_ref.collection(
+                    "rowOwnerGenerations"
+                ).document(current_id)
+                current_generation_exists, current_generation_payload = read(
+                    current_generation_ref
+                )
+                if current_generation_exists:
+                    current_generation = current_generation_payload
+                    try:
+                        checked_current_generation = (
+                            validate_owner_generation_document(
+                                document=current_generation_payload
+                            )
+                        )
+                        current_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(checked_current_generation["requestId"])
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "source link current generation is malformed"
+                            )
+                        )
+                    current_claim_exists, current_claim_payload = read(
+                        current_claim_ref
+                    )
+                    if current_claim_exists:
+                        current_claim = current_claim_payload
+                current_settlement_ref = owner_settlements_ref.document(
+                    current_id
+                )
+                current_settlement_exists, current_settlement_payload = read(
+                    current_settlement_ref
+                )
+                if current_settlement_exists:
+                    current_settlement = current_settlement_payload
+
+            release_result = None
+            release_result_path = None
+            released_authority = None
+            restored_authority = None
+            if (
+                current_head["latestSettlementHash"]
+                != current_head["effectiveSettlementHash"]
+                and current_head["latestOptOutReleaseResultHash"] is not None
+            ):
+                try:
+                    release_query = (
+                        user_ref.collection("contactOptOutFanoutResults")
+                        .where("rowId", "==", checked_row_id)
+                        .where(
+                            "contactFanoutResultHash",
+                            "==",
+                            current_head["latestOptOutReleaseResultHash"],
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    release_snapshots = tuple(transaction.get(release_query))
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "source link release-result query failed before writes"
+                    ) from exc
+                if len(release_snapshots) != 1:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link release-result bridge is missing or duplicated"
+                        )
+                    )
+                release_snapshot = release_snapshots[0]
+                release_exists, release_payload = read(
+                    release_snapshot.reference
+                )
+                if not release_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link release-result query returned a missing document"
+                        )
+                    )
+                release_result = release_payload
+                release_result_path = release_snapshot.reference.path
+                callback_state["history_query_readbacks"].append(
+                    {
+                        "query": release_query,
+                        "matches": (
+                            (
+                                release_result_path,
+                                _defensive_copy(release_payload),
+                            ),
+                        ),
+                    }
+                )
+                try:
+                    checked_release = validate_contact_fanout_result_document(
+                        document=release_payload
+                    )
+                    released_number = checked_release[
+                        "releasedRowGeneration"
+                    ]
+                    released_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=released_number,
+                    )
+                    released_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(released_id)
+                    (
+                        released_generation_exists,
+                        released_generation_payload,
+                    ) = read(released_generation_ref)
+                    released_claim_payload = None
+                    if released_generation_exists:
+                        checked_released_generation = (
+                            validate_owner_generation_document(
+                                document=released_generation_payload
+                            )
+                        )
+                        released_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(checked_released_generation["requestId"])
+                        (
+                            released_claim_exists,
+                            observed_released_claim,
+                        ) = read(released_claim_ref)
+                        if released_claim_exists:
+                            released_claim_payload = observed_released_claim
+                    released_settlement_ref = owner_settlements_ref.document(
+                        released_id
+                    )
+                    (
+                        released_settlement_exists,
+                        released_settlement_payload,
+                    ) = read(released_settlement_ref)
+                    released_authority = {
+                        "path": released_settlement_ref.path,
+                        "generation": (
+                            released_generation_payload
+                            if released_generation_exists
+                            else None
+                        ),
+                        "claimSet": released_claim_payload,
+                        "settlement": (
+                            released_settlement_payload
+                            if released_settlement_exists
+                            else None
+                        ),
+                    }
+                    restored_number = checked_release[
+                        "restoredEffectiveGeneration"
+                    ]
+                    if restored_number is not None:
+                        restored_id = _generation_document_id(
+                            row_id=checked_row_id,
+                            generation=restored_number,
+                        )
+                        restored_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(restored_id)
+                        (
+                            restored_generation_exists,
+                            restored_generation_payload,
+                        ) = read(restored_generation_ref)
+                        restored_claim_payload = None
+                        if restored_generation_exists:
+                            checked_restored_generation = (
+                                validate_owner_generation_document(
+                                    document=restored_generation_payload
+                                )
+                            )
+                            restored_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_restored_generation["requestId"]
+                            )
+                            (
+                                restored_claim_exists,
+                                observed_restored_claim,
+                            ) = read(restored_claim_ref)
+                            if restored_claim_exists:
+                                restored_claim_payload = observed_restored_claim
+                        restored_settlement_ref = owner_settlements_ref.document(
+                            restored_id
+                        )
+                        (
+                            restored_settlement_exists,
+                            restored_settlement_payload,
+                        ) = read(restored_settlement_ref)
+                        restored_authority = {
+                            "generation": (
+                                restored_generation_payload
+                                if restored_generation_exists
+                                else None
+                            ),
+                            "claimSet": restored_claim_payload,
+                            "settlement": (
+                                restored_settlement_payload
+                                if restored_settlement_exists
+                                else None
+                            ),
+                        }
+                except RowAuthorityRetryable:
+                    raise
+                except Exception:
+                    released_authority = {"malformed": True}
+                    restored_authority = {"malformed": True}
+            try:
+                _validate_bounded_row_history(
+                    scope=checked_scope,
+                    row_id=checked_row_id,
+                    head=current_head,
+                    row_state={
+                        "currentGeneration": current_generation,
+                        "currentClaimSet": current_claim,
+                        "currentSettlement": current_settlement,
+                        "latestSettlements": latest_settlement_entries,
+                        "latestSettlementAuthorities": (
+                            latest_settlement_authorities
+                        ),
+                        "latestPredecessorReleaseMatches": (
+                            latest_predecessor_release_matches
+                        ),
+                        "latestPredecessorRestoredAuthority": (
+                            latest_predecessor_restored_authority
+                        ),
+                        "releaseResult": release_result,
+                        "releaseResultPath": release_result_path,
+                        "releasedAuthority": released_authority,
+                        "restoredAuthority": restored_authority,
+                    },
+                )
+            except RowAuthorityError as exc:
+                reject(exc)
+            latest_settlement = (
+                latest_settlements[0] if latest_settlements else None
+            )
+            expected_latest_settlement_hash = (
+                latest_settlement["settlementHash"]
+                if latest_settlement is not None
+                else None
+            )
+            if (
+                current_head["latestSettlementHash"]
+                != expected_latest_settlement_hash
+                or any(
+                    settlement["settledAt"] > current_head["updatedAt"]
+                    for settlement in latest_settlements
+                )
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link head does not match bounded settlement history"
+                    )
+                )
             if (
                 checked_generation["requestId"] != checked_claim["requestId"]
                 or checked_generation["claimSetHash"]
@@ -9598,8 +16189,6 @@ class RowAuthorityStore:
                 or checked_claim["createdAt"] < current_head["createdAt"]
                 or checked_generation["createdAt"]
                 < checked_claim["createdAt"]
-                or checked_generation["generation"]
-                > checked_generation["priority"]
                 or (
                     checked_generation["generation"] == 1
                     and checked_generation["predecessorSettlementHash"]
@@ -9823,6 +16412,20 @@ class RowAuthorityStore:
             except RowAuthorityError as exc:
                 reject(exc)
             if (
+                latest_settlement is None
+                or b2_settlement["generation"]
+                > latest_settlement["generation"]
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link target is not present in bounded settlement history"
+                    )
+                )
+            historical_target = (
+                b2_settlement["generation"]
+                < latest_settlement["generation"]
+            )
+            if (
                 b2_settlement["outcome"] != "dominated"
                 and b2_settlement["outcome"]
                 != _expected_owner_settlement_outcome(
@@ -9847,6 +16450,7 @@ class RowAuthorityStore:
                 head_document=current_head,
                 generation_document=checked_generation,
                 settlement_document=b2_settlement,
+                historical_generation_proven=historical_target,
             ):
                 reject(
                     RowAuthorityAmbiguous(
@@ -9857,8 +16461,14 @@ class RowAuthorityStore:
                 timezone.utc
             ) or checked_linked_at < b2_settlement["settledAt"]:
                 reject(
-                    RowAuthorityConfigError(
-                        "source link time predates B1 or B2 settlement"
+                    (
+                        RowAuthorityAmbiguous(
+                            "historical source link proof postdates the link"
+                        )
+                        if historical_target
+                        else RowAuthorityConfigError(
+                            "source link time predates B1 or B2 settlement"
+                        )
                     )
                 )
 
@@ -9933,7 +16543,7 @@ class RowAuthorityStore:
                         "sourceSettlementLinkHash",
                         "==",
                         current_pointer,
-                    )
+                    ).order_by("__name__").limit(2)
                     current_snapshots = list(transaction.get(query))
                 except Exception as exc:
                     callback_state["read_failed"] = True
@@ -10125,13 +16735,77 @@ class RowAuthorityStore:
                         bool(snapshot.exists),
                         snapshot.to_dict() if snapshot.exists else None,
                     )
+                settlement_query_readback = callback_state[
+                    "settlement_query_readback"
+                ]
+                if settlement_query_readback is not None:
+                    settlement_query = (
+                        owner_settlements_ref.where(
+                            "rowId",
+                            "==",
+                            settlement_query_readback["rowId"],
+                        )
+                        .order_by("generation", direction="DESCENDING")
+                        .limit(2)
+                    )
+                    stream = getattr(settlement_query, "stream", None)
+                    if callable(stream):
+                        settlement_snapshots = list(stream())
+                    else:
+                        get = getattr(settlement_query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "source link settlement query cannot be read back"
+                            )
+                        settlement_snapshots = list(get())
+                    settlement_matches = tuple(
+                        (
+                            snapshot.reference.path,
+                            snapshot.to_dict(),
+                        )
+                        for snapshot in settlement_snapshots
+                        if snapshot.exists
+                    )
+                    if (
+                        settlement_matches
+                        != settlement_query_readback["matches"]
+                    ):
+                        raise RowAuthorityAmbiguous(
+                            "source link settlement query changed during readback"
+                        )
+                for history_query_readback in callback_state[
+                    "history_query_readbacks"
+                ]:
+                    history_query = history_query_readback["query"]
+                    stream = getattr(history_query, "stream", None)
+                    if callable(stream):
+                        history_snapshots = tuple(stream())
+                    else:
+                        get = getattr(history_query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "source link bounded query cannot be read back"
+                            )
+                        history_snapshots = tuple(get())
+                    history_matches = tuple(
+                        (
+                            snapshot.reference.path,
+                            snapshot.to_dict(),
+                        )
+                        for snapshot in history_snapshots
+                        if snapshot.exists
+                    )
+                    if history_matches != history_query_readback["matches"]:
+                        raise RowAuthorityAmbiguous(
+                            "source link bounded query changed during readback"
+                        )
                 query_readback = callback_state["query_readback"]
                 if query_readback is not None:
                     query = source_links_ref.where(
                         "sourceSettlementLinkHash",
                         "==",
                         query_readback["sourceSettlementLinkHash"],
-                    )
+                    ).order_by("__name__").limit(2)
                     stream = getattr(query, "stream", None)
                     if callable(stream):
                         query_snapshots = list(stream())
@@ -10260,6 +16934,7 @@ class RowAuthorityStore:
             "before": {},
             "ordered_paths": [],
             "mutation_references": {},
+            "query_readbacks": [],
         }
 
         def reject(error):
@@ -10279,6 +16954,7 @@ class RowAuthorityStore:
                     "before": {},
                     "ordered_paths": [],
                     "mutation_references": {},
+                    "query_readbacks": [],
                 }
             )
 
@@ -10426,166 +17102,596 @@ class RowAuthorityStore:
                 row_id = basic["rowId"]
                 head = basic["preliminaryHead"]
                 current_number = head["effectiveOwnerGeneration"]
-                if current_number is not None and current_number > 3:
-                    reject(
-                        RowAuthorityConflict(
-                            "operator decline exceeds bounded owner lineage"
-                        )
+                try:
+                    settlements_query = (
+                        user_ref.collection("rowOwnerSettlements")
+                        .where("rowId", "==", row_id)
+                        .order_by("generation", direction="DESCENDING")
+                        .limit(2)
                     )
-                owner_lineage = []
-                for lineage_number in range(1, (current_number or 0) + 1):
-                    lineage_id = _generation_document_id(
-                        row_id=row_id,
-                        generation=lineage_number,
+                    settlement_snapshots = tuple(
+                        transaction.get(settlements_query)
                     )
-                    lineage_generation_ref = user_ref.collection(
-                        "rowOwnerGenerations"
-                    ).document(lineage_id)
-                    generation_exists, generation_payload = read(
-                        lineage_generation_ref
-                    )
-                    if not generation_exists:
-                        reject(
-                            RowAuthorityAmbiguous(
-                                "operator decline owner lineage is missing a generation"
-                            )
-                        )
-                    try:
-                        checked_generation = (
-                            validate_owner_generation_document(
-                                document=generation_payload
-                            )
-                        )
-                        if (
-                            checked_generation["userScopeHash"]
-                            != checked_scope
-                            or checked_generation["rowId"] != row_id
-                            or checked_generation["generation"]
-                            != lineage_number
-                        ):
-                            raise RowAuthorityConfigError(
-                                "owner generation occupies the wrong path"
-                            )
-                        lineage_claim_ref = user_ref.collection(
-                            "rowClaimSets"
-                        ).document(checked_generation["requestId"])
-                    except Exception as exc:
-                        reject(
-                            RowAuthorityConflict(
-                                "operator decline owner generation is malformed"
-                            )
-                        )
-                    lineage_claim_exists, lineage_claim_payload = read(
-                        lineage_claim_ref
-                    )
-                    if not lineage_claim_exists:
-                        reject(
-                            RowAuthorityAmbiguous(
-                                "operator decline owner lineage is missing a claim"
-                            )
-                        )
-                    try:
-                        checked_lineage_claim = validate_claim_set_document(
-                            document=lineage_claim_payload
-                        )
-                        if (
-                            checked_lineage_claim["requestId"]
-                            != checked_generation["requestId"]
-                            or checked_lineage_claim["claimSetHash"]
-                            != checked_generation["claimSetHash"]
-                        ):
-                            raise RowAuthorityConfigError(
-                                "owner claim does not match its generation"
-                            )
-                    except Exception as exc:
-                        reject(
-                            RowAuthorityConflict(
-                                "operator decline owner claim is malformed"
-                            )
-                        )
-                    lineage_settlement_ref = user_ref.collection(
-                        "rowOwnerSettlements"
-                    ).document(lineage_id)
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "operator decline bounded settlement query failed before writes"
+                    ) from exc
+                latest_settlements = []
+                latest_settlement_authorities = []
+                for settlement_snapshot in settlement_snapshots:
                     settlement_exists, settlement_payload = read(
-                        lineage_settlement_ref
+                        settlement_snapshot.reference
                     )
-                    if (
-                        not settlement_exists
-                        and (
-                            lineage_number < current_number
-                            or head["state"] == "settled"
-                        )
-                    ):
+                    if not settlement_exists:
                         reject(
                             RowAuthorityAmbiguous(
-                                "operator decline owner lineage is missing a settlement"
+                                "operator decline bounded settlement query returned a missing document"
                             )
                         )
-                    if settlement_exists:
-                        try:
-                            checked_settlement = (
-                                validate_owner_settlement_document(
-                                    document=settlement_payload
-                                )
-                            )
-                            if (
-                                checked_settlement["userScopeHash"]
-                                != checked_scope
-                                or checked_settlement["rowId"] != row_id
-                                or checked_settlement["generation"]
-                                != lineage_number
-                                or checked_settlement["generationHash"]
-                                != checked_generation["generationHash"]
-                            ):
-                                raise RowAuthorityConfigError(
-                                    "owner settlement occupies the wrong path"
-                                )
-                        except Exception as exc:
-                            reject(
-                                RowAuthorityConflict(
-                                    "operator decline owner settlement is malformed"
-                                )
-                            )
-                    owner_lineage.append(
+                    latest_settlements.append(
                         {
-                            "generation": generation_payload,
-                            "claimSet": lineage_claim_payload,
-                            "settlement": (
-                                settlement_payload
-                                if settlement_exists
-                                else None
+                            "path": settlement_snapshot.reference.path,
+                            "document": settlement_payload,
+                        }
+                    )
+                    settlement_generation = None
+                    settlement_claim = None
+                    try:
+                        checked_settlement = (
+                            validate_owner_settlement_document(
+                                document=settlement_payload
+                            )
+                        )
+                        settlement_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(
+                            _generation_document_id(
+                                row_id=row_id,
+                                generation=checked_settlement["generation"],
+                            )
+                        )
+                        (
+                            settlement_generation_exists,
+                            settlement_generation_payload,
+                        ) = read(settlement_generation_ref)
+                        if settlement_generation_exists:
+                            settlement_generation = (
+                                settlement_generation_payload
+                            )
+                            checked_settlement_generation = (
+                                validate_owner_generation_document(
+                                    document=settlement_generation_payload
+                                )
+                            )
+                            settlement_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_settlement_generation["requestId"]
+                            )
+                            (
+                                settlement_claim_exists,
+                                settlement_claim_payload,
+                            ) = read(settlement_claim_ref)
+                            if settlement_claim_exists:
+                                settlement_claim = settlement_claim_payload
+                    except RowAuthorityRetryable:
+                        raise
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "operator decline bounded settlement authority is malformed"
+                            )
+                        )
+                    latest_settlement_authorities.append(
+                        {
+                            "generation": settlement_generation,
+                            "claimSet": settlement_claim,
+                        }
+                    )
+                callback_state["query_readbacks"].append(
+                    {
+                        "kind": "settlement_history",
+                        "rowId": row_id,
+                        "query": settlements_query,
+                        "matches": tuple(
+                            (
+                                entry["path"],
+                                _defensive_copy(entry["document"]),
+                            )
+                            for entry in latest_settlements
+                        ),
+                    }
+                )
+                latest_predecessor_release_matches = []
+                latest_predecessor_restored_authority = None
+                predecessor_release_hash = (
+                    _bounded_predecessor_release_lookup_hash(
+                        latest_settlements=latest_settlements,
+                        latest_authorities=latest_settlement_authorities,
+                    )
+                )
+                if predecessor_release_hash is not None:
+                    try:
+                        history_release_query = (
+                            user_ref.collection(
+                                "contactOptOutFanoutResults"
+                            )
+                            .where("rowId", "==", row_id)
+                            .where(
+                                "releasedRowSettlementHash",
+                                "==",
+                                predecessor_release_hash,
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                        history_release_snapshots = tuple(
+                            transaction.get(history_release_query)
+                        )
+                    except Exception as exc:
+                        callback_state["read_failed"] = True
+                        raise RowAuthorityRetryable(
+                            "operator decline predecessor-history release query failed before writes"
+                        ) from exc
+                    for release_snapshot in history_release_snapshots:
+                        release_exists, release_payload = read(
+                            release_snapshot.reference
+                        )
+                        if not release_exists:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "operator decline predecessor-history release query returned a missing document"
+                                )
+                            )
+                        latest_predecessor_release_matches.append(
+                            {
+                                "path": release_snapshot.reference.path,
+                                "document": release_payload,
+                            }
+                        )
+                    callback_state["query_readbacks"].append(
+                        {
+                            "kind": "stable",
+                            "query": history_release_query,
+                            "matches": tuple(
+                                (
+                                    entry["path"],
+                                    _defensive_copy(entry["document"]),
+                                )
+                                for entry in (
+                                    latest_predecessor_release_matches
+                                )
                             ),
                         }
                     )
-                current_entry = owner_lineage[-1] if owner_lineage else None
-                predecessor = (
-                    owner_lineage[-2] if len(owner_lineage) > 1 else None
+                    if len(latest_predecessor_release_matches) == 1:
+                        latest_predecessor_restored_authority = (
+                            _read_bounded_release_restored_authority(
+                                user_ref=user_ref,
+                                row_id=row_id,
+                                release_document=(
+                                    latest_predecessor_release_matches[0][
+                                        "document"
+                                    ]
+                                ),
+                                read=read,
+                            )
+                        )
+
+                current_generation = None
+                current_claim = None
+                current_settlement = None
+                current_settlement_ref = None
+                if current_number is not None:
+                    current_id = _generation_document_id(
+                        row_id=row_id,
+                        generation=current_number,
+                    )
+                    current_generation_ref = user_ref.collection(
+                        "rowOwnerGenerations"
+                    ).document(current_id)
+                    current_generation_exists, current_generation_payload = read(
+                        current_generation_ref
+                    )
+                    if current_generation_exists:
+                        current_generation = current_generation_payload
+                        try:
+                            checked_current_generation = (
+                                validate_owner_generation_document(
+                                    document=current_generation_payload
+                                )
+                            )
+                            current_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_current_generation["requestId"]
+                            )
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityConflict(
+                                    "operator decline current generation is malformed"
+                                )
+                            )
+                        current_claim_exists, current_claim_payload = read(
+                            current_claim_ref
+                        )
+                        if current_claim_exists:
+                            current_claim = current_claim_payload
+                            try:
+                                validate_claim_set_document(
+                                    document=current_claim_payload
+                                )
+                            except Exception as exc:
+                                reject(
+                                    RowAuthorityConflict(
+                                        "operator decline current claim is malformed"
+                                    )
+                                )
+                    current_settlement_ref = user_ref.collection(
+                        "rowOwnerSettlements"
+                    ).document(current_id)
+                    (
+                        current_settlement_exists,
+                        current_settlement_payload,
+                    ) = read(current_settlement_ref)
+                    if current_settlement_exists:
+                        current_settlement = current_settlement_payload
+
+                release_result = None
+                release_result_path = None
+                released_authority = None
+                restored_authority = None
+                if (
+                    head["latestSettlementHash"]
+                    != head["effectiveSettlementHash"]
+                    and head["latestOptOutReleaseResultHash"] is not None
+                ):
+                    try:
+                        release_query = (
+                            user_ref.collection("contactOptOutFanoutResults")
+                            .where("rowId", "==", row_id)
+                            .where(
+                                "contactFanoutResultHash",
+                                "==",
+                                head["latestOptOutReleaseResultHash"],
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                        release_snapshots = tuple(
+                            transaction.get(release_query)
+                        )
+                    except Exception as exc:
+                        callback_state["read_failed"] = True
+                        raise RowAuthorityRetryable(
+                            "operator decline release-result query failed before writes"
+                        ) from exc
+                    if len(release_snapshots) != 1:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline release-result bridge is missing or duplicated"
+                            )
+                        )
+                    release_snapshot = release_snapshots[0]
+                    release_exists, release_payload = read(
+                        release_snapshot.reference
+                    )
+                    if not release_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline release-result query returned a missing document"
+                            )
+                        )
+                    release_result = release_payload
+                    release_result_path = release_snapshot.reference.path
+                    callback_state["query_readbacks"].append(
+                        {
+                            "kind": "stable",
+                            "query": release_query,
+                            "matches": (
+                                (
+                                    release_result_path,
+                                    _defensive_copy(release_payload),
+                                ),
+                            ),
+                        }
+                    )
+                    try:
+                        checked_release_result = (
+                            validate_contact_fanout_result_document(
+                                document=release_payload
+                            )
+                        )
+                        released_number = checked_release_result[
+                            "releasedRowGeneration"
+                        ]
+                        released_id = _generation_document_id(
+                            row_id=row_id,
+                            generation=released_number,
+                        )
+                        released_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(released_id)
+                        (
+                            released_generation_exists,
+                            released_generation_payload,
+                        ) = read(released_generation_ref)
+                        released_claim_payload = None
+                        if released_generation_exists:
+                            checked_released_generation = (
+                                validate_owner_generation_document(
+                                    document=released_generation_payload
+                                )
+                            )
+                            released_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(
+                                checked_released_generation["requestId"]
+                            )
+                            (
+                                released_claim_exists,
+                                observed_released_claim,
+                            ) = read(released_claim_ref)
+                            if released_claim_exists:
+                                released_claim_payload = observed_released_claim
+                        released_settlement_ref = user_ref.collection(
+                            "rowOwnerSettlements"
+                        ).document(released_id)
+                        (
+                            released_settlement_exists,
+                            released_settlement_payload,
+                        ) = read(released_settlement_ref)
+                        released_authority = {
+                            "path": released_settlement_ref.path,
+                            "generation": (
+                                released_generation_payload
+                                if released_generation_exists
+                                else None
+                            ),
+                            "claimSet": released_claim_payload,
+                            "settlement": (
+                                released_settlement_payload
+                                if released_settlement_exists
+                                else None
+                            ),
+                        }
+                        restored_number = checked_release_result[
+                            "restoredEffectiveGeneration"
+                        ]
+                        if restored_number is not None:
+                            restored_id = _generation_document_id(
+                                row_id=row_id,
+                                generation=restored_number,
+                            )
+                            restored_generation_ref = user_ref.collection(
+                                "rowOwnerGenerations"
+                            ).document(restored_id)
+                            (
+                                restored_generation_exists,
+                                restored_generation_payload,
+                            ) = read(restored_generation_ref)
+                            restored_claim_payload = None
+                            if restored_generation_exists:
+                                checked_restored_generation = (
+                                    validate_owner_generation_document(
+                                        document=restored_generation_payload
+                                    )
+                                )
+                                restored_claim_ref = user_ref.collection(
+                                    "rowClaimSets"
+                                ).document(
+                                    checked_restored_generation["requestId"]
+                                )
+                                (
+                                    restored_claim_exists,
+                                    observed_restored_claim,
+                                ) = read(restored_claim_ref)
+                                if restored_claim_exists:
+                                    restored_claim_payload = (
+                                        observed_restored_claim
+                                    )
+                            restored_settlement_ref = user_ref.collection(
+                                "rowOwnerSettlements"
+                            ).document(restored_id)
+                            (
+                                restored_settlement_exists,
+                                restored_settlement_payload,
+                            ) = read(restored_settlement_ref)
+                            restored_authority = {
+                                "generation": (
+                                    restored_generation_payload
+                                    if restored_generation_exists
+                                    else None
+                                ),
+                                "claimSet": restored_claim_payload,
+                                "settlement": (
+                                    restored_settlement_payload
+                                    if restored_settlement_exists
+                                    else None
+                                ),
+                            }
+                    except RowAuthorityRetryable:
+                        raise
+                    except Exception:
+                        released_authority = {"malformed": True}
+                        restored_authority = {"malformed": True}
+
+                provisional_state = {
+                    **basic,
+                    "currentGeneration": current_generation,
+                    "currentClaimSet": current_claim,
+                    "currentSettlement": current_settlement,
+                    "latestSettlements": latest_settlements,
+                    "latestSettlementAuthorities": (
+                        latest_settlement_authorities
+                    ),
+                    "latestPredecessorReleaseMatches": (
+                        latest_predecessor_release_matches
+                    ),
+                    "latestPredecessorRestoredAuthority": (
+                        latest_predecessor_restored_authority
+                    ),
+                    "releaseResult": release_result,
+                    "releaseResultPath": release_result_path,
+                    "releasedAuthority": released_authority,
+                    "restoredAuthority": restored_authority,
+                }
+                try:
+                    bounded_history = _validate_bounded_row_history(
+                        scope=checked_scope,
+                        row_id=row_id,
+                        head=head,
+                        row_state=provisional_state,
+                    )
+                except RowAuthorityError as exc:
+                    reject(exc)
+
+                try:
+                    action_settlements_query = (
+                        user_ref.collection("rowOwnerSettlements")
+                        .where("rowId", "==", row_id)
+                        .where(
+                            "operatorActionHash",
+                            "==",
+                            action["operatorActionHash"],
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    action_settlement_snapshots = tuple(
+                        transaction.get(action_settlements_query)
+                    )
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "operator decline action-settlement query failed before writes"
+                    ) from exc
+                action_settlement_matches = []
+                action_query_matches = []
+                for action_settlement_snapshot in action_settlement_snapshots:
+                    (
+                        action_settlement_exists,
+                        action_settlement_payload,
+                    ) = read(action_settlement_snapshot.reference)
+                    if not action_settlement_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline action-settlement query returned a missing document"
+                            )
+                        )
+                    action_query_matches.append(
+                        (
+                            action_settlement_snapshot.reference.path,
+                            _defensive_copy(action_settlement_payload),
+                        )
+                    )
+                    try:
+                        checked_action_settlement = (
+                            validate_owner_settlement_document(
+                                document=action_settlement_payload
+                            )
+                        )
+                        action_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(
+                            _generation_document_id(
+                                row_id=row_id,
+                                generation=checked_action_settlement[
+                                    "generation"
+                                ],
+                            )
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "operator decline action settlement is malformed"
+                            )
+                        )
+                    (
+                        action_generation_exists,
+                        action_generation_payload,
+                    ) = read(action_generation_ref)
+                    if not action_generation_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline action settlement lacks its generation"
+                            )
+                        )
+                    try:
+                        checked_action_generation = (
+                            validate_owner_generation_document(
+                                document=action_generation_payload
+                            )
+                        )
+                        action_claim_ref = user_ref.collection(
+                            "rowClaimSets"
+                        ).document(
+                            checked_action_generation["requestId"]
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConflict(
+                                "operator decline action generation is malformed"
+                            )
+                        )
+                    action_claim_exists, action_claim_payload = read(
+                        action_claim_ref
+                    )
+                    if not action_claim_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "operator decline action settlement lacks its claim"
+                            )
+                        )
+                    action_settlement_matches.append(
+                        {
+                            "path": action_settlement_snapshot.reference.path,
+                            "generation": action_generation_payload,
+                            "claimSet": action_claim_payload,
+                            "settlement": action_settlement_payload,
+                        }
+                    )
+                callback_state["query_readbacks"].append(
+                    {
+                        "kind": "operator_action_history",
+                        "rowId": row_id,
+                        "query": action_settlements_query,
+                        "matches": tuple(action_query_matches),
+                    }
                 )
+
+                stored_decision = None
+                if stored_claim is not None:
+                    decisions = [
+                        decision
+                        for decision in stored_claim["rowDecisions"]
+                        if decision["rowId"] == row_id
+                    ]
+                    if len(decisions) != 1:
+                        reject(
+                            RowAuthorityConflict(
+                                "operator claim decisions do not cover its binding"
+                            )
+                        )
+                    stored_decision = decisions[0]
                 candidate_generation = None
                 candidate_settlement = None
+                candidate_predecessor_generation = None
+                candidate_predecessor_claim = None
+                candidate_predecessor_settlement = None
+                candidate_predecessor_release_matches = []
+                candidate_predecessor_restored_authority = None
                 if not skip_candidates:
                     if (
                         stored_claim is not None
                         and stored_claim["outcome"] == "accepted"
                     ):
-                        decisions = [
-                            decision
-                            for decision in stored_claim["rowDecisions"]
-                            if decision["rowId"] == row_id
-                        ]
-                        if len(decisions) != 1:
-                            reject(
-                                RowAuthorityConflict(
-                                    "operator claim decisions do not cover its binding"
-                                )
-                            )
-                        candidate_number = decisions[0][
+                        candidate_number = stored_decision[
                             "plannedGeneration"
                         ]
                     else:
-                        candidate_number = (
-                            1 if current_number is None else current_number + 1
-                        )
+                        candidate_number = bounded_history["nextGeneration"]
                     candidate_id = _generation_document_id(
                         row_id=row_id,
                         generation=candidate_number,
@@ -10618,44 +17724,368 @@ class RowAuthorityStore:
                             "candidate_settlement": candidate_settlement_ref,
                         }
                     )
+                    if (
+                        stored_claim is not None
+                        and stored_claim["outcome"] == "accepted"
+                        and candidate_number > 1
+                    ):
+                        predecessor_id = _generation_document_id(
+                            row_id=row_id,
+                            generation=candidate_number - 1,
+                        )
+                        predecessor_generation_ref = user_ref.collection(
+                            "rowOwnerGenerations"
+                        ).document(predecessor_id)
+                        (
+                            predecessor_generation_exists,
+                            predecessor_generation_payload,
+                        ) = read(predecessor_generation_ref)
+                        if predecessor_generation_exists:
+                            candidate_predecessor_generation = (
+                                predecessor_generation_payload
+                            )
+                            try:
+                                checked_predecessor_generation = (
+                                    validate_owner_generation_document(
+                                        document=predecessor_generation_payload
+                                    )
+                                )
+                                predecessor_claim_ref = user_ref.collection(
+                                    "rowClaimSets"
+                                ).document(
+                                    checked_predecessor_generation[
+                                        "requestId"
+                                    ]
+                                )
+                            except Exception as exc:
+                                reject(
+                                    RowAuthorityConflict(
+                                        "operator claim replay predecessor generation is malformed"
+                                    )
+                                )
+                            (
+                                predecessor_claim_exists,
+                                predecessor_claim_payload,
+                            ) = read(predecessor_claim_ref)
+                            if predecessor_claim_exists:
+                                candidate_predecessor_claim = (
+                                    predecessor_claim_payload
+                                )
+                        predecessor_settlement_ref = user_ref.collection(
+                            "rowOwnerSettlements"
+                        ).document(predecessor_id)
+                        (
+                            predecessor_settlement_exists,
+                            predecessor_settlement_payload,
+                        ) = read(predecessor_settlement_ref)
+                        if predecessor_settlement_exists:
+                            candidate_predecessor_settlement = (
+                                predecessor_settlement_payload
+                            )
+                        try:
+                            checked_candidate_generation = (
+                                validate_owner_generation_document(
+                                    document=candidate_generation
+                                )
+                            )
+                            checked_predecessor_settlement = (
+                                validate_owner_settlement_document(
+                                    document=candidate_predecessor_settlement
+                                )
+                            )
+                        except Exception:
+                            checked_candidate_generation = None
+                            checked_predecessor_settlement = None
+                        if (
+                            checked_candidate_generation is not None
+                            and checked_predecessor_settlement is not None
+                            and checked_candidate_generation["rowId"] == row_id
+                            and checked_candidate_generation["generation"]
+                            == candidate_number
+                            and checked_predecessor_settlement["rowId"] == row_id
+                            and checked_predecessor_settlement["generation"]
+                            == candidate_number - 1
+                            and checked_predecessor_settlement["outcome"]
+                            == "contact_optout"
+                            and checked_candidate_generation[
+                                "predecessorSettlementHash"
+                            ]
+                            != checked_predecessor_settlement[
+                                "settlementHash"
+                            ]
+                        ):
+                            try:
+                                predecessor_release_query = (
+                                    user_ref.collection(
+                                        "contactOptOutFanoutResults"
+                                    )
+                                    .where("rowId", "==", row_id)
+                                    .where(
+                                        "releasedRowSettlementHash",
+                                        "==",
+                                        checked_predecessor_settlement[
+                                            "settlementHash"
+                                        ],
+                                    )
+                                    .order_by("__name__")
+                                    .limit(2)
+                                )
+                                predecessor_release_snapshots = tuple(
+                                    transaction.get(
+                                        predecessor_release_query
+                                    )
+                                )
+                            except Exception as exc:
+                                callback_state["read_failed"] = True
+                                raise RowAuthorityRetryable(
+                                    "operator predecessor-release query failed before writes"
+                                ) from exc
+                            for release_snapshot in (
+                                predecessor_release_snapshots
+                            ):
+                                release_exists, release_payload = read(
+                                    release_snapshot.reference
+                                )
+                                if not release_exists:
+                                    reject(
+                                        RowAuthorityAmbiguous(
+                                            "operator predecessor-release query returned a missing document"
+                                        )
+                                    )
+                                candidate_predecessor_release_matches.append(
+                                    {
+                                        "path": release_snapshot.reference.path,
+                                        "document": release_payload,
+                                    }
+                                )
+                            callback_state["query_readbacks"].append(
+                                {
+                                    "kind": "stable",
+                                    "query": predecessor_release_query,
+                                    "matches": tuple(
+                                        (
+                                            entry["path"],
+                                            _defensive_copy(
+                                                entry["document"]
+                                            ),
+                                        )
+                                        for entry in (
+                                            candidate_predecessor_release_matches
+                                        )
+                                    ),
+                                }
+                            )
+                            if len(candidate_predecessor_release_matches) == 1:
+                                candidate_predecessor_restored_authority = (
+                                    _read_bounded_release_restored_authority(
+                                        user_ref=user_ref,
+                                        row_id=row_id,
+                                        release_document=(
+                                            candidate_predecessor_release_matches[
+                                                0
+                                            ]["document"]
+                                        ),
+                                        read=read,
+                                    )
+                                )
+
+                replay_winner_matches = []
+                replay_winner_claim = None
+                replay_winner_settlement = None
+                replay_winner_successor = {
+                    "generation": None,
+                    "claimSet": None,
+                    "settlement": None,
+                    "linkReleaseMatches": [],
+                    "linkRestoredAuthority": None,
+                    "restorationReleaseMatches": [],
+                    "restoredWinnerAuthority": None,
+                    "restorationExitGeneration": None,
+                    "restorationExitClaimSet": None,
+                    "restorationExitSettlement": None,
+                }
+                if (
+                    stored_claim is not None
+                    and stored_claim["outcome"] == "dominated"
+                    and stored_decision["decision"] == "dominated"
+                ):
+                    try:
+                        winner_query = (
+                            user_ref.collection("rowOwnerGenerations")
+                            .where("rowId", "==", row_id)
+                            .where(
+                                "generationHash",
+                                "==",
+                                stored_decision["winnerGenerationHash"],
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                        winner_snapshots = tuple(
+                            transaction.get(winner_query)
+                        )
+                    except Exception as exc:
+                        callback_state["read_failed"] = True
+                        raise RowAuthorityRetryable(
+                            "operator decline replay winner query failed before writes"
+                        ) from exc
+                    for winner_snapshot in winner_snapshots:
+                        winner_exists, winner_payload = read(
+                            winner_snapshot.reference
+                        )
+                        if winner_exists:
+                            replay_winner_matches.append(
+                                {
+                                    "path": winner_snapshot.reference.path,
+                                    "document": winner_payload,
+                                }
+                            )
+                    callback_state["query_readbacks"].append(
+                        {
+                            "kind": "stable",
+                            "query": winner_query,
+                            "matches": tuple(
+                                (
+                                    entry["path"],
+                                    _defensive_copy(entry["document"]),
+                                )
+                                for entry in replay_winner_matches
+                            ),
+                        }
+                    )
+                    if len(replay_winner_matches) == 1:
+                        try:
+                            winner_generation = (
+                                validate_owner_generation_document(
+                                    document=replay_winner_matches[0][
+                                        "document"
+                                    ]
+                                )
+                            )
+                            winner_claim_ref = user_ref.collection(
+                                "rowClaimSets"
+                            ).document(winner_generation["requestId"])
+                            winner_id = _generation_document_id(
+                                row_id=row_id,
+                                generation=winner_generation["generation"],
+                            )
+                            winner_settlement_ref = user_ref.collection(
+                                "rowOwnerSettlements"
+                            ).document(winner_id)
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityConflict(
+                                    "operator decline replay winner generation is malformed"
+                                )
+                            )
+                        winner_claim_exists, winner_claim_payload = read(
+                            winner_claim_ref
+                        )
+                        if winner_claim_exists:
+                            replay_winner_claim = winner_claim_payload
+                        (
+                            winner_settlement_exists,
+                            winner_settlement_payload,
+                        ) = read(winner_settlement_ref)
+                        if winner_settlement_exists:
+                            replay_winner_settlement = (
+                                winner_settlement_payload
+                            )
+                        try:
+                            replay_winner_successor = (
+                                _read_bounded_replay_winner_successor(
+                                    user_ref=user_ref,
+                                    row_id=row_id,
+                                    winner_generation=winner_generation,
+                                    winner_settlement=(
+                                        replay_winner_settlement
+                                    ),
+                                    claim_created_at=stored_claim["createdAt"],
+                                    read=read,
+                                    transaction=transaction,
+                                    query_readbacks=callback_state[
+                                        "query_readbacks"
+                                    ],
+                                )
+                            )
+                        except RowAuthorityError as exc:
+                            reject(exc)
+
+                row_references[row_id]["current_settlement"] = (
+                    current_settlement_ref
+                )
                 row_states.append(
                     {
-                        "rowId": row_id,
-                        "identity": basic["identity"],
-                        "head": basic["head"],
-                        "currentGeneration": (
-                            current_entry["generation"]
-                            if current_entry is not None
-                            else None
+                        **provisional_state,
+                        "actionSettlementMatches": (
+                            action_settlement_matches
                         ),
-                        "currentClaimSet": (
-                            current_entry["claimSet"]
-                            if current_entry is not None
-                            else None
-                        ),
-                        "currentSettlement": (
-                            current_entry["settlement"]
-                            if current_entry is not None
-                            else None
-                        ),
-                        "currentPredecessorGeneration": (
-                            predecessor["generation"]
-                            if predecessor is not None
-                            else None
-                        ),
-                        "currentPredecessorClaimSet": (
-                            predecessor["claimSet"]
-                            if predecessor is not None
-                            else None
-                        ),
-                        "currentPredecessorSettlement": (
-                            predecessor["settlement"]
-                            if predecessor is not None
-                            else None
-                        ),
-                        "ownerLineage": owner_lineage,
                         "candidateGeneration": candidate_generation,
                         "candidateSettlement": candidate_settlement,
+                        "candidatePredecessorGeneration": (
+                            candidate_predecessor_generation
+                        ),
+                        "candidatePredecessorClaimSet": (
+                            candidate_predecessor_claim
+                        ),
+                        "candidatePredecessorSettlement": (
+                            candidate_predecessor_settlement
+                        ),
+                        "candidatePredecessorReleaseMatches": (
+                            candidate_predecessor_release_matches
+                        ),
+                        "candidatePredecessorRestoredAuthority": (
+                            candidate_predecessor_restored_authority
+                        ),
+                        "replayWinnerMatches": replay_winner_matches,
+                        "replayWinnerClaimSet": replay_winner_claim,
+                        "replayWinnerSettlement": (
+                            replay_winner_settlement
+                        ),
+                        "replayWinnerSuccessorGeneration": (
+                            replay_winner_successor["generation"]
+                        ),
+                        "replayWinnerSuccessorClaimSet": (
+                            replay_winner_successor["claimSet"]
+                        ),
+                        "replayWinnerSuccessorSettlement": (
+                            replay_winner_successor["settlement"]
+                        ),
+                        "replayWinnerSuccessorReleaseMatches": (
+                            replay_winner_successor[
+                                "linkReleaseMatches"
+                            ]
+                        ),
+                        "replayWinnerSuccessorRestoredAuthority": (
+                            replay_winner_successor[
+                                "linkRestoredAuthority"
+                            ]
+                        ),
+                        "replayWinnerRestorationReleaseMatches": (
+                            replay_winner_successor[
+                                "restorationReleaseMatches"
+                            ]
+                        ),
+                        "replayWinnerRestoredAuthority": (
+                            replay_winner_successor[
+                                "restoredWinnerAuthority"
+                            ]
+                        ),
+                        "replayWinnerRestorationExitGeneration": (
+                            replay_winner_successor[
+                                "restorationExitGeneration"
+                            ]
+                        ),
+                        "replayWinnerRestorationExitClaimSet": (
+                            replay_winner_successor[
+                                "restorationExitClaimSet"
+                            ]
+                        ),
+                        "replayWinnerRestorationExitSettlement": (
+                            replay_winner_successor[
+                                "restorationExitSettlement"
+                            ]
+                        ),
                     }
                 )
 
@@ -10784,6 +18214,29 @@ class RowAuthorityStore:
                         bool(snapshot.exists),
                         snapshot.to_dict() if snapshot.exists else None,
                     )
+                query_observed = []
+                for query_readback in callback_state["query_readbacks"]:
+                    query = query_readback["query"]
+                    stream = getattr(query, "stream", None)
+                    if callable(stream):
+                        query_snapshots = tuple(stream())
+                    else:
+                        get = getattr(query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "operator decline bounded query cannot be read back"
+                            )
+                        query_snapshots = tuple(get())
+                    query_observed.append(
+                        tuple(
+                            (
+                                snapshot.reference.path,
+                                snapshot.to_dict(),
+                            )
+                            for snapshot in query_snapshots
+                            if snapshot.exists
+                        )
+                    )
             except Exception as readback_exc:
                 raise RowAuthorityAmbiguous(
                     "operator decline commit outcome cannot be read back"
@@ -10799,11 +18252,66 @@ class RowAuthorityStore:
                 )
             exact_before = readback == callback_state["before"]
             exact_after = readback == expected_after
-            if exact_after:
+            query_before_ok = all(
+                observed == query_readback["matches"]
+                for observed, query_readback in zip(
+                    query_observed,
+                    callback_state["query_readbacks"],
+                    strict=True,
+                )
+            )
+            query_after_expectations = []
+            for query_readback in callback_state["query_readbacks"]:
+                expected_matches = query_readback["matches"]
+                if query_readback["kind"] in {
+                    "settlement_history",
+                    "operator_action_history",
+                }:
+                    by_path = {
+                        path: _defensive_copy(document)
+                        for path, document in expected_matches
+                    }
+                    for mutation in plan["mutations"]:
+                        if not mutation["target"].startswith("settlement:"):
+                            continue
+                        document = mutation["document"]
+                        if document["rowId"] != query_readback["rowId"]:
+                            continue
+                        if (
+                            query_readback["kind"]
+                            == "operator_action_history"
+                            and document["operatorActionHash"]
+                            != plan["action"]["operatorActionHash"]
+                        ):
+                            continue
+                        reference = callback_state[
+                            "mutation_references"
+                        ][mutation["target"]]
+                        by_path[reference.path] = _defensive_copy(document)
+                    expected_matches = tuple(
+                        sorted(
+                            by_path.items(),
+                            key=lambda item: (
+                                item[1]["generation"],
+                                item[0],
+                            ),
+                            reverse=True,
+                        )[:2]
+                    )
+                query_after_expectations.append(expected_matches)
+            query_after_ok = all(
+                observed == expected_matches
+                for observed, expected_matches in zip(
+                    query_observed,
+                    query_after_expectations,
+                    strict=True,
+                )
+            )
+            if exact_after and query_after_ok:
                 disposition = plan["disposition"]
-            elif exact_before and not plan["mutations"]:
+            elif exact_before and query_before_ok and not plan["mutations"]:
                 disposition = plan["disposition"]
-            elif exact_before:
+            elif exact_before and query_before_ok:
                 raise RowAuthorityRetryable(
                     "operator decline commit failed before any apply"
                 ) from exc

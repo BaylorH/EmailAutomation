@@ -313,7 +313,7 @@ production.
 - Create: `tests/test_row_authority_contact_compliance.py`
 - Modify: `email_automation/row_authority.py`
 
-- [ ] **Step 1: Write the failing fake-order and cursor tests**
+- [x] **Step 1: Write the failing fake-order and cursor tests**
 
 Add selected tests named:
 
@@ -329,7 +329,7 @@ Use document IDs whose lexical path order differs from their `rowId` and
 `generation` values. Run only these tests and preserve the selected RED output
 in the implementation log.
 
-- [ ] **Step 2: Implement the minimal backward-compatible fake behavior**
+- [x] **Step 2: Implement the minimal backward-compatible fake behavior**
 
 Add `direction="ASCENDING"` to `order_by`; canonicalize
 `ASCENDING|DESCENDING`; order by declared field tuple plus document path; make
@@ -337,7 +337,7 @@ mapping/list/tuple/snapshot cursors compare those values; retain equality
 filters, limits, event recording, and transaction phantom detection. Existing
 single-argument callers must remain byte-behavior compatible.
 
-- [ ] **Step 3: Verify the fake tests GREEN and retained B1 fake users**
+- [x] **Step 3: Verify the fake tests GREEN and retained B1 fake users**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -347,7 +347,7 @@ single-argument callers must remain byte-behavior compatible.
   tests.test_source_coordinator_integration -q
 ```
 
-- [ ] **Step 4: Write failing independent contact hash/schema tests**
+- [x] **Step 4: Write failing independent contact hash/schema tests**
 
 Cover both new hash domains and all seven contact record builders/validators.
 Use independent canonical JSON and fixed expected digests, not production hash
@@ -372,20 +372,20 @@ ContactContractTests.test_every_contact_record_rejects_path_hash_schema_and_user
 ContactContractTests.test_all_contact_domains_are_registered_and_runtime_contained
 ```
 
-- [ ] **Step 5: Implement only strict constants/builders/validators**
+- [x] **Step 5: Implement only strict constants/builders/validators**
 
 Do not add a store method. Keep all production values derived from validated
 inputs, include every null in hashes, and reject unknown keys. Preserve every
 B2-A/B digest.
 
-- [ ] **Step 6: Verify contract GREEN and frozen legacy vectors**
+- [x] **Step 6: Verify contract GREEN and frozen legacy vectors**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
   tests.test_row_authority_contact_compliance.ContactContractTests \
   tests.test_row_authority_contracts -v
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
-  tests.test_row_authority_ownership.B1AuthorityLinkTests -q
+  tests.test_row_authority_ownership.RowOwnershipContractTests -q
 ```
 
 ## Task 2: Make row allocation and historical replay release-aware
@@ -396,7 +396,7 @@ B2-A/B digest.
 - Modify: `tests/test_row_authority_ownership.py`
 - Modify: `tests/test_row_authority_contact_compliance.py`
 
-- [ ] **Step 1: Write failing descending-history allocation tests**
+- [x] **Step 1: Write failing descending-history allocation tests**
 
 Prove empty history, ordinary settled history, restored-clear history, restored
 terminal/human history, current pending generation above latest settlement,
@@ -418,7 +418,7 @@ ReleaseAwareRowHistoryTests.test_current_pending_generation_can_exceed_latest_se
 ReleaseAwareRowHistoryTests.test_candidate_generation_or_settlement_collision_writes_nothing
 ```
 
-- [ ] **Step 2: Implement a shared bounded row-history loader**
+- [x] **Step 2: Implement a shared bounded row-history loader**
 
 Read current effective artifacts, latest two settlements, the exact release or
 active-dominated bridge when latest/effective differ, and candidate paths.
@@ -428,13 +428,13 @@ generation/priority-depth assumptions without weakening priority comparison or
 B2-B exact retry semantics, and do not add fields or versions to published v1
 row documents.
 
-- [ ] **Step 3: Route every allocator and replay through the loader**
+- [x] **Step 3: Route every allocator and replay through the loader**
 
 Cover direct B1 claims, no-pending operator decline, contact-fanout private
 claims, lease/settlement retry as applicable, and source-settlement link
 forward/retry validation. Preserve v1 and B2-B non-release output bytes.
 
-- [ ] **Step 4: Write failing delayed historical link/replay tests**
+- [x] **Step 4: Write failing delayed historical link/replay tests**
 
 Selected RED names:
 
@@ -446,12 +446,12 @@ ReleaseAwareRowHistoryTests.test_historical_link_missing_duplicate_or_future_pro
 ReleaseAwareRowHistoryTests.test_nonreleased_b2b_claim_and_link_vectors_are_byte_identical
 ```
 
-- [ ] **Step 5: Make the historical replay tests GREEN**
+- [x] **Step 5: Make the historical replay tests GREEN**
 
 Never reactivate an old owner during settlement/link readback. Keep the newest
 historical settlement pointer and the effective owner independent.
 
-- [ ] **Step 6: Run the complete B2-B ownership suite**
+- [x] **Step 6: Run the complete B2-B ownership suite**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -965,6 +965,53 @@ or merge `main`, deploy, launch a campaign, or contact a user under this plan.
   [run 31010099996](https://github.com/BaylorH/EmailAutomation/actions/runs/31010099996),
   [job 92319757381](https://github.com/BaylorH/EmailAutomation/actions/runs/31010099996/job/92319757381)
   completed successfully.
+- Publication-record checkpoint: local HEAD, owned remote branch, and workflow
+  head SHA were `732fab4003a83486c9f4bd8570c804b78751e738`;
+  [run 31010330183](https://github.com/BaylorH/EmailAutomation/actions/runs/31010330183),
+  [job 92320550877](https://github.com/BaylorH/EmailAutomation/actions/runs/31010330183/job/92320550877)
+  completed successfully.
+- Task 1 query-fake RED: all five selected tests executed; seven assertions
+  failed only because `direction` was unsupported and field-value cursors were
+  rejected. GREEN: all five selected tests pass, and 211 retained source
+  coordinator/fake integration tests pass.
+- Query-fake review then exposed partial-prefix, bare `__name__`, and reference
+  cursor gaps. Each was reproduced RED, corrected, and independently approved
+  with the same five selected and 211 retained tests green.
+- Task 1 contact-contract RED: all nine selected tests executed and failed only
+  on the absent B2-C domains and seven builder/validator pairs; there were zero
+  setup errors or unexpected exceptions.
+- Contract-oracle review rejected forged transition/fan-out fixtures and added
+  released-head, re-opt-out predecessor, self-alias, obligation-correlation,
+  completion, and fully paired result-matrix refutations. The corrected nine
+  tests remain clean RED on only the absent builder/validator pairs.
+- Task 1 contract GREEN: nine contact-contract tests, 25 retained primitive
+  contract tests, and 27 full row-ownership contract tests all pass (61 total),
+  with compile and diff checks clean. The stale nonexistent
+  `B1AuthorityLinkTests` plan selector was corrected to the containing
+  `RowOwnershipContractTests` class. No store or runtime wiring was added.
+- Task 1 semantic review then reproduced accepted-invalid epoch, head revision,
+  fan-out fence/lease/count/supersession/completion-snapshot, and restoration
+  generation shapes as strict RED cases. Builders now reject every shape while
+  preserving all published hashes and schemas. The nine contact tests and all
+  61 focused contract/vector tests returned GREEN after correction.
+- Two independent Task 1 final reviews approved the corrected diff with no
+  remaining Critical or Important findings. Together they observed the five
+  ordered-query fake tests, 211 retained source-coordinator tests, all 61
+  focused contract/vector tests, compilation, and diff checks GREEN.
+- Fresh automatic B2 discovery after Task 1 ran 313 tests successfully.
+- Task 2 allocation/history RED covered the ten planned cases plus restored
+  clear/owner, combined release and active-dominated bridges, exact query/path
+  shape, restored-artifact drift, commit uncertainty, multi-cycle accepted
+  replay, predecessor-link drift, historical release proof, and forged
+  `blocked_by_claim_set` history. Each failed on the intended absent bounded
+  behavior before its production correction.
+- Task 2 GREEN routes direct claims, lease takeover, settlement retry, source
+  linking, and operator decline through descending generation history limited
+  to two, with exact authority/release reads and query readback. The 39
+  release-aware tests, 197 retained ownership tests, and exact combined
+  236-test Task 2 command all pass. Fresh automatic B2 discovery passes 352
+  tests; compile and diff checks are clean. Independent Task 1-2 code reviews
+  and publication are pending.
 - Plan reviews, publication SHA/run, selected RED outputs, code milestone
   SHAs/runs, final diff digest, final review outcomes, and evidence SHA/run are
   appended here only after they exist and are independently verified.
