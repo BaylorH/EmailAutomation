@@ -191,6 +191,7 @@ select a run for a different SHA.
   `bbd739abb3c272443e35fcd356c6a820871e027e`.
 - [x] B2-A0 child plan is independently approved and published at its plan milestone.
 - [x] B2-A0 code is green and published.
+- [x] B2-A1 child plan is independently approved and published.
 - [ ] B2-A1 is green and published.
 - [ ] B2-B is green and published.
 - [ ] B2-C is green and published.
