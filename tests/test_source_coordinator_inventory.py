@@ -43,6 +43,7 @@ B1_COLLECTION_NAMES = frozenset(
 )
 B1_RUNTIME_COLLECTION_PATHS = frozenset(
     {
+        "email_automation/row_authority.py",
         "email_automation/source_coordinator.py",
         "email_automation/system_health.py",
         "scripts/production_reset.py",
@@ -2417,6 +2418,12 @@ class InventoryContractTests(unittest.TestCase):
             [],
             _system_health_write_calls(
                 _parse_module(Path("email_automation/system_health.py"))
+            ),
+        )
+        self.assertEqual(
+            [],
+            _system_health_write_calls(
+                _parse_module(Path("email_automation/row_authority.py"))
             ),
         )
 

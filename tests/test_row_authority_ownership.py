@@ -843,8 +843,8 @@ class RowOwnershipContractTests(unittest.TestCase):
         *,
         owner_kind="terminal",
         model_contact_optout=False,
+        source_id="source-1",
     ):
-        source_id = "source-1"
         b1_created = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
         snapshot_at = datetime(2026, 8, 4, 11, 1, tzinfo=timezone.utc)
         if owner_kind == "contact_optout":
@@ -5095,6 +5095,2860 @@ class ContactRowAssociationStoreTests(unittest.TestCase):
         ), self.assertRaises(self.module.RowAuthorityAmbiguous) as caught:
             self._associate(unreadable_store)
         self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+
+class RowClaimStoreTests(unittest.TestCase):
+    @staticmethod
+    def _fakes():
+        return importlib.import_module("tests.row_authority_fakes")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+
+    def setUp(self):
+        self.user_id = "uid-claim-1"
+        self.scope = self.module.user_scope_hash(self.user_id)
+        self.first = _row_id(1)
+        self.second = _row_id(2)
+        self.row_created_at = "2026-08-04T12:00:00.000000Z"
+        self.binding_at = "2026-08-04T12:00:01.000000Z"
+        self.claimed_at = "2026-08-04T12:00:02.000000Z"
+        self.lease_until = "2026-08-04T12:05:00.000000Z"
+        self.lease_owner_hash = "a" * 64
+
+    def _store(self):
+        return self._fakes().BoundedFakeFirestore()
+
+    def _authority(self, store, *, executor=None):
+        return self.module.RowAuthorityStore(
+            store,
+            transaction_executor=(
+                executor or self._fakes().run_bounded_transaction
+            ),
+        )
+
+    def _user_reference(self, store):
+        return store.collection("users").document(self.user_id)
+
+    def _row_references(self, store, row_id):
+        user = self._user_reference(store)
+        return (
+            user.collection("rowIdentities").document(row_id),
+            user.collection("rowAuthorityHeads").document(row_id),
+        )
+
+    def _rehash_head(self, head):
+        material = {
+            key: value
+            for key, value in head.items()
+            if key not in {"schemaVersion", "userScopeHash", "headHash"}
+        }
+        head["headHash"] = self.module.domain_hash(
+            self.module.ROW_AUTHORITY_HEAD_HASH_DOMAIN,
+            material,
+            user_scope_hash=head["userScopeHash"],
+        )
+        return self.module.validate_row_authority_head(document=head)
+
+    def _rehash_claim(self, claim):
+        claim["claimSetHash"] = self.module.domain_hash(
+            self.module.CLAIM_SET_HASH_DOMAIN,
+            self.module._claim_set_hash_payload(claim),
+            user_scope_hash=claim["userScopeHash"],
+        )
+        return self.module.validate_claim_set_document(document=claim)
+
+    def _rehash_generation(self, generation):
+        generation["generationHash"] = self.module.domain_hash(
+            self.module.OWNER_GENERATION_HASH_DOMAIN,
+            self.module._generation_hash_payload(generation),
+            user_scope_hash=generation["userScopeHash"],
+        )
+        return self.module.validate_owner_generation_document(
+            document=generation
+        )
+
+    def _rehash_settlement(self, settlement):
+        settlement["settlementHash"] = self.module.domain_hash(
+            self.module.OWNER_SETTLEMENT_HASH_DOMAIN,
+            self.module._settlement_hash_payload(settlement),
+            user_scope_hash=settlement["userScopeHash"],
+        )
+        return self.module.validate_owner_settlement_document(
+            document=settlement
+        )
+
+    def _seed_row(self, store, row_id, *, lifecycle="active"):
+        index = 0 if row_id == self.first else 1
+        identity = self.module.build_row_identity_document(
+            user_scope_hash=self.scope,
+            row_id=row_id,
+            client_id="client-1",
+            spreadsheet_id="spreadsheet-1",
+            sheet_id=0,
+            creation_kind="fresh",
+            creation_source_hash="1" * 64,
+            created_at=self.row_created_at,
+        )
+        observation = self.module.build_row_observation(
+            spreadsheet_id="spreadsheet-1",
+            marker_observation={
+                "rowId": row_id,
+                "sheetId": 0,
+                "providerRowIndex": index,
+                "displayRowNumber": index + 1,
+                "metadataId": index + 1,
+            },
+            ordered_headers=("Email",),
+            ordered_cell_values=(f"row-{index}@example.test",),
+            user_scope_hash=self.scope,
+        )
+        revision = self.module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=1,
+            lifecycle="active",
+            observations=(observation,),
+            previous_revision_hash=None,
+            observed_at=self.row_created_at,
+        )
+        head = self.module.build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=self.row_created_at,
+        )
+        if lifecycle != "active":
+            head.update(
+                {
+                    "stateRevision": 2,
+                    "currentLocationRevision": 2,
+                    "currentLocationHash": "2" * 64,
+                    "currentLocationLifecycle": lifecycle,
+                    "updatedAt": self.binding_at,
+                }
+            )
+            head = self._rehash_head(head)
+        identity_ref, head_ref = self._row_references(store, row_id)
+        identity_ref.create(identity)
+        head_ref.create(head)
+        return identity, head
+
+    def _seed_thread_binding(self, store, row_ids):
+        binding = self.module.build_thread_row_binding_document(
+            user_scope_hash=self.scope,
+            thread_id="thread-1",
+            client_id="client-1",
+            row_ids=row_ids,
+            primary_row_id=row_ids[0],
+            created_at=self.binding_at,
+        )
+        user = self._user_reference(store)
+        user.collection("threadRowBindings").document("thread-1").create(
+            binding
+        )
+        for edge in self.module.build_row_thread_binding_documents(
+            thread_binding_document=binding
+        ):
+            user.collection("rowThreadBindings").document(
+                edge["edgeId"]
+            ).create(edge)
+        return binding
+
+    def _seed_b1_bundle(
+        self,
+        store,
+        *,
+        owner_kind="terminal",
+        source_id="source-1",
+    ):
+        bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind=owner_kind,
+            source_id=source_id,
+        )
+        user = self._user_reference(store)
+        source_id = bundle["identity"]["canonicalSourceId"]
+        for collection, key in (
+            ("sourceIdentities", "identity"),
+            ("sourceClassifications", "classification"),
+            ("sourceTransitionOwners", "owner"),
+            ("sourceWorkLedgers", "ledger"),
+        ):
+            user.collection(collection).document(source_id).create(
+                bundle[key]
+            )
+        return bundle
+
+    def _seed_prerequisites(
+        self,
+        store,
+        *,
+        owner_kind="terminal",
+        row_ids=None,
+    ):
+        rows = list(row_ids or [self.first])
+        for row_id in rows:
+            self._seed_row(store, row_id)
+        binding = self._seed_thread_binding(store, rows)
+        bundle = self._seed_b1_bundle(store, owner_kind=owner_kind)
+        return bundle, binding
+
+    def _claim(self, store, *, executor=None, bundle=None, **overrides):
+        if bundle is None:
+            user = self._user_reference(store)
+            identity = store.data[
+                user.collection("sourceIdentities")
+                .document("source-1")
+                .path
+            ]
+            work_key = store.data[
+                user.collection("sourceWorkLedgers")
+                .document("source-1")
+                .path
+            ]["entries"][0]["workKey"]
+            source_id = identity["canonicalSourceId"]
+        else:
+            source_id = bundle["identity"]["canonicalSourceId"]
+            work_key = bundle["work_key"]
+        arguments = {
+            "verified_user_id": self.user_id,
+            "canonical_source_id": source_id,
+            "work_key": work_key,
+            "created_at": self.claimed_at,
+            "lease_owner_hash": self.lease_owner_hash,
+            "lease_until": self.lease_until,
+        }
+        arguments.update(overrides)
+        return self._authority(store, executor=executor).claim_row_set(
+            **arguments
+        )
+
+    def _install_contact_owner(self, store, row_id):
+        identity_ref, head_ref = self._row_references(store, row_id)
+        identity = store.data[identity_ref.path]
+        predecessor = store.data[head_ref.path]
+        bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind="contact_optout",
+        )
+        link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=bundle["identity"],
+            source_classification_document=bundle["classification"],
+            source_owner_document=bundle["owner"],
+            source_ledger_document=bundle["ledger"],
+            work_key=bundle["work_key"],
+        )
+        claim = self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin="contact_fanout",
+            authority_link=link,
+            operator_action_document=None,
+            fanout_id="b" * 64,
+            row_ids=[row_id],
+            primary_row_id=row_id,
+            planned_writes=3,
+            outcome="accepted",
+            row_decisions=[
+                {
+                    "rowId": row_id,
+                    "decision": "accepted",
+                    "plannedGeneration": 1,
+                    "winnerGenerationHash": None,
+                    "winnerSettlementHash": None,
+                }
+            ],
+            created_at=self.claimed_at,
+            canonical_mailbox_identity_hash="c" * 64,
+            contact_settlement_hash="d" * 64,
+        )
+        generation = self.module.build_owner_generation_document(
+            claim_set_document=claim,
+            row_id=row_id,
+            generation=1,
+            predecessor_head_hash=predecessor["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.claimed_at,
+        )
+        head = self.module._build_claim_advanced_head(
+            expected_head=predecessor,
+            generation_document=generation,
+            lease_owner_hash="e" * 64,
+            lease_until=self.lease_until,
+            dominated_predecessor_settlement_hash=None,
+            claimed_at=self.claimed_at,
+        )
+        user = self._user_reference(store)
+        user.collection("rowClaimSets").document(claim["requestId"]).create(
+            claim
+        )
+        user.collection("rowOwnerGenerations").document(
+            f"{row_id}--1"
+        ).create(generation)
+        head_ref.set(head, merge=False)
+        self.assertEqual(identity["rowId"], head["rowId"])
+        return claim, generation, head
+
+    @staticmethod
+    def _write_events(store):
+        return [
+            event
+            for event in store.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def _claim_reference(self, store, request_id):
+        return self._user_reference(store).collection("rowClaimSets").document(
+            request_id
+        )
+
+    def _generation_reference(self, store, row_id, generation):
+        return self._user_reference(store).collection(
+            "rowOwnerGenerations"
+        ).document(f"{row_id}--{generation}")
+
+    def _settlement_reference(self, store, row_id, generation):
+        return self._user_reference(store).collection(
+            "rowOwnerSettlements"
+        ).document(f"{row_id}--{generation}")
+
+    def _install_owner(self, store, row_id, *, owner_kind):
+        _identity_ref, head_ref = self._row_references(store, row_id)
+        predecessor = deepcopy(store.data[head_ref.path])
+        source_id = f"historical-{owner_kind.replace('_', '-')}"
+        bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind=owner_kind,
+            source_id=source_id,
+        )
+        link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=bundle["identity"],
+            source_classification_document=bundle["classification"],
+            source_owner_document=bundle["owner"],
+            source_ledger_document=bundle["ledger"],
+            work_key=bundle["work_key"],
+        )
+        claim = self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin="b1_source",
+            authority_link=link,
+            operator_action_document=None,
+            fanout_id=None,
+            row_ids=[row_id],
+            primary_row_id=row_id,
+            planned_writes=3,
+            outcome="accepted",
+            row_decisions=[
+                {
+                    "rowId": row_id,
+                    "decision": "accepted",
+                    "plannedGeneration": 1,
+                    "winnerGenerationHash": None,
+                    "winnerSettlementHash": None,
+                }
+            ],
+            created_at=self.claimed_at,
+        )
+        generation = self.module.build_owner_generation_document(
+            claim_set_document=claim,
+            row_id=row_id,
+            generation=1,
+            predecessor_head_hash=predecessor["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.claimed_at,
+        )
+        head = self.module._build_claim_advanced_head(
+            expected_head=predecessor,
+            generation_document=generation,
+            lease_owner_hash="f" * 64,
+            lease_until=self.lease_until,
+            dominated_predecessor_settlement_hash=None,
+            claimed_at=self.claimed_at,
+        )
+        self._claim_reference(store, claim["requestId"]).create(claim)
+        self._generation_reference(store, row_id, 1).create(generation)
+        head_ref.set(head, merge=False)
+        return claim, generation, head
+
+    def _current_row_state(self, store, row_id):
+        identity_ref, head_ref = self._row_references(store, row_id)
+        identity = deepcopy(store.data[identity_ref.path])
+        head = deepcopy(store.data[head_ref.path])
+        generation = None
+        claim = None
+        settlement = None
+        predecessor_generation = None
+        predecessor_claim = None
+        current_predecessor_settlement = None
+        owner_lineage = []
+        if head["effectiveOwnerGeneration"] is not None:
+            number = head["effectiveOwnerGeneration"]
+            for lineage_number in range(1, number + 1):
+                lineage_generation = deepcopy(
+                    store.data.get(
+                        self._generation_reference(
+                            store,
+                            row_id,
+                            lineage_number,
+                        ).path
+                    )
+                )
+                lineage_claim = (
+                    deepcopy(
+                        store.data.get(
+                            self._claim_reference(
+                                store,
+                                lineage_generation["requestId"],
+                            ).path
+                        )
+                    )
+                    if lineage_generation is not None
+                    else None
+                )
+                lineage_settlement = deepcopy(
+                    store.data.get(
+                        self._settlement_reference(
+                            store,
+                            row_id,
+                            lineage_number,
+                        ).path
+                    )
+                )
+                owner_lineage.append(
+                    {
+                        "generation": lineage_generation,
+                        "claimSet": lineage_claim,
+                        "settlement": lineage_settlement,
+                    }
+                )
+            generation = owner_lineage[-1]["generation"]
+            claim = owner_lineage[-1]["claimSet"]
+            settlement = owner_lineage[-1]["settlement"]
+            if number > 1:
+                predecessor_generation = owner_lineage[-2]["generation"]
+                predecessor_claim = owner_lineage[-2]["claimSet"]
+                current_predecessor_settlement = owner_lineage[-2][
+                    "settlement"
+                ]
+        return {
+            "rowId": row_id,
+            "identity": identity,
+            "head": head,
+            "currentGeneration": generation,
+            "currentClaimSet": claim,
+            "currentSettlement": settlement,
+            "candidateGeneration": None,
+            "candidateSettlement": None,
+            "predecessorSettlement": settlement,
+            "currentPredecessorGeneration": predecessor_generation,
+            "currentPredecessorClaimSet": predecessor_claim,
+            "currentPredecessorSettlement": current_predecessor_settlement,
+            "ownerLineage": owner_lineage,
+        }
+
+    def _contact_plan(
+        self,
+        store,
+        binding,
+        *,
+        created_at="2026-08-04T12:00:03.000000Z",
+        lease_until="2026-08-04T12:06:00.000000Z",
+    ):
+        bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind="contact_optout",
+            source_id="private-contact-authority",
+        )
+        link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=bundle["identity"],
+            source_classification_document=bundle["classification"],
+            source_owner_document=bundle["owner"],
+            source_ledger_document=bundle["ledger"],
+            work_key=bundle["work_key"],
+        )
+        return self.module._plan_contact_fanout_row_claim(
+            user_scope_hash=self.scope,
+            authority_link=link,
+            fanout_id="8" * 64,
+            canonical_mailbox_identity_hash="9" * 64,
+            contact_settlement_hash="7" * 64,
+            thread_binding_document=binding,
+            row_states=[self._current_row_state(store, self.first)],
+            stored_claim_set_document=None,
+            created_at=created_at,
+            lease_owner_hash="6" * 64,
+            lease_until=lease_until,
+        )
+
+    def _settle_terminal_owner(
+        self,
+        store,
+        claim,
+        generation,
+        head,
+        *,
+        settled_at="2026-08-04T12:00:03.000000Z",
+    ):
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=head["fencingToken"],
+            outcome="terminal",
+            settled_at=settled_at,
+        )
+        settled_head = self.module._build_settlement_advanced_head(
+            expected_head=head,
+            generation_document=generation,
+            settlement_document=settlement,
+        )
+        self._settlement_reference(
+            store,
+            generation["rowId"],
+            generation["generation"],
+        ).create(settlement)
+        self._row_references(store, generation["rowId"])[1].set(
+            settled_head,
+            merge=False,
+        )
+        return settlement, settled_head
+
+    def _install_settled_human_owner(self, store, row_id):
+        _identity_ref, head_ref = self._row_references(store, row_id)
+        predecessor = deepcopy(store.data[head_ref.path])
+        binding_ref = self._user_reference(store).collection(
+            "threadRowBindings"
+        ).document("thread-1")
+        binding = deepcopy(store.data[binding_ref.path])
+        action = self.module.build_operator_action_document(
+            user_scope_hash=self.scope,
+            actor_scope_hash="5" * 64,
+            row_bindings_hash=binding["rowBindingsHash"],
+            client_request_id="settled-human-request",
+            issued_at=self.claimed_at,
+        )
+        claim = self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin="authenticated_operator",
+            authority_link=None,
+            operator_action_document=action,
+            fanout_id=None,
+            row_ids=[row_id],
+            primary_row_id=row_id,
+            planned_writes=3,
+            outcome="accepted",
+            row_decisions=[
+                {
+                    "rowId": row_id,
+                    "decision": "accepted",
+                    "plannedGeneration": 1,
+                    "winnerGenerationHash": None,
+                    "winnerSettlementHash": None,
+                }
+            ],
+            created_at=self.claimed_at,
+        )
+        generation = self.module.build_owner_generation_document(
+            claim_set_document=claim,
+            row_id=row_id,
+            generation=1,
+            predecessor_head_hash=predecessor["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.claimed_at,
+        )
+        claimed_head = self.module._build_claim_advanced_head(
+            expected_head=predecessor,
+            generation_document=generation,
+            lease_owner_hash="4" * 64,
+            lease_until=self.lease_until,
+            dominated_predecessor_settlement_hash=None,
+            claimed_at=self.claimed_at,
+        )
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=1,
+            outcome="human_declined",
+            settled_at="2026-08-04T12:00:03.000000Z",
+            operator_action_document=action,
+        )
+        settled_head = self.module._build_settlement_advanced_head(
+            expected_head=claimed_head,
+            generation_document=generation,
+            settlement_document=settlement,
+        )
+        self._claim_reference(store, claim["requestId"]).create(claim)
+        self._generation_reference(store, row_id, 1).create(generation)
+        self._settlement_reference(store, row_id, 1).create(settlement)
+        head_ref.set(settled_head, merge=False)
+        return action, claim, generation, settlement, settled_head
+
+    def test_claim_row_set_has_exact_public_surface_and_non_b1_public_claims_do_not_exist(self):
+        method = getattr(self.module.RowAuthorityStore, "claim_row_set", None)
+        self.assertIsNotNone(method, "RowAuthorityStore.claim_row_set is missing")
+        self.assertEqual(
+            [
+                "self",
+                "verified_user_id",
+                "canonical_source_id",
+                "work_key",
+                "created_at",
+                "lease_owner_hash",
+                "lease_until",
+            ],
+            list(inspect.signature(method).parameters),
+        )
+        for forbidden in (
+            "claim_operator_row_set",
+            "claim_contact_fanout_row_set",
+            "claim_authenticated_operator",
+            "claim_contact_fanout",
+        ):
+            self.assertFalse(hasattr(self.module.RowAuthorityStore, forbidden))
+
+    def test_b1_claim_derives_bundle_binding_and_creates_first_terminal_claim_atomically(self):
+        store = self._store()
+        bundle, binding = self._seed_prerequisites(store)
+        store.events.clear()
+
+        result = self._claim(store, bundle=bundle)
+
+        self.assertEqual(
+            {
+                "disposition",
+                "claimSet",
+                "generations",
+                "heads",
+                "predecessorSettlements",
+            },
+            set(result),
+        )
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual("b1_source", result["claimSet"]["authorityOrigin"])
+        self.assertEqual(binding["rowBindingsHash"], result["claimSet"]["rowBindingsHash"])
+        self.assertEqual(1, result["generations"][0]["generation"])
+        self.assertEqual(1, result["generations"][0]["firstFencingToken"])
+        self.assertEqual("claimed", result["heads"][0]["state"])
+        self.assertEqual([], result["predecessorSettlements"])
+        self.assertIn(("commit_applied", 3), store.events)
+        writes = self._write_events(store)
+        self.assertEqual(["create", "create", "set"], [event[0] for event in writes])
+        reads = [event[1] for event in store.events if event[0] == "get"]
+        self.assertEqual(
+            [
+                "users/uid-claim-1/sourceIdentities/source-1",
+                "users/uid-claim-1/sourceClassifications/source-1",
+                "users/uid-claim-1/sourceTransitionOwners/source-1",
+                "users/uid-claim-1/sourceWorkLedgers/source-1",
+                "users/uid-claim-1/threadRowBindings/thread-1",
+            ],
+            reads[:5],
+        )
+
+    def test_public_b1_human_is_review_pending_and_contact_optout_is_zero_write_blocked(self):
+        human_store = self._store()
+        human_bundle, _binding = self._seed_prerequisites(
+            human_store,
+            owner_kind="human_decision",
+        )
+        human_store.events.clear()
+        human = self._claim(human_store, bundle=human_bundle)
+        self.assertEqual("review_pending", human["heads"][0]["state"])
+        self.assertEqual("human_decision", human["claimSet"]["ownerKind"])
+
+        optout_store = self._store()
+        optout_bundle, _binding = self._seed_prerequisites(
+            optout_store,
+            owner_kind="contact_optout",
+        )
+        before = deepcopy(optout_store.data)
+        optout_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(optout_store, bundle=optout_bundle)
+        self.assertEqual(before, optout_store.data)
+        self.assertEqual([], self._write_events(optout_store))
+
+    def test_multirow_dominated_marks_peer_blocked_and_advances_nothing(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(
+            store,
+            row_ids=[self.first, self.second],
+        )
+        self._install_contact_owner(store, self.first)
+        heads_before = {
+            row_id: deepcopy(store.data[self._row_references(store, row_id)[1].path])
+            for row_id in (self.first, self.second)
+        }
+        generations_before = {
+            path: deepcopy(payload)
+            for path, payload in store.data.items()
+            if "/rowOwnerGenerations/" in path
+        }
+        store.events.clear()
+
+        result = self._claim(store, bundle=bundle)
+
+        self.assertEqual("dominated", result["disposition"])
+        self.assertEqual("dominated", result["claimSet"]["outcome"])
+        self.assertEqual(
+            ["dominated", "blocked_by_claim_set"],
+            [item["decision"] for item in result["claimSet"]["rowDecisions"]],
+        )
+        self.assertEqual([], result["generations"])
+        self.assertEqual([], result["predecessorSettlements"])
+        self.assertEqual(
+            heads_before,
+            {
+                row_id: store.data[self._row_references(store, row_id)[1].path]
+                for row_id in (self.first, self.second)
+            },
+        )
+        self.assertEqual(
+            generations_before,
+            {
+                path: payload
+                for path, payload in store.data.items()
+                if "/rowOwnerGenerations/" in path
+            },
+        )
+        self.assertEqual(1, len(self._write_events(store)))
+        self.assertIn(("commit_applied", 1), store.events)
+
+    def test_b1_claim_derives_link_from_exact_stored_source_bundle_and_thread_binding(self):
+        store = self._store()
+        bundle, binding = self._seed_prerequisites(store)
+        expected_link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=bundle["identity"],
+            source_classification_document=bundle["classification"],
+            source_owner_document=bundle["owner"],
+            source_ledger_document=bundle["ledger"],
+            work_key=bundle["work_key"],
+        )
+        result = self._claim(store, bundle=bundle)
+        self.assertEqual(expected_link, result["claimSet"]["authorityLink"])
+        self.assertEqual(
+            binding["rowBindings"],
+            result["claimSet"]["rowBindings"],
+        )
+        self.assertEqual(
+            binding["primaryRowId"],
+            result["claimSet"]["primaryRowId"],
+        )
+
+    def test_b1_claim_rejects_missing_malformed_hash_drifted_wrong_thread_or_wrong_work_bundle(self):
+        cases = (
+            "missing",
+            "malformed",
+            "hash_drift",
+            "wrong_thread",
+            "wrong_work",
+        )
+        for mode in cases:
+            with self.subTest(mode=mode):
+                store = self._store()
+                bundle, _binding = self._seed_prerequisites(store)
+                user = self._user_reference(store)
+                classification_ref = user.collection(
+                    "sourceClassifications"
+                ).document("source-1")
+                identity_ref = user.collection("sourceIdentities").document(
+                    "source-1"
+                )
+                if mode == "missing":
+                    classification_ref.delete()
+                elif mode == "malformed":
+                    store.data[classification_ref.path]["unexpected"] = True
+                elif mode == "hash_drift":
+                    store.data[classification_ref.path][
+                        "snapshotImmutableHash"
+                    ] = "f" * 64
+                elif mode == "wrong_thread":
+                    store.data[identity_ref.path]["threadId"] = "thread-2"
+                before = deepcopy(store.data)
+                store.events.clear()
+                arguments = {}
+                if mode == "wrong_work":
+                    arguments["work_key"] = "f" * 64
+                with self.assertRaises(self.module.RowAuthorityError):
+                    self._claim(store, bundle=bundle, **arguments)
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_unsafe_canonical_source_or_b1_thread_id_fails_before_reference_or_transaction(self):
+        class NeverAccessFirestore:
+            def __init__(self):
+                self.collection_calls = 0
+                self.transaction_calls = 0
+
+            def collection(self, _name):
+                self.collection_calls += 1
+                raise AssertionError("document reference creation was reached")
+
+            def transaction(self):
+                self.transaction_calls += 1
+                raise AssertionError("transaction creation was reached")
+
+        never = NeverAccessFirestore()
+        authority = self.module.RowAuthorityStore(
+            never,
+            transaction_executor=lambda _transaction, _callback: None,
+        )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            authority.claim_row_set(
+                verified_user_id=self.user_id,
+                canonical_source_id="../unsafe",
+                work_key="a" * 64,
+                created_at=self.claimed_at,
+                lease_owner_hash=self.lease_owner_hash,
+                lease_until=self.lease_until,
+            )
+        self.assertEqual(0, never.collection_calls)
+        self.assertEqual(0, never.transaction_calls)
+
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        identity_ref = self._user_reference(store).collection(
+            "sourceIdentities"
+        ).document("source-1")
+        store.data[identity_ref.path]["threadId"] = "unsafe/thread"
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(store, bundle=bundle)
+        accessed = "\n".join(
+            event[1] for event in store.events if event[0] == "get"
+        )
+        self.assertNotIn("threadRowBindings", accessed)
+        self.assertEqual([], self._write_events(store))
+
+    def test_well_formed_forged_terminal_or_model_optout_link_cannot_enter_public_claim(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        forged_link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=bundle["identity"],
+            source_classification_document=bundle["classification"],
+            source_owner_document=bundle["owner"],
+            source_ledger_document=bundle["ledger"],
+            work_key=bundle["work_key"],
+        )
+        with self.assertRaises(TypeError):
+            self._authority(store).claim_row_set(
+                verified_user_id=self.user_id,
+                canonical_source_id="source-1",
+                work_key=bundle["work_key"],
+                created_at=self.claimed_at,
+                lease_owner_hash=self.lease_owner_hash,
+                lease_until=self.lease_until,
+                authority_link=forged_link,
+            )
+
+        model_store = self._store()
+        self._seed_row(model_store, self.first)
+        self._seed_thread_binding(model_store, [self.first])
+        model_bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind="human_decision",
+            model_contact_optout=True,
+        )
+        user = self._user_reference(model_store)
+        for collection, key in (
+            ("sourceIdentities", "identity"),
+            ("sourceClassifications", "classification"),
+            ("sourceTransitionOwners", "owner"),
+            ("sourceWorkLedgers", "ledger"),
+        ):
+            user.collection(collection).document("source-1").create(
+                model_bundle[key]
+            )
+        result = self._claim(model_store, bundle=model_bundle)
+        self.assertEqual("human_decision", result["claimSet"]["ownerKind"])
+        self.assertEqual(1, result["claimSet"]["derivedPriority"])
+        self.assertEqual("review_pending", result["heads"][0]["state"])
+
+    def test_public_b1_contact_optout_claim_is_blocked_until_b2c(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(
+            store,
+            owner_kind="contact_optout",
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(store, bundle=bundle)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_public_authenticated_operator_and_contact_fanout_claims_do_not_exist(self):
+        public_names = set(vars(self.module.RowAuthorityStore))
+        self.assertNotIn("claim_authenticated_operator", public_names)
+        self.assertNotIn("claim_operator_row_set", public_names)
+        self.assertNotIn("claim_contact_fanout", public_names)
+        self.assertNotIn("claim_contact_fanout_row_set", public_names)
+        signature = inspect.signature(self.module.RowAuthorityStore.claim_row_set)
+        for forbidden in (
+            "authority_origin",
+            "authority_link",
+            "operator_action_document",
+            "fanout_id",
+            "priority",
+            "planned_writes",
+            "row_ids",
+            "thread_id",
+        ):
+            self.assertNotIn(forbidden, signature.parameters)
+
+    def test_private_operator_and_contact_planners_never_open_nested_transactions(self):
+        for name in (
+            "_plan_operator_row_claim",
+            "_plan_contact_fanout_row_claim",
+        ):
+            planner = getattr(self.module, name)
+            source = inspect.getsource(planner)
+            self.assertNotIn(".transaction(", source)
+            self.assertNotIn("_transaction_executor", source)
+        store = self._store()
+        self._seed_row(store, self.first)
+        binding = self._seed_thread_binding(store, [self.first])
+        store.events.clear()
+        plan = self._contact_plan(store, binding)
+        self.assertEqual("created", plan["disposition"])
+        self.assertEqual("contact_fanout", plan["claimSet"]["authorityOrigin"])
+        self.assertEqual([], store.events)
+
+    def test_first_claim_creates_claim_set_generation_and_head_per_row(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(
+            store,
+            row_ids=[self.first, self.second],
+        )
+        store.events.clear()
+        result = self._claim(store, bundle=bundle)
+        self.assertEqual(5, result["claimSet"]["plannedWrites"])
+        self.assertEqual(2, len(result["generations"]))
+        self.assertEqual(2, len(result["heads"]))
+        self.assertEqual([1, 1], [item["generation"] for item in result["generations"]])
+        self.assertEqual([1, 1], [item["fencingToken"] for item in result["heads"]])
+        self.assertIn(("commit_applied", 5), store.events)
+
+    def test_human_claim_enters_review_pending_without_settlement(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+        )
+        result = self._claim(store, bundle=bundle)
+        self.assertEqual("review_pending", result["heads"][0]["state"])
+        self.assertEqual([], result["predecessorSettlements"])
+        self.assertFalse(
+            any("/rowOwnerSettlements/" in path for path in store.data)
+        )
+
+    def test_terminal_claim_enters_claimed(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        result = self._claim(store, bundle=bundle)
+        self.assertEqual("terminal", result["claimSet"]["ownerKind"])
+        self.assertEqual(2, result["claimSet"]["derivedPriority"])
+        self.assertEqual("claimed", result["heads"][0]["state"])
+
+    def test_active_and_nonviable_are_claimable_deleted_and_ambiguous_are_not(self):
+        for lifecycle, claimable in (
+            ("active", True),
+            ("nonviable", True),
+            ("deleted", False),
+            ("ambiguous", False),
+        ):
+            with self.subTest(lifecycle=lifecycle):
+                store = self._store()
+                self._seed_row(store, self.first, lifecycle=lifecycle)
+                self._seed_thread_binding(store, [self.first])
+                bundle = self._seed_b1_bundle(store)
+                before = deepcopy(store.data)
+                store.events.clear()
+                if claimable:
+                    result = self._claim(store, bundle=bundle)
+                    self.assertEqual("created", result["disposition"])
+                else:
+                    with self.assertRaises(self.module.RowAuthorityConflict):
+                        self._claim(store, bundle=bundle)
+                    self.assertEqual(before, store.data)
+                    self.assertEqual([], self._write_events(store))
+
+    def test_claim_reads_b1_bundle_then_binding_then_derived_claim_set_then_rows_before_writes(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(
+            store,
+            row_ids=[self.second, self.first],
+        )
+        store.events.clear()
+        result = self._claim(store, bundle=bundle)
+        reads = [event[1] for event in store.events if event[0] == "get"]
+        self.assertEqual(
+            [
+                "users/uid-claim-1/sourceIdentities/source-1",
+                "users/uid-claim-1/sourceClassifications/source-1",
+                "users/uid-claim-1/sourceTransitionOwners/source-1",
+                "users/uid-claim-1/sourceWorkLedgers/source-1",
+                "users/uid-claim-1/threadRowBindings/thread-1",
+                self._claim_reference(store, result["claimSet"]["requestId"]).path,
+                self._row_references(store, self.first)[0].path,
+                self._row_references(store, self.first)[1].path,
+                self._row_references(store, self.second)[0].path,
+                self._row_references(store, self.second)[1].path,
+            ],
+            reads[:10],
+        )
+        read_indexes = [
+            index for index, event in enumerate(store.events) if event[0] == "get"
+        ]
+        write_indexes = [
+            index
+            for index, event in enumerate(store.events)
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+        self.assertLess(max(read_indexes), min(write_indexes))
+
+    def test_claim_rejects_event_time_before_binding_identity_or_current_head(self):
+        binding_store = self._store()
+        bundle, _binding = self._seed_prerequisites(binding_store)
+        before = deepcopy(binding_store.data)
+        binding_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                binding_store,
+                bundle=bundle,
+                created_at=self.row_created_at,
+            )
+        self.assertEqual(before, binding_store.data)
+
+        head_store = self._store()
+        bundle, _binding = self._seed_prerequisites(head_store)
+        _identity_ref, head_ref = self._row_references(head_store, self.first)
+        head = deepcopy(head_store.data[head_ref.path])
+        head.update(
+            {
+                "stateRevision": 2,
+                "currentLocationRevision": 2,
+                "currentLocationHash": "3" * 64,
+                "updatedAt": "2026-08-04T12:00:03.000000Z",
+            }
+        )
+        head_ref.set(self._rehash_head(head), merge=False)
+        before = deepcopy(head_store.data)
+        head_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(head_store, bundle=bundle)
+        self.assertEqual(before, head_store.data)
+
+    def test_claim_time_must_follow_immutable_b1_identity_snapshot_owner_and_ledger_readiness(self):
+        for collection, field in (
+            ("sourceIdentities", "createdAt"),
+            ("sourceClassifications", "snapshotPersistedAt"),
+            ("sourceTransitionOwners", "createdAt"),
+            ("sourceWorkLedgers", "createdAt"),
+        ):
+            with self.subTest(collection=collection, field=field):
+                store = self._store()
+                bundle, _binding = self._seed_prerequisites(store)
+                reference = self._user_reference(store).collection(
+                    collection
+                ).document("source-1")
+                store.data[reference.path][field] = datetime(
+                    2026,
+                    8,
+                    4,
+                    12,
+                    0,
+                    3,
+                    tzinfo=timezone.utc,
+                )
+                before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._claim(store, bundle=bundle)
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_claim_validates_385_worst_case_before_executor_and_exact_count_before_write(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        original = self.module._require_row_authority_planned_writes
+        with patch.object(
+            self.module,
+            "_require_row_authority_planned_writes",
+            wraps=original,
+        ) as validator:
+            result = self._claim(store, bundle=bundle)
+        observed = [call.args[0] for call in validator.call_args_list]
+        self.assertEqual(385, observed[0])
+        self.assertIn(3, observed[1:])
+        self.assertEqual(3, result["claimSet"]["plannedWrites"])
+        self.assertIn(("commit_applied", 3), store.events)
+
+    def test_private_validated_optout_plan_dominates_terminal_and_human(self):
+        for owner_kind in ("terminal", "human_decision"):
+            with self.subTest(owner_kind=owner_kind):
+                store = self._store()
+                self._seed_row(store, self.first)
+                binding = self._seed_thread_binding(store, [self.first])
+                _claim, prior_generation, prior_head = self._install_owner(
+                    store,
+                    self.first,
+                    owner_kind=owner_kind,
+                )
+                plan = self._contact_plan(store, binding)
+                self.assertEqual("created", plan["disposition"])
+                self.assertEqual(3, plan["claimSet"]["derivedPriority"])
+                self.assertEqual(2, plan["generations"][0]["generation"])
+                self.assertEqual(
+                    prior_generation["generationHash"],
+                    plan["predecessorSettlements"][0]["generationHash"],
+                )
+                self.assertEqual(
+                    prior_head["fencingToken"],
+                    plan["predecessorSettlements"][0]["fencingToken"],
+                )
+                self.assertEqual(
+                    plan["generations"][0]["generationHash"],
+                    plan["predecessorSettlements"][0][
+                        "dominantGenerationHash"
+                    ],
+                )
+
+    def test_terminal_dominates_human(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        _human_claim, human_generation, _human_head = self._install_owner(
+            store,
+            self.first,
+            owner_kind="human_decision",
+        )
+        store.events.clear()
+        result = self._claim(
+            store,
+            bundle=bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual(2, result["generations"][0]["generation"])
+        self.assertEqual(2, result["heads"][0]["effectivePriority"])
+        self.assertEqual(1, len(result["predecessorSettlements"]))
+        self.assertEqual(
+            human_generation["generationHash"],
+            result["predecessorSettlements"][0]["generationHash"],
+        )
+        self.assertIn(("commit_applied", 4), store.events)
+
+    def test_unverified_model_optout_cannot_exceed_human_priority(self):
+        bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind="human_decision",
+            model_contact_optout=True,
+        )
+        link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=bundle["identity"],
+            source_classification_document=bundle["classification"],
+            source_owner_document=bundle["owner"],
+            source_ledger_document=bundle["ledger"],
+            work_key=bundle["work_key"],
+        )
+        self.assertEqual("human_decision", link["ownerKind"])
+        self.assertEqual(1, self.module.derive_owner_priority(link["ownerKind"]))
+        self.assertIsNone(link["hardOptOutEvidenceHash"])
+
+    def test_equal_priority_first_commit_wins_without_lexical_election(self):
+        store = self._store()
+        first_bundle, _binding = self._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+        )
+        first = self._claim(store, bundle=first_bundle)
+        second_bundle = self._seed_b1_bundle(
+            store,
+            owner_kind="human_decision",
+            source_id="000-lexically-first",
+        )
+        store.events.clear()
+        second = self._claim(
+            store,
+            bundle=second_bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self.assertEqual("dominated", second["disposition"])
+        self.assertEqual(
+            first["generations"][0]["generationHash"],
+            second["claimSet"]["rowDecisions"][0][
+                "winnerGenerationHash"
+            ],
+        )
+        self.assertIn(("commit_applied", 1), store.events)
+
+    def test_lower_claim_writes_only_dominated_claim_set(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        self._install_contact_owner(store, self.first)
+        head_before = deepcopy(
+            store.data[self._row_references(store, self.first)[1].path]
+        )
+        store.events.clear()
+        result = self._claim(store, bundle=bundle)
+        self.assertEqual("dominated", result["disposition"])
+        writes = self._write_events(store)
+        self.assertEqual(1, len(writes))
+        self.assertEqual("create", writes[0][0])
+        self.assertIn("/rowClaimSets/", writes[0][1])
+        self.assertEqual(
+            head_before,
+            store.data[self._row_references(store, self.first)[1].path],
+        )
+
+    def test_multirow_dominated_marks_peers_blocked_and_advances_no_generation(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(
+            store,
+            row_ids=[self.first, self.second],
+        )
+        self._install_contact_owner(store, self.first)
+        before_generations = {
+            path: deepcopy(payload)
+            for path, payload in store.data.items()
+            if "/rowOwnerGenerations/" in path
+        }
+        result = self._claim(store, bundle=bundle)
+        self.assertEqual(
+            ["dominated", "blocked_by_claim_set"],
+            [item["decision"] for item in result["claimSet"]["rowDecisions"]],
+        )
+        self.assertEqual([], result["generations"])
+        self.assertEqual(
+            before_generations,
+            {
+                path: payload
+                for path, payload in store.data.items()
+                if "/rowOwnerGenerations/" in path
+            },
+        )
+
+    def test_higher_claim_dominates_unsettled_predecessor_and_preserves_effective_settlement(self):
+        store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(store)
+        (
+            _action,
+            _human_claim,
+            _human_generation,
+            human_settlement,
+            _human_head,
+        ) = self._install_settled_human_owner(store, self.first)
+        terminal = self._claim(
+            store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:04.000000Z",
+            lease_until="2026-08-04T12:07:00.000000Z",
+        )
+        self.assertEqual(
+            human_settlement["settlementHash"],
+            terminal["heads"][0]["effectiveSettlementHash"],
+        )
+        contact = self._contact_plan(
+            store,
+            self.module.validate_thread_row_binding_document(
+                document=store.data[
+                    self._user_reference(store)
+                    .collection("threadRowBindings")
+                    .document("thread-1")
+                    .path
+                ]
+            ),
+            created_at="2026-08-04T12:00:05.000000Z",
+            lease_until="2026-08-04T12:08:00.000000Z",
+        )
+        self.assertEqual(3, contact["generations"][0]["generation"])
+        self.assertEqual(1, len(contact["predecessorSettlements"]))
+        self.assertEqual(
+            human_settlement["settlementHash"],
+            contact["generations"][0]["predecessorSettlementHash"],
+        )
+        self.assertEqual(
+            human_settlement["settlementHash"],
+            contact["heads"][0]["effectiveSettlementHash"],
+        )
+        self.assertEqual(
+            contact["predecessorSettlements"][0]["settlementHash"],
+            contact["heads"][0]["latestSettlementHash"],
+        )
+
+    def test_higher_claim_after_takeover_freezes_current_not_first_fence(self):
+        store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(store)
+        _claim, generation, head = self._install_owner(
+            store,
+            self.first,
+            owner_kind="human_decision",
+        )
+        takeover = self.module._build_lease_takeover_head(
+            expected_head=head,
+            generation_document=generation,
+            new_lease_owner_hash="3" * 64,
+            new_lease_until="2026-08-04T12:10:00.000000Z",
+            taken_at="2026-08-04T12:06:00.000000Z",
+        )
+        self._row_references(store, self.first)[1].set(takeover, merge=False)
+        result = self._claim(
+            store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:07:00.000000Z",
+            lease_until="2026-08-04T12:12:00.000000Z",
+        )
+        self.assertEqual(1, generation["firstFencingToken"])
+        self.assertEqual(2, takeover["fencingToken"])
+        self.assertEqual(
+            2,
+            result["predecessorSettlements"][0]["fencingToken"],
+        )
+        self.assertEqual(3, result["generations"][0]["firstFencingToken"])
+
+    def test_higher_claim_never_rewrites_settled_lower_generation(self):
+        store = self._store()
+        self._seed_row(store, self.first)
+        binding = self._seed_thread_binding(store, [self.first])
+        claim, generation, head = self._install_owner(
+            store,
+            self.first,
+            owner_kind="terminal",
+        )
+        settlement, _settled_head = self._settle_terminal_owner(
+            store,
+            claim,
+            generation,
+            head,
+        )
+        settlement_before = deepcopy(
+            store.data[self._settlement_reference(store, self.first, 1).path]
+        )
+        plan = self._contact_plan(
+            store,
+            binding,
+            created_at="2026-08-04T12:00:04.000000Z",
+        )
+        self.assertEqual((), plan["predecessorSettlements"])
+        self.assertFalse(
+            any(
+                item["target"] == f"predecessor_settlement:{self.first}"
+                for item in plan["mutations"]
+            )
+        )
+        self.assertEqual(settlement, settlement_before)
+        self.assertEqual(
+            settlement["settlementHash"],
+            plan["heads"][0]["effectiveSettlementHash"],
+        )
+
+    def test_ownerless_historical_postrelease_shape_fails_closed(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        _identity_ref, head_ref = self._row_references(store, self.first)
+        head = deepcopy(store.data[head_ref.path])
+        head.update(
+            {
+                "stateRevision": 2,
+                "latestSettlementHash": "2" * 64,
+                "updatedAt": self.binding_at,
+            }
+        )
+        head_ref.set(self._rehash_head(head), merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(store, bundle=bundle)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_first_and_next_generation_allocation_are_exact(self):
+        first_store = self._store()
+        bundle, _binding = self._seed_prerequisites(first_store)
+        first = self._claim(first_store, bundle=bundle)
+        self.assertEqual(1, first["generations"][0]["generation"])
+        self.assertEqual(1, first["generations"][0]["firstFencingToken"])
+
+        next_store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(next_store)
+        self._install_owner(
+            next_store,
+            self.first,
+            owner_kind="human_decision",
+        )
+        following = self._claim(
+            next_store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self.assertEqual(2, following["generations"][0]["generation"])
+        self.assertEqual(2, following["generations"][0]["firstFencingToken"])
+
+    def test_exact_claim_retry_is_zero_write_already_applied(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        created = self._claim(store, bundle=bundle)
+        before = deepcopy(store.data)
+        store.events.clear()
+        replay = self._claim(store, bundle=bundle)
+        self.assertEqual("created", created["disposition"])
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(created["claimSet"], replay["claimSet"])
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertIn(("commit_applied", 0), store.events)
+
+    def test_exact_claim_retry_after_location_settlement_or_higher_generation_keeps_later_head(self):
+        location_store = self._store()
+        location_bundle, _binding = self._seed_prerequisites(location_store)
+        created = self._claim(location_store, bundle=location_bundle)
+        _identity_ref, location_head_ref = self._row_references(
+            location_store,
+            self.first,
+        )
+        location_head = deepcopy(created["heads"][0])
+        location_head.update(
+            {
+                "stateRevision": location_head["stateRevision"] + 1,
+                "currentLocationRevision": (
+                    location_head["currentLocationRevision"] + 1
+                ),
+                "currentLocationHash": "a" * 64,
+                "updatedAt": "2026-08-04T12:00:03.000000Z",
+            }
+        )
+        location_head = self._rehash_head(location_head)
+        location_head_ref.set(location_head, merge=False)
+        replay = self._claim(location_store, bundle=location_bundle)
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(location_head, replay["heads"][0])
+        self.assertEqual(location_head, location_store.data[location_head_ref.path])
+
+        settlement_store = self._store()
+        settlement_bundle, _binding = self._seed_prerequisites(settlement_store)
+        accepted = self._claim(settlement_store, bundle=settlement_bundle)
+        settlement, settled_head = self._settle_terminal_owner(
+            settlement_store,
+            accepted["claimSet"],
+            accepted["generations"][0],
+            accepted["heads"][0],
+        )
+        settled_replay = self._claim(settlement_store, bundle=settlement_bundle)
+        self.assertEqual("already_applied", settled_replay["disposition"])
+        self.assertEqual(settled_head, settled_replay["heads"][0])
+        self.assertEqual(
+            settlement,
+            settlement_store.data[
+                self._settlement_reference(settlement_store, self.first, 1).path
+            ],
+        )
+
+        higher_store = self._store()
+        human_bundle, _binding = self._seed_prerequisites(
+            higher_store,
+            owner_kind="human_decision",
+        )
+        human = self._claim(higher_store, bundle=human_bundle)
+        terminal_bundle = self._seed_b1_bundle(
+            higher_store,
+            owner_kind="terminal",
+            source_id="later-terminal",
+        )
+        higher = self._claim(
+            higher_store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        higher_head_before = deepcopy(higher["heads"][0])
+        human_replay = self._claim(higher_store, bundle=human_bundle)
+        self.assertEqual("already_applied", human_replay["disposition"])
+        self.assertEqual(higher_head_before, human_replay["heads"][0])
+        self.assertEqual(1, human["generations"][0]["generation"])
+        self.assertEqual(2, higher["generations"][0]["generation"])
+
+    def test_existing_request_hash_or_timestamp_drift_is_conflict(self):
+        timestamp_store = self._store()
+        bundle, _binding = self._seed_prerequisites(timestamp_store)
+        self._claim(timestamp_store, bundle=bundle)
+        before = deepcopy(timestamp_store.data)
+        timestamp_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                timestamp_store,
+                bundle=bundle,
+                created_at="2026-08-04T12:00:03.000000Z",
+                lease_until="2026-08-04T12:06:00.000000Z",
+            )
+        self.assertEqual(before, timestamp_store.data)
+        self.assertEqual([], self._write_events(timestamp_store))
+
+        hash_store = self._store()
+        bundle, _binding = self._seed_prerequisites(hash_store)
+        created = self._claim(hash_store, bundle=bundle)
+        claim_ref = self._claim_reference(
+            hash_store,
+            created["claimSet"]["requestId"],
+        )
+        hash_store.data[claim_ref.path]["claimSetHash"] = "f" * 64
+        before = deepcopy(hash_store.data)
+        hash_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(hash_store, bundle=bundle)
+        self.assertEqual(before, hash_store.data)
+        self.assertEqual([], self._write_events(hash_store))
+
+    def test_identical_workers_create_one_claim_and_both_succeed(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        store.events.clear()
+        store.before_commit_barrier = Barrier(2)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(self._claim, store, bundle=bundle)
+                for _index in range(2)
+            ]
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual(
+            ["already_applied", "created"],
+            sorted(item["disposition"] for item in results),
+        )
+        self.assertEqual(results[0]["claimSet"], results[1]["claimSet"])
+        self.assertEqual(1, store.events.count(("commit_applied", 3)))
+        self.assertEqual(1, store.events.count(("commit_applied", 0)))
+        self.assertTrue(
+            any(event[0] == "commit_aborted_stale_read" for event in store.events)
+        )
+
+    def test_different_equal_priority_workers_preserve_first_commit(self):
+        store = self._store()
+        first_bundle, _binding = self._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+        )
+        second_bundle = self._seed_b1_bundle(
+            store,
+            owner_kind="human_decision",
+            source_id="source-2",
+        )
+        store.events.clear()
+        store.before_commit_barrier = Barrier(2)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = (
+                pool.submit(self._claim, store, bundle=first_bundle),
+                pool.submit(self._claim, store, bundle=second_bundle),
+            )
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual(
+            ["created", "dominated"],
+            sorted(item["disposition"] for item in results),
+        )
+        winner = next(item for item in results if item["disposition"] == "created")
+        loser = next(item for item in results if item["disposition"] == "dominated")
+        self.assertEqual(
+            winner["generations"][0]["generationHash"],
+            loser["claimSet"]["rowDecisions"][0]["winnerGenerationHash"],
+        )
+        self.assertEqual(1, store.events.count(("commit_applied", 3)))
+        self.assertEqual(1, store.events.count(("commit_applied", 1)))
+
+    def test_claim_128_rows_stays_at_or_below_385_writes(self):
+        rows = [_row_id(index) for index in range(1, 129)]
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store, row_ids=rows)
+        for row_id in rows:
+            self._install_owner(
+                store,
+                row_id,
+                owner_kind="human_decision",
+            )
+        store.events.clear()
+        result = self._claim(
+            store,
+            bundle=bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self.assertEqual(128, len(result["generations"]))
+        self.assertEqual(128, len(result["predecessorSettlements"]))
+        self.assertEqual(385, result["claimSet"]["plannedWrites"])
+        self.assertIn(("commit_applied", 385), store.events)
+        self.assertFalse(
+            any(event[0] == "commit_refused_write_ceiling" for event in store.events)
+        )
+
+    def test_claim_rejects_malformed_stored_129_row_binding_with_zero_writes(self):
+        rows = [_row_id(index) for index in range(1, 130)]
+        store = self._store()
+        bundle = self._seed_b1_bundle(store)
+        binding = self.module.build_thread_row_binding_document(
+            user_scope_hash=self.scope,
+            thread_id="thread-1",
+            client_id="client-1",
+            row_ids=rows[:128],
+            primary_row_id=rows[0],
+            created_at=self.binding_at,
+        )
+        malformed = deepcopy(binding)
+        malformed["rowBindings"].append(
+            {"rowId": rows[128], "role": "related"}
+        )
+        malformed["bindingCount"] = 129
+        self._user_reference(store).collection("threadRowBindings").document(
+            "thread-1"
+        ).create(malformed)
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(store, bundle=bundle)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_claim_preapply_failure_is_retryable_with_zero_writes(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        before = deepcopy(store.data)
+        store.events.clear()
+        store.fail_next_commit = RuntimeError("preapply claim failure")
+        with self.assertRaises(self.module.RowAuthorityRetryable):
+            self._claim(store, bundle=bundle)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertIn(("commit_failed_before_apply",), store.events)
+
+    def test_claim_apply_then_raise_requires_claim_generations_heads_and_dominated_settlements(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        self._install_owner(
+            store,
+            self.first,
+            owner_kind="human_decision",
+        )
+        store.events.clear()
+        store.apply_then_raise_next_commit = RuntimeError(
+            "unknown claim commit outcome"
+        )
+        result = self._claim(
+            store,
+            bundle=bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual(1, len(result["generations"]))
+        self.assertEqual(1, len(result["predecessorSettlements"]))
+        self.assertIn(("commit_applied", 4), store.events)
+        failure_index = store.events.index(("commit_raised_after_apply",))
+        self.assertTrue(
+            any(event[0] == "get" for event in store.events[failure_index + 1 :])
+        )
+
+    def test_claim_partial_malformed_or_unreadable_readback_is_ambiguous(self):
+        def partial_executor(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            operation, reference, payload, merge = transaction._operations[0]
+            transaction._rollback()
+            self.assertEqual(("create", False), (operation, merge))
+            reference.create(payload)
+            raise RuntimeError("partial claim apply")
+
+        partial_store = self._store()
+        partial_bundle, _binding = self._seed_prerequisites(partial_store)
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._claim(
+                partial_store,
+                bundle=partial_bundle,
+                executor=partial_executor,
+            )
+
+        malformed_store = self._store()
+        malformed_bundle, _binding = self._seed_prerequisites(malformed_store)
+
+        def malformed_executor(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            generation_path = next(
+                reference.path
+                for operation, reference, _payload, _merge in transaction._operations
+                if operation == "create" and "/rowOwnerGenerations/" in reference.path
+            )
+            transaction._commit()
+            malformed_store.data[generation_path]["generationHash"] = "f" * 64
+            raise RuntimeError("malformed claim after-image")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._claim(
+                malformed_store,
+                bundle=malformed_bundle,
+                executor=malformed_executor,
+            )
+
+        unreadable_store = self._store()
+        unreadable_bundle, _binding = self._seed_prerequisites(unreadable_store)
+        fake_module = importlib.import_module("tests.source_coordinator_fakes")
+        original_get = fake_module.FakeDocumentReference.get
+
+        def fail_readback(reference, *, transaction=None):
+            if transaction is None:
+                raise RuntimeError("claim readback unavailable")
+            return original_get(reference, transaction=transaction)
+
+        unreadable_store.apply_then_raise_next_commit = RuntimeError(
+            "applied then raised"
+        )
+        with patch.object(
+            fake_module.FakeDocumentReference,
+            "get",
+            new=fail_readback,
+        ), self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._claim(unreadable_store, bundle=unreadable_bundle)
+
+    def test_transaction_retry_rebuilds_every_decision_from_fresh_reads(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        _identity_ref, head_ref = self._row_references(store, self.first)
+        advanced = deepcopy(store.data[head_ref.path])
+        advanced.update(
+            {
+                "stateRevision": 2,
+                "currentLocationRevision": 2,
+                "currentLocationHash": "b" * 64,
+                "updatedAt": "2026-08-04T12:00:02.000000Z",
+            }
+        )
+        advanced = self._rehash_head(advanced)
+
+        def advance_location_before_first_commit():
+            head_ref.set(advanced, merge=False)
+
+        store.events.clear()
+        store.before_next_commit_hook = advance_location_before_first_commit
+        result = self._claim(
+            store,
+            bundle=bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        self.assertEqual(
+            advanced["headHash"],
+            result["generations"][0]["predecessorHeadHash"],
+        )
+        self.assertIn(("transaction_began", 0), store.events)
+        self.assertIn(("transaction_began", 1), store.events)
+        self.assertTrue(
+            any(event[0] == "commit_aborted_stale_read" for event in store.events)
+        )
+
+    def test_dominated_claim_rejects_partial_future_generation_or_settlement_state(self):
+        for collection in ("rowOwnerGenerations", "rowOwnerSettlements"):
+            with self.subTest(collection=collection):
+                store = self._store()
+                bundle, _binding = self._seed_prerequisites(store)
+                self._install_contact_owner(store, self.first)
+                future_ref = self._user_reference(store).collection(
+                    collection
+                ).document(f"{self.first}--2")
+                future_ref.create({"partial": "future ownership state"})
+                before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(self.module.RowAuthorityAmbiguous):
+                    self._claim(store, bundle=bundle)
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_current_owner_state_revision_and_time_cannot_regress_below_generation(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        _claim, generation, _head = self._install_owner(
+            store,
+            self.first,
+            owner_kind="human_decision",
+        )
+        _identity_ref, head_ref = self._row_references(store, self.first)
+        regressed = deepcopy(store.data[head_ref.path])
+        regressed["stateRevision"] = generation["generation"]
+        head_ref.set(self._rehash_head(regressed), merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                store,
+                bundle=bundle,
+                created_at="2026-08-04T12:00:03.000000Z",
+                lease_until="2026-08-04T12:06:00.000000Z",
+            )
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_current_generation_owner_must_match_its_accepted_claim(self):
+        store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(store)
+        _human_claim, human_generation, _human_head = self._install_owner(
+            store,
+            self.first,
+            owner_kind="human_decision",
+        )
+        generation_ref = self._generation_reference(store, self.first, 1)
+        forged_generation = deepcopy(human_generation)
+        forged_generation.update(
+            {
+                "ownerKind": "terminal",
+                "priority": 2,
+            }
+        )
+        generation_material = {
+            key: forged_generation[key]
+            for key in (
+                "rowId",
+                "generation",
+                "requestId",
+                "claimSetHash",
+                "predecessorHeadHash",
+                "predecessorSettlementHash",
+                "ownerKind",
+                "ownerKey",
+                "priority",
+                "leaseEpoch",
+                "firstFencingToken",
+                "createdAt",
+            )
+        }
+        forged_generation["generationHash"] = self.module.domain_hash(
+            self.module.OWNER_GENERATION_HASH_DOMAIN,
+            generation_material,
+            user_scope_hash=self.scope,
+        )
+        generation_ref.set(forged_generation, merge=False)
+        _identity_ref, head_ref = self._row_references(store, self.first)
+        forged_head = deepcopy(store.data[head_ref.path])
+        forged_head.update(
+            {
+                "effectiveOwnerGenerationHash": forged_generation[
+                    "generationHash"
+                ],
+                "effectiveOwnerKind": "terminal",
+                "effectivePriority": 2,
+                "state": "claimed",
+            }
+        )
+        head_ref.set(self._rehash_head(forged_head), merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                store,
+                bundle=terminal_bundle,
+                created_at="2026-08-04T12:00:03.000000Z",
+                lease_until="2026-08-04T12:06:00.000000Z",
+            )
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_active_generation_predecessor_settlement_must_match_effective_head(self):
+        store = self._store()
+        bundle, _binding = self._seed_prerequisites(store)
+        self._install_owner(store, self.first, owner_kind="terminal")
+        _identity_ref, head_ref = self._row_references(store, self.first)
+        drifted = deepcopy(store.data[head_ref.path])
+        drifted.update(
+            {
+                "latestSettlementHash": "2" * 64,
+                "effectiveSettlementHash": "2" * 64,
+            }
+        )
+        head_ref.set(self._rehash_head(drifted), merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                store,
+                bundle=bundle,
+                created_at="2026-08-04T12:00:03.000000Z",
+                lease_until="2026-08-04T12:06:00.000000Z",
+            )
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_settled_generation_fence_and_time_must_match_head(self):
+        for mode in ("fence", "time"):
+            with self.subTest(mode=mode):
+                store = self._store()
+                self._seed_row(store, self.first)
+                binding = self._seed_thread_binding(store, [self.first])
+                claim, generation, head = self._install_owner(
+                    store,
+                    self.first,
+                    owner_kind="terminal",
+                )
+                _settlement, settled_head = self._settle_terminal_owner(
+                    store,
+                    claim,
+                    generation,
+                    head,
+                )
+                drifted = deepcopy(settled_head)
+                if mode == "fence":
+                    drifted["fencingToken"] += 1
+                else:
+                    drifted["updatedAt"] = self.claimed_at
+                self._row_references(store, self.first)[1].set(
+                    self._rehash_head(drifted),
+                    merge=False,
+                )
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._contact_plan(
+                        store,
+                        binding,
+                        created_at="2026-08-04T12:00:04.000000Z",
+                    )
+
+    def test_settlement_derived_hashes_and_contact_supersession_are_correlated(self):
+        derived_store = self._store()
+        human_bundle, _binding = self._seed_prerequisites(
+            derived_store,
+            owner_kind="human_decision",
+        )
+        terminal_claim, terminal_generation, terminal_head = (
+            self._install_owner(
+                derived_store,
+                self.first,
+                owner_kind="terminal",
+            )
+        )
+        terminal_settlement, terminal_settled_head = (
+            self._settle_terminal_owner(
+                derived_store,
+                terminal_claim,
+                terminal_generation,
+                terminal_head,
+            )
+        )
+        drifted_settlement = deepcopy(terminal_settlement)
+        drifted_settlement.update(
+            {
+                "outcomeEvidenceHash": "d" * 64,
+                "logicalOutcomeHash": "e" * 64,
+            }
+        )
+        drifted_settlement = self._rehash_settlement(drifted_settlement)
+        self._settlement_reference(derived_store, self.first, 1).set(
+            drifted_settlement,
+            merge=False,
+        )
+        drifted_head = deepcopy(terminal_settled_head)
+        drifted_head.update(
+            {
+                "latestSettlementHash": drifted_settlement[
+                    "settlementHash"
+                ],
+                "effectiveSettlementHash": drifted_settlement[
+                    "settlementHash"
+                ],
+            }
+        )
+        self._row_references(derived_store, self.first)[1].set(
+            self._rehash_head(drifted_head),
+            merge=False,
+        )
+        before = deepcopy(derived_store.data)
+        derived_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                derived_store,
+                bundle=human_bundle,
+                created_at="2026-08-04T12:00:04.000000Z",
+                lease_until="2026-08-04T12:07:00.000000Z",
+            )
+        self.assertEqual(before, derived_store.data)
+        self.assertEqual([], self._write_events(derived_store))
+
+        contact_store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(contact_store)
+        contact_claim, contact_generation, contact_head = (
+            self._install_contact_owner(contact_store, self.first)
+        )
+        contact_settlement = self.module.build_owner_settlement_document(
+            generation_document=contact_generation,
+            claim_set_document=contact_claim,
+            fencing_token=contact_head["fencingToken"],
+            outcome="contact_optout",
+            settled_at="2026-08-04T12:00:03.000000Z",
+            superseded_effective_settlement_hash=None,
+        )
+        contact_settlement["supersededEffectiveSettlementHash"] = "f" * 64
+        contact_settlement = self._rehash_settlement(contact_settlement)
+        contact_settled_head = self.module._build_settlement_advanced_head(
+            expected_head=contact_head,
+            generation_document=contact_generation,
+            settlement_document=contact_settlement,
+        )
+        self._settlement_reference(contact_store, self.first, 1).create(
+            contact_settlement
+        )
+        self._row_references(contact_store, self.first)[1].set(
+            contact_settled_head,
+            merge=False,
+        )
+        before = deepcopy(contact_store.data)
+        contact_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                contact_store,
+                bundle=terminal_bundle,
+                created_at="2026-08-04T12:00:04.000000Z",
+                lease_until="2026-08-04T12:07:00.000000Z",
+            )
+        self.assertEqual(before, contact_store.data)
+        self.assertEqual([], self._write_events(contact_store))
+
+    def test_full_lineage_enforces_priority_outcome_and_effective_preservation(self):
+        preservation_store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(
+            preservation_store
+        )
+        self._install_owner(
+            preservation_store,
+            self.first,
+            owner_kind="human_decision",
+        )
+        terminal = self._claim(
+            preservation_store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        generation_ref = self._generation_reference(
+            preservation_store,
+            self.first,
+            2,
+        )
+        forged_generation = deepcopy(
+            preservation_store.data[generation_ref.path]
+        )
+        forged_generation["predecessorSettlementHash"] = "f" * 64
+        forged_generation = self._rehash_generation(forged_generation)
+        generation_ref.set(forged_generation, merge=False)
+        settlement_ref = self._settlement_reference(
+            preservation_store,
+            self.first,
+            1,
+        )
+        forged_settlement = deepcopy(
+            preservation_store.data[settlement_ref.path]
+        )
+        forged_settlement["dominantGenerationHash"] = forged_generation[
+            "generationHash"
+        ]
+        forged_settlement = self._rehash_settlement(forged_settlement)
+        settlement_ref.set(forged_settlement, merge=False)
+        _identity_ref, head_ref = self._row_references(
+            preservation_store,
+            self.first,
+        )
+        forged_head = deepcopy(terminal["heads"][0])
+        forged_head.update(
+            {
+                "effectiveOwnerGenerationHash": forged_generation[
+                    "generationHash"
+                ],
+                "latestSettlementHash": forged_settlement[
+                    "settlementHash"
+                ],
+            }
+        )
+        head_ref.set(self._rehash_head(forged_head), merge=False)
+        before = deepcopy(preservation_store.data)
+        preservation_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(preservation_store, bundle=terminal_bundle)
+        self.assertEqual(before, preservation_store.data)
+        self.assertEqual([], self._write_events(preservation_store))
+
+        priority_store = self._store()
+        human_bundle, _binding = self._seed_prerequisites(
+            priority_store,
+            owner_kind="human_decision",
+        )
+        first_claim, first_generation, first_head = self._install_owner(
+            priority_store,
+            self.first,
+            owner_kind="terminal",
+        )
+        first_settlement, settled_head = self._settle_terminal_owner(
+            priority_store,
+            first_claim,
+            first_generation,
+            first_head,
+        )
+        equal_bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind="terminal",
+            source_id="equal-priority-terminal",
+        )
+        equal_link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=equal_bundle["identity"],
+            source_classification_document=equal_bundle["classification"],
+            source_owner_document=equal_bundle["owner"],
+            source_ledger_document=equal_bundle["ledger"],
+            work_key=equal_bundle["work_key"],
+        )
+        equal_claim = self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin="b1_source",
+            authority_link=equal_link,
+            operator_action_document=None,
+            fanout_id=None,
+            row_ids=[self.first],
+            primary_row_id=self.first,
+            planned_writes=3,
+            outcome="accepted",
+            row_decisions=[
+                {
+                    "rowId": self.first,
+                    "decision": "accepted",
+                    "plannedGeneration": 2,
+                    "winnerGenerationHash": None,
+                    "winnerSettlementHash": None,
+                }
+            ],
+            created_at="2026-08-04T12:00:04.000000Z",
+        )
+        equal_generation = self.module.build_owner_generation_document(
+            claim_set_document=equal_claim,
+            row_id=self.first,
+            generation=2,
+            predecessor_head_hash=settled_head["headHash"],
+            predecessor_settlement_hash=first_settlement["settlementHash"],
+            lease_epoch=1,
+            first_fencing_token=2,
+            created_at="2026-08-04T12:00:04.000000Z",
+        )
+        equal_head = deepcopy(settled_head)
+        equal_head.update(
+            {
+                "stateRevision": settled_head["stateRevision"] + 1,
+                "effectiveOwnerGeneration": 2,
+                "effectiveOwnerGenerationHash": equal_generation[
+                    "generationHash"
+                ],
+                "effectiveOwnerKind": "terminal",
+                "effectivePriority": 2,
+                "state": "claimed",
+                "leaseOwnerHash": "b" * 64,
+                "leaseUntil": "2026-08-04T12:07:00.000000Z",
+                "fencingToken": 2,
+                "updatedAt": "2026-08-04T12:00:04.000000Z",
+            }
+        )
+        self._claim_reference(
+            priority_store,
+            equal_claim["requestId"],
+        ).create(equal_claim)
+        self._generation_reference(priority_store, self.first, 2).create(
+            equal_generation
+        )
+        self._row_references(priority_store, self.first)[1].set(
+            self._rehash_head(equal_head),
+            merge=False,
+        )
+        before = deepcopy(priority_store.data)
+        priority_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                priority_store,
+                bundle=human_bundle,
+                created_at="2026-08-04T12:00:05.000000Z",
+                lease_until="2026-08-04T12:08:00.000000Z",
+            )
+        self.assertEqual(before, priority_store.data)
+        self.assertEqual([], self._write_events(priority_store))
+
+        outcome_store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(outcome_store)
+        (
+            _action,
+            human_claim,
+            human_generation,
+            human_settlement,
+            human_settled_head,
+        ) = self._install_settled_human_owner(outcome_store, self.first)
+        forged_human_settlement = deepcopy(human_settlement)
+        forged_human_settlement.update(
+            {
+                "outcome": "contact_optout",
+                "operatorActionHash": None,
+                "outcomeReasonCode": "verified_optout",
+            }
+        )
+        forged_human_settlement["outcomeEvidenceHash"] = (
+            self.module._outcome_evidence_hash(
+                user_scope_hash=self.scope,
+                authority_link_hash=human_claim["authorityLinkHash"],
+                operator_action_hash=human_claim["operatorActionHash"],
+                fanout_id=human_claim["fanoutId"],
+                payload_hash=human_claim["payloadHash"],
+                outcome_reason_code="verified_optout",
+            )
+        )
+        forged_human_settlement["logicalOutcomeHash"] = (
+            self.module._logical_outcome_hash(
+                user_scope_hash=self.scope,
+                row_id=self.first,
+                generation=1,
+                owner_kind="human_decision",
+                owner_key=human_generation["ownerKey"],
+                outcome="contact_optout",
+                outcome_reason_code="verified_optout",
+                outcome_evidence_hash=forged_human_settlement[
+                    "outcomeEvidenceHash"
+                ],
+            )
+        )
+        forged_human_settlement = self._rehash_settlement(
+            forged_human_settlement
+        )
+        self._settlement_reference(outcome_store, self.first, 1).set(
+            forged_human_settlement,
+            merge=False,
+        )
+        human_settled_head.update(
+            {
+                "latestSettlementHash": forged_human_settlement[
+                    "settlementHash"
+                ],
+                "effectiveSettlementHash": forged_human_settlement[
+                    "settlementHash"
+                ],
+            }
+        )
+        forged_predecessor_head = self._rehash_head(human_settled_head)
+        terminal_link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=terminal_bundle["identity"],
+            source_classification_document=terminal_bundle["classification"],
+            source_owner_document=terminal_bundle["owner"],
+            source_ledger_document=terminal_bundle["ledger"],
+            work_key=terminal_bundle["work_key"],
+        )
+        terminal_claim = self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin="b1_source",
+            authority_link=terminal_link,
+            operator_action_document=None,
+            fanout_id=None,
+            row_ids=[self.first],
+            primary_row_id=self.first,
+            planned_writes=3,
+            outcome="accepted",
+            row_decisions=[
+                {
+                    "rowId": self.first,
+                    "decision": "accepted",
+                    "plannedGeneration": 2,
+                    "winnerGenerationHash": None,
+                    "winnerSettlementHash": None,
+                }
+            ],
+            created_at="2026-08-04T12:00:04.000000Z",
+        )
+        terminal_generation = self.module.build_owner_generation_document(
+            claim_set_document=terminal_claim,
+            row_id=self.first,
+            generation=2,
+            predecessor_head_hash=forged_predecessor_head["headHash"],
+            predecessor_settlement_hash=forged_human_settlement[
+                "settlementHash"
+            ],
+            lease_epoch=1,
+            first_fencing_token=2,
+            created_at="2026-08-04T12:00:04.000000Z",
+        )
+        terminal_head = deepcopy(forged_predecessor_head)
+        terminal_head.update(
+            {
+                "stateRevision": forged_predecessor_head[
+                    "stateRevision"
+                ]
+                + 1,
+                "effectiveOwnerGeneration": 2,
+                "effectiveOwnerGenerationHash": terminal_generation[
+                    "generationHash"
+                ],
+                "effectiveOwnerKind": "terminal",
+                "effectivePriority": 2,
+                "state": "claimed",
+                "leaseOwnerHash": "b" * 64,
+                "leaseUntil": "2026-08-04T12:07:00.000000Z",
+                "fencingToken": 2,
+                "updatedAt": "2026-08-04T12:00:04.000000Z",
+            }
+        )
+        self._claim_reference(
+            outcome_store,
+            terminal_claim["requestId"],
+        ).create(terminal_claim)
+        self._generation_reference(outcome_store, self.first, 2).create(
+            terminal_generation
+        )
+        self._row_references(outcome_store, self.first)[1].set(
+            self._rehash_head(terminal_head),
+            merge=False,
+        )
+        before = deepcopy(outcome_store.data)
+        outcome_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                outcome_store,
+                bundle=terminal_bundle,
+                created_at="2026-08-04T12:00:04.000000Z",
+                lease_until="2026-08-04T12:07:00.000000Z",
+            )
+        self.assertEqual(before, outcome_store.data)
+        self.assertEqual([], self._write_events(outcome_store))
+
+    def test_nonadjacent_replay_requires_complete_bounded_lineage(self):
+        store = self._store()
+        human_bundle, binding = self._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+        )
+        human = self._claim(store, bundle=human_bundle)
+        terminal_bundle = self._seed_b1_bundle(
+            store,
+            owner_kind="terminal",
+            source_id="bounded-terminal",
+        )
+        self._claim(
+            store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        contact = self._contact_plan(
+            store,
+            binding,
+            created_at="2026-08-04T12:00:04.000000Z",
+            lease_until="2026-08-04T12:07:00.000000Z",
+        )
+        self._claim_reference(
+            store,
+            contact["claimSet"]["requestId"],
+        ).create(contact["claimSet"])
+        for generation in contact["generations"]:
+            self._generation_reference(
+                store,
+                generation["rowId"],
+                generation["generation"],
+            ).create(generation)
+        for settlement in contact["predecessorSettlements"]:
+            self._settlement_reference(
+                store,
+                settlement["rowId"],
+                settlement["generation"],
+            ).create(settlement)
+        for head in contact["heads"]:
+            self._row_references(store, head["rowId"])[1].set(
+                head,
+                merge=False,
+            )
+        replay = self._claim(store, bundle=human_bundle)
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(3, replay["heads"][0]["effectiveOwnerGeneration"])
+        self.assertEqual(1, human["generations"][0]["generation"])
+
+        store.data.pop(
+            self._generation_reference(store, self.first, 1).path
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._claim(store, bundle=human_bundle)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_full_lineage_rejects_impossible_writes_time_and_lease(self):
+        for mode in (
+            "planned_writes",
+            "historical_time",
+            "expired_lease",
+            "inflated_fence",
+        ):
+            with self.subTest(mode=mode):
+                store = self._store()
+                human_bundle, _binding = self._seed_prerequisites(
+                    store,
+                    owner_kind="human_decision",
+                )
+                claim, generation, head = self._install_owner(
+                    store,
+                    self.first,
+                    owner_kind="terminal",
+                )
+                claim_ref = self._claim_reference(
+                    store,
+                    claim["requestId"],
+                )
+                generation_ref = self._generation_reference(
+                    store,
+                    self.first,
+                    1,
+                )
+                _identity_ref, head_ref = self._row_references(
+                    store,
+                    self.first,
+                )
+                if mode == "planned_writes":
+                    claim["plannedWrites"] = 400
+                    claim = self._rehash_claim(claim)
+                    generation["claimSetHash"] = claim["claimSetHash"]
+                    generation = self._rehash_generation(generation)
+                    head["effectiveOwnerGenerationHash"] = generation[
+                        "generationHash"
+                    ]
+                elif mode == "historical_time":
+                    claim["createdAt"] = "2026-08-04T11:00:00.000000Z"
+                    claim = self._rehash_claim(claim)
+                    generation.update(
+                        {
+                            "claimSetHash": claim["claimSetHash"],
+                            "createdAt": "2026-08-04T11:00:00.000000Z",
+                        }
+                    )
+                    generation = self._rehash_generation(generation)
+                    head["effectiveOwnerGenerationHash"] = generation[
+                        "generationHash"
+                    ]
+                elif mode == "expired_lease":
+                    head["leaseUntil"] = "2026-08-04T11:00:00.000000Z"
+                else:
+                    head["fencingToken"] = 99
+                claim_ref.set(claim, merge=False)
+                generation_ref.set(generation, merge=False)
+                head_ref.set(self._rehash_head(head), merge=False)
+                before = deepcopy(store.data)
+                store.events.clear()
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._claim(
+                        store,
+                        bundle=human_bundle,
+                        created_at="2026-08-04T12:00:03.000000Z",
+                        lease_until="2026-08-04T12:06:00.000000Z",
+                    )
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+        exact_store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(exact_store)
+        self._install_settled_human_owner(exact_store, self.first)
+        terminal = self._claim(
+            exact_store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:04.000000Z",
+            lease_until="2026-08-04T12:07:00.000000Z",
+        )
+        claim_ref = self._claim_reference(
+            exact_store,
+            terminal["claimSet"]["requestId"],
+        )
+        drifted_claim = deepcopy(terminal["claimSet"])
+        drifted_claim["plannedWrites"] = 4
+        drifted_claim = self._rehash_claim(drifted_claim)
+        claim_ref.set(drifted_claim, merge=False)
+        generation_ref = self._generation_reference(
+            exact_store,
+            self.first,
+            2,
+        )
+        drifted_generation = deepcopy(
+            exact_store.data[generation_ref.path]
+        )
+        drifted_generation["claimSetHash"] = drifted_claim["claimSetHash"]
+        drifted_generation = self._rehash_generation(drifted_generation)
+        generation_ref.set(drifted_generation, merge=False)
+        _identity_ref, head_ref = self._row_references(
+            exact_store,
+            self.first,
+        )
+        drifted_head = deepcopy(exact_store.data[head_ref.path])
+        drifted_head["effectiveOwnerGenerationHash"] = drifted_generation[
+            "generationHash"
+        ]
+        head_ref.set(self._rehash_head(drifted_head), merge=False)
+        before = deepcopy(exact_store.data)
+        exact_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                exact_store,
+                bundle=terminal_bundle,
+                created_at="2026-08-04T12:00:04.000000Z",
+                lease_until="2026-08-04T12:07:00.000000Z",
+            )
+        self.assertEqual(before, exact_store.data)
+        self.assertEqual([], self._write_events(exact_store))
+
+    def test_complete_claim_cohort_rejects_missing_peer_generation(self):
+        store = self._store()
+        first_bundle, _binding = self._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+            row_ids=[self.first, self.second],
+        )
+        _identity_ref, second_head_ref = self._row_references(
+            store,
+            self.second,
+        )
+        second_clear_head = deepcopy(store.data[second_head_ref.path])
+        self._claim(store, bundle=first_bundle)
+        store.data.pop(
+            self._generation_reference(store, self.second, 1).path
+        )
+        second_head_ref.set(second_clear_head, merge=False)
+        second_bundle = self._seed_b1_bundle(
+            store,
+            owner_kind="human_decision",
+            source_id="second-human-cohort",
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                store,
+                bundle=second_bundle,
+                created_at="2026-08-04T12:00:03.000000Z",
+                lease_until="2026-08-04T12:06:00.000000Z",
+            )
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_overlapping_binding_validates_only_the_target_claim_cohort(self):
+        store = self._store()
+        human_bundle, _binding = self._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+            row_ids=[self.first, self.second],
+        )
+        self._claim(store, bundle=human_bundle)
+        overlap_binding = self.module.build_thread_row_binding_document(
+            user_scope_hash=self.scope,
+            thread_id="thread-2",
+            client_id="client-1",
+            row_ids=[self.first],
+            primary_row_id=self.first,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+        user = self._user_reference(store)
+        user.collection("threadRowBindings").document("thread-2").create(
+            overlap_binding
+        )
+        for edge in self.module.build_row_thread_binding_documents(
+            thread_binding_document=overlap_binding
+        ):
+            user.collection("rowThreadBindings").document(
+                edge["edgeId"]
+            ).create(edge)
+        terminal_bundle = self._seed_b1_bundle(
+            store,
+            owner_kind="terminal",
+            source_id="overlapping-terminal",
+        )
+        source_identity_ref = user.collection("sourceIdentities").document(
+            terminal_bundle["identity"]["canonicalSourceId"]
+        )
+        store.data[source_identity_ref.path]["threadId"] = "thread-2"
+        result = self._claim(
+            store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:04.000000Z",
+            lease_until="2026-08-04T12:07:00.000000Z",
+        )
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual([self.first], [head["rowId"] for head in result["heads"]])
+        self.assertEqual(2, result["generations"][0]["generation"])
+        second_head = store.data[
+            self._row_references(store, self.second)[1].path
+        ]
+        self.assertEqual(1, second_head["effectiveOwnerGeneration"])
+
+    def test_dominated_replay_proves_winners_and_blocked_peer_semantics(self):
+        winner_store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(winner_store)
+        self._install_contact_owner(winner_store, self.first)
+        dominated = self._claim(winner_store, bundle=terminal_bundle)
+        dominated_ref = self._claim_reference(
+            winner_store,
+            dominated["claimSet"]["requestId"],
+        )
+        drifted_claim = deepcopy(winner_store.data[dominated_ref.path])
+        drifted_claim["rowDecisions"][0]["winnerGenerationHash"] = "f" * 64
+        drifted_claim = self._rehash_claim(drifted_claim)
+        dominated_ref.set(drifted_claim, merge=False)
+        before = deepcopy(winner_store.data)
+        winner_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(winner_store, bundle=terminal_bundle)
+        self.assertEqual(before, winner_store.data)
+        self.assertEqual([], self._write_events(winner_store))
+
+        blocked_store = self._store()
+        terminal_bundle, _binding = self._seed_prerequisites(
+            blocked_store,
+            row_ids=[self.first, self.second],
+        )
+        self._install_contact_owner(blocked_store, self.first)
+        self._install_contact_owner(blocked_store, self.second)
+        dominated = self._claim(
+            blocked_store,
+            bundle=terminal_bundle,
+            created_at="2026-08-04T12:00:03.000000Z",
+            lease_until="2026-08-04T12:06:00.000000Z",
+        )
+        dominated_ref = self._claim_reference(
+            blocked_store,
+            dominated["claimSet"]["requestId"],
+        )
+        drifted_claim = deepcopy(blocked_store.data[dominated_ref.path])
+        drifted_claim["rowDecisions"][1].update(
+            {
+                "decision": "blocked_by_claim_set",
+                "winnerGenerationHash": None,
+                "winnerSettlementHash": None,
+            }
+        )
+        drifted_claim = self._rehash_claim(drifted_claim)
+        dominated_ref.set(drifted_claim, merge=False)
+        before = deepcopy(blocked_store.data)
+        blocked_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(
+                blocked_store,
+                bundle=terminal_bundle,
+                created_at="2026-08-04T12:00:03.000000Z",
+                lease_until="2026-08-04T12:06:00.000000Z",
+            )
+        self.assertEqual(before, blocked_store.data)
+        self.assertEqual([], self._write_events(blocked_store))
+
+    def test_replay_rejects_unproven_numeric_only_higher_generation(self):
+        store = self._store()
+        human_bundle, binding = self._seed_prerequisites(
+            store,
+            owner_kind="human_decision",
+        )
+        original = self._claim(store, bundle=human_bundle)
+        terminal_bundle = RowOwnershipContractTests._b1_bundle(
+            self,
+            owner_kind="terminal",
+            source_id="unlinked-terminal",
+        )
+        terminal_link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=terminal_bundle["identity"],
+            source_classification_document=terminal_bundle["classification"],
+            source_owner_document=terminal_bundle["owner"],
+            source_ledger_document=terminal_bundle["ledger"],
+            work_key=terminal_bundle["work_key"],
+        )
+        forged_claim = self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin="b1_source",
+            authority_link=terminal_link,
+            operator_action_document=None,
+            fanout_id=None,
+            row_ids=[self.first],
+            primary_row_id=self.first,
+            planned_writes=3,
+            outcome="accepted",
+            row_decisions=[
+                {
+                    "rowId": self.first,
+                    "decision": "accepted",
+                    "plannedGeneration": 2,
+                    "winnerGenerationHash": None,
+                    "winnerSettlementHash": None,
+                }
+            ],
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+        forged_generation = self.module.build_owner_generation_document(
+            claim_set_document=forged_claim,
+            row_id=self.first,
+            generation=2,
+            predecessor_head_hash="a" * 64,
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=2,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+        forged_head = deepcopy(original["heads"][0])
+        forged_head.update(
+            {
+                "stateRevision": forged_head["stateRevision"] + 1,
+                "effectiveOwnerGeneration": 2,
+                "effectiveOwnerGenerationHash": forged_generation[
+                    "generationHash"
+                ],
+                "effectiveOwnerKind": "terminal",
+                "effectivePriority": 2,
+                "state": "claimed",
+                "leaseOwnerHash": "b" * 64,
+                "leaseUntil": "2026-08-04T12:06:00.000000Z",
+                "fencingToken": 2,
+                "updatedAt": "2026-08-04T12:00:03.000000Z",
+            }
+        )
+        forged_head = self._rehash_head(forged_head)
+        self._claim_reference(store, forged_claim["requestId"]).create(
+            forged_claim
+        )
+        self._generation_reference(store, self.first, 2).create(
+            forged_generation
+        )
+        self._row_references(store, self.first)[1].set(
+            forged_head,
+            merge=False,
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._contact_plan(
+                store,
+                binding,
+                created_at="2026-08-04T12:00:04.000000Z",
+            )
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(store, bundle=human_bundle)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_replay_enforces_semantic_planned_write_count(self):
+        dominated_store = self._store()
+        dominated_bundle, _binding = self._seed_prerequisites(dominated_store)
+        self._install_contact_owner(dominated_store, self.first)
+        dominated = self._claim(dominated_store, bundle=dominated_bundle)
+        dominated_ref = self._claim_reference(
+            dominated_store,
+            dominated["claimSet"]["requestId"],
+        )
+        drifted_claim = deepcopy(dominated_store.data[dominated_ref.path])
+        drifted_claim["plannedWrites"] = 400
+        claim_material = {
+            key: deepcopy(drifted_claim[key])
+            for key in (
+                "requestId",
+                "authorityOrigin",
+                "authorityLinkHash",
+                "operatorActionHash",
+                "fanoutId",
+                "rowBindingsHash",
+                "ownerKind",
+                "ownerKey",
+                "derivedPriority",
+                "plannedWrites",
+                "outcome",
+                "rowDecisions",
+                "createdAt",
+            )
+        }
+        drifted_claim["claimSetHash"] = self.module.domain_hash(
+            self.module.CLAIM_SET_HASH_DOMAIN,
+            claim_material,
+            user_scope_hash=self.scope,
+        )
+        dominated_ref.set(drifted_claim, merge=False)
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(dominated_store, bundle=dominated_bundle)
+
+        accepted_store = self._store()
+        accepted_bundle, _binding = self._seed_prerequisites(accepted_store)
+        accepted = self._claim(accepted_store, bundle=accepted_bundle)
+        accepted_ref = self._claim_reference(
+            accepted_store,
+            accepted["claimSet"]["requestId"],
+        )
+        drifted_claim = deepcopy(accepted_store.data[accepted_ref.path])
+        drifted_claim["plannedWrites"] = 400
+        claim_material = {
+            key: deepcopy(drifted_claim[key])
+            for key in (
+                "requestId",
+                "authorityOrigin",
+                "authorityLinkHash",
+                "operatorActionHash",
+                "fanoutId",
+                "rowBindingsHash",
+                "ownerKind",
+                "ownerKey",
+                "derivedPriority",
+                "plannedWrites",
+                "outcome",
+                "rowDecisions",
+                "createdAt",
+            )
+        }
+        drifted_claim["claimSetHash"] = self.module.domain_hash(
+            self.module.CLAIM_SET_HASH_DOMAIN,
+            claim_material,
+            user_scope_hash=self.scope,
+        )
+        accepted_ref.set(drifted_claim, merge=False)
+        generation_ref = self._generation_reference(
+            accepted_store,
+            self.first,
+            1,
+        )
+        drifted_generation = deepcopy(accepted_store.data[generation_ref.path])
+        drifted_generation["claimSetHash"] = drifted_claim["claimSetHash"]
+        generation_material = {
+            key: drifted_generation[key]
+            for key in (
+                "rowId",
+                "generation",
+                "requestId",
+                "claimSetHash",
+                "predecessorHeadHash",
+                "predecessorSettlementHash",
+                "ownerKind",
+                "ownerKey",
+                "priority",
+                "leaseEpoch",
+                "firstFencingToken",
+                "createdAt",
+            )
+        }
+        drifted_generation["generationHash"] = self.module.domain_hash(
+            self.module.OWNER_GENERATION_HASH_DOMAIN,
+            generation_material,
+            user_scope_hash=self.scope,
+        )
+        generation_ref.set(drifted_generation, merge=False)
+        _identity_ref, head_ref = self._row_references(
+            accepted_store,
+            self.first,
+        )
+        drifted_head = deepcopy(accepted_store.data[head_ref.path])
+        drifted_head["effectiveOwnerGenerationHash"] = drifted_generation[
+            "generationHash"
+        ]
+        head_ref.set(self._rehash_head(drifted_head), merge=False)
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._claim(accepted_store, bundle=accepted_bundle)
 
 
 
