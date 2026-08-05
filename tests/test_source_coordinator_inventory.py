@@ -23,6 +23,7 @@ FORBIDDEN_SOURCE_COORDINATOR_APPLICATION_MODULES = {
     "notifications",
     "pending_responses",
     "processing",
+    "row_authority",
     "send_permits",
     "sheet_operations",
     "sheets",
@@ -2337,6 +2338,7 @@ class InventoryContractTests(unittest.TestCase):
             "from .openai.client import OpenAI",
             "from .email import send_message",
             "from . import sheets",
+            "from . import row_authority",
             "from .file_handling.internal import load_file",
         )
         for source in sources:
@@ -2786,6 +2788,40 @@ class InventoryContractTests(unittest.TestCase):
             "winner",
         ):
             self.assertNotIn(forbidden, deterministic_parameters)
+
+        helper_signatures = {
+            "_contact_identity_canonical_json_bytes": ("value",),
+            "_hard_optout_contact_identity_hashes": (
+                "user_id",
+                "canonical_source_id",
+                "classification_input",
+            ),
+            "_bound_hard_optout_evidence": (
+                "user_id",
+                "canonical_source_id",
+                "classification_input",
+                "verified_evidence",
+            ),
+        }
+        for helper_name, expected_parameters in helper_signatures.items():
+            with self.subTest(helper_name=helper_name):
+                helper_definitions = [
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == helper_name
+                ]
+                self.assertEqual(1, len(helper_definitions))
+                definition = helper_definitions[0]
+                self.assertIsNone(definition.args.vararg)
+                self.assertIsNone(definition.args.kwarg)
+                actual_parameters = tuple(
+                    argument.arg
+                    for argument in (
+                        definition.args.args + definition.args.kwonlyargs
+                    )
+                )
+                self.assertEqual(expected_parameters, actual_parameters)
 
         module_bindings = {
             node.name

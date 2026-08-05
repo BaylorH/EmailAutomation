@@ -164,6 +164,20 @@ _HARD_OPTOUT_EVIDENCE_FIELDS = {
     "evidenceKind",
     "evidenceHash",
 }
+_BOUND_HARD_OPTOUT_EVIDENCE_FIELDS = {
+    *_HARD_OPTOUT_EVIDENCE_FIELDS,
+    "exactIdentityHash",
+    "canonicalMailboxIdentityHash",
+}
+_CONTACT_USER_SCOPE_HASH_DOMAIN = "sitesift.user.scope.v1"
+_CONTACT_IDENTITY_HASH_DOMAIN = "sitesift.contact.identity.v1"
+_CONTACT_NORMALIZATION_VERSION = "sitesift-mailbox-v1"
+_CONTACT_VERIFIED_USER_ID_MAX_BYTES = 512
+_CONTACT_MAILBOX_MAX_BYTES = 320
+_CONTACT_JSON_SAFE_INTEGER_MAX = 9007199254740991
+_CONTACT_JSON_MAX_DEPTH = 64
+_CONTACT_JSON_MAX_NODES = 4096
+_CONTACT_JSON_MAX_BYTES = 16 * 1024 * 1024
 _LOCAL_SOURCE_POLICY_EVIDENCE_KINDS = {
     "local_ignore_auto_reply",
     "local_ignore_self_sender",
@@ -895,6 +909,257 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 def _contains_control_character(value: str) -> bool:
     return any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _contact_identity_canonical_json_bytes(value) -> bytes:
+    state = {"nodes": 0, "utf8_bytes": 0}
+
+    def track_utf8(encoded):
+        state["utf8_bytes"] += len(encoded)
+        if state["utf8_bytes"] > _CONTACT_JSON_MAX_BYTES:
+            raise SourceCoordinatorConfigError(
+                "contact identity JSON exceeds the byte bound"
+            )
+
+    def normalize(item, *, active_containers, depth):
+        if depth > _CONTACT_JSON_MAX_DEPTH:
+            raise SourceCoordinatorConfigError(
+                "contact identity JSON exceeds the depth bound"
+            )
+        state["nodes"] += 1
+        if state["nodes"] > _CONTACT_JSON_MAX_NODES:
+            raise SourceCoordinatorConfigError(
+                "contact identity JSON exceeds the node bound"
+            )
+        if item is None or type(item) is bool:
+            return item
+        if type(item) is str:
+            try:
+                encoded = item.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise SourceCoordinatorConfigError(
+                    "contact identity JSON contains invalid UTF-8"
+                ) from exc
+            track_utf8(encoded)
+            return item
+        if type(item) is int:
+            if abs(item) > _CONTACT_JSON_SAFE_INTEGER_MAX:
+                raise SourceCoordinatorConfigError(
+                    "contact identity JSON exceeds the safe-integer bound"
+                )
+            return item
+        if type(item) is float:
+            raise SourceCoordinatorConfigError(
+                "contact identity JSON cannot contain a float"
+            )
+        if type(item) in {list, tuple}:
+            container_id = id(item)
+            if container_id in active_containers:
+                raise SourceCoordinatorConfigError(
+                    "contact identity JSON contains a cycle"
+                )
+            active_containers.add(container_id)
+            try:
+                return [
+                    normalize(
+                        value,
+                        active_containers=active_containers,
+                        depth=depth + 1,
+                    )
+                    for value in item
+                ]
+            finally:
+                active_containers.remove(container_id)
+        if type(item) is dict:
+            container_id = id(item)
+            if container_id in active_containers:
+                raise SourceCoordinatorConfigError(
+                    "contact identity JSON contains a cycle"
+                )
+            active_containers.add(container_id)
+            try:
+                normalized = {}
+                for key, nested in item.items():
+                    if type(key) is not str:
+                        raise SourceCoordinatorConfigError(
+                            "contact identity JSON keys must be exact strings"
+                        )
+                    try:
+                        encoded_key = key.encode("utf-8")
+                    except UnicodeEncodeError as exc:
+                        raise SourceCoordinatorConfigError(
+                            "contact identity JSON contains invalid UTF-8"
+                        ) from exc
+                    track_utf8(encoded_key)
+                    normalized[key] = normalize(
+                        nested,
+                        active_containers=active_containers,
+                        depth=depth + 1,
+                    )
+                return normalized
+            finally:
+                active_containers.remove(container_id)
+        raise SourceCoordinatorConfigError(
+            "contact identity JSON contains an unsupported type"
+        )
+
+    normalized = normalize(value, active_containers=set(), depth=0)
+    try:
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (
+        OverflowError,
+        RecursionError,
+        TypeError,
+        UnicodeEncodeError,
+        ValueError,
+    ) as exc:
+        raise SourceCoordinatorConfigError(
+            "contact identity value is not canonical finite JSON"
+        ) from exc
+    if len(encoded) > _CONTACT_JSON_MAX_BYTES:
+        raise SourceCoordinatorConfigError(
+            "contact identity JSON output exceeds the byte bound"
+        )
+    return encoded
+
+
+def _hard_optout_contact_identity_hashes(
+    *,
+    user_id,
+    canonical_source_id,
+    classification_input,
+) -> tuple[str, str]:
+    if type(classification_input) is not dict:
+        raise SourceCoordinatorConfigError(
+            "verified hard opt-out input must be an exact mapping"
+        )
+    if (
+        type(canonical_source_id) is not str
+        or not canonical_source_id
+        or type(classification_input.get("canonicalSourceId")) is not str
+        or classification_input["canonicalSourceId"] != canonical_source_id
+    ):
+        raise SourceCoordinatorConfigError(
+            "verified hard opt-out input source conflicts with authority"
+        )
+    message = classification_input.get("message")
+    if type(message) is not dict or type(message.get("from")) is not str:
+        raise SourceCoordinatorConfigError(
+            "verified hard opt-out sender must be an exact string"
+        )
+
+    if type(user_id) is not str:
+        raise SourceCoordinatorConfigError(
+            "verified user ID must be an exact string"
+        )
+    try:
+        encoded_user_id = user_id.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SourceCoordinatorConfigError(
+            "verified user ID must contain valid UTF-8"
+        ) from exc
+    if (
+        not encoded_user_id
+        or len(encoded_user_id) > _CONTACT_VERIFIED_USER_ID_MAX_BYTES
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in user_id
+        )
+    ):
+        raise SourceCoordinatorConfigError(
+            "verified user ID must be nonempty, bounded, and control-free"
+        )
+
+    sender = message["from"]
+    try:
+        normalized = unicodedata.normalize("NFC", sender).strip().lower()
+        normalized = unicodedata.normalize("NFC", normalized)
+        encoded_mailbox = normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SourceCoordinatorConfigError(
+            "verified hard opt-out sender must contain valid UTF-8"
+        ) from exc
+    if (
+        not encoded_mailbox
+        or len(encoded_mailbox) > _CONTACT_MAILBOX_MAX_BYTES
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in normalized
+        )
+        or normalized.count("@") != 1
+    ):
+        raise SourceCoordinatorConfigError(
+            "verified hard opt-out sender is malformed or over-bound"
+        )
+    local_part, domain = normalized.split("@", 1)
+    if not local_part or not domain:
+        raise SourceCoordinatorConfigError(
+            "verified hard opt-out sender parts must be nonempty"
+        )
+    canonical_local = local_part.split("+", 1)[0]
+    if not canonical_local:
+        raise SourceCoordinatorConfigError(
+            "verified hard opt-out canonical sender is empty"
+        )
+    canonical = f"{canonical_local}@{domain}"
+
+    user_scope_hash = hashlib.sha256(
+        _CONTACT_USER_SCOPE_HASH_DOMAIN.encode("utf-8")
+        + b"\0"
+        + _contact_identity_canonical_json_bytes(
+            {"verifiedUserId": user_id}
+        )
+    ).hexdigest()
+
+    def identity_hash(mailbox):
+        return hashlib.sha256(
+            _CONTACT_IDENTITY_HASH_DOMAIN.encode("utf-8")
+            + b"\0"
+            + _contact_identity_canonical_json_bytes(
+                {
+                    "normalizationVersion": _CONTACT_NORMALIZATION_VERSION,
+                    "normalizedMailboxIdentity": mailbox,
+                    "schemaVersion": 1,
+                    "userScopeHash": user_scope_hash,
+                }
+            )
+        ).hexdigest()
+
+    return identity_hash(normalized), identity_hash(canonical)
+
+
+def _bound_hard_optout_evidence(
+    *,
+    user_id,
+    canonical_source_id,
+    classification_input,
+    verified_evidence,
+) -> dict:
+    checked = _validated_deterministic_evidence(verified_evidence)
+    if (
+        checked["schemaVersion"] != 1
+        or checked["evidenceKind"] in _LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
+    ):
+        raise SourceCoordinatorConfigError(
+            "only exact verifier evidence can bind contact identity"
+        )
+    exact_hash, canonical_hash = _hard_optout_contact_identity_hashes(
+        user_id=user_id,
+        canonical_source_id=canonical_source_id,
+        classification_input=classification_input,
+    )
+    return {
+        **checked,
+        "schemaVersion": 2,
+        "exactIdentityHash": exact_hash,
+        "canonicalMailboxIdentityHash": canonical_hash,
+    }
 
 
 def normalize_source_alias(alias_type: str, value: str) -> SourceAlias:
@@ -2838,6 +3103,51 @@ def _wake_token_for_release(
     )
 
 
+def _validated_deterministic_evidence(
+    deterministic_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    copied = _copy_exact_json_mapping(
+        deterministic_evidence,
+        field_name="deterministic evidence",
+    )
+    fields = set(copied)
+    schema_version = copied.get("schemaVersion")
+    if (
+        fields == _HARD_OPTOUT_EVIDENCE_FIELDS
+        and _is_exact_schema_version(schema_version, 1)
+    ):
+        pass
+    elif (
+        fields == _BOUND_HARD_OPTOUT_EVIDENCE_FIELDS
+        and _is_exact_schema_version(schema_version, 2)
+    ):
+        if copied.get("evidenceKind") in _LOCAL_SOURCE_POLICY_EVIDENCE_KINDS:
+            raise SourceCoordinatorConfigError(
+                "local source-policy evidence cannot bind contact identity"
+            )
+        for field in (
+            "exactIdentityHash",
+            "canonicalMailboxIdentityHash",
+        ):
+            if not _is_sha256(copied.get(field)):
+                raise SourceCoordinatorConfigError(
+                    f"deterministic evidence {field} is malformed"
+                )
+    else:
+        raise SourceCoordinatorConfigError(
+            "deterministic evidence version and fields conflict"
+        )
+    if (
+        type(copied.get("evidenceKind")) is not str
+        or not copied["evidenceKind"]
+        or not _is_sha256(copied.get("evidenceHash"))
+    ):
+        raise SourceCoordinatorConfigError(
+            "deterministic evidence proof is malformed"
+        )
+    return copied
+
+
 def _build_classification_snapshot_material(
     *,
     canonical_source_id: str,
@@ -2856,9 +3166,8 @@ def _build_classification_snapshot_material(
         )
     copied_deterministic_evidence = None
     if deterministic_evidence is not None:
-        copied_deterministic_evidence = _copy_exact_json_mapping(
-            deterministic_evidence,
-            field_name="deterministic evidence",
+        copied_deterministic_evidence = _validated_deterministic_evidence(
+            deterministic_evidence
         )
     if (copied_proposal_evidence is None) == (copied_deterministic_evidence is None):
         raise SourceCoordinatorConfigError(
@@ -6605,13 +6914,28 @@ class SourceCoordinator:
                 hard_optout=False,
             )
 
-        def material_from_verified(verified_result):
-            deterministic_evidence = _thaw_json(verified_result.evidence)
+        def material_from_verified(
+            verified_result,
+            *,
+            bind_hard_optout_identity,
+        ):
+            verified_evidence = _thaw_json(verified_result.evidence)
             if verified_result.hard_optout:
+                deterministic_evidence = (
+                    _bound_hard_optout_evidence(
+                        user_id=user_id,
+                        canonical_source_id=canonical_source_id,
+                        classification_input=input_copy,
+                        verified_evidence=verified_evidence,
+                    )
+                    if bind_hard_optout_identity
+                    else verified_evidence
+                )
                 complete_proposal = _deterministic_hard_optout_proposal(
                     deterministic_evidence
                 )
             else:
+                deterministic_evidence = verified_evidence
                 complete_proposal = {
                     "schemaVersion": _CLASSIFICATION_SNAPSHOT_SCHEMA_VERSION,
                     "transitionCandidates": [],
@@ -6670,7 +6994,12 @@ class SourceCoordinator:
                     raise ClassificationSnapshotConflict(
                         "deterministic evidence disappeared on retry"
                     )
-                material = material_from_verified(verified)
+                material = material_from_verified(
+                    verified,
+                    bind_hard_optout_identity=(
+                        before["deterministicEvidence"].get("schemaVersion") == 2
+                    ),
+                )
                 if any(
                     before.get(field) != value
                     for field, value in material.items()
@@ -6704,7 +7033,10 @@ class SourceCoordinator:
                     before_data=before,
                     expected_data=before,
                 )
-            material = material_from_verified(verified)
+            material = material_from_verified(
+                verified,
+                bind_hard_optout_identity=True,
+            )
             expected = deepcopy(before)
             expected.update(
                 {

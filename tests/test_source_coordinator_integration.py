@@ -4166,6 +4166,7 @@ class SourceCoordinatorAuthorityOrderTests(unittest.TestCase):
         thread_id = "thread-order"
         graph_id = f"graph-{candidate_type}"
         internet_id = f"<{candidate_type}@example.test>"
+        expected_canonical_source_id = "integration-0001"
         thread_root_path = f"users/{user_id}/threads/{thread_id}"
         seeded_thread_root = {
             "clientId": "client-order",
@@ -4183,10 +4184,12 @@ class SourceCoordinatorAuthorityOrderTests(unittest.TestCase):
 
         classification_input = {
             "schemaVersion": 1,
+            "canonicalSourceId": expected_canonical_source_id,
             "message": {
                 "graphMessageId": graph_id,
                 "internetMessageId": internet_id,
                 "threadId": thread_id,
+                "from": "sender@example.test",
                 "body": "Please handle this exact source.",
             },
         }
@@ -4197,7 +4200,7 @@ class SourceCoordinatorAuthorityOrderTests(unittest.TestCase):
         verifier = None
         if deterministic:
             self.assertEqual(
-                "1d4fa0152f03ea202f6ac138d480ee800850f579e292a12550efe1eacffd2524",
+                "a7d8026b62528defb5758b90a92ffcabf706e0e0cac5c2f07b9f24dd5bce746b",
                 classification_input_hash,
                 "deterministic authority fixture changed without rebinding its hash",
             )
@@ -4220,6 +4223,8 @@ class SourceCoordinatorAuthorityOrderTests(unittest.TestCase):
         class RecordingCoordinator(source_coordinator.SourceCoordinator):
             def admit_or_repair_source_identity(self, **kwargs):
                 result = super().admit_or_repair_source_identity(**kwargs)
+                if result.canonical_source_id != expected_canonical_source_id:
+                    raise AssertionError("integration source ID fixture drifted")
                 timeline.append("identity")
                 return result
 
@@ -4763,6 +4768,20 @@ class SourceCoordinatorAuthorityOrderTests(unittest.TestCase):
             self.assertEqual(
                 classification_input_hash,
                 classification_records[0]["classificationInputHash"],
+            )
+            self.assertEqual(
+                {
+                    "schemaVersion": 2,
+                    "evidenceKind": "header_list_unsubscribe",
+                    "evidenceHash": "d" * 64,
+                    "exactIdentityHash": (
+                        "17d9db02082394d7bbdf4384cfec4d17b78c615037ca1b476a5b4ad2cbde9f95"
+                    ),
+                    "canonicalMailboxIdentityHash": (
+                        "17d9db02082394d7bbdf4384cfec4d17b78c615037ca1b476a5b4ad2cbde9f95"
+                    ),
+                },
+                classification_records[0]["deterministicEvidence"],
             )
 
     def test_model_terminal_authority_precedes_effects(self):

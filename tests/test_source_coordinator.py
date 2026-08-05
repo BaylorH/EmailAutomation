@@ -116,6 +116,30 @@ class CorruptingReadbackFirestore(FakeFirestore):
         return snapshot
 
 
+class MutatingReadbackFirestore(FakeFirestore):
+    """Return a configured corrupt applied document during commit readback."""
+
+    def __init__(self, readback_mutator):
+        super().__init__()
+        self.corrupt_readback_path = None
+        self.readback_mutator = readback_mutator
+
+    def _snapshot(self, document_ref):
+        snapshot = super()._snapshot(document_ref)
+        apply_error_seen = any(
+            event[0] == "commit_raised_after_apply" for event in self.events
+        )
+        if (
+            apply_error_seen
+            and document_ref.path == self.corrupt_readback_path
+        ):
+            return FakeDocumentSnapshot(
+                document_ref,
+                self.readback_mutator(snapshot.to_dict()),
+            )
+        return snapshot
+
+
 class SourceCoordinatorContractTests(unittest.TestCase):
     def setUp(self):
         self.coordinator = _load_source_coordinator(self)
@@ -1322,6 +1346,256 @@ class ClassificationTests(unittest.TestCase):
             classifier=classifier,
         )
 
+    def hard_optout_input(
+        self,
+        *,
+        sender="sender@example.test",
+        canonical_source_id=None,
+    ):
+        return {
+            "schemaVersion": 1,
+            "canonicalSourceId": (
+                self.source_id
+                if canonical_source_id is None
+                else canonical_source_id
+            ),
+            "message": {
+                **deepcopy(CLASSIFICATION_INPUT["message"]),
+                "from": sender,
+            },
+        }
+
+    def test_contact_identity_helpers_match_frozen_b2_vectors_and_json(self):
+        self.assertTrue(
+            hasattr(self.module, "_hard_optout_contact_identity_hashes"),
+            "B1 contact identity derivation helper is absent",
+        )
+        self.assertTrue(
+            hasattr(self.module, "_contact_identity_canonical_json_bytes"),
+            "B1 contact canonical JSON helper is absent",
+        )
+        vectors = (
+            (
+                "user-1",
+                "first.last@example.com",
+                (
+                    "00385f4f38db7a7924a65872a1f15a41f1f41b1e3b17153307eb2f428d43de03",
+                    "00385f4f38db7a7924a65872a1f15a41f1f41b1e3b17153307eb2f428d43de03",
+                ),
+            ),
+            (
+                "user-1",
+                "first.last+tag@example.com",
+                (
+                    "3c130f3bd717de5b7a7061e25a647d8c3ef1435a869ffe0d8553c04b44a25287",
+                    "00385f4f38db7a7924a65872a1f15a41f1f41b1e3b17153307eb2f428d43de03",
+                ),
+            ),
+            (
+                "user-1",
+                " First.La\u0301st+Tour@Example.COM ",
+                (
+                    "11c02fb7cc23778de9bce10acb6b3346317715aa35b333702ff05000830c711d",
+                    "1d9e757cf402d69cd41da2aa239f8d36bdbe53fd64fb74fc2a2f25d84e882919",
+                ),
+            ),
+            (
+                "user-2",
+                "first.last@example.com",
+                (
+                    "dde167dbc6a0c37dda8990a4cd7d5f0e7a29dd65a8f7c7f06936cf88d8676f75",
+                    "dde167dbc6a0c37dda8990a4cd7d5f0e7a29dd65a8f7c7f06936cf88d8676f75",
+                ),
+            ),
+        )
+        actual_vectors = []
+        for user_id, sender, expected in vectors:
+            with self.subTest(user_id=user_id, sender=sender):
+                input_value = self.hard_optout_input(sender=sender)
+                actual = self.module._hard_optout_contact_identity_hashes(
+                    user_id=user_id,
+                    canonical_source_id=self.source_id,
+                    classification_input=input_value,
+                )
+                self.assertEqual(expected, actual)
+                actual_vectors.append(actual)
+        self.assertEqual(actual_vectors[0][0], actual_vectors[0][1])
+        self.assertNotEqual(actual_vectors[1][0], actual_vectors[1][1])
+        self.assertEqual(actual_vectors[0][1], actual_vectors[1][1])
+        self.assertNotEqual(actual_vectors[0], actual_vectors[3])
+
+        input_value = self.hard_optout_input(sender=vectors[2][1])
+        actual = actual_vectors[2]
+        from email_automation import row_authority
+
+        scope = row_authority.user_scope_hash("user-1")
+        exact, canonical = row_authority.normalize_contact_mailbox(
+            input_value["message"]["from"]
+        )
+        self.assertEqual(
+            (
+                row_authority.contact_identity_hash(
+                    exact,
+                    user_scope_hash=scope,
+                ),
+                row_authority.contact_identity_hash(
+                    canonical,
+                    user_scope_hash=scope,
+                ),
+            ),
+            actual,
+        )
+        encoded = self.module._contact_identity_canonical_json_bytes(
+            {"verifiedUserId": "\u00fcser-1"}
+        )
+        self.assertEqual(
+            '{"verifiedUserId":"\u00fcser-1"}'.encode("utf-8"),
+            encoded,
+        )
+        self.assertNotIn(b"\\u00fc", encoded)
+        self.assertNotEqual(
+            self.module._canonical_json_bytes({"verifiedUserId": "\u00fcser-1"}),
+            encoded,
+        )
+
+    def test_contact_identity_json_matches_frozen_b2_resource_bounds(self):
+        self.assertEqual(64, self.module._CONTACT_JSON_MAX_DEPTH)
+        self.assertEqual(4096, self.module._CONTACT_JSON_MAX_NODES)
+        self.assertEqual(16 * 1024 * 1024, self.module._CONTACT_JSON_MAX_BYTES)
+
+        too_deep = "leaf"
+        for _ in range(65):
+            too_deep = [too_deep]
+        invalid_values = {
+            "depth": too_deep,
+            "nodes": [None] * 4096,
+        }
+        for case, value in invalid_values.items():
+            with self.subTest(case=case), self.assertRaises(
+                self.module.SourceCoordinatorConfigError
+            ):
+                self.module._contact_identity_canonical_json_bytes(value)
+
+        with mock.patch.object(self.module, "_CONTACT_JSON_MAX_BYTES", 8):
+            with self.assertRaises(self.module.SourceCoordinatorConfigError):
+                self.module._contact_identity_canonical_json_bytes(
+                    {"value": "123456789"}
+                )
+
+    def test_contact_identity_helpers_reject_source_user_and_mailbox_drift(self):
+        self.assertTrue(
+            hasattr(self.module, "_hard_optout_contact_identity_hashes"),
+            "B1 contact identity derivation helper is absent",
+        )
+        helper = self.module._hard_optout_contact_identity_hashes
+        valid = self.hard_optout_input()
+        invalid_calls = {
+            "missing source": {
+                "user_id": "user-1",
+                "canonical_source_id": self.source_id,
+                "classification_input": {
+                    key: deepcopy(value)
+                    for key, value in valid.items()
+                    if key != "canonicalSourceId"
+                },
+            },
+            "wrong source": {
+                "user_id": "user-1",
+                "canonical_source_id": self.source_id,
+                "classification_input": {
+                    **deepcopy(valid),
+                    "canonicalSourceId": "other-source",
+                },
+            },
+            "empty user": {
+                "user_id": "",
+                "canonical_source_id": self.source_id,
+                "classification_input": deepcopy(valid),
+            },
+            "format-control user": {
+                "user_id": "user\u200d-1",
+                "canonical_source_id": self.source_id,
+                "classification_input": deepcopy(valid),
+            },
+            "513-byte user": {
+                "user_id": "u" * 513,
+                "canonical_source_id": self.source_id,
+                "classification_input": deepcopy(valid),
+            },
+            "surrogate user": {
+                "user_id": "user-" + chr(0xD800),
+                "canonical_source_id": self.source_id,
+                "classification_input": deepcopy(valid),
+            },
+        }
+        invalid_senders = {
+            "missing sender": None,
+            "missing at": "plain-address",
+            "multiple at": "a@@example.test",
+            "empty canonical local": "+tag@example.test",
+            "C0 control": "send\ner@example.test",
+            "format control": "send\u200der@example.test",
+            "surrogate": chr(0xD800) + "@example.test",
+            "321 bytes": "a" * 308 + "@example.test",
+        }
+        for case, sender in invalid_senders.items():
+            candidate = deepcopy(valid)
+            if sender is None:
+                candidate["message"].pop("from")
+            else:
+                candidate["message"]["from"] = sender
+            invalid_calls[case] = {
+                "user_id": "user-1",
+                "canonical_source_id": self.source_id,
+                "classification_input": candidate,
+            }
+        for case, arguments in invalid_calls.items():
+            with self.subTest(case=case), self.assertRaises(
+                self.module.SourceCoordinatorConfigError
+            ):
+                helper(**arguments)
+
+    def test_deterministic_evidence_requires_exact_v1_or_bound_v2_shape(self):
+        invalid_evidence = {
+            "v1 with v2 fields": {
+                **HARD_OPTOUT_EVIDENCE,
+                "exactIdentityHash": "1" * 64,
+                "canonicalMailboxIdentityHash": "2" * 64,
+            },
+            "v2 missing canonical": {
+                **HARD_OPTOUT_EVIDENCE,
+                "schemaVersion": 2,
+                "exactIdentityHash": "1" * 64,
+            },
+            "v2 local policy": {
+                **HARD_OPTOUT_EVIDENCE,
+                "schemaVersion": 2,
+                "evidenceKind": "local_ignore_auto_reply",
+                "exactIdentityHash": "1" * 64,
+                "canonicalMailboxIdentityHash": "2" * 64,
+            },
+            "v2 uppercase identity": {
+                **HARD_OPTOUT_EVIDENCE,
+                "schemaVersion": 2,
+                "exactIdentityHash": "A" * 64,
+                "canonicalMailboxIdentityHash": "2" * 64,
+            },
+        }
+        for case, evidence in invalid_evidence.items():
+            with self.subTest(case=case), self.assertRaises(
+                self.module.SourceCoordinatorConfigError
+            ):
+                self.module._build_classification_snapshot_material(
+                    canonical_source_id=self.source_id,
+                    classification_input_hash="f" * 64,
+                    model_request_key=None,
+                    complete_proposal=(
+                        self.module._deterministic_hard_optout_proposal(evidence)
+                    ),
+                    proposal_evidence=None,
+                    deterministic_evidence=evidence,
+                )
+
     def test_first_claim_is_epoch_one_unique_and_does_not_start_model(self):
         claim = self.claim()
 
@@ -1995,11 +2269,12 @@ class ClassificationTests(unittest.TestCase):
 
     def test_verified_deterministic_hard_optout_skips_model_and_freezes(self):
         verifier_calls = 0
+        classification_input = self.hard_optout_input()
 
-        def verifier(classification_input):
+        def verifier(actual_input):
             nonlocal verifier_calls
             verifier_calls += 1
-            self.assertEqual(CLASSIFICATION_INPUT, classification_input)
+            self.assertEqual(classification_input, actual_input)
             return deepcopy(HARD_OPTOUT_EVIDENCE)
 
         self.coordinator = self.module.SourceCoordinator(
@@ -2016,7 +2291,10 @@ class ClassificationTests(unittest.TestCase):
             raise AssertionError("verified hard opt-out called model")
 
         try:
-            snapshot = self.classify(classifier)
+            snapshot = self.classify(
+                classifier,
+                classification_input=classification_input,
+            )
         except self.module.SourceCoordinatorConfigError as exc:
             self.fail(f"exact hard opt-out evidence dict was rejected: {exc}")
 
@@ -2027,12 +2305,374 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual("not_applicable", stored["modelRequestState"])
         self.assertIsNone(stored["modelRequestKey"])
         self.assertEqual(
-            self.module.canonical_json_hash(CLASSIFICATION_INPUT),
+            self.module.canonical_json_hash(classification_input),
             stored["classificationInputHash"],
         )
+        expected_evidence = {
+            **HARD_OPTOUT_EVIDENCE,
+            "schemaVersion": 2,
+            "exactIdentityHash": (
+                "054b84708c0935f8d321703fb8fc352f314c6fb0e7dda042ca97a48049f8b724"
+            ),
+            "canonicalMailboxIdentityHash": (
+                "054b84708c0935f8d321703fb8fc352f314c6fb0e7dda042ca97a48049f8b724"
+            ),
+        }
+        self.assertEqual(expected_evidence, stored["deterministicEvidence"])
+        self.assertEqual(
+            self.module.canonical_json_hash(expected_evidence),
+            stored["deterministicEvidenceHash"],
+        )
+        self.assertEqual(
+            stored["deterministicEvidenceHash"],
+            stored["transitionCandidates"][0]["evidenceHash"],
+        )
+        self.assertNotIn("sender@example.test", repr(stored))
+        self.assertNotIn("user-1", repr(stored))
         self.assertEqual(
             "contact_optout",
             snapshot.complete_proposal["transitionCandidates"][0]["type"],
+        )
+
+    def test_verified_hard_optout_rejects_wrong_source_or_sender_before_writes(self):
+        verifier_calls = 0
+
+        def verifier(_classification_input):
+            nonlocal verifier_calls
+            verifier_calls += 1
+            return deepcopy(HARD_OPTOUT_EVIDENCE)
+
+        invalid_cases = (
+            "missing source",
+            "wrong source",
+            "missing sender",
+            "non-string sender",
+            "malformed sender",
+        )
+        for case in invalid_cases:
+            with self.subTest(case=case):
+                fake = FakeFirestore()
+                clock = MutableClock(FROZEN_NOW)
+                uuids = SequentialUUIDs()
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=uuids,
+                    now_factory=clock,
+                    hard_optout_verifier=verifier,
+                )
+                identity = coordinator.admit_or_repair_source_identity(
+                    user_id="user-1",
+                    hydrated_message={"id": "graph-A"},
+                    evidence_kind="graph_hydration",
+                    thread_id="thread-1",
+                )
+                claim = coordinator.claim_source_classification(
+                    user_id="user-1",
+                    canonical_source_id=identity.canonical_source_id,
+                    lease_seconds=60,
+                )
+                classification_input = {
+                    "schemaVersion": 1,
+                    "canonicalSourceId": identity.canonical_source_id,
+                    "message": deepcopy(CLASSIFICATION_INPUT["message"]),
+                }
+                if case == "missing source":
+                    classification_input.pop("canonicalSourceId")
+                elif case == "wrong source":
+                    classification_input["canonicalSourceId"] = "other-source"
+                elif case == "missing sender":
+                    classification_input["message"].pop("from")
+                elif case == "non-string sender":
+                    classification_input["message"]["from"] = None
+                else:
+                    classification_input["message"]["from"] = "a@@example.test"
+                fake.events.clear()
+                self.assertErrorCode(
+                    "source_coordinator_config",
+                    lambda: coordinator.persist_deterministic_classification_snapshot(
+                        user_id="user-1",
+                        canonical_source_id=identity.canonical_source_id,
+                        classification_epoch=claim.classification_epoch,
+                        classification_claim_id=claim.classification_claim_id,
+                        classification_input=classification_input,
+                    ),
+                )
+                write_events = [
+                    event
+                    for event in fake.events
+                    if event[0] in {"create", "set", "update", "delete"}
+                ]
+                self.assertEqual([], write_events)
+                self.assertEqual(
+                    "claimed",
+                    fake.data[
+                        "users/user-1/sourceClassifications/"
+                        f"{identity.canonical_source_id}"
+                    ]["classificationState"],
+                )
+        self.assertEqual(len(invalid_cases), verifier_calls)
+
+    def test_bound_hard_optout_apply_then_raise_uses_exact_v2_readback(self):
+        classification_input = self.hard_optout_input(
+            sender="first.last+tour@example.com"
+        )
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=lambda _: deepcopy(HARD_OPTOUT_EVIDENCE),
+        )
+        claim = self.claim()
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown commit")
+
+        snapshot = self.coordinator.persist_deterministic_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            classification_input=classification_input,
+        )
+
+        stored = self.classification_data()
+        self.assertEqual(2, stored["deterministicEvidence"]["schemaVersion"])
+        self.assertEqual(
+            stored["snapshotImmutableHash"],
+            snapshot.snapshot_immutable_hash,
+        )
+        self.assertIn(("commit_raised_after_apply",), self.fake.events)
+
+    def test_bound_hard_optout_apply_then_raise_rejects_corrupt_readback(self):
+        def partial(data):
+            data["deterministicEvidence"].pop(
+                "canonicalMailboxIdentityHash"
+            )
+            return data
+
+        def malformed(data):
+            data["deterministicEvidence"]["exactIdentityHash"] = "A" * 64
+            return data
+
+        cases = {
+            "partial": partial,
+            "malformed": malformed,
+            "unreadable": lambda _data: None,
+        }
+        for case, mutator in cases.items():
+            with self.subTest(case=case):
+                fake = MutatingReadbackFirestore(mutator)
+                clock = MutableClock(FROZEN_NOW)
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=SequentialUUIDs(),
+                    now_factory=clock,
+                    hard_optout_verifier=(
+                        lambda _: deepcopy(HARD_OPTOUT_EVIDENCE)
+                    ),
+                )
+                identity = coordinator.admit_or_repair_source_identity(
+                    user_id="user-1",
+                    hydrated_message={"id": "graph-A"},
+                    evidence_kind="graph_hydration",
+                    thread_id="thread-1",
+                )
+                claim = coordinator.claim_source_classification(
+                    user_id="user-1",
+                    canonical_source_id=identity.canonical_source_id,
+                    lease_seconds=60,
+                )
+                fake.corrupt_readback_path = (
+                    "users/user-1/sourceClassifications/"
+                    f"{identity.canonical_source_id}"
+                )
+                fake.apply_then_raise_next_commit = RuntimeError(
+                    "unknown commit"
+                )
+
+                self.assertErrorCode(
+                    "source_coordinator_ambiguous",
+                    lambda: coordinator.persist_deterministic_classification_snapshot(
+                        user_id="user-1",
+                        canonical_source_id=identity.canonical_source_id,
+                        classification_epoch=claim.classification_epoch,
+                        classification_claim_id=claim.classification_claim_id,
+                        classification_input={
+                            "schemaVersion": 1,
+                            "canonicalSourceId": identity.canonical_source_id,
+                            "message": {
+                                **deepcopy(CLASSIFICATION_INPUT["message"]),
+                                "from": "sender@example.test",
+                            },
+                        },
+                    ),
+                )
+
+    def test_bound_hard_optout_retry_rejects_swapped_identity_evidence(self):
+        classification_input = self.hard_optout_input(
+            sender="first.last+tour@example.com"
+        )
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=lambda _: deepcopy(HARD_OPTOUT_EVIDENCE),
+        )
+        claim = self.claim()
+        self.coordinator.persist_deterministic_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            classification_input=classification_input,
+        )
+        stored = self.classification_data()
+        evidence = deepcopy(stored["deterministicEvidence"])
+        evidence["exactIdentityHash"], evidence[
+            "canonicalMailboxIdentityHash"
+        ] = (
+            evidence["canonicalMailboxIdentityHash"],
+            evidence["exactIdentityHash"],
+        )
+        stored.update(
+            self.module._build_classification_snapshot_material(
+                canonical_source_id=self.source_id,
+                classification_input_hash=stored["classificationInputHash"],
+                model_request_key=None,
+                complete_proposal=(
+                    self.module._deterministic_hard_optout_proposal(evidence)
+                ),
+                proposal_evidence=None,
+                deterministic_evidence=evidence,
+            )
+        )
+        before_writes = list(self.write_events())
+
+        self.assertErrorCode(
+            "classification_snapshot_conflict",
+            lambda: self.coordinator.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                classification_epoch=claim.classification_epoch,
+                classification_claim_id=claim.classification_claim_id,
+                classification_input=classification_input,
+            ),
+        )
+        self.assertEqual(before_writes, self.write_events())
+
+    def test_two_workers_persist_one_equal_bound_hard_optout_snapshot(self):
+        classification_input = self.hard_optout_input()
+        verifier_calls = 0
+
+        def verifier(_classification_input):
+            nonlocal verifier_calls
+            verifier_calls += 1
+            return deepcopy(HARD_OPTOUT_EVIDENCE)
+
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=verifier,
+        )
+        claim = self.claim()
+        self.fake.before_commit_barrier = Barrier(2)
+        results = []
+        errors = []
+
+        def persist():
+            try:
+                results.append(
+                    self.coordinator.persist_deterministic_classification_snapshot(
+                        user_id="user-1",
+                        canonical_source_id=self.source_id,
+                        classification_epoch=claim.classification_epoch,
+                        classification_claim_id=claim.classification_claim_id,
+                        classification_input=classification_input,
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        workers = [Thread(target=persist) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual([], errors)
+        self.assertEqual(2, len(results))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(2, verifier_calls)
+        self.assertEqual(
+            2,
+            self.classification_data()["deterministicEvidence"]["schemaVersion"],
+        )
+
+    def test_legacy_v1_hard_snapshot_retry_bypasses_identity_derivation(self):
+        self.assertTrue(
+            hasattr(self.module, "_hard_optout_contact_identity_hashes"),
+            "B1 contact identity derivation helper is absent",
+        )
+        legacy_input = {
+            "schemaVersion": 1,
+            "message": {"subject": "historical exact input"},
+        }
+        claim = self.claim()
+        material = self.module._build_classification_snapshot_material(
+            canonical_source_id=self.source_id,
+            classification_input_hash=self.module.canonical_json_hash(legacy_input),
+            model_request_key=None,
+            complete_proposal=(
+                self.module._deterministic_hard_optout_proposal(
+                    HARD_OPTOUT_EVIDENCE
+                )
+            ),
+            proposal_evidence=None,
+            deterministic_evidence=deepcopy(HARD_OPTOUT_EVIDENCE),
+        )
+        stored = self.classification_data()
+        stored.update(
+            {
+                "classificationState": "snapshot_ready",
+                "classificationInputHash": self.module.canonical_json_hash(
+                    legacy_input
+                ),
+                "modelRequestKey": None,
+                "modelRequestState": "not_applicable",
+                "requestStartFence": None,
+                **material,
+                "snapshotPersistedAt": self.clock.current,
+                "updatedAt": self.clock.current,
+            }
+        )
+        expected = deepcopy(stored)
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=lambda _: deepcopy(HARD_OPTOUT_EVIDENCE),
+        )
+        before_writes = list(self.write_events())
+
+        with mock.patch.object(
+            self.module,
+            "_hard_optout_contact_identity_hashes",
+            side_effect=AssertionError("legacy v1 retry derived contact identity"),
+        ) as identity_helper:
+            retry = self.coordinator.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                classification_epoch=claim.classification_epoch,
+                classification_claim_id=claim.classification_claim_id,
+                classification_input=legacy_input,
+            )
+
+        identity_helper.assert_not_called()
+        self.assertEqual(expected, self.classification_data())
+        self.assertEqual(before_writes, self.write_events())
+        self.assertEqual(
+            expected["snapshotImmutableHash"],
+            retry.snapshot_immutable_hash,
         )
 
     def test_verified_evidence_has_no_external_mint_or_capability(self):
@@ -2056,6 +2696,11 @@ class ClassificationTests(unittest.TestCase):
                 for key, value in HARD_OPTOUT_EVIDENCE.items()
             },
             "extra field": {**HARD_OPTOUT_EVIDENCE, "verified": True},
+            "caller identity fields": {
+                **HARD_OPTOUT_EVIDENCE,
+                "exactIdentityHash": "1" * 64,
+                "canonicalMailboxIdentityHash": "2" * 64,
+            },
             "bool schema": {**HARD_OPTOUT_EVIDENCE, "schemaVersion": True},
             "wrong schema": {**HARD_OPTOUT_EVIDENCE, "schemaVersion": 2},
             "empty evidence kind": {**HARD_OPTOUT_EVIDENCE, "evidenceKind": ""},
@@ -2153,6 +2798,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_deterministic_no_match_validates_authority_inside_one_transaction(self):
         observations = []
+        historical_input = {"schemaVersion": 1, "message": {}}
 
         def verifier(classification_input):
             observations.append(tuple(self.fake.events))
@@ -2172,7 +2818,7 @@ class ClassificationTests(unittest.TestCase):
             canonical_source_id=self.source_id,
             classification_epoch=claim.classification_epoch,
             classification_claim_id=claim.classification_claim_id,
-            classification_input=CLASSIFICATION_INPUT,
+            classification_input=historical_input,
         )
 
         self.assertIsNone(result)
@@ -2188,6 +2834,36 @@ class ClassificationTests(unittest.TestCase):
         )
         self.assertEqual([], self.write_events())
         self.assertEqual("claimed", self.classification_data()["classificationState"])
+
+    def test_local_policy_snapshot_does_not_require_contact_identity(self):
+        historical_input = {"schemaVersion": 1, "message": {}}
+        local_evidence = {
+            "schemaVersion": 1,
+            "evidenceKind": "local_ignore_auto_reply",
+            "evidenceHash": "c" * 64,
+        }
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=lambda _: None,
+            local_source_policy_verifier=lambda _: deepcopy(local_evidence),
+        )
+        claim = self.claim()
+
+        snapshot = self.coordinator.persist_deterministic_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            classification_input=historical_input,
+        )
+
+        self.assertEqual([], snapshot.complete_proposal["transitionCandidates"])
+        self.assertEqual(
+            local_evidence,
+            self.classification_data()["deterministicEvidence"],
+        )
 
     def test_invalid_deterministic_claims_never_invoke_verifier(self):
         verifier_calls = 0
@@ -2252,6 +2928,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_deterministic_snapshot_retry_verifies_exact_evidence_after_input_gate(self):
         verifier_calls = 0
+        classification_input = self.hard_optout_input()
 
         def verifier(classification_input):
             nonlocal verifier_calls
@@ -2270,7 +2947,7 @@ class ClassificationTests(unittest.TestCase):
             canonical_source_id=self.source_id,
             classification_epoch=claim.classification_epoch,
             classification_claim_id=claim.classification_claim_id,
-            classification_input=CLASSIFICATION_INPUT,
+            classification_input=classification_input,
         )
         writes_after_first = list(self.write_events())
 
@@ -2279,7 +2956,7 @@ class ClassificationTests(unittest.TestCase):
             canonical_source_id=self.source_id,
             classification_epoch=claim.classification_epoch,
             classification_claim_id=claim.classification_claim_id,
-            classification_input=CLASSIFICATION_INPUT,
+            classification_input=classification_input,
         )
 
         self.assertEqual(first, exact_retry)
@@ -2293,7 +2970,7 @@ class ClassificationTests(unittest.TestCase):
                 canonical_source_id=self.source_id,
                 classification_epoch=claim.classification_epoch,
                 classification_claim_id=claim.classification_claim_id,
-                classification_input={**CLASSIFICATION_INPUT, "drift": True},
+                classification_input={**classification_input, "drift": True},
             ),
         )
         self.assertEqual(2, verifier_calls)
@@ -2302,6 +2979,7 @@ class ClassificationTests(unittest.TestCase):
     def test_expired_deterministic_snapshot_retry_still_verifies_evidence(self):
         evidence_hash = "b" * 64
         verifier_calls = 0
+        classification_input = self.hard_optout_input()
 
         def verifier(classification_input):
             nonlocal verifier_calls
@@ -2323,7 +3001,7 @@ class ClassificationTests(unittest.TestCase):
             canonical_source_id=self.source_id,
             classification_epoch=claim.classification_epoch,
             classification_claim_id=claim.classification_claim_id,
-            classification_input=CLASSIFICATION_INPUT,
+            classification_input=classification_input,
         )
         self.clock.advance(seconds=61)
         evidence_hash = "c" * 64
@@ -2336,7 +3014,7 @@ class ClassificationTests(unittest.TestCase):
                 canonical_source_id=self.source_id,
                 classification_epoch=claim.classification_epoch,
                 classification_claim_id=claim.classification_claim_id,
-                classification_input=CLASSIFICATION_INPUT,
+                classification_input=classification_input,
             ),
         )
         self.assertEqual(2, verifier_calls)
@@ -2354,7 +3032,7 @@ class ClassificationTests(unittest.TestCase):
                 canonical_source_id=self.source_id,
                 classification_epoch=claim.classification_epoch,
                 classification_claim_id=claim.classification_claim_id,
-                classification_input=CLASSIFICATION_INPUT,
+                classification_input=classification_input,
             ),
         )
 
@@ -3280,6 +3958,11 @@ class SelectionAndLedgerTests(unittest.TestCase):
         self.assertEqual(400, self.module.MAX_SOURCE_WORK_TRANSACTION_WRITES)
 
     def test_verified_hard_optout_dominates_other_transition_work(self):
+        classification_input = {
+            "schemaVersion": 1,
+            "canonicalSourceId": self.source_id,
+            "message": deepcopy(CLASSIFICATION_INPUT["message"]),
+        }
         self.coordinator = self.module.SourceCoordinator(
             self.fake,
             uuid_factory=self.uuids,
@@ -3290,7 +3973,7 @@ class SelectionAndLedgerTests(unittest.TestCase):
             user_id="user-1",
             canonical_source_id=self.source_id,
             lease_seconds=60,
-            classification_input=CLASSIFICATION_INPUT,
+            classification_input=classification_input,
             classifier=lambda: self.fail("hard opt-out invoked classifier"),
         )
         classification = self.fake.data[self.classification_path]
