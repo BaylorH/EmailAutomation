@@ -1073,6 +1073,273 @@ def validate_contact_row_binding_head_document(*, document):
     return dict(expected)
 
 
+def _plan_contact_row_association(
+    *,
+    thread_binding_document,
+    reverse_binding_document,
+    row_identity_document,
+    row_head_document,
+    proposed_association_document,
+    proposed_evidence_document,
+    stored_association_document,
+    stored_evidence_document,
+    contact_binding_head_document,
+):
+    """Return a deterministic contact-association plan without executing it."""
+
+    thread_binding = validate_thread_row_binding_document(
+        document=thread_binding_document
+    )
+    reverse_binding = validate_row_thread_binding_document(
+        document=reverse_binding_document
+    )
+    row_identity = validate_row_identity_document(document=row_identity_document)
+    row_head = validate_row_authority_head(document=row_head_document)
+    proposed_association = validate_contact_row_binding_document(
+        document=proposed_association_document
+    )
+    proposed_evidence = validate_contact_row_binding_evidence_document(
+        document=proposed_evidence_document
+    )
+
+    scope = proposed_association["userScopeHash"]
+    row_id = proposed_association["rowId"]
+    matching_rows = [
+        row_binding
+        for row_binding in thread_binding["rowBindings"]
+        if row_binding["rowId"] == row_id
+    ]
+    if len(matching_rows) != 1:
+        raise RowAuthorityConflict(
+            "stored thread binding does not authorize the requested row"
+        )
+    expected_reverse = next(
+        document
+        for document in build_row_thread_binding_documents(
+            thread_binding_document=thread_binding
+        )
+        if document["rowId"] == row_id
+    )
+    if (
+        thread_binding["userScopeHash"] != scope
+        or reverse_binding != expected_reverse
+        or row_identity["userScopeHash"] != scope
+        or row_identity["rowId"] != row_id
+        or row_identity["clientId"] != thread_binding["clientId"]
+        or row_head["userScopeHash"] != scope
+        or row_head["rowId"] != row_id
+        or row_head["createdAt"] != row_identity["createdAt"]
+        or proposed_evidence["userScopeHash"] != scope
+        or proposed_evidence["edgeId"] != proposed_association["edgeId"]
+        or proposed_evidence["threadId"] != thread_binding["threadId"]
+        or proposed_evidence["threadBindingHash"]
+        != thread_binding["bindingHash"]
+    ):
+        raise RowAuthorityConflict(
+            "contact association prerequisites do not correlate"
+        )
+
+    association_exists = stored_association_document is not None
+    evidence_exists = stored_evidence_document is not None
+    head_exists = contact_binding_head_document is not None
+    if evidence_exists and not association_exists:
+        raise RowAuthorityAmbiguous(
+            "contact association evidence exists without its stable edge"
+        )
+    if association_exists and not head_exists:
+        raise RowAuthorityAmbiguous(
+            "contact association edge exists without a binding head"
+        )
+
+    if association_exists:
+        try:
+            association = validate_contact_row_binding_document(
+                document=stored_association_document
+            )
+        except Exception as exc:
+            raise RowAuthorityConflict(
+                "stored contact association contains immutable drift"
+            ) from exc
+        if any(
+            association[field] != proposed_association[field]
+            for field in (
+                "schemaVersion",
+                "userScopeHash",
+                "edgeId",
+                "canonicalMailboxIdentityHash",
+                "rowId",
+            )
+        ):
+            raise RowAuthorityConflict(
+                "stored contact association differs from the proposal"
+            )
+    else:
+        association = proposed_association
+
+    if association["createdAt"] < row_identity["createdAt"]:
+        raise RowAuthorityConflict(
+            "contact association predates immutable row identity"
+        )
+    if (
+        not association_exists
+        and association["createdAt"] < thread_binding["createdAt"]
+    ):
+        raise RowAuthorityConflict(
+            "contact association predates its supporting thread binding"
+        )
+    if thread_binding["createdAt"] < row_identity["createdAt"]:
+        raise RowAuthorityConflict(
+            "supporting thread binding predates immutable row identity"
+        )
+    if (
+        proposed_evidence["createdAt"] < thread_binding["createdAt"]
+        or proposed_evidence["createdAt"] < association["createdAt"]
+    ):
+        raise RowAuthorityConflict(
+            "contact evidence predates its supporting authority"
+        )
+
+    if evidence_exists:
+        try:
+            evidence = validate_contact_row_binding_evidence_document(
+                document=stored_evidence_document
+            )
+        except Exception as exc:
+            raise RowAuthorityConflict(
+                "stored contact evidence contains immutable drift"
+            ) from exc
+        if evidence != proposed_evidence:
+            raise RowAuthorityConflict(
+                "stored contact evidence differs from the proposal"
+            )
+    else:
+        evidence = proposed_evidence
+
+    binding_head = None
+    if head_exists:
+        try:
+            binding_head = validate_contact_row_binding_head_document(
+                document=contact_binding_head_document
+            )
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "contact binding head is malformed"
+            ) from exc
+        if (
+            binding_head["userScopeHash"] != scope
+            or binding_head["canonicalMailboxIdentityHash"]
+            != association["canonicalMailboxIdentityHash"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "contact binding head is not protocol-correlated"
+            )
+
+    if association_exists:
+        if (
+            binding_head["associationCount"] < 1
+            or binding_head["createdAt"] > association["createdAt"]
+            or binding_head["updatedAt"] < association["createdAt"]
+            or (
+                binding_head["lastAssociationHash"]
+                == association["contactRowEdgeHash"]
+                and binding_head["updatedAt"] != association["createdAt"]
+            )
+            or (
+                binding_head["lastAssociationHash"]
+                != association["contactRowEdgeHash"]
+                and binding_head["associationCount"] < 2
+            )
+        ):
+            raise RowAuthorityAmbiguous(
+                "contact binding head does not contain the stable association"
+            )
+        if evidence_exists:
+            disposition = "already_applied"
+            mutations = ()
+        else:
+            disposition = "evidence_created"
+            mutations = (
+                {
+                    "target": "evidence",
+                    "operation": "create",
+                    "document": dict(evidence),
+                },
+            )
+        result_head = binding_head
+    else:
+        if (
+            binding_head is not None
+            and binding_head["lastAssociationHash"]
+            == association["contactRowEdgeHash"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "contact binding head points to a missing stable association"
+            )
+        if binding_head is None:
+            result_head = build_contact_row_binding_head_document(
+                user_scope_hash=scope,
+                canonical_mailbox_identity_hash=association[
+                    "canonicalMailboxIdentityHash"
+                ],
+                state_revision=1,
+                association_count=1,
+                last_association_hash=association["contactRowEdgeHash"],
+                created_at=association["createdAt"],
+                updated_at=association["createdAt"],
+            )
+            head_operation = "create"
+        else:
+            if association["createdAt"] < binding_head["updatedAt"]:
+                raise RowAuthorityConflict(
+                    "contact association predates the binding head"
+                )
+            result_head = build_contact_row_binding_head_document(
+                user_scope_hash=scope,
+                canonical_mailbox_identity_hash=association[
+                    "canonicalMailboxIdentityHash"
+                ],
+                state_revision=binding_head["stateRevision"] + 1,
+                association_count=binding_head["associationCount"] + 1,
+                last_association_hash=association["contactRowEdgeHash"],
+                created_at=binding_head["createdAt"],
+                updated_at=association["createdAt"],
+            )
+            head_operation = "set"
+        disposition = "created"
+        mutations = (
+            {
+                "target": "association",
+                "operation": "create",
+                "document": dict(association),
+            },
+            {
+                "target": "evidence",
+                "operation": "create",
+                "document": dict(evidence),
+            },
+            {
+                "target": "binding_head",
+                "operation": head_operation,
+                "document": dict(result_head),
+            },
+        )
+
+    return {
+        "disposition": disposition,
+        "association": dict(association),
+        "evidence": dict(evidence),
+        "bindingHead": dict(result_head),
+        "mutations": tuple(
+            {
+                "target": mutation["target"],
+                "operation": mutation["operation"],
+                "document": dict(mutation["document"]),
+            }
+            for mutation in mutations
+        ),
+    }
+
+
 def normalize_provider_text(*, value, field_name):
     if type(field_name) is not str or not field_name:
         raise RowAuthorityConfigError("field_name must be a nonempty string")
@@ -2024,6 +2291,35 @@ def _thread_binding_result(*, disposition, thread_binding, reverse_bindings):
     }
 
 
+def _contact_association_result(
+    *,
+    disposition,
+    association,
+    evidence,
+    binding_head,
+):
+    if disposition not in {
+        "created",
+        "evidence_created",
+        "already_applied",
+    }:
+        raise RowAuthorityConfigError(
+            "contact association disposition is not approved"
+        )
+    return {
+        "disposition": disposition,
+        "association": validate_contact_row_binding_document(
+            document=association
+        ),
+        "evidence": validate_contact_row_binding_evidence_document(
+            document=evidence
+        ),
+        "bindingHead": validate_contact_row_binding_head_document(
+            document=binding_head
+        ),
+    }
+
+
 def _location_semantics(revision):
     return tuple(
         revision[field]
@@ -2619,6 +2915,402 @@ class RowAuthorityStore:
             disposition=disposition,
             thread_binding=thread_binding,
             reverse_bindings=reverse_bindings,
+        )
+
+    def record_contact_row_association(
+        self,
+        *,
+        verified_user_id,
+        canonical_mailbox_identity_hash,
+        exact_identity_hash,
+        row_id,
+        thread_id,
+        created_at,
+    ):
+        maximum_planned_writes = 3
+        if maximum_planned_writes > MAX_ROW_AUTHORITY_PLANNED_WRITES:
+            raise RowAuthorityConfigError(
+                "contact association exceeds the planned-write ceiling"
+            )
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        checked_canonical_hash = _require_sha256(
+            canonical_mailbox_identity_hash,
+            field_name="canonical_mailbox_identity_hash",
+        )
+        checked_exact_hash = _require_sha256(
+            exact_identity_hash,
+            field_name="exact_identity_hash",
+        )
+        checked_row_id = validate_row_id(row_id)
+        checked_thread_id = _require_thread_document_id(
+            thread_id,
+            field_name="thread_id",
+        )
+        checked_created_at = _require_timestamp(
+            created_at,
+            field_name="created_at",
+        )
+        proposed_association = build_contact_row_binding_document(
+            user_scope_hash=checked_scope,
+            canonical_mailbox_identity_hash=checked_canonical_hash,
+            row_id=checked_row_id,
+            created_at=checked_created_at,
+        )
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            optout_head_ref = user_ref.collection(
+                "contactOptOutHeads"
+            ).document(checked_canonical_hash)
+            thread_binding_ref = user_ref.collection(
+                "threadRowBindings"
+            ).document(checked_thread_id)
+            row_identity_ref = user_ref.collection("rowIdentities").document(
+                checked_row_id
+            )
+            row_head_ref = user_ref.collection("rowAuthorityHeads").document(
+                checked_row_id
+            )
+            association_ref = user_ref.collection("contactRowBindings").document(
+                proposed_association["edgeId"]
+            )
+            contact_binding_head_ref = user_ref.collection(
+                "contactRowBindingHeads"
+            ).document(checked_canonical_hash)
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "contact association cannot form exact document paths"
+            ) from exc
+
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "references": None,
+            "observed": None,
+            "plan": None,
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "references": None,
+                    "observed": None,
+                    "plan": None,
+                }
+            )
+
+            def read_one(reference):
+                try:
+                    return self._read_reference_payloads(
+                        (reference,),
+                        transaction=transaction,
+                    )[0]
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "contact association transaction read failed before writes"
+                    ) from exc
+
+            optout_observed = read_one(optout_head_ref)
+            if optout_observed[0]:
+                reject(
+                    RowAuthorityConflict(
+                        "an existing contact opt-out head blocks association"
+                    )
+                )
+
+            binding_observed = read_one(thread_binding_ref)
+            if not binding_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact association is missing its thread binding"
+                    )
+                )
+            try:
+                thread_binding = validate_thread_row_binding_document(
+                    document=binding_observed[1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact association thread binding is malformed"
+                    )
+                )
+            if (
+                thread_binding["userScopeHash"] != checked_scope
+                or thread_binding["threadId"] != checked_thread_id
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "contact association thread binding does not correlate"
+                    )
+                )
+            matching_reverse = [
+                document
+                for document in build_row_thread_binding_documents(
+                    thread_binding_document=thread_binding
+                )
+                if document["rowId"] == checked_row_id
+            ]
+            if len(matching_reverse) != 1:
+                reject(
+                    RowAuthorityConflict(
+                        "thread binding does not authorize the requested row"
+                    )
+                )
+            expected_reverse = matching_reverse[0]
+            proposed_evidence = (
+                build_contact_row_binding_evidence_document(
+                    user_scope_hash=checked_scope,
+                    edge_id=proposed_association["edgeId"],
+                    thread_id=checked_thread_id,
+                    thread_binding_hash=thread_binding["bindingHash"],
+                    exact_identity_hash=checked_exact_hash,
+                    created_at=checked_created_at,
+                )
+            )
+            try:
+                reverse_ref = user_ref.collection(
+                    "rowThreadBindings"
+                ).document(expected_reverse["edgeId"])
+                evidence_ref = user_ref.collection(
+                    "contactRowBindingEvidence"
+                ).document(proposed_evidence["evidenceId"])
+            except Exception as exc:
+                reject(
+                    RowAuthorityConfigError(
+                        "contact association cannot form derived document paths"
+                    )
+                )
+
+            trailing_references = (
+                reverse_ref,
+                row_identity_ref,
+                row_head_ref,
+                association_ref,
+                evidence_ref,
+                contact_binding_head_ref,
+            )
+            trailing_observed = tuple(
+                read_one(reference) for reference in trailing_references
+            )
+            references = (
+                optout_head_ref,
+                thread_binding_ref,
+                *trailing_references,
+            )
+            observed = (
+                optout_observed,
+                binding_observed,
+                *trailing_observed,
+            )
+            callback_state["references"] = references
+            callback_state["observed"] = observed
+
+            reverse_observed, identity_observed, row_head_observed = (
+                trailing_observed[:3]
+            )
+            if not all(
+                item[0]
+                for item in (
+                    reverse_observed,
+                    identity_observed,
+                    row_head_observed,
+                )
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact association is missing row authority proof"
+                    )
+                )
+            try:
+                reverse_binding = validate_row_thread_binding_document(
+                    document=reverse_observed[1]
+                )
+                row_identity = validate_row_identity_document(
+                    document=identity_observed[1]
+                )
+                row_head = validate_row_authority_head(
+                    document=row_head_observed[1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact association row authority proof is malformed"
+                    )
+                )
+            if reverse_binding != expected_reverse:
+                reject(
+                    RowAuthorityConflict(
+                        "contact association reverse binding does not correlate"
+                    )
+                )
+
+            association_observed, evidence_observed, binding_head_observed = (
+                trailing_observed[3:]
+            )
+            try:
+                plan = _plan_contact_row_association(
+                    thread_binding_document=thread_binding,
+                    reverse_binding_document=reverse_binding,
+                    row_identity_document=row_identity,
+                    row_head_document=row_head,
+                    proposed_association_document=proposed_association,
+                    proposed_evidence_document=proposed_evidence,
+                    stored_association_document=(
+                        association_observed[1]
+                        if association_observed[0]
+                        else None
+                    ),
+                    stored_evidence_document=(
+                        evidence_observed[1] if evidence_observed[0] else None
+                    ),
+                    contact_binding_head_document=(
+                        binding_head_observed[1]
+                        if binding_head_observed[0]
+                        else None
+                    ),
+                )
+            except RowAuthorityError as exc:
+                reject(exc)
+
+            mutations = plan["mutations"]
+            if len(mutations) not in {0, 1, 3}:
+                reject(
+                    RowAuthorityConfigError(
+                        "contact association produced an invalid write count"
+                    )
+                )
+            if len(mutations) > MAX_ROW_AUTHORITY_PLANNED_WRITES:
+                reject(
+                    RowAuthorityConfigError(
+                        "contact association exceeds the planned-write ceiling"
+                    )
+                )
+            target_references = {
+                "association": association_ref,
+                "evidence": evidence_ref,
+                "binding_head": contact_binding_head_ref,
+            }
+            callback_state["plan"] = plan
+            callback_state["disposition"] = plan["disposition"]
+            callback_state["prepared"] = bool(mutations)
+            for mutation in mutations:
+                reference = target_references[mutation["target"]]
+                if mutation["operation"] == "create":
+                    transaction.create(reference, mutation["document"])
+                elif mutation["operation"] == "set":
+                    transaction.set(
+                        reference,
+                        mutation["document"],
+                        merge=False,
+                    )
+                else:
+                    reject(
+                        RowAuthorityConfigError(
+                            "contact association produced an invalid mutation"
+                        )
+                    )
+            return plan["disposition"]
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "contact association transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"]:
+                raise
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "contact association transaction could not start"
+                ) from exc
+            references = callback_state["references"]
+            observed = callback_state["observed"]
+            plan = callback_state["plan"]
+            if references is None or observed is None or plan is None:
+                raise RowAuthorityAmbiguous(
+                    "contact association commit has no complete before-image"
+                ) from exc
+            try:
+                readback = self._read_reference_payloads(references)
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "contact association commit outcome cannot be read back"
+                ) from readback_exc
+
+            expected_after = list(observed)
+            target_indexes = {
+                "association": 5,
+                "evidence": 6,
+                "binding_head": 7,
+            }
+            for mutation in plan["mutations"]:
+                expected_after[target_indexes[mutation["target"]]] = (
+                    True,
+                    mutation["document"],
+                )
+            exact_before = readback == observed
+            exact_after = readback == tuple(expected_after)
+            if exact_after:
+                disposition = plan["disposition"]
+            elif exact_before and plan["mutations"]:
+                raise RowAuthorityRetryable(
+                    "contact association commit failed before any apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "contact association commit readback is partial or drifted"
+                ) from exc
+
+        if disposition not in {
+            "created",
+            "evidence_created",
+            "already_applied",
+        }:
+            raise RowAuthorityRetryable(
+                "contact association returned no approved disposition"
+            )
+        if disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "contact association returned a mismatched disposition"
+            )
+        plan = callback_state["plan"]
+        if plan is None:
+            raise RowAuthorityRetryable(
+                "contact association returned without an observed plan"
+            )
+        if plan["mutations"] and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "contact association returned an unprepared write disposition"
+            )
+        return _contact_association_result(
+            disposition=disposition,
+            association=plan["association"],
+            evidence=plan["evidence"],
+            binding_head=plan["bindingHead"],
         )
 
     def advance_row_location(

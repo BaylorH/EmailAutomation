@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -1076,6 +1077,7 @@ class ThreadRowBindingStoreTests(unittest.TestCase):
                 self.assertEqual(before, store.data)
                 self.assertEqual([], self._write_events(store))
 
+
     def test_binding_rejects_each_isolated_scope_and_row_correlation_drift(self):
         for mode in (
             "identity_scope",
@@ -1610,6 +1612,1522 @@ class ThreadRowBindingStoreTests(unittest.TestCase):
                     self._bind(store)
                 self.assertEqual(before, store.data)
                 self.assertEqual([], self._write_events(store))
+
+
+class ContactRowAssociationStoreTests(unittest.TestCase):
+    @staticmethod
+    def _fakes():
+        return importlib.import_module("tests.row_authority_fakes")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+
+    def setUp(self):
+        self.assertTrue(
+            hasattr(
+                self.module.RowAuthorityStore,
+                "record_contact_row_association",
+            ),
+            "RowAuthorityStore.record_contact_row_association is missing",
+        )
+        self.user_id = "uid-1"
+        self.scope = self.module.user_scope_hash(self.user_id)
+        self.first = _row_id(1)
+        self.second = _row_id(2)
+        self.thread_id = "thread-1"
+        self.canonical_hash = "c" * 64
+        self.exact_hash = "d" * 64
+        self.row_created_at = "2026-08-04T12:00:00.000000Z"
+        self.binding_at = "2026-08-04T12:00:01.000000Z"
+        self.association_at = "2026-08-04T12:00:02.000000Z"
+
+    def _store(self):
+        return self._fakes().BoundedFakeFirestore()
+
+    def _authority(self, store, *, executor=None):
+        return self.module.RowAuthorityStore(
+            store,
+            transaction_executor=(
+                executor or self._fakes().run_bounded_transaction
+            ),
+        )
+
+    def _user_reference(self, store):
+        return store.collection("users").document(self.user_id)
+
+    def _row_references(self, store, row_id):
+        user = self._user_reference(store)
+        return (
+            user.collection("rowIdentities").document(row_id),
+            user.collection("rowAuthorityHeads").document(row_id),
+        )
+
+    def _rehash_row_head(self, head):
+        payload = {
+            key: value
+            for key, value in head.items()
+            if key not in {"schemaVersion", "userScopeHash", "headHash"}
+        }
+        head["headHash"] = self.module.domain_hash(
+            "sitesift.row.authority_head.v1",
+            payload,
+            user_scope_hash=head["userScopeHash"],
+        )
+        return self.module.validate_row_authority_head(document=head)
+
+    def _seed_row(
+        self,
+        store,
+        row_id,
+        *,
+        lifecycle="active",
+        created_at=None,
+    ):
+        created_at = created_at or self.row_created_at
+        index = 0 if row_id == self.first else 1
+        identity = self.module.build_row_identity_document(
+            user_scope_hash=self.scope,
+            row_id=row_id,
+            client_id="client-1",
+            spreadsheet_id="spreadsheet-1",
+            sheet_id=0,
+            creation_kind="fresh",
+            creation_source_hash="1" * 64,
+            created_at=created_at,
+        )
+        observation = self.module.build_row_observation(
+            spreadsheet_id="spreadsheet-1",
+            marker_observation={
+                "rowId": row_id,
+                "sheetId": 0,
+                "providerRowIndex": index,
+                "displayRowNumber": index + 1,
+                "metadataId": index + 1,
+            },
+            ordered_headers=("Email",),
+            ordered_cell_values=(f"row-{index}@example.com",),
+            user_scope_hash=self.scope,
+        )
+        revision = self.module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=1,
+            lifecycle="active",
+            observations=(observation,),
+            previous_revision_hash=None,
+            observed_at=created_at,
+        )
+        head = self.module.build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=created_at,
+        )
+        if lifecycle == "deleted":
+            head.update(
+                {
+                    "stateRevision": 2,
+                    "currentLocationRevision": 2,
+                    "currentLocationHash": "2" * 64,
+                    "currentLocationLifecycle": "deleted",
+                    "updatedAt": self.binding_at,
+                }
+            )
+            head = self._rehash_row_head(head)
+        identity_ref, head_ref = self._row_references(store, row_id)
+        identity_ref.create(identity)
+        head_ref.create(head)
+        return identity, head
+
+    def _seed_thread_binding(
+        self,
+        store,
+        *,
+        row_ids=None,
+        thread_id=None,
+        created_at=None,
+    ):
+        row_ids = tuple(row_ids or (self.first,))
+        thread_id = thread_id or self.thread_id
+        created_at = created_at or self.binding_at
+        binding = self.module.build_thread_row_binding_document(
+            user_scope_hash=self.scope,
+            thread_id=thread_id,
+            client_id="client-1",
+            row_ids=row_ids,
+            primary_row_id=row_ids[0],
+            created_at=created_at,
+        )
+        reverse = self.module.build_row_thread_binding_documents(
+            thread_binding_document=binding
+        )
+        user = self._user_reference(store)
+        binding_ref = user.collection("threadRowBindings").document(thread_id)
+        binding_ref.create(binding)
+        reverse_refs = tuple(
+            user.collection("rowThreadBindings").document(document["edgeId"])
+            for document in reverse
+        )
+        for reference, document in zip(reverse_refs, reverse):
+            reference.create(document)
+        return binding, reverse, binding_ref, reverse_refs
+
+    def _seed_prerequisites(
+        self,
+        store,
+        *,
+        row_ids=None,
+        lifecycle="active",
+        thread_id=None,
+        row_created_at=None,
+    ):
+        row_ids = tuple(row_ids or (self.first,))
+        seeded_rows = {
+            row_id: self._seed_row(
+                store,
+                row_id,
+                lifecycle=lifecycle,
+                created_at=row_created_at,
+            )
+            for row_id in row_ids
+        }
+        binding = self._seed_thread_binding(
+            store,
+            row_ids=row_ids,
+            thread_id=thread_id,
+        )
+        return seeded_rows, binding
+
+    def _association_documents(
+        self,
+        binding,
+        *,
+        row_id=None,
+        thread_id=None,
+        exact_identity_hash=None,
+        created_at=None,
+    ):
+        row_id = row_id or self.first
+        thread_id = thread_id or self.thread_id
+        exact_identity_hash = exact_identity_hash or self.exact_hash
+        created_at = created_at or self.association_at
+        association = self.module.build_contact_row_binding_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            row_id=row_id,
+            created_at=created_at,
+        )
+        evidence = self.module.build_contact_row_binding_evidence_document(
+            user_scope_hash=self.scope,
+            edge_id=association["edgeId"],
+            thread_id=thread_id,
+            thread_binding_hash=binding["bindingHash"],
+            exact_identity_hash=exact_identity_hash,
+            created_at=created_at,
+        )
+        return association, evidence
+
+    def _association_references(
+        self,
+        store,
+        binding,
+        *,
+        row_id=None,
+        thread_id=None,
+        exact_identity_hash=None,
+        created_at=None,
+    ):
+        row_id = row_id or self.first
+        thread_id = thread_id or self.thread_id
+        association, evidence = self._association_documents(
+            binding,
+            row_id=row_id,
+            thread_id=thread_id,
+            exact_identity_hash=exact_identity_hash,
+            created_at=created_at,
+        )
+        reverse_by_row = {
+            document["rowId"]: document
+            for document in self.module.build_row_thread_binding_documents(
+                thread_binding_document=binding
+            )
+        }
+        user = self._user_reference(store)
+        references = {
+            "optout": user.collection("contactOptOutHeads").document(
+                self.canonical_hash
+            ),
+            "binding": user.collection("threadRowBindings").document(
+                thread_id
+            ),
+            "reverse": user.collection("rowThreadBindings").document(
+                reverse_by_row[row_id]["edgeId"]
+            ),
+            "identity": user.collection("rowIdentities").document(row_id),
+            "row_head": user.collection("rowAuthorityHeads").document(row_id),
+            "association": user.collection("contactRowBindings").document(
+                association["edgeId"]
+            ),
+            "evidence": user.collection(
+                "contactRowBindingEvidence"
+            ).document(evidence["evidenceId"]),
+            "binding_head": user.collection(
+                "contactRowBindingHeads"
+            ).document(self.canonical_hash),
+        }
+        return association, evidence, references
+
+    def _associate(self, store, *, executor=None, **overrides):
+        arguments = {
+            "verified_user_id": self.user_id,
+            "canonical_mailbox_identity_hash": self.canonical_hash,
+            "exact_identity_hash": self.exact_hash,
+            "row_id": self.first,
+            "thread_id": self.thread_id,
+            "created_at": self.association_at,
+        }
+        arguments.update(overrides)
+        return self._authority(
+            store,
+            executor=executor,
+        ).record_contact_row_association(**arguments)
+
+    @staticmethod
+    def _write_events(store):
+        return [
+            event
+            for event in store.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def test_first_contact_association_reads_prerequisites_then_writes_exact_three(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        association, evidence, references = self._association_references(
+            store,
+            binding,
+        )
+        store.events.clear()
+
+        result = self._associate(store)
+
+        expected_read_order = [
+            references[name].path
+            for name in (
+                "optout",
+                "binding",
+                "reverse",
+                "identity",
+                "row_head",
+                "association",
+                "evidence",
+                "binding_head",
+            )
+        ]
+        self.assertEqual(
+            expected_read_order,
+            [event[1] for event in store.events if event[0] == "get"],
+        )
+        read_indexes = [
+            index for index, event in enumerate(store.events) if event[0] == "get"
+        ]
+        write_indexes = [
+            index
+            for index, event in enumerate(store.events)
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+        self.assertLess(max(read_indexes), min(write_indexes))
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual(association, result["association"])
+        self.assertEqual(evidence, result["evidence"])
+        self.assertEqual(
+            [
+                ("create", references["association"].path, association, False),
+                ("create", references["evidence"].path, evidence, False),
+                (
+                    "create",
+                    references["binding_head"].path,
+                    result["bindingHead"],
+                    False,
+                ),
+            ],
+            self._write_events(store),
+        )
+        self.assertEqual(1, result["bindingHead"]["stateRevision"])
+        self.assertEqual(1, result["bindingHead"]["associationCount"])
+        self.assertEqual(
+            association["contactRowEdgeHash"],
+            result["bindingHead"]["lastAssociationHash"],
+        )
+
+    def test_empty_contact_binding_head_advances_to_one(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        association, _evidence, references = self._association_references(
+            store,
+            binding,
+        )
+        empty = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            state_revision=4,
+            association_count=0,
+            last_association_hash=None,
+            created_at=self.binding_at,
+            updated_at=self.binding_at,
+        )
+        references["binding_head"].create(empty)
+        store.events.clear()
+
+        result = self._associate(store)
+
+        self.assertEqual("created", result["disposition"])
+        head = result["bindingHead"]
+        self.assertEqual(5, head["stateRevision"])
+        self.assertEqual(1, head["associationCount"])
+        self.assertEqual(association["contactRowEdgeHash"], head["lastAssociationHash"])
+        self.assertEqual(empty["createdAt"], head["createdAt"])
+        self.assertEqual(self.association_at, head["updatedAt"])
+        self.assertEqual(
+            ["create", "create", "set"],
+            [event[0] for event in self._write_events(store)],
+        )
+        self.assertEqual(False, self._write_events(store)[-1][3])
+
+    def test_existing_edge_new_evidence_writes_only_evidence_and_preserves_head(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        created = self._associate(store)
+        original_head = deepcopy(created["bindingHead"])
+        original_association = deepcopy(created["association"])
+        _association, evidence, references = self._association_references(
+            store,
+            binding,
+            exact_identity_hash="e" * 64,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+        store.events.clear()
+
+        result = self._associate(
+            store,
+            exact_identity_hash="e" * 64,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+
+        self.assertEqual("evidence_created", result["disposition"])
+        self.assertEqual(original_association, result["association"])
+        self.assertEqual(evidence, result["evidence"])
+        self.assertEqual(original_head, result["bindingHead"])
+        self.assertEqual(
+            [("create", references["evidence"].path, evidence, False)],
+            self._write_events(store),
+        )
+
+    def test_later_recreated_thread_adds_evidence_to_older_stable_edge(self):
+        store = self._store()
+        self._seed_prerequisites(store)
+        first = self._associate(store)
+        second_binding, _reverse, _binding_ref, _reverse_refs = (
+            self._seed_thread_binding(
+                store,
+                row_ids=(self.first,),
+                thread_id="thread-2",
+                created_at="2026-08-04T12:00:04.000000Z",
+            )
+        )
+        _candidate, second_evidence, references = (
+            self._association_references(
+                store,
+                second_binding,
+                thread_id="thread-2",
+                exact_identity_hash="e" * 64,
+                created_at="2026-08-04T12:00:05.000000Z",
+            )
+        )
+        association_before = deepcopy(first["association"])
+        head_before = deepcopy(first["bindingHead"])
+        store.events.clear()
+
+        result = self._associate(
+            store,
+            thread_id="thread-2",
+            exact_identity_hash="e" * 64,
+            created_at="2026-08-04T12:00:05.000000Z",
+        )
+
+        self.assertEqual("evidence_created", result["disposition"])
+        self.assertEqual(association_before, result["association"])
+        self.assertEqual(second_evidence, result["evidence"])
+        self.assertEqual(head_before, result["bindingHead"])
+        self.assertEqual(
+            [
+                (
+                    "create",
+                    references["evidence"].path,
+                    second_evidence,
+                    False,
+                )
+            ],
+            self._write_events(store),
+        )
+
+    def test_exact_edge_evidence_and_head_retry_is_zero_write(self):
+        store = self._store()
+        self._seed_prerequisites(store)
+        created = self._associate(store)
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        replay = self._associate(store)
+
+        self.assertEqual("created", created["disposition"])
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertIn(("commit_applied", 0), store.events)
+
+    def test_supporting_thread_binding_and_reverse_edge_are_required_and_exact(self):
+        for mode, error in (
+            ("missing_binding", self.module.RowAuthorityAmbiguous),
+            ("missing_reverse", self.module.RowAuthorityAmbiguous),
+            ("binding_drift", self.module.RowAuthorityConflict),
+            ("reverse_drift", self.module.RowAuthorityConflict),
+        ):
+            with self.subTest(mode=mode):
+                store = self._store()
+                _rows, (binding, _reverse, binding_ref, reverse_refs) = (
+                    self._seed_prerequisites(
+                        store,
+                        row_ids=(self.first, self.second),
+                    )
+                )
+                if mode == "missing_binding":
+                    binding_ref.delete()
+                elif mode == "missing_reverse":
+                    reverse_refs[0].delete()
+                elif mode == "binding_drift":
+                    drift = self.module.build_thread_row_binding_document(
+                        user_scope_hash=self.scope,
+                        thread_id=self.thread_id,
+                        client_id="client-2",
+                        row_ids=(self.first, self.second),
+                        primary_row_id=self.first,
+                        created_at=self.binding_at,
+                    )
+                    binding_ref.set(drift, merge=False)
+                else:
+                    alternate = self.module.build_thread_row_binding_document(
+                        user_scope_hash=self.scope,
+                        thread_id=self.thread_id,
+                        client_id="client-1",
+                        row_ids=(self.first, self.second),
+                        primary_row_id=self.second,
+                        created_at=self.binding_at,
+                    )
+                    drift = next(
+                        document
+                        for document in self.module.build_row_thread_binding_documents(
+                            thread_binding_document=alternate
+                        )
+                        if document["rowId"] == self.first
+                    )
+                    reverse_refs[0].set(drift, merge=False)
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(error):
+                    self._associate(store)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_association_rejects_each_isolated_row_identity_and_head_drift(self):
+        for mode in (
+            "identity_scope",
+            "identity_row",
+            "identity_client",
+            "head_scope",
+            "head_row",
+            "head_created_at",
+        ):
+            with self.subTest(mode=mode):
+                store = self._store()
+                self._seed_prerequisites(store)
+                identity_ref, head_ref = self._row_references(
+                    store,
+                    self.first,
+                )
+                identity = deepcopy(store.data[identity_ref.path])
+                head = deepcopy(store.data[head_ref.path])
+                if mode.startswith("identity_"):
+                    values = {
+                        "user_scope_hash": identity["userScopeHash"],
+                        "row_id": identity["rowId"],
+                        "client_id": identity["clientId"],
+                        "spreadsheet_id": identity["spreadsheetId"],
+                        "sheet_id": identity["sheetId"],
+                        "creation_kind": identity["creationKind"],
+                        "creation_source_hash": identity[
+                            "creationSourceHash"
+                        ],
+                        "created_at": identity["createdAt"],
+                    }
+                    if mode == "identity_scope":
+                        values["user_scope_hash"] = "f" * 64
+                    elif mode == "identity_row":
+                        values["row_id"] = _row_id(3)
+                    else:
+                        values["client_id"] = "client-2"
+                    identity_ref.set(
+                        self.module.build_row_identity_document(**values),
+                        merge=False,
+                    )
+                else:
+                    if mode == "head_scope":
+                        head["userScopeHash"] = "f" * 64
+                    elif mode == "head_row":
+                        head["rowId"] = _row_id(3)
+                    else:
+                        head[
+                            "createdAt"
+                        ] = "2026-08-04T11:59:59.000000Z"
+                    head_ref.set(self._rehash_row_head(head), merge=False)
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._associate(store)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_deleted_row_accepts_historical_contact_evidence_but_grants_no_claim(self):
+        store = self._store()
+        rows, _binding = self._seed_prerequisites(
+            store,
+            lifecycle="deleted",
+        )
+        identity_before, head_before = deepcopy(rows[self.first])
+        store.events.clear()
+
+        result = self._associate(store)
+
+        identity_ref, head_ref = self._row_references(store, self.first)
+        self.assertEqual("created", result["disposition"])
+        self.assertEqual(identity_before, store.data[identity_ref.path])
+        self.assertEqual(head_before, store.data[head_ref.path])
+        accessed = "\n".join(
+            event[1]
+            for event in store.events
+            if event[0] in {"get", "create", "set", "update", "delete"}
+        )
+        for forbidden in (
+            "rowClaimSets",
+            "rowOwnerGenerations",
+            "rowOwnerSettlements",
+        ):
+            self.assertNotIn(forbidden, accessed)
+
+    def test_existing_contact_optout_head_blocks_association_with_zero_writes(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        _association, _evidence, references = self._association_references(
+            store,
+            binding,
+        )
+        references["optout"].create(
+            {"malformed": "existence alone is the sentinel"}
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._associate(store)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertEqual(
+            [references["optout"].path],
+            [event[1] for event in store.events if event[0] == "get"],
+        )
+
+    def test_contact_optout_head_blocks_exact_association_replay_first(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        self._associate(store)
+        _association, _evidence, references = self._association_references(
+            store,
+            binding,
+        )
+        references["optout"].create({"existence": "is the sentinel"})
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._associate(store)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertEqual(
+            [references["optout"].path],
+            [event[1] for event in store.events if event[0] == "get"],
+        )
+
+    def test_association_never_accesses_alias_settlement_fanout_or_release_collections(self):
+        store = self._store()
+        self._seed_prerequisites(store)
+        store.events.clear()
+
+        self._associate(store)
+
+        forbidden = (
+            "contactOptOutAliases",
+            "contactOptOutSettlements",
+            "contactOptOutFanoutHeads",
+            "contactOptOutFanoutObligations",
+            "contactOptOutFanoutResults",
+            "contactOptOutRelease",
+        )
+        accessed = "\n".join(
+            event[1]
+            for event in store.events
+            if event[0] in {"get", "create", "set", "update", "delete"}
+        )
+        source = inspect.getsource(
+            self.module.RowAuthorityStore.record_contact_row_association
+        )
+        for collection in forbidden:
+            self.assertNotIn(collection, accessed)
+            self.assertNotIn(collection, source)
+
+    def test_identical_first_association_workers_create_one_edge_and_evidence(self):
+        store = self._store()
+        self._seed_prerequisites(store)
+        store.before_commit_barrier = Barrier(2)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self._associate, store) for _index in range(2)]
+            results = [future.result(timeout=10) for future in futures]
+
+        self.assertEqual(
+            ["already_applied", "created"],
+            sorted(result["disposition"] for result in results),
+        )
+        association_paths = [
+            path for path in store.data if "/contactRowBindings/" in path
+        ]
+        evidence_paths = [
+            path
+            for path in store.data
+            if "/contactRowBindingEvidence/" in path
+        ]
+        head_paths = [
+            path
+            for path in store.data
+            if "/contactRowBindingHeads/" in path
+        ]
+        self.assertEqual((1, 1, 1), (
+            len(association_paths),
+            len(evidence_paths),
+            len(head_paths),
+        ))
+        self.assertEqual(1, store.data[head_paths[0]]["associationCount"])
+        self.assertTrue(
+            any(event[0] == "commit_aborted_stale_read" for event in store.events)
+        )
+
+    def test_different_evidence_workers_create_one_edge_two_evidence_and_count_one(self):
+        store = self._store()
+        self._seed_prerequisites(store)
+        store.before_commit_barrier = Barrier(2)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                self._associate,
+                store,
+                exact_identity_hash="d" * 64,
+            )
+            second_future = pool.submit(
+                self._associate,
+                store,
+                exact_identity_hash="e" * 64,
+            )
+            results = [
+                first_future.result(timeout=10),
+                second_future.result(timeout=10),
+            ]
+
+        self.assertEqual(
+            ["created", "evidence_created"],
+            sorted(result["disposition"] for result in results),
+        )
+        association_paths = [
+            path for path in store.data if "/contactRowBindings/" in path
+        ]
+        evidence_paths = [
+            path
+            for path in store.data
+            if "/contactRowBindingEvidence/" in path
+        ]
+        head_path = next(
+            path
+            for path in store.data
+            if "/contactRowBindingHeads/" in path
+        )
+        self.assertEqual(1, len(association_paths))
+        self.assertEqual(2, len(evidence_paths))
+        self.assertEqual(1, store.data[head_path]["associationCount"])
+        self.assertEqual(1, store.data[head_path]["stateRevision"])
+
+    def test_different_row_workers_cas_retry_to_count_two(self):
+        store = self._store()
+        self._seed_prerequisites(
+            store,
+            row_ids=(self.first, self.second),
+        )
+        store.before_commit_barrier = Barrier(2)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(self._associate, store, row_id=row_id)
+                for row_id in (self.first, self.second)
+            ]
+            results = [future.result(timeout=10) for future in futures]
+
+        self.assertEqual(
+            ["created", "created"],
+            sorted(result["disposition"] for result in results),
+        )
+        association_paths = [
+            path for path in store.data if "/contactRowBindings/" in path
+        ]
+        evidence_paths = [
+            path
+            for path in store.data
+            if "/contactRowBindingEvidence/" in path
+        ]
+        head_path = next(
+            path
+            for path in store.data
+            if "/contactRowBindingHeads/" in path
+        )
+        head = store.data[head_path]
+        self.assertEqual(2, len(association_paths))
+        self.assertEqual(2, len(evidence_paths))
+        self.assertEqual(2, head["associationCount"])
+        self.assertEqual(2, head["stateRevision"])
+        self.assertIn(
+            head["lastAssociationHash"],
+            {
+                result["association"]["contactRowEdgeHash"]
+                for result in results
+            },
+        )
+
+    def test_old_association_retry_after_another_row_preserves_advanced_head(self):
+        store = self._store()
+        self._seed_prerequisites(
+            store,
+            row_ids=(self.first, self.second),
+        )
+        first = self._associate(store, row_id=self.first)
+        second = self._associate(
+            store,
+            row_id=self.second,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+        advanced_head = deepcopy(second["bindingHead"])
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        replay = self._associate(store, row_id=self.first)
+
+        self.assertEqual("created", first["disposition"])
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(2, replay["bindingHead"]["associationCount"])
+        self.assertEqual(advanced_head, replay["bindingHead"])
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_contact_binding_head_revision_does_not_order_association_count(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        created = self._associate(store)
+        _association, _evidence, references = self._association_references(
+            store,
+            binding,
+        )
+        advanced = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            state_revision=1,
+            association_count=2,
+            last_association_hash="f" * 64,
+            created_at=created["bindingHead"]["createdAt"],
+            updated_at="2026-08-04T12:00:03.000000Z",
+        )
+        references["binding_head"].set(advanced, merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        replay = self._associate(store)
+
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(advanced, replay["bindingHead"])
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_same_last_association_hash_cannot_claim_a_later_head_update(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        created = self._associate(store)
+        association, _evidence, references = self._association_references(
+            store,
+            binding,
+        )
+        unreachable = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            state_revision=7,
+            association_count=2,
+            last_association_hash=association["contactRowEdgeHash"],
+            created_at=created["bindingHead"]["createdAt"],
+            updated_at="2026-08-04T12:00:03.000000Z",
+        )
+        references["binding_head"].set(unreachable, merge=False)
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._associate(store)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_stored_thread_binding_cannot_predate_immutable_row_identity(self):
+        store = self._store()
+        self._seed_prerequisites(
+            store,
+            row_created_at="2026-08-04T12:00:02.000000Z",
+        )
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._associate(
+                store,
+                created_at="2026-08-04T12:00:03.000000Z",
+            )
+
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_existing_association_cannot_predate_immutable_row_identity(self):
+        for evidence_exists in (False, True):
+            with self.subTest(evidence_exists=evidence_exists):
+                store = self._store()
+                self._seed_row(
+                    store,
+                    self.first,
+                    created_at="2026-08-04T12:00:03.000000Z",
+                )
+                binding, _reverse, _binding_ref, _reverse_refs = (
+                    self._seed_thread_binding(
+                        store,
+                        created_at="2026-08-04T12:00:04.000000Z",
+                    )
+                )
+                stored_association = (
+                    self.module.build_contact_row_binding_document(
+                        user_scope_hash=self.scope,
+                        canonical_mailbox_identity_hash=self.canonical_hash,
+                        row_id=self.first,
+                        created_at=self.association_at,
+                    )
+                )
+                _proposed_association, evidence, references = (
+                    self._association_references(
+                        store,
+                        binding,
+                        created_at="2026-08-04T12:00:05.000000Z",
+                    )
+                )
+                head = self.module.build_contact_row_binding_head_document(
+                    user_scope_hash=self.scope,
+                    canonical_mailbox_identity_hash=self.canonical_hash,
+                    state_revision=1,
+                    association_count=1,
+                    last_association_hash=stored_association[
+                        "contactRowEdgeHash"
+                    ],
+                    created_at=self.association_at,
+                    updated_at=self.association_at,
+                )
+                references["association"].create(stored_association)
+                if evidence_exists:
+                    references["evidence"].create(evidence)
+                references["binding_head"].create(head)
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._associate(
+                        store,
+                        created_at="2026-08-04T12:00:05.000000Z",
+                    )
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_same_evidence_id_timestamp_drift_is_conflict(self):
+        store = self._store()
+        self._seed_prerequisites(store)
+        created = self._associate(store)
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._associate(
+                store,
+                created_at="2026-08-04T12:00:03.000000Z",
+            )
+
+        self.assertEqual("created", created["disposition"])
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_contact_evidence_time_cannot_precede_thread_binding_or_association(self):
+        early_store = self._store()
+        self._seed_prerequisites(early_store)
+        before = deepcopy(early_store.data)
+        early_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._associate(
+                early_store,
+                created_at="2026-08-04T12:00:00.500000Z",
+            )
+        self.assertEqual(before, early_store.data)
+        self.assertEqual([], self._write_events(early_store))
+
+        stable_store = self._store()
+        self._seed_prerequisites(stable_store)
+        self._associate(stable_store)
+        stable_before = deepcopy(stable_store.data)
+        stable_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._associate(
+                stable_store,
+                exact_identity_hash="e" * 64,
+                created_at="2026-08-04T12:00:01.500000Z",
+            )
+        self.assertEqual(stable_before, stable_store.data)
+        self.assertEqual([], self._write_events(stable_store))
+
+        future_head_store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(future_head_store)
+        )
+        _association, _evidence, references = self._association_references(
+            future_head_store,
+            binding,
+        )
+        future_head = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            state_revision=3,
+            association_count=0,
+            last_association_hash=None,
+            created_at=self.binding_at,
+            updated_at="2026-08-04T12:00:03.000000Z",
+        )
+        references["binding_head"].create(future_head)
+        future_before = deepcopy(future_head_store.data)
+        future_head_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._associate(future_head_store)
+        self.assertEqual(future_before, future_head_store.data)
+        self.assertEqual([], self._write_events(future_head_store))
+
+        equal_store = self._store()
+        self._seed_prerequisites(equal_store)
+        equal = self._associate(equal_store, created_at=self.binding_at)
+        self.assertEqual("created", equal["disposition"])
+
+    def test_missing_head_edge_without_evidence_or_evidence_without_edge_is_ambiguous(self):
+        for mode in (
+            "edge_without_head",
+            "evidence_without_edge",
+            "edge_and_evidence_without_head",
+        ):
+            with self.subTest(mode=mode):
+                store = self._store()
+                _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+                    self._seed_prerequisites(store)
+                )
+                self._associate(store)
+                _association, _evidence, references = (
+                    self._association_references(store, binding)
+                )
+                if mode == "edge_without_head":
+                    references["evidence"].delete()
+                    references["binding_head"].delete()
+                elif mode == "evidence_without_edge":
+                    references["association"].delete()
+                else:
+                    references["binding_head"].delete()
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityAmbiguous):
+                    self._associate(store)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_head_pointing_to_missing_candidate_edge_is_ambiguous(self):
+        store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        association, _evidence, references = self._association_references(
+            store,
+            binding,
+        )
+        orphaned_head = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            state_revision=1,
+            association_count=1,
+            last_association_hash=association["contactRowEdgeHash"],
+            created_at=self.association_at,
+            updated_at=self.association_at,
+        )
+        references["binding_head"].create(orphaned_head)
+        before = deepcopy(store.data)
+        store.events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._associate(store)
+
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+
+    def test_malformed_drifted_or_noncorrelated_association_state_fails_closed(self):
+        for mode, error in (
+            ("malformed_edge", self.module.RowAuthorityConflict),
+            ("malformed_evidence", self.module.RowAuthorityConflict),
+            ("malformed_head", self.module.RowAuthorityAmbiguous),
+            ("empty_head_with_edge", self.module.RowAuthorityAmbiguous),
+            ("wrong_last_hash", self.module.RowAuthorityAmbiguous),
+            ("head_created_after_edge", self.module.RowAuthorityAmbiguous),
+            ("head_updated_before_edge", self.module.RowAuthorityAmbiguous),
+            ("wrong_head_scope", self.module.RowAuthorityAmbiguous),
+        ):
+            with self.subTest(mode=mode):
+                store = self._store()
+                _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+                    self._seed_prerequisites(store)
+                )
+                created = self._associate(store)
+                association, _evidence, references = (
+                    self._association_references(store, binding)
+                )
+                if mode == "malformed_edge":
+                    drift = deepcopy(store.data[references["association"].path])
+                    drift["contactRowEdgeHash"] = "f" * 64
+                    references["association"].set(drift, merge=False)
+                elif mode == "malformed_evidence":
+                    drift = deepcopy(store.data[references["evidence"].path])
+                    drift["contactRowEvidenceHash"] = "f" * 64
+                    references["evidence"].set(drift, merge=False)
+                elif mode == "malformed_head":
+                    drift = deepcopy(store.data[references["binding_head"].path])
+                    drift["contactRowBindingHeadHash"] = "f" * 64
+                    references["binding_head"].set(drift, merge=False)
+                else:
+                    values = {
+                        "user_scope_hash": self.scope,
+                        "canonical_mailbox_identity_hash": self.canonical_hash,
+                        "state_revision": 1,
+                        "association_count": 1,
+                        "last_association_hash": association[
+                            "contactRowEdgeHash"
+                        ],
+                        "created_at": created["bindingHead"]["createdAt"],
+                        "updated_at": created["bindingHead"]["updatedAt"],
+                    }
+                    if mode == "empty_head_with_edge":
+                        values.update(
+                            association_count=0,
+                            last_association_hash=None,
+                        )
+                    elif mode == "wrong_last_hash":
+                        values["last_association_hash"] = "f" * 64
+                    elif mode == "head_created_after_edge":
+                        values.update(
+                            created_at="2026-08-04T12:00:03.000000Z",
+                            updated_at="2026-08-04T12:00:03.000000Z",
+                        )
+                    elif mode == "head_updated_before_edge":
+                        values.update(
+                            created_at=self.binding_at,
+                            updated_at=self.binding_at,
+                        )
+                    else:
+                        values["user_scope_hash"] = "f" * 64
+                    drift = self.module.build_contact_row_binding_head_document(
+                        **values
+                    )
+                    references["binding_head"].set(drift, merge=False)
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(error):
+                    self._associate(store)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+
+    def test_planner_uses_association_time_for_reachable_advanced_head(self):
+        store = self._store()
+        rows, (binding, reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        association = self.module.build_contact_row_binding_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            row_id=self.first,
+            created_at=self.association_at,
+        )
+        evidence = self.module.build_contact_row_binding_evidence_document(
+            user_scope_hash=self.scope,
+            edge_id=association["edgeId"],
+            thread_id=self.thread_id,
+            thread_binding_hash=binding["bindingHash"],
+            exact_identity_hash=self.exact_hash,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+        prior_head = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=self.scope,
+            canonical_mailbox_identity_hash=self.canonical_hash,
+            state_revision=4,
+            association_count=1,
+            last_association_hash="f" * 64,
+            created_at=self.binding_at,
+            updated_at=self.binding_at,
+        )
+        planner_inputs = {
+            "thread_binding_document": binding,
+            "reverse_binding_document": reverse[0],
+            "row_identity_document": rows[self.first][0],
+            "row_head_document": rows[self.first][1],
+            "proposed_association_document": association,
+            "proposed_evidence_document": evidence,
+            "stored_association_document": None,
+            "stored_evidence_document": None,
+            "contact_binding_head_document": prior_head,
+        }
+
+        created = self.module._plan_contact_row_association(**planner_inputs)
+
+        self.assertEqual("created", created["disposition"])
+        self.assertEqual(
+            association["createdAt"],
+            created["bindingHead"]["updatedAt"],
+        )
+        replay = self.module._plan_contact_row_association(
+            **{
+                **planner_inputs,
+                "stored_association_document": association,
+                "stored_evidence_document": evidence,
+                "contact_binding_head_document": created["bindingHead"],
+            }
+        )
+        self.assertEqual("already_applied", replay["disposition"])
+
+    def test_private_association_planner_never_opens_or_commits_a_transaction(self):
+        self.assertTrue(
+            hasattr(self.module, "_plan_contact_row_association"),
+            "private contact association planner is missing",
+        )
+        store = self._store()
+        rows, (binding, reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        association, evidence = self._association_documents(binding)
+        planner = self.module._plan_contact_row_association
+        signature_names = set(inspect.signature(planner).parameters)
+        for forbidden_name in (
+            "store",
+            "firestore",
+            "transaction",
+            "executor",
+            "sentinel",
+        ):
+            self.assertNotIn(forbidden_name, signature_names)
+        source = inspect.getsource(planner)
+        for forbidden_text in (
+            "_firestore",
+            ".transaction(",
+            ".commit(",
+            "contactOptOutHeads",
+        ):
+            self.assertNotIn(forbidden_text, source)
+        store.events.clear()
+
+        with patch.object(
+            type(store),
+            "transaction",
+            side_effect=AssertionError("planner opened a transaction"),
+        ):
+            plan = planner(
+                thread_binding_document=binding,
+                reverse_binding_document=reverse[0],
+                row_identity_document=rows[self.first][0],
+                row_head_document=rows[self.first][1],
+                proposed_association_document=association,
+                proposed_evidence_document=evidence,
+                stored_association_document=None,
+                stored_evidence_document=None,
+                contact_binding_head_document=None,
+            )
+
+        self.assertEqual("created", plan["disposition"])
+        self.assertEqual(3, len(plan["mutations"]))
+        self.assertEqual([], store.events)
+
+    def test_association_and_planner_results_are_defensive(self):
+        store = self._store()
+        rows, (binding, reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(store)
+        )
+        association, evidence = self._association_documents(binding)
+        planner_inputs = {
+            "thread_binding_document": binding,
+            "reverse_binding_document": reverse[0],
+            "row_identity_document": rows[self.first][0],
+            "row_head_document": rows[self.first][1],
+            "proposed_association_document": association,
+            "proposed_evidence_document": evidence,
+            "stored_association_document": None,
+            "stored_evidence_document": None,
+            "contact_binding_head_document": None,
+        }
+        original_inputs = deepcopy(planner_inputs)
+        plan = self.module._plan_contact_row_association(**planner_inputs)
+        plan["association"]["rowId"] = self.second
+        plan["evidence"]["threadId"] = "mutated"
+        plan["bindingHead"]["associationCount"] = 999
+        plan["mutations"][0]["document"]["rowId"] = self.second
+        self.assertEqual(original_inputs, planner_inputs)
+
+        created = self._associate(store)
+        stored = deepcopy(store.data)
+        created["association"]["rowId"] = self.second
+        created["evidence"]["threadId"] = "mutated"
+        created["bindingHead"]["associationCount"] = 999
+        self.assertEqual(stored, store.data)
+        replay = self._associate(store)
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(1, replay["bindingHead"]["associationCount"])
+
+    def test_association_preapply_failure_is_retryable(self):
+        store = self._store()
+        self._seed_prerequisites(store)
+        before = deepcopy(store.data)
+        store.events.clear()
+        store.fail_next_commit = RuntimeError("preapply failure")
+
+        with self.assertRaises(self.module.RowAuthorityRetryable) as caught:
+            self._associate(store)
+
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        self.assertEqual(before, store.data)
+        self.assertEqual([], self._write_events(store))
+        self.assertIn(("commit_failed_before_apply",), store.events)
+
+    def test_association_transactional_first_or_mid_read_failure_is_retryable_without_readback(self):
+        fake_module = importlib.import_module("tests.source_coordinator_fakes")
+        original_get = fake_module.FakeDocumentReference.get
+        for fail_at in (1, 5):
+            with self.subTest(fail_at=fail_at):
+                store = self._store()
+                self._seed_prerequisites(store)
+                before = deepcopy(store.data)
+                store.events.clear()
+                counts = {"transactional": 0, "nontransactional": 0}
+
+                def fail_selected_read(reference, *, transaction=None):
+                    if transaction is None:
+                        counts["nontransactional"] += 1
+                    else:
+                        counts["transactional"] += 1
+                        if counts["transactional"] == fail_at:
+                            raise RuntimeError(
+                                f"transaction read {fail_at} failed"
+                            )
+                    return original_get(reference, transaction=transaction)
+
+                with patch.object(
+                    fake_module.FakeDocumentReference,
+                    "get",
+                    new=fail_selected_read,
+                ), self.assertRaises(
+                    self.module.RowAuthorityRetryable
+                ) as caught:
+                    self._associate(store)
+
+                self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+                self.assertEqual(fail_at, counts["transactional"])
+                self.assertEqual(0, counts["nontransactional"])
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._write_events(store))
+                self.assertIn(("transaction_rolled_back",), store.events)
+
+    def test_association_apply_then_raise_accepts_only_exact_disposition_after_image(self):
+        cases = (
+            ("created", None, None, "created"),
+            (
+                "evidence_created",
+                "e" * 64,
+                "2026-08-04T12:00:03.000000Z",
+                "evidence_created",
+            ),
+            ("already_applied", self.exact_hash, self.association_at, "already_applied"),
+        )
+        for mode, exact_hash, event_time, expected in cases:
+            with self.subTest(mode=mode):
+                store = self._store()
+                self._seed_prerequisites(store)
+                if mode != "created":
+                    self._associate(store)
+                store.events.clear()
+                store.apply_then_raise_next_commit = RuntimeError(
+                    f"{mode} raised after apply"
+                )
+                overrides = {}
+                if exact_hash is not None:
+                    overrides["exact_identity_hash"] = exact_hash
+                if event_time is not None:
+                    overrides["created_at"] = event_time
+
+                result = self._associate(store, **overrides)
+
+                self.assertEqual(expected, result["disposition"])
+                self.assertIn(("commit_raised_after_apply",), store.events)
+
+        strict_store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(strict_store)
+        )
+        self._associate(strict_store)
+        _association, _evidence, references = self._association_references(
+            strict_store,
+            binding,
+            exact_identity_hash="e" * 64,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+
+        def apply_then_advance_head(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            transaction._commit()
+            advanced = self.module.build_contact_row_binding_head_document(
+                user_scope_hash=self.scope,
+                canonical_mailbox_identity_hash=self.canonical_hash,
+                state_revision=2,
+                association_count=2,
+                last_association_hash="f" * 64,
+                created_at=self.association_at,
+                updated_at="2026-08-04T12:00:04.000000Z",
+            )
+            references["binding_head"].set(advanced, merge=False)
+            raise RuntimeError("head advanced after association apply")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._associate(
+                strict_store,
+                executor=apply_then_advance_head,
+                exact_identity_hash="e" * 64,
+                created_at="2026-08-04T12:00:03.000000Z",
+            )
+
+    def test_association_partial_readback_is_ambiguous(self):
+        def partially_apply_first_mutation(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            operation, reference, payload, merge = transaction._operations[0]
+            transaction._rollback()
+            self.assertEqual(("create", False), (operation, merge))
+            reference.create(payload)
+            raise RuntimeError("only the first mutation applied")
+
+        partial_store = self._store()
+        self._seed_prerequisites(partial_store)
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._associate(
+                partial_store,
+                executor=partially_apply_first_mutation,
+            )
+
+        malformed_store = self._store()
+        _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
+            self._seed_prerequisites(malformed_store)
+        )
+        _association, _evidence, references = self._association_references(
+            malformed_store,
+            binding,
+        )
+
+        def apply_then_malform_evidence(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            transaction._commit()
+            malformed = deepcopy(malformed_store.data[references["evidence"].path])
+            malformed["contactRowEvidenceHash"] = "f" * 64
+            malformed_store.data[references["evidence"].path] = malformed
+            raise RuntimeError("after-image evidence drifted")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._associate(
+                malformed_store,
+                executor=apply_then_malform_evidence,
+            )
+
+        unreadable_store = self._store()
+        self._seed_prerequisites(unreadable_store)
+        fake_module = importlib.import_module("tests.source_coordinator_fakes")
+        original_get = fake_module.FakeDocumentReference.get
+
+        def fail_nontransaction_readback(reference, *, transaction=None):
+            if transaction is None:
+                raise RuntimeError("readback unavailable")
+            return original_get(reference, transaction=transaction)
+
+        unreadable_store.apply_then_raise_next_commit = RuntimeError(
+            "applied then raised"
+        )
+        with patch.object(
+            fake_module.FakeDocumentReference,
+            "get",
+            new=fail_nontransaction_readback,
+        ), self.assertRaises(self.module.RowAuthorityAmbiguous) as caught:
+            self._associate(unreadable_store)
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
 
 
 if __name__ == "__main__":
