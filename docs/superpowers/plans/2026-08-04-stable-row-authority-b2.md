@@ -212,6 +212,8 @@ select a run for a different SHA.
   child plan is published.
 - [x] B1 contact-identity binding amendment code/evidence is green and
   published.
+- [x] B2-C child plan and contract amendment are independently approved and
+  published.
 - [ ] B2-C is green and published.
 - [ ] B2-D code/evidence is green and published.
 - [ ] B3-B4 production clearance gates are complete.

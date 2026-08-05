@@ -454,6 +454,12 @@ record avoids circular settlement hashes.
 
 ## Contact-wide hard opt-out
 
+The normative clarification for this section is
+`docs/superpowers/specs/2026-08-04-stable-row-authority-b2-c-contact-compliance-amendment.md`.
+It governs transition receipts, retry semantics, historical row allocation,
+fan-out completion, late associations, and authenticated release wherever it
+is more specific than this base design.
+
 Normalize by Unicode-NFC normalizing the input, trimming surrounding Unicode
 whitespace, applying Python `str.lower()`, and requiring exactly one nonempty
 local part, one `@`, and one nonempty domain. Reject controls and normalized

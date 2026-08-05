@@ -183,6 +183,19 @@ replace them. The contact settlement's `exactIdentityHash`, canonical document
 path, `authorityLinkHash`, and `hardOptOutEvidenceHash` must equal the amended
 link. Any missing legacy field or mismatch is a zero-write conflict.
 
+The normative B2-C contact-compliance amendment adds one exact already-active
+case. When a different valid v2 B1 opt-out arrives while that canonical contact
+is already active, B2-C appends no contact settlement or row epoch. Instead its
+immutable `already_active` transition receipt must copy this new link's exact
+and canonical identity hashes, authority-link hash, and hard-opt-out evidence
+hash; atomically validate the existing active settlement, its own creating
+receipt, contact head, aliases, and current apply fan-out; and point to that
+existing contact generation/settlement/fan-out. That receipt is first-class B2
+completion evidence for the later B1 source. It never authorizes a row
+source-settlement link for the later B1 link because that link did not create a
+row generation. All other verified opt-out transitions retain the contact
+settlement equality rule above.
+
 Authenticated release continues to derive authority from the exact active
 contact settlement/head and authenticated actor scope. It cannot introduce a
 new mailbox binding.
