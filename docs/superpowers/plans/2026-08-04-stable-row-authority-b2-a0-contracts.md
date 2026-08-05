@@ -1296,7 +1296,7 @@ git commit -m "feat: add contact identity primitives"
 - Modify: `docs/superpowers/plans/2026-08-04-stable-row-authority-b2-a0-contracts.md`
 - Create: `docs/superpowers/evidence/2026-08-04-stable-row-authority-b2-a0.md`
 
-- [ ] **Step 1: Run the complete local B2-A0 gate with provider egress unavailable**
+- [x] **Step 1: Run the complete local B2-A0 gate with provider egress unavailable**
 
 ```bash
 B2_A0_PY=../codex-release-a-medium-recovery-20260714/.venv/bin/python
@@ -1377,7 +1377,7 @@ requirements, YAML prints `ok`, and the diff check has no output. Record exact
 counts and durations from the actual run rather than copying these expected
 baselines.
 
-- [ ] **Step 2: Obtain independent spec-compliance and code-quality approvals**
+- [x] **Step 2: Obtain independent spec-compliance and code-quality approvals**
 
 Dispatch a fresh read-only reviewer against the B2 design plus the B2-A0 diff.
 Dispatch a different fresh read-only reviewer for correctness, standard-library
@@ -1387,7 +1387,7 @@ rerun the focused and retained gates, commit, and request re-review.
 
 Expected: both reviewers return `APPROVED`.
 
-- [ ] **Step 3: Create the exact evidence document and mark plans**
+- [x] **Step 3: Create the exact evidence document and mark plans**
 
 Create the evidence document with exactly these headings:
 
@@ -1413,7 +1413,7 @@ production posture
 must state: `B2-A0 adds provider-free primitives only; production remains
 NO-GO.`
 
-- [ ] **Step 4: Commit the pre-publication evidence state**
+- [x] **Step 4: Commit the pre-publication evidence state**
 
 ```bash
 git add docs/superpowers/plans/2026-08-04-stable-row-authority-b2.md \
