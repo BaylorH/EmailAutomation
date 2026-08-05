@@ -310,6 +310,15 @@ must match the receipt. Tests exercise retry
 after discovery progress, completion, release, later re-opt-out, and an
 immediate competing fan-out mutation after the transition commit.
 
+The immutable transition receipt is the storage trust root for
+`resultingFanoutHeadHash`. After a fan-out legitimately advances its binding
+snapshot, the mutable head no longer retains enough predecessor material to
+reconstruct that original hash locally. B2-C therefore proves that every
+application mutation uses create-only receipt semantics; B4 must additionally
+prove that deployed API, frontend, rules, and privileged runtime paths cannot
+update or delete a receipt. Production deployment and Jill's return remain
+NO-GO until that create-only storage boundary has executable evidence.
+
 The reachable new-request matrix is exact:
 
 | Prior contact | New request | Result |

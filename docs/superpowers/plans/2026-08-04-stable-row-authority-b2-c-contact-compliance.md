@@ -127,6 +127,11 @@ return remain NO-GO.
 18. B2-C remains runtime-unwired. Finishing it advances only to B2-D; B3/B4
     still own provider effects, real adapters, frontend/rules, deployment, and
     authorized production proof.
+19. The immutable transition receipt is the storage trust root for its frozen
+    fan-out hash after mutable binding-snapshot progress. B2-C must prove that
+    every application path uses create-only receipt writes. B4 must prove that
+    deployed API, frontend, rules, and privileged runtime paths cannot update
+    or delete receipts before production or Jill clearance.
 
 ## Provider-free API delta
 
@@ -480,7 +485,7 @@ workflow `headSha`. Record the commit/run/job in the implementation log.
 - Modify: `tests/test_row_authority_contact_compliance.py`
 - Modify: `tests/test_row_authority_contracts.py`
 
-- [ ] **Step 1: Write failing alias and suppression-read tests**
+- [x] **Step 1: Write failing alias and suppression-read tests**
 
 Cover the complete alias table, unseen plus variants, active/released/absent
 heads, exact latest settlement and creating-receipt validation, alias/head RPC
@@ -498,13 +503,13 @@ ContactSuppressionTests.test_missing_or_mismatched_creating_receipt_cannot_allow
 ContactSuppressionTests.test_suppression_is_zero_write_and_persists_no_raw_identity
 ```
 
-- [ ] **Step 2: Implement pure suppression classification and zero-write API**
+- [x] **Step 2: Implement pure suppression classification and zero-write API**
 
 Compute hashes internally from verified user/raw mailbox, validate exact and
 self aliases, head, and latest settlement, and return the amendment's four
 semantic outcomes. Any fake read exception must never produce `allow`.
 
-- [ ] **Step 3: Write failing first-opt-out transaction tests**
+- [x] **Step 3: Write failing first-opt-out transaction tests**
 
 Build real stored B1 v2 bundles. Prove the caller cannot provide contact hashes
 or a link. Cover aliases equal/distinct, first generation, released-to-active,
@@ -525,7 +530,7 @@ ContactTransitionTests.test_v1_or_caller_supplied_contact_authority_cannot_write
 ContactTransitionTests.test_transition_write_count_matches_exact_after_image
 ```
 
-- [ ] **Step 4: Implement the verified-opt-out planner/store method**
+- [x] **Step 4: Implement the verified-opt-out planner/store method**
 
 Compose B1 bundle validation, alias planner, deterministic request, contact
 settlement/head, and initial unleased apply fan-out at fence 1 in one
@@ -534,7 +539,7 @@ hashes internally. The receipt freezes the exact resulting contact/fan-out head
 hashes. Receipt-first retry validates immutable artifacts exactly and mutable
 heads only as allowed forward successors; it never allocates again.
 
-- [ ] **Step 5: Write failing active-to-active receipt tests**
+- [x] **Step 5: Write failing active-to-active receipt tests**
 
 Cover exact same request retry; distinct v2 proof for same exact identity;
 distinct plus alias for same canonical identity; allowed current fan-out states;
@@ -552,14 +557,14 @@ ContactTransitionTests.test_active_to_active_requires_exact_current_fanout
 ContactTransitionTests.test_active_to_active_validates_active_settlements_creating_receipt
 ```
 
-- [ ] **Step 6: Implement already-active receipt behavior**
+- [x] **Step 6: Implement already-active receipt behavior**
 
 Read and CAS-protect the active head/current fan-out even when only immutable
 documents are created. Allow `discovering|applying|complete`; reject every
 other state. Validate the active settlement's own `created` receipt. Return the
 exact later receipt as B2 completion evidence.
 
-- [ ] **Step 7: Write failing authenticated-release transaction tests**
+- [x] **Step 7: Write failing authenticated-release transaction tests**
 
 Cover actor/client request/expected settlement binding, exact aliases,
 generation append, released head/new fan-out, prior fan-out superseding,
@@ -581,7 +586,7 @@ ContactReleaseTransitionTests.test_transition_retry_accepts_valid_fanout_progres
 ContactReleaseTransitionTests.test_first_winner_time_is_retained_on_same_id_retry
 ```
 
-- [ ] **Step 8: Implement authenticated release and transition superseding CAS**
+- [x] **Step 8: Implement authenticated release and transition superseding CAS**
 
 Derive identity from the active settlement, not caller mailbox material. Create
 the release receipt/settlement/head/fan-out and prior-fan-out transition in one
@@ -592,7 +597,7 @@ settlement first with the amendment's canonical+settlement-hash `limit(2)`
 query, so its exact identity and receipt path remain derivable after later
 epochs. Do not restore rows here.
 
-- [ ] **Step 9: Verify, review, commit, and publish `B2-C transitions`**
+- [x] **Step 9: Verify, review, commit, and publish `B2-C transitions`**
 
 Run all Task 3 classes, complete B2 tests, B1 tests, provider blackhole, compile,
 and diff checks. Obtain an independent review, correct findings, commit:
@@ -1024,6 +1029,24 @@ or merge `main`, deploy, launch a campaign, or contact a user under this plan.
   SHA were `a0dbc970aa5df063988faa0aa50b89f168abf6d4`;
   [run 31031535151](https://github.com/BaylorH/EmailAutomation/actions/runs/31031535151),
   [job 92393190332](https://github.com/BaylorH/EmailAutomation/actions/runs/31031535151/job/92393190332)
+  completed successfully. This milestone remains provider-free and
+  runtime-unwired; it did not deploy or contact a user.
+- Task 3 RED/GREEN covered suppression, verified opt-out, already-active
+  receipts, authenticated release, historical retries, alias chronology,
+  receipt/head reconstruction, binding monotonicity, and fan-out successor
+  reachability. The final focused transition gate passed 66 tests and automatic
+  B2 discovery passed 461 tests. Adversarial review first found retry-integrity
+  gaps; every finding received a focused RED regression and production
+  correction. The exact revised diff then received a clean independent review.
+- The final Task 3 candidate passed 95 release/identity tests, 617 complete B1
+  tests, 461 complete B2 tests, and 669 retained M2 tests under provider and
+  Firestore blackholes (1,842 total). Compilation, dependency, and diff checks
+  were clean. The staged code/test diff SHA-256 was
+  `95c5dfc198bad0c502527705e9714d0803bec5a3063439f467fd476eb82a5722`.
+- Task 3 code publication: local HEAD, owned remote branch, and workflow head
+  SHA were `9531206e660779ead93ad47867b1519f447e7f58`;
+  [run 31042024656](https://github.com/BaylorH/EmailAutomation/actions/runs/31042024656),
+  [job 92428426959](https://github.com/BaylorH/EmailAutomation/actions/runs/31042024656/job/92428426959)
   completed successfully. This milestone remains provider-free and
   runtime-unwired; it did not deploy or contact a user.
 - Plan reviews, publication SHA/run, selected RED outputs, code milestone
