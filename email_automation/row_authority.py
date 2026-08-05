@@ -685,6 +685,37 @@ _B1_LINK_KEYS = frozenset(
         "authorityLinkHash",
     }
 )
+_B1_SOURCE_SETTLEMENT_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "canonicalSourceId",
+        "identityHash",
+        "snapshotImmutableHash",
+        "selectionHash",
+        "ownerDecisionHash",
+        "ledgerHash",
+        "finalLedgerEvidenceHash",
+        "threadHeadBinding",
+        "aliases",
+        "aliasSetHash",
+        "settlementRevision",
+        "settlementHash",
+        "settledAt",
+    }
+)
+_B1_SOURCE_SETTLEMENT_ALIAS_KEYS = frozenset(
+    {"sourceAliasKey", "aliasType", "normalizedValueHash"}
+)
+_B1_THREAD_BLOCKER_KEYS = frozenset(
+    {
+        "canonicalSourceId",
+        "ownerKind",
+        "ownerKey",
+        "generation",
+        "threadHeadRevision",
+        "headHash",
+    }
+)
 _B1_MAX_SOURCE_ALIASES = 8
 _B1_MAX_SOURCE_ENTRIES = 128
 _B1_MAX_CLASSIFICATION_BYTES = 614400
@@ -1359,6 +1390,239 @@ def _validate_b1_ledger(document, *, canonical_source_id, classification, owner)
     }
     if len(_b1_canonical_json_bytes(material)) > _B1_MAX_LEDGER_BYTES:
         raise RowAuthorityConfigError("B1 source work ledger exceeds its byte bound")
+    return _defensive_copy(checked)
+
+
+def _b1_source_settlement_identity_hash(identity):
+    return _b1_canonical_hash(
+        {
+            "hashKind": "source-settlement-identity-v1",
+            "schemaVersion": identity["schemaVersion"],
+            "canonicalSourceId": identity["canonicalSourceId"],
+            "creationHash": identity["creationHash"],
+            "threadId": identity["threadId"],
+        }
+    )
+
+
+def _b1_final_ledger_evidence_hash(ledger):
+    if any(
+        entry["state"] not in {"completed", "delegated", "dominated"}
+        for entry in ledger["entries"]
+    ):
+        raise RowAuthorityConfigError(
+            "B1 source settlement retains unfinished ledger work"
+        )
+    ordered_evidence = [
+        {
+            "workKey": entry["workKey"],
+            "payloadHash": entry["payloadHash"],
+            "state": entry["state"],
+            "resolutionEvidenceHash": entry["resolutionEvidenceHash"],
+        }
+        for entry in ledger["entries"]
+    ]
+    return _b1_canonical_hash(
+        {
+            "hashKind": "source-final-ledger-evidence-v1",
+            "ledgerHash": ledger["ledgerHash"],
+            "entries": ordered_evidence,
+        }
+    )
+
+
+def _b1_source_settlement_hash_material(document):
+    return {
+        "hashKind": "source-settlement-v1",
+        **{
+            field: _defensive_copy(document[field])
+            for field in (
+                "schemaVersion",
+                "canonicalSourceId",
+                "identityHash",
+                "snapshotImmutableHash",
+                "selectionHash",
+                "ownerDecisionHash",
+                "ledgerHash",
+                "finalLedgerEvidenceHash",
+                "threadHeadBinding",
+                "aliases",
+                "aliasSetHash",
+                "settlementRevision",
+            )
+        },
+    }
+
+
+def _validate_b1_source_settlement(
+    document,
+    *,
+    canonical_source_id,
+    identity,
+    classification,
+    owner,
+    ledger,
+):
+    checked = _require_exact_dict(
+        document,
+        keys=_B1_SOURCE_SETTLEMENT_KEYS,
+        field_name="B1 source settlement",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != 1
+        or checked["canonicalSourceId"] != canonical_source_id
+        or type(checked["settlementRevision"]) is not int
+        or checked["settlementRevision"] != 1
+        or not _is_aware_datetime(checked["settledAt"])
+    ):
+        raise RowAuthorityConfigError("B1 source settlement is malformed")
+    for field in (
+        "identityHash",
+        "snapshotImmutableHash",
+        "selectionHash",
+        "ownerDecisionHash",
+        "ledgerHash",
+        "finalLedgerEvidenceHash",
+        "aliasSetHash",
+        "settlementHash",
+    ):
+        _require_sha256(checked[field], field_name=f"B1 {field}")
+
+    aliases = checked["aliases"]
+    if type(aliases) is not list or not aliases:
+        raise RowAuthorityConfigError(
+            "B1 source settlement alias set is malformed"
+        )
+    validated_aliases = []
+    seen_aliases = set()
+    for descriptor in aliases:
+        item = _require_exact_dict(
+            descriptor,
+            keys=_B1_SOURCE_SETTLEMENT_ALIAS_KEYS,
+            field_name="B1 source settlement alias",
+        )
+        alias_key = _require_sha256(
+            item["sourceAliasKey"],
+            field_name="B1 source settlement alias key",
+        )
+        if alias_key in seen_aliases:
+            raise RowAuthorityConfigError(
+                "B1 source settlement aliases are duplicated"
+            )
+        seen_aliases.add(alias_key)
+        if (
+            type(item["aliasType"]) is not str
+            or item["aliasType"] not in _B1_SOURCE_ALIAS_TYPES
+        ):
+            raise RowAuthorityConfigError(
+                "B1 source settlement alias type is unsupported"
+            )
+        _require_sha256(
+            item["normalizedValueHash"],
+            field_name="B1 source settlement normalized alias hash",
+        )
+        validated_aliases.append(_defensive_copy(item))
+    if validated_aliases != sorted(
+        validated_aliases,
+        key=lambda item: item["sourceAliasKey"],
+    ):
+        raise RowAuthorityConfigError(
+            "B1 source settlement aliases are unordered"
+        )
+    current_aliases = {
+        descriptor["sourceAliasKey"]: descriptor
+        for descriptor in identity["verifiedAliases"]
+    }
+    if any(
+        current_aliases.get(descriptor["sourceAliasKey"]) != descriptor
+        for descriptor in validated_aliases
+    ):
+        raise RowAuthorityConfigError(
+            "B1 source settlement aliases conflict with source identity"
+        )
+
+    blocker = checked["threadHeadBinding"]
+    if owner["ownerKind"] == "none":
+        if blocker is not None:
+            raise RowAuthorityConfigError(
+                "B1 none-owner settlement retains a thread binding"
+            )
+    else:
+        blocker = _require_exact_dict(
+            blocker,
+            keys=_B1_THREAD_BLOCKER_KEYS,
+            field_name="B1 source settlement thread binding",
+        )
+        if (
+            blocker["canonicalSourceId"] != canonical_source_id
+            or blocker["ownerKind"] != owner["ownerKind"]
+            or blocker["ownerKey"] != owner["ownerKey"]
+            or type(blocker["generation"]) is not int
+            or blocker["generation"] < 1
+            or type(blocker["threadHeadRevision"]) is not int
+            or blocker["threadHeadRevision"]
+            != (2 * blocker["generation"]) - 1
+        ):
+            raise RowAuthorityConfigError(
+                "B1 source settlement thread binding conflicts"
+            )
+        _require_sha256(
+            blocker["ownerKey"],
+            field_name="B1 source settlement thread owner key",
+        )
+        _require_sha256(
+            blocker["headHash"],
+            field_name="B1 source settlement thread head hash",
+        )
+        expected_head_hash = _b1_canonical_hash(
+            {
+                "hashKind": "thread-transition-head-v1",
+                "schemaVersion": 1,
+                "threadId": identity["threadId"],
+                "threadHeadRevision": blocker["threadHeadRevision"],
+                "activeOwnerKey": blocker["ownerKey"],
+                "activeOwnerKind": blocker["ownerKind"],
+                "activeCanonicalSourceId": blocker[
+                    "canonicalSourceId"
+                ],
+                "activeGeneration": blocker["generation"],
+                "activeState": "active",
+            }
+        )
+        if blocker["headHash"] != expected_head_hash:
+            raise RowAuthorityConfigError(
+                "B1 source settlement thread head hash conflicts"
+            )
+
+    final_ledger_evidence_hash = _b1_final_ledger_evidence_hash(ledger)
+    expected_bindings = {
+        "identityHash": _b1_source_settlement_identity_hash(identity),
+        "snapshotImmutableHash": classification["snapshotImmutableHash"],
+        "selectionHash": classification["selectionHash"],
+        "ownerDecisionHash": owner["ownerDecisionHash"],
+        "ledgerHash": ledger["ledgerHash"],
+        "finalLedgerEvidenceHash": final_ledger_evidence_hash,
+        "aliasSetHash": _b1_canonical_hash(
+            {
+                "hashKind": "source-settlement-alias-set-v1",
+                "aliases": validated_aliases,
+            }
+        ),
+    }
+    if any(
+        checked[field] != value
+        for field, value in expected_bindings.items()
+    ):
+        raise RowAuthorityConfigError(
+            "B1 source settlement conflicts with retained authority"
+        )
+    if checked["settlementHash"] != _b1_canonical_hash(
+        _b1_source_settlement_hash_material(checked)
+    ):
+        raise RowAuthorityConfigError(
+            "B1 source settlement hash does not recompute"
+        )
     return _defensive_copy(checked)
 
 
@@ -4818,6 +5082,60 @@ def _build_source_link_advanced_head(
     return validate_row_authority_head(document=_with_head_hash(result))
 
 
+def _source_link_head_reflects_b2_settlement(
+    *, head_document, generation_document, settlement_document
+):
+    head = validate_row_authority_head(document=head_document)
+    generation = validate_owner_generation_document(
+        document=generation_document
+    )
+    settlement = validate_owner_settlement_document(
+        document=settlement_document
+    )
+    if (
+        head["userScopeHash"] != generation["userScopeHash"]
+        or settlement["userScopeHash"] != generation["userScopeHash"]
+        or head["rowId"] != generation["rowId"]
+        or settlement["rowId"] != generation["rowId"]
+        or settlement["generation"] != generation["generation"]
+        or settlement["generationHash"] != generation["generationHash"]
+        or head["updatedAt"] < settlement["settledAt"]
+    ):
+        return False
+    current_generation = head["effectiveOwnerGeneration"]
+    same_generation = (
+        current_generation == generation["generation"]
+        and head["effectiveOwnerGenerationHash"]
+        == generation["generationHash"]
+        and head["effectiveOwnerKind"] == generation["ownerKind"]
+        and head["effectivePriority"] == generation["priority"]
+        and head["state"] == "settled"
+        and head["fencingToken"] == settlement["fencingToken"]
+        and (
+            head["latestSettlementHash"] == settlement["settlementHash"]
+            or head["latestOptOutReleaseResultHash"] is not None
+        )
+        and head["effectiveSettlementHash"]
+        == settlement["settlementHash"]
+    )
+    higher_generation = (
+        current_generation is not None
+        and current_generation > generation["generation"]
+        and head["effectivePriority"] > generation["priority"]
+        and head["fencingToken"] > settlement["fencingToken"]
+        and head["latestSettlementHash"] is not None
+    )
+    release_restored = (
+        head["latestOptOutReleaseResultHash"] is not None
+        and head["latestSettlementHash"] is not None
+        and (
+            current_generation is None
+            or current_generation < generation["generation"]
+        )
+    )
+    return same_generation or higher_generation or release_restored
+
+
 def _timestamp_as_datetime(value, *, field_name):
     checked = _require_timestamp(value, field_name=field_name)
     return datetime.strptime(
@@ -6933,6 +7251,51 @@ def _owner_settlement_result(
     }
 
 
+def _source_settlement_link_result(
+    *,
+    disposition,
+    source_settlement_link,
+    head,
+    later_link_proven=False,
+):
+    if disposition not in {"linked", "already_applied"}:
+        raise RowAuthorityConfigError(
+            "source settlement link disposition is not approved"
+        )
+    link = validate_source_settlement_link_document(
+        document=source_settlement_link
+    )
+    checked_head = validate_row_authority_head(document=head)
+    pointer_matches = (
+        checked_head["latestSourceSettlementLinkHash"]
+        == link["sourceSettlementLinkHash"]
+    )
+    if (
+        type(later_link_proven) is not bool
+        or checked_head["userScopeHash"] != link["userScopeHash"]
+        or checked_head["rowId"] != link["rowId"]
+        or checked_head["latestSourceSettlementLinkHash"] is None
+        or checked_head["updatedAt"] < link["linkedAt"]
+        or (
+            disposition == "linked"
+            and not pointer_matches
+        )
+        or (
+            disposition == "already_applied"
+            and not pointer_matches
+            and later_link_proven is not True
+        )
+    ):
+        raise RowAuthorityConfigError(
+            "source settlement link result does not correlate"
+        )
+    return {
+        "disposition": disposition,
+        "sourceSettlementLink": link,
+        "head": checked_head,
+    }
+
+
 def _location_semantics(revision):
     return tuple(
         revision[field]
@@ -8900,6 +9263,785 @@ class RowAuthorityStore:
             settlement=plan["settlement"],
             head=plan["head"],
             higher_generation_proven=plan["higherGenerationProven"],
+        )
+
+    def link_b1_source_settlement(
+        self,
+        *,
+        verified_user_id,
+        row_id,
+        generation,
+        linked_at,
+    ):
+        _require_row_authority_planned_writes(2)
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        checked_row_id = validate_row_id(row_id)
+        checked_generation_number = _require_pos(
+            generation,
+            field_name="generation",
+        )
+        checked_linked_at = _require_timestamp(
+            linked_at,
+            field_name="linked_at",
+        )
+        linked_datetime = _timestamp_as_datetime(
+            checked_linked_at,
+            field_name="linked_at",
+        )
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            generation_id = _generation_document_id(
+                row_id=checked_row_id,
+                generation=checked_generation_number,
+            )
+            row_identity_ref = user_ref.collection("rowIdentities").document(
+                checked_row_id
+            )
+            head_ref = user_ref.collection("rowAuthorityHeads").document(
+                checked_row_id
+            )
+            generation_ref = user_ref.collection(
+                "rowOwnerGenerations"
+            ).document(generation_id)
+            b2_settlement_ref = user_ref.collection(
+                "rowOwnerSettlements"
+            ).document(generation_id)
+            source_links_ref = user_ref.collection(
+                "rowSourceSettlementLinks"
+            )
+            source_link_ref = source_links_ref.document(generation_id)
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "source settlement link cannot form exact document paths"
+            ) from exc
+
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "rejected": False,
+            "read_failed": False,
+            "disposition": None,
+            "plan": None,
+            "references": {},
+            "before": {},
+            "ordered_paths": [],
+            "mutation_references": {},
+            "query_readback": None,
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "disposition": None,
+                    "plan": None,
+                    "references": {},
+                    "before": {},
+                    "ordered_paths": [],
+                    "mutation_references": {},
+                    "query_readback": None,
+                }
+            )
+
+            def remember(reference, observed):
+                path = reference.path
+                if path not in callback_state["before"]:
+                    callback_state["references"][path] = reference
+                    callback_state["before"][path] = observed
+                    callback_state["ordered_paths"].append(path)
+                return callback_state["before"][path]
+
+            def read(reference):
+                path = reference.path
+                if path in callback_state["before"]:
+                    return callback_state["before"][path]
+                try:
+                    snapshot = reference.get(transaction=transaction)
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "source link transaction read failed before writes"
+                    ) from exc
+                return remember(
+                    reference,
+                    (
+                        bool(snapshot.exists),
+                        snapshot.to_dict() if snapshot.exists else None,
+                    ),
+                )
+
+            row_identity_observed = read(row_identity_ref)
+            head_observed = read(head_ref)
+            generation_observed = read(generation_ref)
+            if not all(
+                observed[0]
+                for observed in (
+                    row_identity_observed,
+                    head_observed,
+                    generation_observed,
+                )
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link is missing row identity, head, or generation"
+                    )
+                )
+            try:
+                preliminary_generation = validate_owner_generation_document(
+                    document=generation_observed[1]
+                )
+                if (
+                    preliminary_generation["userScopeHash"]
+                    != checked_scope
+                    or preliminary_generation["rowId"] != checked_row_id
+                    or preliminary_generation["generation"]
+                    != checked_generation_number
+                ):
+                    raise RowAuthorityConfigError(
+                        "source link generation occupies the wrong path"
+                    )
+                claim_ref = user_ref.collection("rowClaimSets").document(
+                    preliminary_generation["requestId"]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "source link generation is malformed or drifted"
+                    )
+                )
+
+            claim_observed = read(claim_ref)
+            b2_settlement_observed = read(b2_settlement_ref)
+            source_link_observed = read(source_link_ref)
+            if not claim_observed[0] or not b2_settlement_observed[0]:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link is missing claim or B2 settlement authority"
+                    )
+                )
+
+            try:
+                row_identity = validate_row_identity_document(
+                    document=row_identity_observed[1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "source link row identity contains immutable drift"
+                    )
+                )
+            try:
+                current_head = validate_row_authority_head(
+                    document=head_observed[1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link current row head is malformed"
+                    )
+                )
+            try:
+                checked_generation = validate_owner_generation_document(
+                    document=generation_observed[1]
+                )
+                checked_claim = validate_claim_set_document(
+                    document=claim_observed[1]
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "source link generation or claim contains immutable drift"
+                    )
+                )
+            if (
+                row_identity["userScopeHash"] != checked_scope
+                or row_identity["rowId"] != checked_row_id
+                or current_head["userScopeHash"] != checked_scope
+                or current_head["rowId"] != checked_row_id
+                or current_head["createdAt"] != row_identity["createdAt"]
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "source link row authority does not correlate"
+                    )
+                )
+            if (
+                checked_generation["requestId"] != checked_claim["requestId"]
+                or checked_generation["claimSetHash"]
+                != checked_claim["claimSetHash"]
+                or checked_generation["ownerKind"] != checked_claim["ownerKind"]
+                or checked_generation["ownerKey"] != checked_claim["ownerKey"]
+                or checked_generation["priority"]
+                != checked_claim["derivedPriority"]
+                or checked_claim["outcome"] != "accepted"
+                or checked_claim["createdAt"] < row_identity["createdAt"]
+                or checked_claim["createdAt"] < current_head["createdAt"]
+                or checked_generation["createdAt"]
+                < checked_claim["createdAt"]
+                or checked_generation["generation"]
+                > checked_generation["priority"]
+                or (
+                    checked_generation["generation"] == 1
+                    and checked_generation["predecessorSettlementHash"]
+                    is not None
+                )
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "source link generation does not correlate to its claim"
+                    )
+                )
+            matching_decisions = [
+                decision
+                for decision in checked_claim["rowDecisions"]
+                if decision["rowId"] == checked_row_id
+            ]
+            if (
+                len(matching_decisions) != 1
+                or matching_decisions[0]["decision"] != "accepted"
+                or matching_decisions[0]["plannedGeneration"]
+                != checked_generation_number
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "source link claim decision does not authorize the generation"
+                    )
+                )
+            if checked_claim["authorityOrigin"] not in {
+                "b1_source",
+                "contact_fanout",
+            }:
+                reject(
+                    RowAuthorityConflict(
+                        "source link claim origin is not B1-backed"
+                    )
+                )
+            embedded_authority_link = checked_claim["authorityLink"]
+            if embedded_authority_link is None:
+                reject(
+                    RowAuthorityConflict(
+                        "source link claim lacks embedded B1 authority"
+                    )
+                )
+            try:
+                embedded_authority_link = validate_b1_authority_link(
+                    authority_link=embedded_authority_link,
+                    user_scope_hash=checked_scope,
+                )
+                canonical_source_id = _require_firestore_document_id(
+                    embedded_authority_link["canonicalSourceId"],
+                    field_name="B1 canonicalSourceId",
+                )
+                b1_references = (
+                    user_ref.collection("sourceIdentities").document(
+                        canonical_source_id
+                    ),
+                    user_ref.collection("sourceClassifications").document(
+                        canonical_source_id
+                    ),
+                    user_ref.collection("sourceTransitionOwners").document(
+                        canonical_source_id
+                    ),
+                    user_ref.collection("sourceWorkLedgers").document(
+                        canonical_source_id
+                    ),
+                    user_ref.collection("sourceSettlements").document(
+                        canonical_source_id
+                    ),
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "source link B1 authority cannot form exact paths"
+                    )
+                )
+
+            b1_observed = tuple(read(reference) for reference in b1_references)
+            if not all(exists for exists, _payload in b1_observed):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link B1 authority bundle is incomplete"
+                    )
+                )
+            (
+                b1_identity_document,
+                b1_classification_document,
+                b1_owner_document,
+                b1_ledger_document,
+                b1_settlement_document,
+            ) = tuple(payload for _exists, payload in b1_observed)
+            try:
+                b1_identity = _validate_b1_source_identity(
+                    b1_identity_document
+                )
+                if b1_identity["canonicalSourceId"] != canonical_source_id:
+                    raise RowAuthorityConfigError(
+                        "B1 source identity occupies the wrong path"
+                    )
+                b1_classification = _validate_b1_classification(
+                    b1_classification_document,
+                    canonical_source_id=canonical_source_id,
+                )
+                b1_owner = _validate_b1_owner(
+                    b1_owner_document,
+                    canonical_source_id=canonical_source_id,
+                    classification=b1_classification,
+                )
+                b1_ledger = _validate_b1_ledger(
+                    b1_ledger_document,
+                    canonical_source_id=canonical_source_id,
+                    classification=b1_classification,
+                    owner=b1_owner,
+                )
+                rebuilt_authority_link = build_b1_authority_link(
+                    user_scope_hash=checked_scope,
+                    source_identity_document=b1_identity,
+                    source_classification_document=b1_classification,
+                    source_owner_document=b1_owner,
+                    source_ledger_document=b1_ledger,
+                    work_key=embedded_authority_link["workKey"],
+                )
+                if rebuilt_authority_link != embedded_authority_link:
+                    raise RowAuthorityConfigError(
+                        "B1 authority differs from the immutable claim link"
+                    )
+                b1_settlement = _validate_b1_source_settlement(
+                    b1_settlement_document,
+                    canonical_source_id=canonical_source_id,
+                    identity=b1_identity,
+                    classification=b1_classification,
+                    owner=b1_owner,
+                    ledger=b1_ledger,
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "source link B1 authority is malformed or drifted"
+                    )
+                )
+
+            b1_readiness = (
+                b1_identity["createdAt"],
+                b1_classification["snapshotPersistedAt"],
+                b1_owner["createdAt"],
+                b1_ledger["createdAt"],
+            )
+            claim_datetime = _timestamp_as_datetime(
+                checked_claim["createdAt"],
+                field_name="claim.createdAt",
+            )
+            if claim_datetime < max(
+                value.astimezone(timezone.utc) for value in b1_readiness
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "source link claim predates B1 authority readiness"
+                    )
+                )
+
+            try:
+                b2_settlement = _validate_correlated_owner_settlement(
+                    scope=checked_scope,
+                    row_id=checked_row_id,
+                    generation=checked_generation,
+                    claim=checked_claim,
+                    settlement_document=b2_settlement_observed[1],
+                )
+            except RowAuthorityError as exc:
+                reject(exc)
+            if (
+                b2_settlement["outcome"] != "dominated"
+                and b2_settlement["outcome"]
+                != _expected_owner_settlement_outcome(
+                    checked_generation["ownerKind"]
+                )
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "source link B2 settlement outcome conflicts with its owner"
+                    )
+                )
+            if (
+                b2_settlement["outcome"] == "dominated"
+                and checked_generation["ownerKind"] == "contact_optout"
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "contact opt-out generation cannot be dominated"
+                    )
+                )
+            if not _source_link_head_reflects_b2_settlement(
+                head_document=current_head,
+                generation_document=checked_generation,
+                settlement_document=b2_settlement,
+            ):
+                reject(
+                    RowAuthorityAmbiguous(
+                        "source link head does not reflect its B2 settlement"
+                    )
+                )
+            if linked_datetime < b1_settlement["settledAt"].astimezone(
+                timezone.utc
+            ) or checked_linked_at < b2_settlement["settledAt"]:
+                reject(
+                    RowAuthorityConfigError(
+                        "source link time predates B1 or B2 settlement"
+                    )
+                )
+
+            candidate_link = build_source_settlement_link_document(
+                user_scope_hash=checked_scope,
+                row_id=checked_row_id,
+                generation=checked_generation_number,
+                generation_hash=checked_generation["generationHash"],
+                authority_link_hash=embedded_authority_link[
+                    "authorityLinkHash"
+                ],
+                b1_identity_hash=b1_settlement["identityHash"],
+                b1_final_ledger_evidence_hash=b1_settlement[
+                    "finalLedgerEvidenceHash"
+                ],
+                b1_settlement_revision=b1_settlement[
+                    "settlementRevision"
+                ],
+                b1_settlement_hash=b1_settlement["settlementHash"],
+                b2_settlement_hash=b2_settlement["settlementHash"],
+                linked_at=checked_linked_at,
+            )
+            stored_candidate = None
+            if source_link_observed[0]:
+                try:
+                    stored_candidate = validate_source_settlement_link_document(
+                        document=source_link_observed[1]
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "stored source settlement link contains immutable drift"
+                        )
+                    )
+                if stored_candidate != candidate_link:
+                    reject(
+                        RowAuthorityConflict(
+                            "stored source settlement link differs from the candidate"
+                        )
+                    )
+
+            current_pointer = current_head[
+                "latestSourceSettlementLinkHash"
+            ]
+            disposition = None
+            result_head = current_head
+            mutations = ()
+            if current_pointer == candidate_link["sourceSettlementLinkHash"]:
+                if stored_candidate is None:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link head points to a missing candidate"
+                        )
+                    )
+                if stored_candidate["linkedAt"] > current_head["updatedAt"]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link candidate postdates its current head"
+                        )
+                    )
+                disposition = "already_applied"
+            elif current_pointer is None:
+                if stored_candidate is not None:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "existing source link has no current head pointer"
+                        )
+                    )
+            else:
+                try:
+                    query = source_links_ref.where(
+                        "sourceSettlementLinkHash",
+                        "==",
+                        current_pointer,
+                    )
+                    current_snapshots = list(transaction.get(query))
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "source link pointer query failed before writes"
+                    ) from exc
+                if len(current_snapshots) != 1:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link pointer query is not unique"
+                        )
+                    )
+                current_snapshot = current_snapshots[0]
+                current_payload = current_snapshot.to_dict()
+                remember(
+                    current_snapshot.reference,
+                    (bool(current_snapshot.exists), current_payload),
+                )
+                callback_state["query_readback"] = {
+                    "sourceSettlementLinkHash": current_pointer,
+                    "matches": (
+                        (
+                            current_snapshot.reference.path,
+                            _defensive_copy(current_payload),
+                        ),
+                    ),
+                }
+                try:
+                    queried_current_link = (
+                        validate_source_settlement_link_document(
+                            document=current_payload
+                        )
+                    )
+                    expected_current_id = _generation_document_id(
+                        row_id=queried_current_link["rowId"],
+                        generation=queried_current_link["generation"],
+                    )
+                    if (
+                        not current_snapshot.exists
+                        or current_snapshot.id != expected_current_id
+                        or queried_current_link["userScopeHash"]
+                        != checked_scope
+                        or queried_current_link["rowId"] != checked_row_id
+                        or queried_current_link[
+                            "sourceSettlementLinkHash"
+                        ]
+                        != current_pointer
+                    ):
+                        raise RowAuthorityConfigError(
+                            "queried source link does not match the head pointer"
+                        )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link head pointer resolves to malformed authority"
+                        )
+                    )
+                if queried_current_link["linkedAt"] > current_head["updatedAt"]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "source link head predates its pointed link"
+                        )
+                    )
+                if stored_candidate is not None:
+                    if queried_current_link["linkedAt"] < candidate_link[
+                        "linkedAt"
+                    ]:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "source link replay points to an earlier current link"
+                            )
+                        )
+                    disposition = "already_applied"
+                elif queried_current_link["linkedAt"] > candidate_link[
+                    "linkedAt"
+                ]:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "new source link predates its current pointer"
+                        )
+                    )
+
+            if disposition is None:
+                if candidate_link["linkedAt"] < current_head["updatedAt"]:
+                    reject(
+                        RowAuthorityConfigError(
+                            "new source link predates the current row head"
+                        )
+                    )
+                try:
+                    result_head = _build_source_link_advanced_head(
+                        expected_head=current_head,
+                        source_link_document=candidate_link,
+                    )
+                except RowAuthorityError as exc:
+                    reject(exc)
+                disposition = "linked"
+                mutations = (
+                    {
+                        "target": "source_link",
+                        "operation": "create",
+                        "document": candidate_link,
+                    },
+                    {
+                        "target": "head",
+                        "operation": "set",
+                        "document": result_head,
+                    },
+                )
+
+            expected_count = 2 if disposition == "linked" else 0
+            if len(mutations) != expected_count:
+                reject(
+                    RowAuthorityConfigError(
+                        "source link callback write plan is not exact"
+                    )
+                )
+            mutation_references = {
+                "source_link": source_link_ref,
+                "head": head_ref,
+            }
+            callback_state["mutation_references"] = mutation_references
+            for mutation in mutations:
+                reference = mutation_references.get(mutation["target"])
+                if reference is None:
+                    reject(
+                        RowAuthorityConfigError(
+                            "source link mutation has no exact reference"
+                        )
+                    )
+                if mutation["operation"] == "create":
+                    transaction.create(reference, mutation["document"])
+                elif mutation["operation"] == "set":
+                    transaction.set(
+                        reference,
+                        mutation["document"],
+                        merge=False,
+                    )
+                else:
+                    reject(
+                        RowAuthorityConfigError(
+                            "source link mutation operation is unsupported"
+                        )
+                    )
+            plan = {
+                "disposition": disposition,
+                "sourceSettlementLink": candidate_link,
+                "head": result_head,
+                "mutations": mutations,
+                "laterLinkProven": (
+                    disposition == "already_applied"
+                    and current_pointer
+                    != candidate_link["sourceSettlementLinkHash"]
+                ),
+            }
+            callback_state["prepared"] = bool(mutations)
+            callback_state["disposition"] = disposition
+            callback_state["plan"] = plan
+            return disposition
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "source link transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"]:
+                raise
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "source link transaction could not start"
+                ) from exc
+            plan = callback_state["plan"]
+            if plan is None:
+                raise RowAuthorityAmbiguous(
+                    "source link commit has no complete prepared plan"
+                ) from exc
+            try:
+                readback = {}
+                for path in callback_state["ordered_paths"]:
+                    reference = callback_state["references"][path]
+                    snapshot = reference.get()
+                    readback[path] = (
+                        bool(snapshot.exists),
+                        snapshot.to_dict() if snapshot.exists else None,
+                    )
+                query_readback = callback_state["query_readback"]
+                if query_readback is not None:
+                    query = source_links_ref.where(
+                        "sourceSettlementLinkHash",
+                        "==",
+                        query_readback["sourceSettlementLinkHash"],
+                    )
+                    stream = getattr(query, "stream", None)
+                    if callable(stream):
+                        query_snapshots = list(stream())
+                    else:
+                        get = getattr(query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "source link query cannot be read back"
+                            )
+                        query_snapshots = list(get())
+                    query_matches = tuple(
+                        (
+                            snapshot.reference.path,
+                            snapshot.to_dict(),
+                        )
+                        for snapshot in query_snapshots
+                        if snapshot.exists
+                    )
+                    if query_matches != query_readback["matches"]:
+                        raise RowAuthorityAmbiguous(
+                            "source link pointer query changed during readback"
+                        )
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "source link commit outcome cannot be read back"
+                ) from readback_exc
+            expected_after = dict(callback_state["before"])
+            for mutation in plan["mutations"]:
+                reference = callback_state["mutation_references"][
+                    mutation["target"]
+                ]
+                expected_after[reference.path] = (
+                    True,
+                    mutation["document"],
+                )
+            exact_before = readback == callback_state["before"]
+            exact_after = readback == expected_after
+            if exact_after and callback_state["prepared"]:
+                disposition = "linked"
+            elif (
+                exact_before
+                and callback_state["disposition"] == "already_applied"
+            ):
+                disposition = "already_applied"
+            elif exact_before:
+                raise RowAuthorityRetryable(
+                    "source link commit failed before apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "source link commit readback is partial or drifted"
+                ) from exc
+        plan = callback_state["plan"]
+        if plan is None or disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "source link transaction returned a mismatched disposition"
+            )
+        if disposition == "linked" and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "source link transaction reported an unprepared write"
+            )
+        if disposition not in {"linked", "already_applied"}:
+            raise RowAuthorityRetryable(
+                "source link transaction returned no approved disposition"
+            )
+        return _source_settlement_link_result(
+            disposition=disposition,
+            source_settlement_link=plan["sourceSettlementLink"],
+            head=plan["head"],
+            later_link_proven=plan["laterLinkProven"],
         )
 
     def record_operator_decline(

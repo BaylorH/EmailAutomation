@@ -155,6 +155,17 @@ class FakeQuery:
             start_after_path=snapshot.reference.path,
         )
 
+    def stream(self):
+        """Match Firestore Query.stream() for nontransactional readback."""
+        transaction = self._store.transaction()
+        transaction._begin(retry_id="query-stream")
+        try:
+            snapshots = transaction.get_query(self)
+        finally:
+            if transaction.in_progress:
+                transaction._rollback()
+        return iter(snapshots)
+
 
 class FakeDocumentReference:
     def __init__(self, store, path):

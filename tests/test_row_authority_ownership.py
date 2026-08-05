@@ -9650,5 +9650,1160 @@ class RowOperatorDeclineStoreTests(unittest.TestCase):
         self.assertEqual([], self._writes(forged_store))
 
 
+class RowSourceSettlementLinkTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+        RowClaimStoreTests.setUpClass()
+
+    def setUp(self):
+        self.fixture = RowClaimStoreTests("test_terminal_claim_enters_claimed")
+        self.fixture.setUp()
+        self.user_id = self.fixture.user_id
+        self.scope = self.fixture.scope
+        self.row_id = self.fixture.first
+        self.linked_at = "2026-08-04T12:00:04.000000Z"
+        self.b1_settled_at = datetime(
+            2026,
+            8,
+            4,
+            12,
+            0,
+            3,
+            tzinfo=timezone.utc,
+        )
+
+    def _store(self):
+        return self.fixture._store()
+
+    def _authority(self, store, *, executor=None):
+        return self.fixture._authority(store, executor=executor)
+
+    def _user_reference(self, store):
+        return self.fixture._user_reference(store)
+
+    def _head_reference(self, store, *, row_id=None):
+        return self.fixture._row_references(
+            store,
+            row_id or self.row_id,
+        )[1]
+
+    def _link_reference(self, store, *, row_id=None, generation=1):
+        checked_row_id = row_id or self.row_id
+        return self._user_reference(store).collection(
+            "rowSourceSettlementLinks"
+        ).document(f"{checked_row_id}--{generation}")
+
+    def _b1_reference(self, store, collection, source_id="source-1"):
+        return self._user_reference(store).collection(collection).document(
+            source_id
+        )
+
+    @staticmethod
+    def _writes(store):
+        return RowClaimStoreTests._write_events(store)
+
+    @staticmethod
+    def _b1_timestamp_token(value):
+        return (
+            value.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+
+    def _settled_b1_bundle(self, bundle, *, settled_at=None):
+        settled_time = settled_at or self.b1_settled_at
+        settled = deepcopy(bundle)
+        identity = settled["identity"]
+        classification = settled["classification"]
+        owner = settled["owner"]
+        ledger = settled["ledger"]
+        entry = ledger["entries"][0]
+
+        deferred_material = {
+            "schemaVersion": 1,
+            "workKey": entry["workKey"],
+            "canonicalSourceId": identity["canonicalSourceId"],
+            "ledgerHash": ledger["ledgerHash"],
+            "entryPayloadHash": entry["payloadHash"],
+            "targetOwnerKind": entry["selectedOwnerKind"],
+            "targetOwnerKey": entry["selectedOwnerKey"],
+            "wakeCondition": "owner_adapter_ready",
+            "completionContract": deepcopy(entry["completionContract"]),
+        }
+        deferred_binding_hash = _independent_b1_hash(
+            {
+                "hashKind": "source-deferred-work-v1",
+                **deferred_material,
+            }
+        )
+        resolution_evidence = {
+            "schemaVersion": 1,
+            "evidenceKind": "owner_delegation",
+            "canonicalSourceId": identity["canonicalSourceId"],
+            "ledgerHash": ledger["ledgerHash"],
+            "workKey": entry["workKey"],
+            "payloadHash": entry["payloadHash"],
+            "workKind": entry["kind"],
+            "deferredBindingHash": deferred_binding_hash,
+        }
+        entry.update(
+            {
+                "state": "delegated",
+                "resolutionEvidence": resolution_evidence,
+                "resolutionEvidenceHash": _independent_b1_hash(
+                    {
+                        "hashKind": (
+                            "source-work-resolution-evidence-v1"
+                        ),
+                        "evidence": resolution_evidence,
+                    }
+                ),
+            }
+        )
+        ledger.update(
+            {
+                "revision": 2,
+                "updatedAt": settled_time,
+            }
+        )
+
+        aliases = deepcopy(identity["verifiedAliases"])
+        thread_head_material = {
+            "hashKind": "thread-transition-head-v1",
+            "schemaVersion": 1,
+            "threadId": identity["threadId"],
+            "threadHeadRevision": 1,
+            "activeOwnerKey": owner["ownerKey"],
+            "activeOwnerKind": owner["ownerKind"],
+            "activeCanonicalSourceId": identity["canonicalSourceId"],
+            "activeGeneration": 1,
+            "activeState": "active",
+        }
+        thread_head_binding = {
+            "canonicalSourceId": identity["canonicalSourceId"],
+            "ownerKind": owner["ownerKind"],
+            "ownerKey": owner["ownerKey"],
+            "generation": 1,
+            "threadHeadRevision": 1,
+            "headHash": _independent_b1_hash(thread_head_material),
+        }
+        identity_hash = _independent_b1_hash(
+            {
+                "hashKind": "source-settlement-identity-v1",
+                "schemaVersion": identity["schemaVersion"],
+                "canonicalSourceId": identity["canonicalSourceId"],
+                "creationHash": identity["creationHash"],
+                "threadId": identity["threadId"],
+            }
+        )
+        final_ledger_evidence_hash = _independent_b1_hash(
+            {
+                "hashKind": "source-final-ledger-evidence-v1",
+                "ledgerHash": ledger["ledgerHash"],
+                "entries": [
+                    {
+                        "workKey": item["workKey"],
+                        "payloadHash": item["payloadHash"],
+                        "state": item["state"],
+                        "resolutionEvidenceHash": item[
+                            "resolutionEvidenceHash"
+                        ],
+                    }
+                    for item in ledger["entries"]
+                ],
+            }
+        )
+        settlement = {
+            "schemaVersion": 1,
+            "canonicalSourceId": identity["canonicalSourceId"],
+            "identityHash": identity_hash,
+            "snapshotImmutableHash": classification[
+                "snapshotImmutableHash"
+            ],
+            "selectionHash": classification["selectionHash"],
+            "ownerDecisionHash": owner["ownerDecisionHash"],
+            "ledgerHash": ledger["ledgerHash"],
+            "finalLedgerEvidenceHash": final_ledger_evidence_hash,
+            "threadHeadBinding": thread_head_binding,
+            "aliases": aliases,
+            "aliasSetHash": _independent_b1_hash(
+                {
+                    "hashKind": "source-settlement-alias-set-v1",
+                    "aliases": aliases,
+                }
+            ),
+            "settlementRevision": 1,
+        }
+        settlement["settlementHash"] = _independent_b1_hash(
+            {
+                "hashKind": "source-settlement-v1",
+                **settlement,
+            }
+        )
+        settlement["settledAt"] = settled_time
+        settled["settlement"] = settlement
+        return settled
+
+    def _seed_b1_settlement(self, store, bundle, *, settled_at=None):
+        settled = self._settled_b1_bundle(
+            bundle,
+            settled_at=settled_at,
+        )
+        source_id = settled["identity"]["canonicalSourceId"]
+        self._b1_reference(
+            store,
+            "sourceWorkLedgers",
+            source_id,
+        ).set(settled["ledger"], merge=False)
+        self._b1_reference(
+            store,
+            "sourceSettlements",
+            source_id,
+        ).create(settled["settlement"])
+        return settled
+
+    def _seed_linkable(
+        self,
+        *,
+        origin="b1_source",
+        b1_settled_at=None,
+    ):
+        store = self._store()
+        if origin == "contact_fanout":
+            bundle, binding = self.fixture._seed_prerequisites(
+                store,
+                owner_kind="contact_optout",
+            )
+            claim, generation, claimed_head = (
+                self.fixture._install_contact_owner(store, self.row_id)
+            )
+            b2_settlement = self.module.build_owner_settlement_document(
+                generation_document=generation,
+                claim_set_document=claim,
+                fencing_token=claimed_head["fencingToken"],
+                outcome="contact_optout",
+                settled_at="2026-08-04T12:00:03.000000Z",
+            )
+            head = self.module._build_settlement_advanced_head(
+                expected_head=claimed_head,
+                generation_document=generation,
+                settlement_document=b2_settlement,
+            )
+            self.fixture._settlement_reference(
+                store,
+                self.row_id,
+                1,
+            ).create(b2_settlement)
+            self._head_reference(store).set(head, merge=False)
+        else:
+            bundle, binding = self.fixture._seed_prerequisites(store)
+            claimed = self.fixture._claim(store, bundle=bundle)
+            settled = self._authority(store).settle_owner_generation(
+                verified_user_id=self.user_id,
+                row_id=self.row_id,
+                expected_head=claimed["heads"][0],
+                settled_at="2026-08-04T12:00:03.000000Z",
+            )
+            claim = claimed["claimSet"]
+            generation = claimed["generations"][0]
+            b2_settlement = settled["settlement"]
+            head = settled["head"]
+        b1 = self._seed_b1_settlement(
+            store,
+            bundle,
+            settled_at=b1_settled_at,
+        )
+        return {
+            "store": store,
+            "binding": binding,
+            "bundle": b1,
+            "claim": claim,
+            "generation": generation,
+            "b2Settlement": b2_settlement,
+            "head": head,
+        }
+
+    def _expected_link(self, state, *, linked_at=None):
+        return self.module.build_source_settlement_link_document(
+            user_scope_hash=self.scope,
+            row_id=self.row_id,
+            generation=state["generation"]["generation"],
+            generation_hash=state["generation"]["generationHash"],
+            authority_link_hash=state["claim"]["authorityLinkHash"],
+            b1_identity_hash=state["bundle"]["settlement"][
+                "identityHash"
+            ],
+            b1_final_ledger_evidence_hash=state["bundle"]["settlement"][
+                "finalLedgerEvidenceHash"
+            ],
+            b1_settlement_revision=state["bundle"]["settlement"][
+                "settlementRevision"
+            ],
+            b1_settlement_hash=state["bundle"]["settlement"][
+                "settlementHash"
+            ],
+            b2_settlement_hash=state["b2Settlement"]["settlementHash"],
+            linked_at=linked_at or self.linked_at,
+        )
+
+    def _link(self, state, *, executor=None, linked_at=None):
+        authority = self._authority(state["store"], executor=executor)
+        method = getattr(authority, "link_b1_source_settlement", None)
+        self.assertIsNotNone(
+            method,
+            "RowAuthorityStore.link_b1_source_settlement is missing",
+        )
+        return method(
+            verified_user_id=self.user_id,
+            row_id=self.row_id,
+            generation=state["generation"]["generation"],
+            linked_at=linked_at or self.linked_at,
+        )
+
+    def _synthetic_link(
+        self,
+        *,
+        row_id=None,
+        generation=2,
+        linked_at="2026-08-04T12:00:05.000000Z",
+        seed="9",
+    ):
+        return self.module.build_source_settlement_link_document(
+            user_scope_hash=self.scope,
+            row_id=row_id or self.row_id,
+            generation=generation,
+            generation_hash=seed * 64,
+            authority_link_hash="8" * 64,
+            b1_identity_hash="7" * 64,
+            b1_final_ledger_evidence_hash="6" * 64,
+            b1_settlement_revision=1,
+            b1_settlement_hash="5" * 64,
+            b2_settlement_hash="4" * 64,
+            linked_at=linked_at,
+        )
+
+    def _advance_head_to_link(self, store, source_link):
+        head = deepcopy(store.data[self._head_reference(store).path])
+        advanced = self.module._build_source_link_advanced_head(
+            expected_head=head,
+            source_link_document=source_link,
+        )
+        self._head_reference(store).set(advanced, merge=False)
+        return advanced
+
+    def _set_head_pointer(self, store, pointer, *, updated_at=None):
+        head_ref = self._head_reference(store)
+        head = deepcopy(store.data[head_ref.path])
+        head["latestSourceSettlementLinkHash"] = pointer
+        if updated_at is not None:
+            head["updatedAt"] = updated_at
+        head["stateRevision"] += 1
+        head_ref.set(self.fixture._rehash_head(head), merge=False)
+        return deepcopy(store.data[head_ref.path])
+
+    def _rewrite_b2_lineage(
+        self,
+        state,
+        *,
+        claim_created_at=None,
+        generation_created_at=None,
+        generation_number=None,
+        settled_at=None,
+    ):
+        store = state["store"]
+        old_generation = state["generation"]["generation"]
+        target_generation = generation_number or old_generation
+        claim = deepcopy(state["claim"])
+        if claim_created_at is not None:
+            claim["createdAt"] = claim_created_at
+        if target_generation != old_generation:
+            matching = [
+                decision
+                for decision in claim["rowDecisions"]
+                if decision["rowId"] == self.row_id
+            ]
+            self.assertEqual(1, len(matching))
+            matching[0]["plannedGeneration"] = target_generation
+        claim = self.fixture._rehash_claim(claim)
+
+        generation = deepcopy(state["generation"])
+        generation["generation"] = target_generation
+        generation["claimSetHash"] = claim["claimSetHash"]
+        if generation_created_at is not None:
+            generation["createdAt"] = generation_created_at
+        generation = self.fixture._rehash_generation(generation)
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=state["b2Settlement"]["fencingToken"],
+            outcome=state["b2Settlement"]["outcome"],
+            settled_at=(
+                settled_at or state["b2Settlement"]["settledAt"]
+            ),
+        )
+
+        claim_ref = self.fixture._claim_reference(
+            store,
+            claim["requestId"],
+        )
+        claim_ref.set(claim, merge=False)
+        old_generation_ref = self.fixture._generation_reference(
+            store,
+            self.row_id,
+            old_generation,
+        )
+        old_settlement_ref = self.fixture._settlement_reference(
+            store,
+            self.row_id,
+            old_generation,
+        )
+        if target_generation != old_generation:
+            old_generation_ref.delete()
+            old_settlement_ref.delete()
+        self.fixture._generation_reference(
+            store,
+            self.row_id,
+            target_generation,
+        ).set(generation, merge=False)
+        self.fixture._settlement_reference(
+            store,
+            self.row_id,
+            target_generation,
+        ).set(settlement, merge=False)
+
+        head = deepcopy(store.data[self._head_reference(store).path])
+        head.update(
+            {
+                "effectiveOwnerGeneration": target_generation,
+                "effectiveOwnerGenerationHash": generation[
+                    "generationHash"
+                ],
+                "effectiveOwnerKind": generation["ownerKind"],
+                "effectivePriority": generation["priority"],
+                "state": "settled",
+                "leaseOwnerHash": None,
+                "leaseUntil": None,
+                "fencingToken": settlement["fencingToken"],
+                "latestSettlementHash": settlement["settlementHash"],
+                "effectiveSettlementHash": settlement[
+                    "settlementHash"
+                ],
+            }
+        )
+        head = self.fixture._rehash_head(head)
+        self._head_reference(store).set(head, merge=False)
+        state.update(
+            {
+                "claim": claim,
+                "generation": generation,
+                "b2Settlement": settlement,
+                "head": head,
+            }
+        )
+        return state
+
+    def _independent_settlement_hash(self, settlement):
+        return _independent_b1_hash(
+            {
+                "hashKind": "source-settlement-v1",
+                **{
+                    field: deepcopy(settlement[field])
+                    for field in (
+                        "schemaVersion",
+                        "canonicalSourceId",
+                        "identityHash",
+                        "snapshotImmutableHash",
+                        "selectionHash",
+                        "ownerDecisionHash",
+                        "ledgerHash",
+                        "finalLedgerEvidenceHash",
+                        "threadHeadBinding",
+                        "aliases",
+                        "aliasSetHash",
+                        "settlementRevision",
+                    )
+                },
+            }
+        )
+
+    def test_source_link_reads_exact_b1_identity_classification_owner_ledger_and_settlement(self):
+        method = getattr(
+            self.module.RowAuthorityStore,
+            "link_b1_source_settlement",
+            None,
+        )
+        self.assertIsNotNone(method)
+        self.assertEqual(
+            [
+                "self",
+                "verified_user_id",
+                "row_id",
+                "generation",
+                "linked_at",
+            ],
+            list(inspect.signature(method).parameters),
+        )
+        state = self._seed_linkable()
+        store = state["store"]
+        source_id = state["bundle"]["identity"]["canonicalSourceId"]
+        store.events.clear()
+
+        self._link(state)
+
+        reads = [event[1] for event in store.events if event[0] == "get"]
+        expected = [
+            self.fixture._row_references(store, self.row_id)[0].path,
+            self._head_reference(store).path,
+            self.fixture._generation_reference(store, self.row_id, 1).path,
+            self.fixture._claim_reference(
+                store,
+                state["claim"]["requestId"],
+            ).path,
+            self.fixture._settlement_reference(store, self.row_id, 1).path,
+            self._link_reference(store).path,
+            *[
+                self._b1_reference(store, collection, source_id).path
+                for collection in (
+                    "sourceIdentities",
+                    "sourceClassifications",
+                    "sourceTransitionOwners",
+                    "sourceWorkLedgers",
+                    "sourceSettlements",
+                )
+            ],
+        ]
+        self.assertEqual(expected, reads[: len(expected)])
+        first_write = next(
+            index
+            for index, event in enumerate(store.events)
+            if event[0] in {"create", "set", "update", "delete"}
+        )
+        self.assertFalse(
+            any(event[0] == "get" for event in store.events[first_write + 1 :])
+        )
+
+    def test_source_link_copies_identity_final_ledger_revision_and_hash_from_b1_settlement(self):
+        state = self._seed_linkable()
+        settlement = deepcopy(state["bundle"]["settlement"])
+
+        result = self._link(state)
+
+        link = result["sourceSettlementLink"]
+        self.assertEqual(
+            (
+                settlement["identityHash"],
+                settlement["finalLedgerEvidenceHash"],
+                settlement["settlementRevision"],
+                settlement["settlementHash"],
+            ),
+            (
+                link["b1IdentityHash"],
+                link["b1FinalLedgerEvidenceHash"],
+                link["b1SettlementRevision"],
+                link["b1SettlementHash"],
+            ),
+        )
+        self.assertEqual(self._expected_link(state), link)
+
+    def test_source_link_reuses_full_b1_bundle_validation_and_reproduces_settlement_hash(self):
+        state = self._seed_linkable()
+        settlement = state["bundle"]["settlement"]
+        self.assertEqual(
+            settlement["settlementHash"],
+            self._independent_settlement_hash(settlement),
+        )
+
+        with patch.object(
+            self.module,
+            "_validate_b1_source_identity",
+            wraps=self.module._validate_b1_source_identity,
+        ) as identity_validator, patch.object(
+            self.module,
+            "_validate_b1_classification",
+            wraps=self.module._validate_b1_classification,
+        ) as classification_validator, patch.object(
+            self.module,
+            "_validate_b1_owner",
+            wraps=self.module._validate_b1_owner,
+        ) as owner_validator, patch.object(
+            self.module,
+            "_validate_b1_ledger",
+            wraps=self.module._validate_b1_ledger,
+        ) as ledger_validator:
+            result = self._link(state)
+
+        self.assertEqual(
+            settlement["settlementHash"],
+            result["sourceSettlementLink"]["b1SettlementHash"],
+        )
+        for validator in (
+            identity_validator,
+            classification_validator,
+            owner_validator,
+            ledger_validator,
+        ):
+            self.assertGreaterEqual(validator.call_count, 1)
+
+    def test_source_link_requires_b1_or_contact_origin_and_matching_work_entry(self):
+        for origin in ("b1_source", "contact_fanout"):
+            with self.subTest(origin=origin):
+                valid = self._seed_linkable(origin=origin)
+                self.assertEqual(
+                    "linked",
+                    self._link(valid)["disposition"],
+                )
+
+        operator_store = self._store()
+        self.fixture._seed_row(operator_store, self.row_id)
+        self.fixture._seed_thread_binding(operator_store, [self.row_id])
+        operator = self._authority(operator_store).record_operator_decline(
+            verified_user_id=self.user_id,
+            thread_id="thread-1",
+            actor_scope_hash="5" * 64,
+            client_request_id="source-link-operator",
+            issued_at="2026-08-04T12:00:03.000000Z",
+        )
+        operator_state = {
+            "store": operator_store,
+            "generation": operator["generations"][0],
+        }
+        operator_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._link(operator_state)
+        self.assertEqual([], self._writes(operator_store))
+
+        wrong_work = self._seed_linkable()
+        ledger_ref = self._b1_reference(
+            wrong_work["store"],
+            "sourceWorkLedgers",
+        )
+        wrong_work["store"].data[ledger_ref.path]["entries"][0][
+            "workKey"
+        ] = "f" * 64
+        before = deepcopy(wrong_work["store"].data)
+        wrong_work["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._link(wrong_work)
+        self.assertEqual(before, wrong_work["store"].data)
+        self.assertEqual([], self._writes(wrong_work["store"]))
+
+    def test_b1_canonical_source_snapshot_selection_owner_ledger_or_hard_evidence_drift_writes_nothing(self):
+        cases = (
+            ("canonical_source", "sourceIdentities", "canonicalSourceId", "source-2", "b1_source"),
+            ("snapshot", "sourceClassifications", "snapshotImmutableHash", "1" * 64, "b1_source"),
+            ("selection", "sourceClassifications", "selectionHash", "2" * 64, "b1_source"),
+            ("owner", "sourceTransitionOwners", "ownerDecisionHash", "3" * 64, "b1_source"),
+            ("ledger", "sourceWorkLedgers", "ledgerHash", "4" * 64, "b1_source"),
+            ("hard_evidence", "sourceClassifications", "deterministicEvidenceHash", "5" * 64, "contact_fanout"),
+        )
+        for name, collection, field, value, origin in cases:
+            with self.subTest(case=name):
+                state = self._seed_linkable(origin=origin)
+                store = state["store"]
+                reference = self._b1_reference(store, collection)
+                store.data[reference.path][field] = value
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityConflict):
+                    self._link(state)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._writes(store))
+
+    def test_source_link_creates_immutable_link_and_cas_advances_head(self):
+        state = self._seed_linkable()
+        store = state["store"]
+        expected_link = self._expected_link(state)
+        expected_head = self.module._build_source_link_advanced_head(
+            expected_head=state["head"],
+            source_link_document=expected_link,
+        )
+        store.events.clear()
+
+        result = self._link(state)
+
+        self.assertEqual("linked", result["disposition"])
+        self.assertEqual(expected_link, result["sourceSettlementLink"])
+        self.assertEqual(expected_head, result["head"])
+        self.assertEqual(
+            [
+                ("create", self._link_reference(store).path, expected_link, False),
+                ("set", self._head_reference(store).path, expected_head, False),
+            ],
+            self._writes(store),
+        )
+
+    def test_source_link_performs_zero_writes_to_every_b1_collection(self):
+        state = self._seed_linkable()
+        store = state["store"]
+        b1_collections = {
+            "sourceIdentities",
+            "sourceClassifications",
+            "sourceTransitionOwners",
+            "sourceWorkLedgers",
+            "sourceSettlements",
+        }
+        b1_before = {
+            path: deepcopy(document)
+            for path, document in store.data.items()
+            if any(f"/{collection}/" in path for collection in b1_collections)
+        }
+        store.events.clear()
+
+        self._link(state)
+
+        self.assertEqual(
+            b1_before,
+            {
+                path: document
+                for path, document in store.data.items()
+                if any(
+                    f"/{collection}/" in path
+                    for collection in b1_collections
+                )
+            },
+        )
+        self.assertTrue(
+            all(
+                not any(f"/{collection}/" in event[1] for collection in b1_collections)
+                for event in self._writes(store)
+            )
+        )
+
+    def test_exact_existing_source_link_is_zero_write_even_after_later_head_link(self):
+        state = self._seed_linkable()
+        store = state["store"]
+        first = self._link(state)
+        later = self._synthetic_link()
+        self._link_reference(store, generation=2).create(later)
+        later_head = self._advance_head_to_link(store, later)
+        store.events.clear()
+
+        replay = self._link(state)
+
+        self.assertEqual("already_applied", replay["disposition"])
+        self.assertEqual(first["sourceSettlementLink"], replay["sourceSettlementLink"])
+        self.assertEqual(later_head, replay["head"])
+        self.assertEqual([], self._writes(store))
+
+    def test_new_source_link_after_older_link_validates_old_pointer_then_advances(self):
+        state = self._seed_linkable()
+        store = state["store"]
+        older = self._synthetic_link(
+            linked_at="2026-08-04T12:00:03.000000Z"
+        )
+        self._link_reference(store, generation=2).create(older)
+        older_head = self._advance_head_to_link(store, older)
+        expected_link = self._expected_link(
+            state,
+            linked_at="2026-08-04T12:00:05.000000Z",
+        )
+        expected_head = self.module._build_source_link_advanced_head(
+            expected_head=older_head,
+            source_link_document=expected_link,
+        )
+        store.events.clear()
+
+        result = self._link(
+            state,
+            linked_at="2026-08-04T12:00:05.000000Z",
+        )
+
+        self.assertEqual("linked", result["disposition"])
+        self.assertEqual(expected_link, result["sourceSettlementLink"])
+        self.assertEqual(expected_head, result["head"])
+        queries = [event for event in store.events if event[0] == "query"]
+        self.assertEqual(1, len(queries))
+        self.assertEqual(
+            (("sourceSettlementLinkHash", "==", older["sourceSettlementLinkHash"]),),
+            queries[0][2],
+        )
+
+    def test_existing_link_with_missing_or_invalid_head_pointer_is_ambiguous(self):
+        for pointer in (None, "f" * 64):
+            with self.subTest(pointer=pointer):
+                state = self._seed_linkable()
+                store = state["store"]
+                expected = self._expected_link(state)
+                self._link_reference(store).create(expected)
+                if pointer is not None:
+                    self._set_head_pointer(store, pointer)
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityAmbiguous):
+                    self._link(state)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._writes(store))
+
+    def test_later_link_hash_query_requires_one_same_row_non_earlier_exact_result(self):
+        for later_at in (
+            "2026-08-04T12:00:04.000000Z",
+            "2026-08-04T12:00:05.000000Z",
+        ):
+            with self.subTest(later_at=later_at):
+                state = self._seed_linkable()
+                store = state["store"]
+                candidate = self._expected_link(state)
+                later = self._synthetic_link(linked_at=later_at)
+                self._link_reference(store).create(candidate)
+                self._link_reference(store, generation=2).create(later)
+                later_head = self._advance_head_to_link(store, later)
+                store.events.clear()
+
+                result = self._link(state)
+
+                self.assertEqual("already_applied", result["disposition"])
+                self.assertEqual(later_head, result["head"])
+                self.assertEqual([], self._writes(store))
+                queries = [event for event in store.events if event[0] == "query"]
+                self.assertEqual(
+                    [
+                        (
+                            "query",
+                            self._user_reference(store)
+                            .collection("rowSourceSettlementLinks")
+                            .path,
+                            (
+                                (
+                                    "sourceSettlementLinkHash",
+                                    "==",
+                                    later["sourceSettlementLinkHash"],
+                                ),
+                            ),
+                            (),
+                        )
+                    ],
+                    queries,
+                )
+
+    def test_later_link_query_zero_duplicate_cross_row_or_malformed_result_is_ambiguous(self):
+        for case in ("zero", "duplicate", "cross_row", "malformed"):
+            with self.subTest(case=case):
+                state = self._seed_linkable()
+                store = state["store"]
+                candidate = self._expected_link(state)
+                self._link_reference(store).create(candidate)
+                pointer = "f" * 64
+                if case == "duplicate":
+                    later = self._synthetic_link()
+                    pointer = later["sourceSettlementLinkHash"]
+                    self._link_reference(store, generation=2).create(later)
+                    self._link_reference(store, generation=3).create(later)
+                elif case == "cross_row":
+                    later = self._synthetic_link(row_id=self.fixture.second)
+                    pointer = later["sourceSettlementLinkHash"]
+                    self._link_reference(
+                        store,
+                        row_id=self.fixture.second,
+                        generation=2,
+                    ).create(later)
+                elif case == "malformed":
+                    pointer = "e" * 64
+                    self._link_reference(store, generation=2).create(
+                        {"sourceSettlementLinkHash": pointer}
+                    )
+                self._set_head_pointer(store, pointer)
+                before = deepcopy(store.data)
+                store.events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityAmbiguous):
+                    self._link(state)
+
+                self.assertEqual(before, store.data)
+                self.assertEqual([], self._writes(store))
+
+        existing_wrong_direction = self._seed_linkable()
+        existing_store = existing_wrong_direction["store"]
+        future_candidate = self._expected_link(
+            existing_wrong_direction,
+            linked_at="2026-08-04T12:00:05.000000Z",
+        )
+        earlier_current = self._synthetic_link(
+            linked_at="2026-08-04T12:00:04.000000Z"
+        )
+        self._link_reference(existing_store).create(future_candidate)
+        self._link_reference(existing_store, generation=2).create(
+            earlier_current
+        )
+        self._advance_head_to_link(existing_store, earlier_current)
+        existing_before = deepcopy(existing_store.data)
+        existing_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._link(
+                existing_wrong_direction,
+                linked_at="2026-08-04T12:00:05.000000Z",
+            )
+        self.assertEqual(existing_before, existing_store.data)
+        self.assertEqual([], self._writes(existing_store))
+
+        new_wrong_direction = self._seed_linkable()
+        new_store = new_wrong_direction["store"]
+        later_current = self._synthetic_link(
+            linked_at="2026-08-04T12:00:05.000000Z"
+        )
+        self._link_reference(new_store, generation=2).create(later_current)
+        self._advance_head_to_link(new_store, later_current)
+        new_before = deepcopy(new_store.data)
+        new_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._link(
+                new_wrong_direction,
+                linked_at="2026-08-04T12:00:04.000000Z",
+            )
+        self.assertEqual(new_before, new_store.data)
+        self.assertEqual([], self._writes(new_store))
+
+    def test_later_link_query_completes_before_any_source_link_or_head_write(self):
+        state = self._seed_linkable()
+        store = state["store"]
+        older = self._synthetic_link(
+            linked_at="2026-08-04T12:00:03.000000Z"
+        )
+        self._link_reference(store, generation=2).create(older)
+        self._advance_head_to_link(store, older)
+        store.events.clear()
+
+        self._link(state, linked_at="2026-08-04T12:00:05.000000Z")
+
+        query_index = next(
+            index
+            for index, event in enumerate(store.events)
+            if event[0] == "query"
+        )
+        write_indexes = [
+            index
+            for index, event in enumerate(store.events)
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+        self.assertEqual(2, len(write_indexes))
+        self.assertLess(query_index, min(write_indexes))
+
+    def test_source_link_time_must_follow_b1_b2_settlements_and_current_head(self):
+        equal = self._seed_linkable()
+        result = self._link(
+            equal,
+            linked_at="2026-08-04T12:00:03.000000Z",
+        )
+        self.assertEqual("linked", result["disposition"])
+
+        b1_late = self._seed_linkable(
+            b1_settled_at=datetime(
+                2026,
+                8,
+                4,
+                12,
+                0,
+                5,
+                tzinfo=timezone.utc,
+            )
+        )
+        b1_before = deepcopy(b1_late["store"].data)
+        b1_late["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self._link(b1_late)
+        self.assertEqual(b1_before, b1_late["store"].data)
+        self.assertEqual([], self._writes(b1_late["store"]))
+
+        b2_late = self._seed_linkable(
+            b1_settled_at=datetime(
+                2026,
+                8,
+                4,
+                12,
+                0,
+                1,
+                tzinfo=timezone.utc,
+            )
+        )
+        b2_before = deepcopy(b2_late["store"].data)
+        b2_late["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self._link(
+                b2_late,
+                linked_at="2026-08-04T12:00:02.000000Z",
+            )
+        self.assertEqual(b2_before, b2_late["store"].data)
+        self.assertEqual([], self._writes(b2_late["store"]))
+
+        head_late = self._seed_linkable()
+        self._set_head_pointer(
+            head_late["store"],
+            None,
+            updated_at="2026-08-04T12:00:05.000000Z",
+        )
+        head_before = deepcopy(head_late["store"].data)
+        head_late["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self._link(head_late)
+        self.assertEqual(head_before, head_late["store"].data)
+        self.assertEqual([], self._writes(head_late["store"]))
+
+        generation_before_claim = self._rewrite_b2_lineage(
+            self._seed_linkable(),
+            claim_created_at="2026-08-04T12:00:05.000000Z",
+            generation_created_at="2026-08-04T12:00:02.000000Z",
+            settled_at="2026-08-04T12:00:03.000000Z",
+        )
+        generation_before = deepcopy(
+            generation_before_claim["store"].data
+        )
+        generation_before_claim["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._link(
+                generation_before_claim,
+                linked_at="2026-08-04T12:00:06.000000Z",
+            )
+        self.assertEqual(
+            generation_before,
+            generation_before_claim["store"].data,
+        )
+        self.assertEqual(
+            [],
+            self._writes(generation_before_claim["store"]),
+        )
+
+        claim_before_row = self._rewrite_b2_lineage(
+            self._seed_linkable(),
+            claim_created_at="2026-08-04T11:30:00.000000Z",
+            generation_created_at="2026-08-04T11:30:00.000000Z",
+            settled_at="2026-08-04T11:31:00.000000Z",
+        )
+        claim_before = deepcopy(claim_before_row["store"].data)
+        claim_before_row["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._link(claim_before_row)
+        self.assertEqual(claim_before, claim_before_row["store"].data)
+        self.assertEqual([], self._writes(claim_before_row["store"]))
+
+        overbound_generation = self._rewrite_b2_lineage(
+            self._seed_linkable(),
+            generation_number=4,
+        )
+        overbound_before = deepcopy(overbound_generation["store"].data)
+        overbound_generation["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._link(overbound_generation)
+        self.assertEqual(
+            overbound_before,
+            overbound_generation["store"].data,
+        )
+        self.assertEqual(
+            [],
+            self._writes(overbound_generation["store"]),
+        )
+
+    def test_source_link_drift_is_conflict_and_partial_readback_is_ambiguous(self):
+        drift = self._seed_linkable()
+        drifted_link = self._expected_link(drift)
+        drifted_link["b1SettlementHash"] = "f" * 64
+        self._link_reference(drift["store"]).create(drifted_link)
+        before = deepcopy(drift["store"].data)
+        drift["store"].events.clear()
+        with self.assertRaises(self.module.RowAuthorityConflict):
+            self._link(drift)
+        self.assertEqual(before, drift["store"].data)
+        self.assertEqual([], self._writes(drift["store"]))
+
+        unrelated_result = self._seed_linkable()
+        unrelated_head = deepcopy(unrelated_result["head"])
+        unrelated_head.update(
+            {
+                "latestSourceSettlementLinkHash": "f" * 64,
+                "updatedAt": self.linked_at,
+            }
+        )
+        unrelated_head = self.fixture._rehash_head(unrelated_head)
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module._source_settlement_link_result(
+                disposition="already_applied",
+                source_settlement_link=self._expected_link(
+                    unrelated_result
+                ),
+                head=unrelated_head,
+            )
+
+        split_head = self._seed_linkable()
+        split_store = split_head["store"]
+        claimed_head = deepcopy(split_head["head"])
+        claimed_head.update(
+            {
+                "state": "claimed",
+                "leaseOwnerHash": "a" * 64,
+                "leaseUntil": "2026-08-04T12:05:00.000000Z",
+                "latestSettlementHash": None,
+                "effectiveSettlementHash": None,
+                "updatedAt": self.linked_at,
+            }
+        )
+        self._head_reference(split_store).set(
+            self.fixture._rehash_head(claimed_head),
+            merge=False,
+        )
+        split_before = deepcopy(split_store.data)
+        split_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._link(split_head)
+        self.assertEqual(split_before, split_store.data)
+        self.assertEqual([], self._writes(split_store))
+
+        split_latest = self._seed_linkable()
+        split_latest_store = split_latest["store"]
+        unrelated_latest = deepcopy(split_latest["head"])
+        unrelated_latest.update(
+            {
+                "latestSettlementHash": "f" * 64,
+                "updatedAt": self.linked_at,
+            }
+        )
+        self._head_reference(split_latest_store).set(
+            self.fixture._rehash_head(unrelated_latest),
+            merge=False,
+        )
+        split_latest_before = deepcopy(split_latest_store.data)
+        split_latest_store.events.clear()
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._link(split_latest)
+        self.assertEqual(split_latest_before, split_latest_store.data)
+        self.assertEqual([], self._writes(split_latest_store))
+
+        partial = self._seed_linkable()
+
+        def partial_executor(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            operation, reference, payload, merge = transaction._operations[0]
+            transaction._rollback()
+            self.assertEqual(("create", False), (operation, merge))
+            reference.create(payload)
+            raise RuntimeError("partial source-link apply")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._link(partial, executor=partial_executor)
+
+        query_race = self._seed_linkable()
+        query_store = query_race["store"]
+        candidate = self._expected_link(query_race)
+        current = self._synthetic_link()
+        self._link_reference(query_store).create(candidate)
+        self._link_reference(query_store, generation=2).create(current)
+        self._advance_head_to_link(query_store, current)
+
+        def duplicate_query_executor(transaction, callback):
+            transaction._begin()
+            callback(transaction)
+            transaction._rollback()
+            self._link_reference(query_store, generation=3).create(
+                current
+            )
+            raise RuntimeError("source-link query changed before readback")
+
+        with self.assertRaises(self.module.RowAuthorityAmbiguous):
+            self._link(query_race, executor=duplicate_query_executor)
+
+
 if __name__ == "__main__":
     unittest.main()
