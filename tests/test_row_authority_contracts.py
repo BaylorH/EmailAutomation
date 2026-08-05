@@ -102,6 +102,11 @@ ROW_METADATA_PATH = REPO_ROOT / "email_automation" / "row_metadata.py"
 ROW_AUTHORITY_STANDARD_LIBRARY_IMPORTS = frozenset(
     {"__future__", "hashlib", "json", "re", "unicodedata", "uuid"}
 )
+ROW_METADATA_STANDARD_LIBRARY_IMPORTS = frozenset({"__future__"})
+ROW_METADATA_APPLICATION_IMPORT = (
+    "email_automation.row_authority",
+    "validate_row_id",
+)
 ROW_AUTHORITY_IMPORTER_ALLOWLIST = frozenset(
     {"email_automation/row_metadata.py"}
 )
