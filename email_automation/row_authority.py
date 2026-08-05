@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from datetime import datetime
 from uuid import RFC_4122, UUID, uuid4
 
 
@@ -22,6 +23,22 @@ CONTACT_ROW_EVIDENCE_ID_DOMAIN = "sitesift.contact.row_evidence_id.v1"
 CONTACT_ROW_EVIDENCE_HASH_DOMAIN = "sitesift.contact.row_evidence.v1"
 CONTACT_ROW_BINDING_HEAD_HASH_DOMAIN = (
     "sitesift.contact.row_binding_head.v1"
+)
+B1_AUTHORITY_LINK_HASH_DOMAIN = "sitesift.row.b1_authority_link.v1"
+OPERATOR_ACTION_ID_DOMAIN = "sitesift.row.operator_action_id.v1"
+OPERATOR_CLIENT_REQUEST_HASH_DOMAIN = (
+    "sitesift.row.operator_client_request.v1"
+)
+OPERATOR_ACTION_HASH_DOMAIN = "sitesift.row.operator_action.v1"
+CLAIM_REQUEST_ID_DOMAIN = "sitesift.row.claim_request_id.v1"
+CLAIM_SET_HASH_DOMAIN = "sitesift.row.claim_set.v1"
+OWNER_GENERATION_HASH_DOMAIN = "sitesift.row.owner_generation.v1"
+LOGICAL_OUTCOME_HASH_DOMAIN = "sitesift.row.logical_outcome.v1"
+OUTCOME_EVIDENCE_HASH_DOMAIN = "sitesift.row.outcome_evidence.v1"
+OWNER_SETTLEMENT_HASH_DOMAIN = "sitesift.row.owner_settlement.v1"
+ROW_AUTHORITY_HEAD_HASH_DOMAIN = "sitesift.row.authority_head.v1"
+SOURCE_SETTLEMENT_LINK_HASH_DOMAIN = (
+    "sitesift.row.source_settlement_link.v1"
 )
 MAX_OPAQUE_BYTES = 512
 MAX_MAILBOX_BYTES = 320
@@ -455,6 +472,2188 @@ def _require_timestamp(value, *, field_name):
     ):
         raise RowAuthorityConfigError(f"{field_name} is not a valid time")
     return value
+
+
+def _defensive_copy(value):
+    if type(value) is dict:
+        return {key: _defensive_copy(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_defensive_copy(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_defensive_copy(item) for item in value)
+    return value
+
+
+def _require_row_authority_planned_writes(value):
+    checked = _require_uint(value, field_name="planned_writes")
+    if checked > MAX_ROW_AUTHORITY_PLANNED_WRITES:
+        raise RowAuthorityConfigError(
+            "planned_writes exceeds the row-authority transaction ceiling"
+        )
+    return checked
+
+
+def derive_owner_priority(owner_kind):
+    if type(owner_kind) is not str or owner_kind not in OWNER_PRIORITIES:
+        raise RowAuthorityConfigError("owner_kind is not approved")
+    return OWNER_PRIORITIES[owner_kind]
+
+
+_B1_SOURCE_IDENTITY_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "canonicalSourceId",
+        "creationHash",
+        "verifiedAliases",
+        "threadId",
+        "lifecycleState",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_B1_SOURCE_CLASSIFICATION_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "canonicalSourceId",
+        "classificationState",
+        "classificationEpoch",
+        "classificationClaimId",
+        "leaseExpiresAt",
+        "classificationInputSchemaVersion",
+        "classificationInputHash",
+        "modelRequestKey",
+        "modelRequestState",
+        "requestStartFence",
+        "completeProposalSnapshot",
+        "completeProposalHash",
+        "transitionCandidates",
+        "ordinaryObligations",
+        "selectionSnapshot",
+        "selectionHash",
+        "snapshotImmutableHash",
+        "proposalEvidence",
+        "proposalEvidenceHash",
+        "deterministicEvidence",
+        "deterministicEvidenceHash",
+        "snapshotPersistedAt",
+        "retainedTerminalKind",
+        "retainedTerminalImmutableHash",
+        "retainedTerminalRecordHash",
+        "retainedTerminalBindingHash",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_B1_SOURCE_OWNER_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "canonicalSourceId",
+        "snapshotImmutableHash",
+        "selectionHash",
+        "ownerKind",
+        "ownerKey",
+        "ownerDecisionHash",
+        "revision",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_B1_SOURCE_LEDGER_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "canonicalSourceId",
+        "completeProposalHash",
+        "snapshotImmutableHash",
+        "selectionHash",
+        "ownerDecisionHash",
+        "entries",
+        "entryCount",
+        "ledgerHash",
+        "revision",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_B1_SOURCE_ENTRY_KEYS = frozenset(
+    {
+        "workKey",
+        "lane",
+        "kind",
+        "payload",
+        "payloadHash",
+        "occurrenceOrdinal",
+        "selectedOwnerKind",
+        "selectedOwnerKey",
+        "dominanceOutcome",
+        "completionContract",
+        "state",
+        "resolutionEvidence",
+        "resolutionEvidenceHash",
+    }
+)
+_B1_SOURCE_ENTRY_MUTABLE_KEYS = frozenset(
+    {"state", "resolutionEvidence", "resolutionEvidenceHash"}
+)
+_B1_TRANSITION_OWNER_KINDS = frozenset(
+    {"none", "contact_optout", "terminal", "human_decision"}
+)
+_B1_TERMINAL_CANDIDATE_TYPES = frozenset(
+    {"property_unavailable", "close_conversation"}
+)
+_B1_HUMAN_CANDIDATE_TYPES = frozenset(
+    {
+        "call_requested",
+        "actionable_tour_review",
+        "needs_user_input",
+        "wrong_contact_pause",
+        "forwarded_observed",
+        "disabled_policy_suppressed",
+    }
+)
+_B1_ORDINARY_CANDIDATE_TYPES = frozenset(
+    {
+        "confirmed_tour",
+        "non_tour",
+        "new_property",
+        "field_update",
+        "generic_reply",
+        "informational",
+    }
+)
+_B1_LOCAL_SOURCE_POLICY_EVIDENCE_KINDS = frozenset(
+    {"local_ignore_auto_reply", "local_ignore_self_sender"}
+)
+_B1_HARD_OPTOUT_EVIDENCE_KEYS = frozenset(
+    {"schemaVersion", "evidenceKind", "evidenceHash"}
+)
+_B1_SOURCE_ALIAS_TYPES = frozenset({"graph", "internet_message_id"})
+_B1_COMPLETE_PROPOSAL_KEYS = frozenset(
+    {"schemaVersion", "transitionCandidates", "ordinaryObligations"}
+)
+_B1_COMPLETION_EVIDENCE_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "evidenceKind",
+        "canonicalSourceId",
+        "ledgerHash",
+        "workKey",
+        "payloadHash",
+        "workKind",
+        "resultHash",
+    }
+)
+_B1_DELEGATION_EVIDENCE_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "evidenceKind",
+        "canonicalSourceId",
+        "ledgerHash",
+        "workKey",
+        "payloadHash",
+        "workKind",
+        "deferredBindingHash",
+    }
+)
+_B1_DOMINANCE_EVIDENCE_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "evidenceKind",
+        "canonicalSourceId",
+        "ledgerHash",
+        "workKey",
+        "payloadHash",
+        "workKind",
+        "selectionHash",
+        "ownerDecisionHash",
+        "dominatingOwnerKind",
+        "dominatingOwnerKey",
+        "dominanceOutcome",
+    }
+)
+_B1_LINK_KEYS = frozenset(
+    {
+        "canonicalSourceId",
+        "snapshotImmutableHash",
+        "selectionHash",
+        "ownerDecisionHash",
+        "ledgerHash",
+        "ownerKind",
+        "ownerKey",
+        "workKey",
+        "payloadHash",
+        "hardOptOutEvidenceHash",
+        "authorityLinkHash",
+    }
+)
+_B1_MAX_SOURCE_ALIASES = 8
+_B1_MAX_SOURCE_ENTRIES = 128
+_B1_MAX_CLASSIFICATION_BYTES = 614400
+_B1_MAX_LEDGER_BYTES = 600 * 1024
+
+
+def _is_aware_datetime(value):
+    try:
+        return (
+            isinstance(value, datetime)
+            and value.tzinfo is not None
+            and value.utcoffset() is not None
+        )
+    except Exception:
+        return False
+
+
+def _validate_b1_json(value, *, active):
+    if value is None or type(value) in {bool, int}:
+        return
+    if type(value) is float:
+        if value != value or value in {float("inf"), float("-inf")}:
+            raise RowAuthorityConfigError("B1 material must be finite JSON")
+        return
+    if type(value) is str:
+        _utf8_bytes(value, field_name="B1 material")
+        return
+    if type(value) not in {dict, list}:
+        raise RowAuthorityConfigError("B1 material must use exact JSON types")
+    identity = id(value)
+    if identity in active:
+        raise RowAuthorityConfigError("B1 material contains a cycle")
+    active.add(identity)
+    try:
+        if type(value) is dict:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise RowAuthorityConfigError(
+                        "B1 material keys must be exact strings"
+                    )
+                _utf8_bytes(key, field_name="B1 material key")
+                _validate_b1_json(item, active=active)
+        else:
+            for item in value:
+                _validate_b1_json(item, active=active)
+    except RecursionError as exc:
+        raise RowAuthorityConfigError("B1 material is too deeply nested") from exc
+    finally:
+        active.remove(identity)
+
+
+def _b1_canonical_json_bytes(value):
+    _validate_b1_json(value, active=set())
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+        raise RowAuthorityConfigError("B1 material is not canonical JSON") from exc
+
+
+def _b1_canonical_hash(value):
+    return hashlib.sha256(_b1_canonical_json_bytes(value)).hexdigest()
+
+
+def _b1_sorted_items(value, *, field_name):
+    if type(value) is not list:
+        raise RowAuthorityConfigError(f"{field_name} must be an exact list")
+    result = []
+    for item in value:
+        if type(item) is not dict:
+            raise RowAuthorityConfigError(
+                f"{field_name} entries must be exact dictionaries"
+            )
+        _validate_b1_json(item, active=set())
+        result.append(_defensive_copy(item))
+    return sorted(result, key=_b1_canonical_json_bytes)
+
+
+def _b1_candidate_type(candidate):
+    value = candidate.get("type")
+    if type(value) is not str or not value:
+        raise RowAuthorityConfigError("B1 candidate type is malformed")
+    return value
+
+
+def _normalize_b1_complete_proposal(value):
+    checked = _require_exact_dict(
+        value,
+        keys=_B1_COMPLETE_PROPOSAL_KEYS,
+        field_name="B1 complete proposal",
+    )
+    if type(checked["schemaVersion"]) is not int or checked["schemaVersion"] != 1:
+        raise RowAuthorityConfigError("B1 proposal schemaVersion must be 1")
+    transitions = _b1_sorted_items(
+        checked["transitionCandidates"],
+        field_name="B1 transitionCandidates",
+    )
+    obligations = _b1_sorted_items(
+        checked["ordinaryObligations"],
+        field_name="B1 ordinaryObligations",
+    )
+    legal_transitions = (
+        {"contact_optout"}
+        | set(_B1_TERMINAL_CANDIDATE_TYPES)
+        | set(_B1_HUMAN_CANDIDATE_TYPES)
+    )
+    if any(_b1_candidate_type(item) not in legal_transitions for item in transitions):
+        raise RowAuthorityConfigError("B1 transition candidate lane is invalid")
+    if any(
+        _b1_candidate_type(item) not in _B1_ORDINARY_CANDIDATE_TYPES
+        for item in obligations
+    ):
+        raise RowAuthorityConfigError("B1 ordinary obligation lane is invalid")
+    return {
+        "schemaVersion": 1,
+        "transitionCandidates": transitions,
+        "ordinaryObligations": obligations,
+    }
+
+
+def _derive_b1_selection(*, canonical_source_id, proposal, hard_optout):
+    candidates = []
+    obligations = _b1_sorted_items(
+        proposal["ordinaryObligations"],
+        field_name="B1 ordinaryObligations",
+    )
+    for candidate in _b1_sorted_items(
+        proposal["transitionCandidates"],
+        field_name="B1 transitionCandidates",
+    ):
+        candidate_type = _b1_candidate_type(candidate)
+        if candidate_type == "contact_optout":
+            if hard_optout:
+                candidates.append(_defensive_copy(candidate))
+            else:
+                candidates.append(
+                    {
+                        "type": "needs_user_input",
+                        "reason": "unverified_optout_review",
+                        "sourceCandidateHash": _b1_canonical_hash(candidate),
+                    }
+                )
+        elif candidate_type in (
+            set(_B1_TERMINAL_CANDIDATE_TYPES)
+            | set(_B1_HUMAN_CANDIDATE_TYPES)
+        ):
+            candidates.append(_defensive_copy(candidate))
+        else:
+            raise RowAuthorityConfigError("B1 transition candidate is unsupported")
+    candidates.sort(key=_b1_canonical_json_bytes)
+    obligations.sort(key=_b1_canonical_json_bytes)
+    hard = [item for item in candidates if item["type"] == "contact_optout"]
+    terminal = [
+        item for item in candidates if item["type"] in _B1_TERMINAL_CANDIDATE_TYPES
+    ]
+    human = [
+        item for item in candidates if item["type"] in _B1_HUMAN_CANDIDATE_TYPES
+    ]
+    if hard:
+        owner_kind, selected = "contact_optout", hard
+    elif terminal:
+        owner_kind, selected = "terminal", terminal
+    elif human:
+        owner_kind, selected = "human_decision", human
+    else:
+        owner_kind, selected = "none", []
+    owner_key = None
+    if owner_kind != "none":
+        owner_key = _b1_canonical_hash(
+            {
+                "hashKind": "source-selection-v1",
+                "canonicalSourceId": canonical_source_id,
+                "ownerKind": owner_kind,
+                "selectedCandidates": selected,
+            }
+        )
+    selected_hashes = {_b1_canonical_hash(item) for item in selected}
+    selection = {
+        "candidateTaxonomyVersion": "source-candidate-taxonomy-v1",
+        "ownerKind": owner_kind,
+        "ownerKey": owner_key,
+        "selectedCandidates": _defensive_copy(selected),
+        "candidateDominance": [
+            {
+                "candidateHash": _b1_canonical_hash(item),
+                "outcome": (
+                    "selected"
+                    if _b1_canonical_hash(item) in selected_hashes
+                    else "dominated"
+                ),
+            }
+            for item in candidates
+        ],
+        "transitionCandidatesHash": _b1_canonical_hash(candidates),
+        "ordinaryObligationsHash": _b1_canonical_hash(obligations),
+    }
+    return candidates, obligations, selection
+
+
+def _validate_b1_source_identity(document):
+    checked = _require_exact_dict(
+        document,
+        keys=_B1_SOURCE_IDENTITY_KEYS,
+        field_name="B1 source identity",
+    )
+    if type(checked["schemaVersion"]) is not int or checked["schemaVersion"] != 1:
+        raise RowAuthorityConfigError("B1 identity schemaVersion must be 1")
+    source_id = _require_firestore_document_id(
+        checked["canonicalSourceId"],
+        field_name="B1 canonicalSourceId",
+    )
+    _require_opaque(source_id, field_name="B1 canonicalSourceId")
+    _require_sha256(checked["creationHash"], field_name="B1 creationHash")
+    if checked["lifecycleState"] != "pending" or type(
+        checked["lifecycleState"]
+    ) is not str:
+        raise RowAuthorityConfigError("B1 identity lifecycle is unsupported")
+    if not _is_aware_datetime(checked["createdAt"]) or not _is_aware_datetime(
+        checked["updatedAt"]
+    ):
+        raise RowAuthorityConfigError("B1 identity timestamps must be aware")
+    thread_id = _require_firestore_document_id(
+        checked["threadId"],
+        field_name="B1 threadId",
+    )
+    _require_opaque(thread_id, field_name="B1 threadId")
+    aliases = checked["verifiedAliases"]
+    if type(aliases) is not list or not 1 <= len(aliases) <= _B1_MAX_SOURCE_ALIASES:
+        raise RowAuthorityConfigError("B1 verifiedAliases is malformed")
+    validated = []
+    seen = set()
+    for alias in aliases:
+        item = _require_exact_dict(
+            alias,
+            keys={"sourceAliasKey", "aliasType", "normalizedValueHash"},
+            field_name="B1 alias descriptor",
+        )
+        key = _require_sha256(item["sourceAliasKey"], field_name="B1 sourceAliasKey")
+        if key in seen:
+            raise RowAuthorityConfigError("B1 alias keys must be unique")
+        seen.add(key)
+        if type(item["aliasType"]) is not str or item[
+            "aliasType"
+        ] not in _B1_SOURCE_ALIAS_TYPES:
+            raise RowAuthorityConfigError("B1 alias type is unsupported")
+        _require_sha256(
+            item["normalizedValueHash"],
+            field_name="B1 normalizedValueHash",
+        )
+        validated.append(_defensive_copy(item))
+    if validated != sorted(validated, key=lambda item: item["sourceAliasKey"]):
+        raise RowAuthorityConfigError("B1 aliases must be canonically sorted")
+    return _defensive_copy(checked)
+
+
+def _validate_b1_classification(document, *, canonical_source_id):
+    checked = _require_exact_dict(
+        document,
+        keys=_B1_SOURCE_CLASSIFICATION_KEYS,
+        field_name="B1 source classification",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != 1
+        or checked["canonicalSourceId"] != canonical_source_id
+        or checked["classificationState"] != "snapshot_ready"
+        or type(checked["classificationEpoch"]) is not int
+        or checked["classificationEpoch"] < 1
+        or type(checked["classificationInputSchemaVersion"]) is not int
+        or checked["classificationInputSchemaVersion"] != 1
+    ):
+        raise RowAuthorityConfigError("B1 ready classification is malformed")
+    _require_firestore_document_id(
+        checked["classificationClaimId"],
+        field_name="B1 classificationClaimId",
+    )
+    for field in ("leaseExpiresAt", "snapshotPersistedAt", "createdAt", "updatedAt"):
+        if not _is_aware_datetime(checked[field]):
+            raise RowAuthorityConfigError(f"B1 {field} must be aware")
+    _require_sha256(
+        checked["classificationInputHash"],
+        field_name="B1 classificationInputHash",
+    )
+    if any(
+        checked[field] is not None
+        for field in (
+            "retainedTerminalKind",
+            "retainedTerminalImmutableHash",
+            "retainedTerminalRecordHash",
+            "retainedTerminalBindingHash",
+        )
+    ):
+        raise RowAuthorityConfigError("B1 classification retains terminal authority")
+    model_state = checked["modelRequestState"]
+    if model_state == "captured":
+        model_key = checked["modelRequestKey"]
+        if (
+            type(model_key) is not str
+            or not model_key
+            or len(_utf8_bytes(model_key, field_name="B1 modelRequestKey")) > 1024
+            or _contains_control(model_key)
+        ):
+            raise RowAuthorityConfigError("B1 modelRequestKey is malformed")
+        _require_firestore_document_id(
+            checked["requestStartFence"],
+            field_name="B1 requestStartFence",
+        )
+        if type(checked["proposalEvidence"]) is not dict:
+            raise RowAuthorityConfigError("B1 proposal evidence is malformed")
+        _validate_b1_json(checked["proposalEvidence"], active=set())
+        if checked["deterministicEvidence"] is not None:
+            raise RowAuthorityConfigError("B1 classification evidence lanes conflict")
+        proposal_evidence = _defensive_copy(checked["proposalEvidence"])
+        deterministic_evidence = None
+    elif model_state == "not_applicable":
+        if (
+            checked["modelRequestKey"] is not None
+            or checked["requestStartFence"] is not None
+            or checked["proposalEvidence"] is not None
+            or type(checked["deterministicEvidence"]) is not dict
+        ):
+            raise RowAuthorityConfigError("B1 deterministic snapshot is malformed")
+        _validate_b1_json(checked["deterministicEvidence"], active=set())
+        proposal_evidence = None
+        deterministic_evidence = _defensive_copy(checked["deterministicEvidence"])
+    else:
+        raise RowAuthorityConfigError("B1 modelRequestState is unsupported")
+    proposal = _normalize_b1_complete_proposal(checked["completeProposalSnapshot"])
+    hard_optout = (
+        deterministic_evidence is not None
+        and deterministic_evidence.get("evidenceKind")
+        not in _B1_LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
+    )
+    transitions, obligations, selection = _derive_b1_selection(
+        canonical_source_id=canonical_source_id,
+        proposal=proposal,
+        hard_optout=hard_optout,
+    )
+    complete_hash = _b1_canonical_hash(proposal)
+    proposal_hash = (
+        _b1_canonical_hash(proposal_evidence)
+        if proposal_evidence is not None
+        else None
+    )
+    deterministic_hash = (
+        _b1_canonical_hash(deterministic_evidence)
+        if deterministic_evidence is not None
+        else None
+    )
+    selection_hash = _b1_canonical_hash(selection)
+    immutable = {
+        "schemaVersion": 1,
+        "hashKind": "source-classification-snapshot-v1",
+        "canonicalSourceId": canonical_source_id,
+        "classificationInputSchemaVersion": 1,
+        "classificationInputHash": checked["classificationInputHash"],
+        "modelRequestKey": checked["modelRequestKey"],
+        "completeProposalSnapshot": proposal,
+        "completeProposalHash": complete_hash,
+        "transitionCandidates": transitions,
+        "ordinaryObligations": obligations,
+        "selectionSnapshot": selection,
+        "selectionHash": selection_hash,
+        "proposalEvidence": proposal_evidence,
+        "proposalEvidenceHash": proposal_hash,
+        "deterministicEvidence": deterministic_evidence,
+        "deterministicEvidenceHash": deterministic_hash,
+    }
+    snapshot_hash = _b1_canonical_hash(immutable)
+    bounded = {**immutable, "snapshotImmutableHash": snapshot_hash}
+    if len(_b1_canonical_json_bytes(bounded)) > _B1_MAX_CLASSIFICATION_BYTES:
+        raise RowAuthorityConfigError("B1 classification exceeds its byte bound")
+    expected = {
+        "completeProposalSnapshot": proposal,
+        "completeProposalHash": complete_hash,
+        "transitionCandidates": transitions,
+        "ordinaryObligations": obligations,
+        "selectionSnapshot": selection,
+        "selectionHash": selection_hash,
+        "snapshotImmutableHash": snapshot_hash,
+        "proposalEvidence": proposal_evidence,
+        "proposalEvidenceHash": proposal_hash,
+        "deterministicEvidence": deterministic_evidence,
+        "deterministicEvidenceHash": deterministic_hash,
+    }
+    if any(checked[field] != value for field, value in expected.items()):
+        raise RowAuthorityConfigError("B1 classification hashes conflict")
+    return _defensive_copy(checked)
+
+
+def _b1_owner_material(classification):
+    selection = classification["selectionSnapshot"]
+    owner_kind = selection["ownerKind"]
+    owner_key = selection["ownerKey"]
+    if (
+        type(owner_kind) is not str
+        or owner_kind not in _B1_TRANSITION_OWNER_KINDS
+        or (owner_kind == "none") != (owner_key is None)
+    ):
+        raise RowAuthorityConfigError("B1 selected owner is malformed")
+    if owner_key is not None:
+        _require_sha256(owner_key, field_name="B1 ownerKey")
+    material = {
+        "schemaVersion": 1,
+        "canonicalSourceId": classification["canonicalSourceId"],
+        "snapshotImmutableHash": classification["snapshotImmutableHash"],
+        "selectionHash": classification["selectionHash"],
+        "ownerKind": owner_kind,
+        "ownerKey": owner_key,
+    }
+    material["ownerDecisionHash"] = _b1_canonical_hash(
+        {"hashKind": "source-transition-owner-v1", **material}
+    )
+    return material
+
+
+def _validate_b1_owner(document, *, canonical_source_id, classification):
+    checked = _require_exact_dict(
+        document,
+        keys=_B1_SOURCE_OWNER_KEYS,
+        field_name="B1 transition owner",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != 1
+        or checked["canonicalSourceId"] != canonical_source_id
+        or type(checked["revision"]) is not int
+        or checked["revision"] != 1
+        or not _is_aware_datetime(checked["createdAt"])
+        or not _is_aware_datetime(checked["updatedAt"])
+    ):
+        raise RowAuthorityConfigError("B1 transition owner is malformed")
+    expected = _b1_owner_material(classification)
+    if any(checked[field] != value for field, value in expected.items()):
+        raise RowAuthorityConfigError("B1 transition owner conflicts")
+    return _defensive_copy(checked)
+
+
+def _b1_dominance(*, lane, kind, payload_hash, owner_kind, selected_hashes):
+    if lane == "ordinary":
+        if kind == "generic_reply":
+            if owner_kind == "terminal":
+                return "delegate_terminal_policy"
+            if owner_kind in {"contact_optout", "human_decision"}:
+                return "dominated_no_send"
+        return "preserve"
+    return "delegate_owner" if payload_hash in selected_hashes else "dominated_by_owner"
+
+
+def _b1_completion_contract(*, kind, dominance):
+    evidence_kind = {
+        "delegate_owner": "owner_delegation",
+        "delegate_terminal_policy": "terminal_policy_delegation",
+        "dominated_by_owner": "selection_dominance",
+        "dominated_no_send": "selection_dominance",
+        "preserve": "work_completion",
+    }[dominance]
+    return {"schemaVersion": 1, "evidenceKind": evidence_kind, "workKind": kind}
+
+
+def _build_b1_entries(*, canonical_source_id, classification, owner):
+    selected_hashes = {
+        _b1_canonical_hash(item)
+        for item in classification["selectionSnapshot"]["selectedCandidates"]
+    }
+    raw = [
+        ("transition", _defensive_copy(item))
+        for item in classification["transitionCandidates"]
+    ] + [
+        ("ordinary", _defensive_copy(item))
+        for item in classification["ordinaryObligations"]
+    ]
+    raw.sort(key=lambda item: _b1_canonical_json_bytes({"lane": item[0], "payload": item[1]}))
+    occurrences = {}
+    result = []
+    for lane, payload in raw:
+        payload_hash = _b1_canonical_hash(payload)
+        semantic_hash = _b1_canonical_hash({"lane": lane, "payloadHash": payload_hash})
+        ordinal = occurrences.get(semantic_hash, 0) + 1
+        occurrences[semantic_hash] = ordinal
+        kind = _b1_candidate_type(payload)
+        dominance = _b1_dominance(
+            lane=lane,
+            kind=kind,
+            payload_hash=payload_hash,
+            owner_kind=owner["ownerKind"],
+            selected_hashes=selected_hashes,
+        )
+        work_key = _b1_canonical_hash(
+            {
+                "hashKind": "source-work-key-v1",
+                "canonicalSourceId": canonical_source_id,
+                "snapshotImmutableHash": classification["snapshotImmutableHash"],
+                "selectionHash": classification["selectionHash"],
+                "lane": lane,
+                "payloadHash": payload_hash,
+                "occurrenceOrdinal": ordinal,
+            }
+        )
+        result.append(
+            {
+                "workKey": work_key,
+                "lane": lane,
+                "kind": kind,
+                "payload": payload,
+                "payloadHash": payload_hash,
+                "occurrenceOrdinal": ordinal,
+                "selectedOwnerKind": owner["ownerKind"],
+                "selectedOwnerKey": owner["ownerKey"],
+                "dominanceOutcome": dominance,
+                "completionContract": _b1_completion_contract(
+                    kind=kind,
+                    dominance=dominance,
+                ),
+                "state": "pending",
+                "resolutionEvidence": None,
+                "resolutionEvidenceHash": None,
+            }
+        )
+    return result
+
+
+def _b1_resolution_hash(evidence):
+    return _b1_canonical_hash(
+        {"hashKind": "source-work-resolution-evidence-v1", "evidence": evidence}
+    )
+
+
+def _validate_b1_entry_resolution(
+    entry, *, canonical_source_id, ledger_hash, selection_hash, owner_decision_hash
+):
+    state = entry["state"]
+    evidence = entry["resolutionEvidence"]
+    evidence_hash = entry["resolutionEvidenceHash"]
+    if state in {"pending", "applying"}:
+        if evidence is not None or evidence_hash is not None:
+            raise RowAuthorityConfigError("B1 unsettled work contains evidence")
+        return
+    if type(evidence) is not dict:
+        raise RowAuthorityConfigError("B1 settled work lacks exact evidence")
+    _require_sha256(evidence_hash, field_name="B1 resolutionEvidenceHash")
+    if evidence_hash != _b1_resolution_hash(evidence):
+        raise RowAuthorityConfigError("B1 resolution evidence hash conflicts")
+    common = (
+        type(evidence.get("schemaVersion")) is not int
+        or evidence.get("schemaVersion") != 1
+        or evidence.get("canonicalSourceId") != canonical_source_id
+        or evidence.get("ledgerHash") != ledger_hash
+        or evidence.get("workKey") != entry["workKey"]
+        or evidence.get("payloadHash") != entry["payloadHash"]
+        or evidence.get("workKind") != entry["kind"]
+    )
+    if common:
+        raise RowAuthorityConfigError("B1 resolution evidence conflicts")
+    if state == "completed":
+        valid = (
+            set(evidence) == _B1_COMPLETION_EVIDENCE_KEYS
+            and evidence.get("evidenceKind") == "work_completion"
+            and entry["completionContract"]["evidenceKind"] == "work_completion"
+            and _SHA256_PATTERN.fullmatch(str(evidence.get("resultHash"))) is not None
+            and type(evidence.get("resultHash")) is str
+        )
+    elif state == "delegated":
+        valid = (
+            set(evidence) == _B1_DELEGATION_EVIDENCE_KEYS
+            and evidence.get("evidenceKind") == entry["completionContract"]["evidenceKind"]
+            and entry["dominanceOutcome"] in {"delegate_owner", "delegate_terminal_policy"}
+            and type(evidence.get("deferredBindingHash")) is str
+            and _SHA256_PATTERN.fullmatch(evidence["deferredBindingHash"]) is not None
+        )
+    else:
+        valid = (
+            set(evidence) == _B1_DOMINANCE_EVIDENCE_KEYS
+            and evidence.get("evidenceKind") == "selection_dominance"
+            and entry["completionContract"]["evidenceKind"] == "selection_dominance"
+            and entry["dominanceOutcome"] in {"dominated_by_owner", "dominated_no_send"}
+            and evidence.get("selectionHash") == selection_hash
+            and evidence.get("ownerDecisionHash") == owner_decision_hash
+            and evidence.get("dominatingOwnerKind") == entry["selectedOwnerKind"]
+            and evidence.get("dominatingOwnerKey") == entry["selectedOwnerKey"]
+            and evidence.get("dominanceOutcome") == entry["dominanceOutcome"]
+        )
+    if not valid:
+        raise RowAuthorityConfigError("B1 resolution evidence is unsupported")
+
+
+def _validate_b1_ledger(document, *, canonical_source_id, classification, owner):
+    checked = _require_exact_dict(
+        document,
+        keys=_B1_SOURCE_LEDGER_KEYS,
+        field_name="B1 source work ledger",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != 1
+        or checked["canonicalSourceId"] != canonical_source_id
+        or type(checked["revision"]) is not int
+        or checked["revision"] < 1
+        or not _is_aware_datetime(checked["createdAt"])
+        or not _is_aware_datetime(checked["updatedAt"])
+        or type(checked["entries"]) is not list
+        or type(checked["entryCount"]) is not int
+        or checked["entryCount"] != len(checked["entries"])
+    ):
+        raise RowAuthorityConfigError("B1 source work ledger is malformed")
+    expected_entries = _build_b1_entries(
+        canonical_source_id=canonical_source_id,
+        classification=classification,
+        owner=owner,
+    )
+    if len(expected_entries) > _B1_MAX_SOURCE_ENTRIES:
+        raise RowAuthorityConfigError("B1 source work ledger is overbound")
+    immutable_keys = _B1_SOURCE_ENTRY_KEYS - _B1_SOURCE_ENTRY_MUTABLE_KEYS
+    immutable_entries = [
+        {field: _defensive_copy(entry[field]) for field in sorted(immutable_keys)}
+        for entry in expected_entries
+    ]
+    ledger_hash = _b1_canonical_hash(
+        {
+            "hashKind": "source-work-ledger-v1",
+            "canonicalSourceId": canonical_source_id,
+            "completeProposalHash": classification["completeProposalHash"],
+            "snapshotImmutableHash": classification["snapshotImmutableHash"],
+            "selectionHash": classification["selectionHash"],
+            "ownerDecisionHash": owner["ownerDecisionHash"],
+            "entries": immutable_entries,
+        }
+    )
+    expected_fields = {
+        "completeProposalHash": classification["completeProposalHash"],
+        "snapshotImmutableHash": classification["snapshotImmutableHash"],
+        "selectionHash": classification["selectionHash"],
+        "ownerDecisionHash": owner["ownerDecisionHash"],
+        "entryCount": len(expected_entries),
+        "ledgerHash": ledger_hash,
+    }
+    if any(checked[field] != value for field, value in expected_fields.items()):
+        raise RowAuthorityConfigError("B1 source work ledger conflicts")
+    if len(checked["entries"]) != len(expected_entries):
+        raise RowAuthorityConfigError("B1 source work entries conflict")
+    for stored, initial in zip(checked["entries"], expected_entries):
+        if (
+            type(stored) is not dict
+            or set(stored) != _B1_SOURCE_ENTRY_KEYS
+            or type(stored.get("state")) is not str
+            or stored["state"] not in {"pending", "applying", "completed", "delegated", "dominated"}
+            or any(stored.get(field) != initial[field] for field in immutable_keys)
+        ):
+            raise RowAuthorityConfigError("B1 source work entry conflicts")
+        _validate_b1_entry_resolution(
+            stored,
+            canonical_source_id=canonical_source_id,
+            ledger_hash=ledger_hash,
+            selection_hash=classification["selectionHash"],
+            owner_decision_hash=owner["ownerDecisionHash"],
+        )
+    material = {
+        "schemaVersion": 1,
+        "canonicalSourceId": canonical_source_id,
+        "completeProposalHash": classification["completeProposalHash"],
+        "snapshotImmutableHash": classification["snapshotImmutableHash"],
+        "selectionHash": classification["selectionHash"],
+        "ownerDecisionHash": owner["ownerDecisionHash"],
+        "entries": expected_entries,
+        "entryCount": len(expected_entries),
+        "ledgerHash": ledger_hash,
+        "revision": 1,
+    }
+    if len(_b1_canonical_json_bytes(material)) > _B1_MAX_LEDGER_BYTES:
+        raise RowAuthorityConfigError("B1 source work ledger exceeds its byte bound")
+    return _defensive_copy(checked)
+
+
+def build_b1_authority_link(
+    *,
+    user_scope_hash,
+    source_identity_document,
+    source_classification_document,
+    source_owner_document,
+    source_ledger_document,
+    work_key,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    selector = _require_sha256(work_key, field_name="work_key")
+    identity = _validate_b1_source_identity(source_identity_document)
+    source_id = identity["canonicalSourceId"]
+    classification = _validate_b1_classification(
+        source_classification_document,
+        canonical_source_id=source_id,
+    )
+    owner = _validate_b1_owner(
+        source_owner_document,
+        canonical_source_id=source_id,
+        classification=classification,
+    )
+    ledger = _validate_b1_ledger(
+        source_ledger_document,
+        canonical_source_id=source_id,
+        classification=classification,
+        owner=owner,
+    )
+    matches = [entry for entry in ledger["entries"] if entry["workKey"] == selector]
+    if len(matches) != 1:
+        raise RowAuthorityConfigError("B1 work selector is not exact")
+    entry = matches[0]
+    if (
+        entry["lane"] != "transition"
+        or entry["dominanceOutcome"] != "delegate_owner"
+        or owner["ownerKind"] not in OWNER_PRIORITIES
+        or entry["selectedOwnerKind"] != owner["ownerKind"]
+        or entry["selectedOwnerKey"] != owner["ownerKey"]
+    ):
+        raise RowAuthorityConfigError("B1 work is not selected owner authority")
+    hard_optout_hash = None
+    if owner["ownerKind"] == "contact_optout":
+        evidence = classification["deterministicEvidence"]
+        if (
+            classification["modelRequestState"] != "not_applicable"
+            or type(evidence) is not dict
+            or set(evidence) != _B1_HARD_OPTOUT_EVIDENCE_KEYS
+            or type(evidence.get("schemaVersion")) is not int
+            or evidence.get("schemaVersion") != 1
+            or type(evidence.get("evidenceKind")) is not str
+            or not evidence.get("evidenceKind")
+            or evidence["evidenceKind"] in _B1_LOCAL_SOURCE_POLICY_EVIDENCE_KINDS
+        ):
+            raise RowAuthorityConfigError("B1 hard opt-out evidence is not verified")
+        _require_sha256(evidence.get("evidenceHash"), field_name="B1 evidenceHash")
+        hard_optout_hash = _b1_canonical_hash(evidence)
+        if (
+            classification["deterministicEvidenceHash"] != hard_optout_hash
+            or entry["kind"] != "contact_optout"
+            or entry["payload"].get("type") != "contact_optout"
+            or entry["payload"].get("evidenceHash") != hard_optout_hash
+        ):
+            raise RowAuthorityConfigError("B1 hard opt-out evidence binding conflicts")
+    material = {
+        "canonicalSourceId": source_id,
+        "snapshotImmutableHash": classification["snapshotImmutableHash"],
+        "selectionHash": classification["selectionHash"],
+        "ownerDecisionHash": owner["ownerDecisionHash"],
+        "ledgerHash": ledger["ledgerHash"],
+        "ownerKind": owner["ownerKind"],
+        "ownerKey": owner["ownerKey"],
+        "workKey": entry["workKey"],
+        "payloadHash": entry["payloadHash"],
+        "hardOptOutEvidenceHash": hard_optout_hash,
+    }
+    result = {
+        **material,
+        "authorityLinkHash": domain_hash(
+            B1_AUTHORITY_LINK_HASH_DOMAIN,
+            material,
+            user_scope_hash=scope,
+        ),
+    }
+    return _defensive_copy(result)
+
+
+def validate_b1_authority_link(*, authority_link, user_scope_hash):
+    checked = _require_exact_dict(
+        authority_link,
+        keys=_B1_LINK_KEYS,
+        field_name="B1 authority link",
+    )
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    _require_opaque(checked["canonicalSourceId"], field_name="canonicalSourceId")
+    for field in (
+        "snapshotImmutableHash",
+        "selectionHash",
+        "ownerDecisionHash",
+        "ledgerHash",
+        "ownerKey",
+        "workKey",
+        "payloadHash",
+        "authorityLinkHash",
+    ):
+        _require_sha256(checked[field], field_name=field)
+    if type(checked["ownerKind"]) is not str or checked["ownerKind"] not in OWNER_PRIORITIES:
+        raise RowAuthorityConfigError("B1 link ownerKind is unsupported")
+    hard = _require_optional_hash(
+        checked["hardOptOutEvidenceHash"],
+        field_name="hardOptOutEvidenceHash",
+    )
+    if (checked["ownerKind"] == "contact_optout") != (hard is not None):
+        raise RowAuthorityConfigError("B1 link hard opt-out evidence is miscorrelated")
+    material = {
+        key: _defensive_copy(value)
+        for key, value in checked.items()
+        if key != "authorityLinkHash"
+    }
+    expected = domain_hash(
+        B1_AUTHORITY_LINK_HASH_DOMAIN,
+        material,
+        user_scope_hash=scope,
+    )
+    if checked["authorityLinkHash"] != expected:
+        raise RowAuthorityConfigError("B1 authorityLinkHash does not recompute")
+    return _defensive_copy(checked)
+
+
+_OPERATOR_ACTION_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "actionId",
+        "actionKind",
+        "actorScopeHash",
+        "rowBindingsHash",
+        "clientRequestHash",
+        "reasonCode",
+        "issuedAt",
+        "operatorActionHash",
+    }
+)
+
+
+def build_operator_action_document(
+    *, user_scope_hash, actor_scope_hash, row_bindings_hash, client_request_id, issued_at
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    actor = _require_sha256(actor_scope_hash, field_name="actor_scope_hash")
+    bindings_hash = _require_sha256(row_bindings_hash, field_name="row_bindings_hash")
+    request_id = _require_opaque(client_request_id, field_name="client_request_id")
+    issued = _require_timestamp(issued_at, field_name="issued_at")
+    client_request_hash = domain_hash(
+        OPERATOR_CLIENT_REQUEST_HASH_DOMAIN,
+        {"clientRequestId": request_id},
+        user_scope_hash=scope,
+    )
+    id_payload = {
+        "actorScopeHash": actor,
+        "rowBindingsHash": bindings_hash,
+        "clientRequestHash": client_request_hash,
+        "actionKind": "decline",
+        "reasonCode": "decline_property",
+        "issuedAt": issued,
+    }
+    action_id = domain_hash(
+        OPERATOR_ACTION_ID_DOMAIN,
+        id_payload,
+        user_scope_hash=scope,
+    )
+    document = {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        "actionId": action_id,
+        "actionKind": "decline",
+        "actorScopeHash": actor,
+        "rowBindingsHash": bindings_hash,
+        "clientRequestHash": client_request_hash,
+        "reasonCode": "decline_property",
+        "issuedAt": issued,
+    }
+    document["operatorActionHash"] = domain_hash(
+        OPERATOR_ACTION_HASH_DOMAIN,
+        {
+            key: document[key]
+            for key in (
+                "actionId",
+                "actorScopeHash",
+                "rowBindingsHash",
+                "clientRequestHash",
+                "actionKind",
+                "reasonCode",
+                "issuedAt",
+            )
+        },
+        user_scope_hash=scope,
+    )
+    return document
+
+
+def validate_operator_action_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_OPERATOR_ACTION_KEYS,
+        field_name="operator action",
+    )
+    if (
+        type(checked["schemaVersion"]) is not int
+        or checked["schemaVersion"] != SCHEMA_VERSION
+        or checked["actionKind"] != "decline"
+        or checked["reasonCode"] != "decline_property"
+    ):
+        raise RowAuthorityConfigError("operator action schema is unsupported")
+    scope = _require_sha256(checked["userScopeHash"], field_name="userScopeHash")
+    for field in (
+        "actionId",
+        "actorScopeHash",
+        "rowBindingsHash",
+        "clientRequestHash",
+        "operatorActionHash",
+    ):
+        _require_sha256(checked[field], field_name=field)
+    _require_timestamp(checked["issuedAt"], field_name="issuedAt")
+    id_payload = {
+        key: checked[key]
+        for key in (
+            "actorScopeHash",
+            "rowBindingsHash",
+            "clientRequestHash",
+            "actionKind",
+            "reasonCode",
+            "issuedAt",
+        )
+    }
+    if checked["actionId"] != domain_hash(
+        OPERATOR_ACTION_ID_DOMAIN,
+        id_payload,
+        user_scope_hash=scope,
+    ):
+        raise RowAuthorityConfigError("operator actionId does not recompute")
+    action_payload = {"actionId": checked["actionId"], **id_payload}
+    if checked["operatorActionHash"] != domain_hash(
+        OPERATOR_ACTION_HASH_DOMAIN,
+        action_payload,
+        user_scope_hash=scope,
+    ):
+        raise RowAuthorityConfigError("operatorActionHash does not recompute")
+    return _defensive_copy(checked)
+
+
+_ROW_DECISION_KEYS = frozenset(
+    {
+        "rowId",
+        "decision",
+        "plannedGeneration",
+        "winnerGenerationHash",
+        "winnerSettlementHash",
+    }
+)
+_CLAIM_SET_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "requestId",
+        "authorityOrigin",
+        "authorityLink",
+        "authorityLinkHash",
+        "operatorActionHash",
+        "fanoutId",
+        "rowBindings",
+        "primaryRowId",
+        "bindingCount",
+        "rowBindingsHash",
+        "ownerKind",
+        "ownerKey",
+        "workKey",
+        "payloadHash",
+        "derivedPriority",
+        "plannedWrites",
+        "outcome",
+        "rowDecisions",
+        "claimSetHash",
+        "createdAt",
+    }
+)
+_OWNER_GENERATION_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "rowId",
+        "generation",
+        "requestId",
+        "claimSetHash",
+        "predecessorHeadHash",
+        "predecessorSettlementHash",
+        "ownerKind",
+        "ownerKey",
+        "priority",
+        "leaseEpoch",
+        "firstFencingToken",
+        "generationHash",
+        "createdAt",
+    }
+)
+_OWNER_SETTLEMENT_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "rowId",
+        "generation",
+        "generationHash",
+        "fencingToken",
+        "outcome",
+        "dominantGenerationHash",
+        "supersededEffectiveSettlementHash",
+        "operatorActionHash",
+        "outcomeReasonCode",
+        "outcomeEvidenceHash",
+        "logicalOutcomeHash",
+        "settlementHash",
+        "settledAt",
+    }
+)
+_SOURCE_SETTLEMENT_LINK_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "userScopeHash",
+        "rowId",
+        "generation",
+        "generationHash",
+        "authorityLinkHash",
+        "b1IdentityHash",
+        "b1FinalLedgerEvidenceHash",
+        "b1SettlementRevision",
+        "b1SettlementHash",
+        "b2SettlementHash",
+        "sourceSettlementLinkHash",
+        "linkedAt",
+    }
+)
+_CLAIM_ORIGINS = frozenset(
+    {"b1_source", "authenticated_operator", "contact_fanout"}
+)
+_CLAIM_OUTCOMES = frozenset({"accepted", "dominated"})
+_SETTLEMENT_REASON_BY_OUTCOME = {
+    "contact_optout": "verified_optout",
+    "terminal": "terminal_source",
+    "human_declined": "operator_decline",
+    "dominated": "superseded_by_higher_priority",
+}
+
+
+def _canonical_claim_bindings(*, user_scope_hash, row_ids, primary_row_id):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    bindings = normalize_row_bindings(row_ids, primary_row_id)
+    primary = validate_row_id(primary_row_id)
+    count = len(bindings)
+    return (
+        bindings,
+        primary,
+        count,
+        _row_bindings_hash(
+            user_scope_hash=scope,
+            row_bindings=bindings,
+            primary_row_id=primary,
+            binding_count=count,
+        ),
+    )
+
+
+def _validated_claim_decisions(*, row_decisions, row_bindings, outcome):
+    if type(row_decisions) not in {list, tuple}:
+        raise RowAuthorityConfigError("row_decisions must be a list or tuple")
+    if type(outcome) is not str or outcome not in _CLAIM_OUTCOMES:
+        raise RowAuthorityConfigError("claim outcome is unsupported")
+    expected_rows = [binding["rowId"] for binding in row_bindings]
+    if len(row_decisions) != len(expected_rows):
+        raise RowAuthorityConfigError("row decisions must cover every bound row")
+    canonical = []
+    for raw in row_decisions:
+        decision = _require_exact_dict(
+            raw,
+            keys=_ROW_DECISION_KEYS,
+            field_name="row decision",
+        )
+        row_id = validate_row_id(decision["rowId"])
+        kind = decision["decision"]
+        if type(kind) is not str or kind not in {
+            "accepted",
+            "dominated",
+            "blocked_by_claim_set",
+        }:
+            raise RowAuthorityConfigError("row decision is unsupported")
+        planned = decision["plannedGeneration"]
+        winner_generation = decision["winnerGenerationHash"]
+        winner_settlement = decision["winnerSettlementHash"]
+        if kind == "accepted":
+            _require_pos(planned, field_name="plannedGeneration")
+            if winner_generation is not None or winner_settlement is not None:
+                raise RowAuthorityConfigError(
+                    "accepted decisions cannot carry winner hashes"
+                )
+        elif kind == "dominated":
+            if planned is not None:
+                raise RowAuthorityConfigError(
+                    "dominated decisions cannot allocate a generation"
+                )
+            _require_sha256(
+                winner_generation,
+                field_name="winnerGenerationHash",
+            )
+            _require_optional_hash(
+                winner_settlement,
+                field_name="winnerSettlementHash",
+            )
+        else:
+            if any(
+                value is not None
+                for value in (planned, winner_generation, winner_settlement)
+            ):
+                raise RowAuthorityConfigError(
+                    "blocked decisions cannot carry generation or winner fields"
+                )
+        canonical.append(
+            {
+                "rowId": row_id,
+                "decision": kind,
+                "plannedGeneration": planned,
+                "winnerGenerationHash": winner_generation,
+                "winnerSettlementHash": winner_settlement,
+            }
+        )
+    canonical.sort(key=lambda item: item["rowId"])
+    if [item["rowId"] for item in canonical] != expected_rows:
+        raise RowAuthorityConfigError("row decisions do not match row bindings")
+    if outcome == "accepted":
+        if any(item["decision"] != "accepted" for item in canonical):
+            raise RowAuthorityConfigError(
+                "accepted claim sets require only accepted decisions"
+            )
+    elif (
+        not any(item["decision"] == "dominated" for item in canonical)
+        or any(item["decision"] == "accepted" for item in canonical)
+    ):
+        raise RowAuthorityConfigError(
+            "dominated claim sets require dominated and blocked decisions"
+        )
+    return canonical
+
+
+def _claim_origin_from_inputs(
+    *,
+    user_scope_hash,
+    authority_origin,
+    authority_link,
+    operator_action_document,
+    fanout_id,
+    row_bindings,
+    canonical_mailbox_identity_hash,
+    contact_settlement_hash,
+):
+    if type(authority_origin) is not str or authority_origin not in _CLAIM_ORIGINS:
+        raise RowAuthorityConfigError("authority_origin is unsupported")
+    if authority_origin == "b1_source":
+        if (
+            operator_action_document is not None
+            or fanout_id is not None
+            or canonical_mailbox_identity_hash is not None
+            or contact_settlement_hash is not None
+        ):
+            raise RowAuthorityConfigError("b1_source origin fields conflict")
+        link = validate_b1_authority_link(
+            authority_link=authority_link,
+            user_scope_hash=user_scope_hash,
+        )
+        if link["ownerKind"] not in {"terminal", "human_decision"}:
+            raise RowAuthorityConfigError("direct B1 contact opt-out claim is forbidden")
+        return {
+            "authorityLink": link,
+            "authorityLinkHash": link["authorityLinkHash"],
+            "operatorActionHash": None,
+            "fanoutId": None,
+            "ownerKind": link["ownerKind"],
+            "ownerKey": link["ownerKey"],
+            "workKey": link["workKey"],
+            "payloadHash": link["payloadHash"],
+        }
+    if authority_origin == "authenticated_operator":
+        if (
+            authority_link is not None
+            or fanout_id is not None
+            or canonical_mailbox_identity_hash is not None
+            or contact_settlement_hash is not None
+        ):
+            raise RowAuthorityConfigError(
+                "authenticated_operator origin fields conflict"
+            )
+        action = validate_operator_action_document(
+            document=operator_action_document
+        )
+        if action["userScopeHash"] != user_scope_hash:
+            raise RowAuthorityConfigError("operator action scope conflicts")
+        return {
+            "authorityLink": None,
+            "authorityLinkHash": None,
+            "operatorActionHash": action["operatorActionHash"],
+            "fanoutId": None,
+            "ownerKind": "human_decision",
+            "ownerKey": action["actorScopeHash"],
+            "workKey": action["actionId"],
+            "payloadHash": action["operatorActionHash"],
+        }
+    if (
+        operator_action_document is not None
+        or fanout_id is None
+        or canonical_mailbox_identity_hash is None
+        or contact_settlement_hash is None
+        or len(row_bindings) != 1
+    ):
+        raise RowAuthorityConfigError("contact_fanout origin fields conflict")
+    fanout = _require_sha256(fanout_id, field_name="fanout_id")
+    canonical_mailbox = _require_sha256(
+        canonical_mailbox_identity_hash,
+        field_name="canonical_mailbox_identity_hash",
+    )
+    contact_settlement = _require_sha256(
+        contact_settlement_hash,
+        field_name="contact_settlement_hash",
+    )
+    link = validate_b1_authority_link(
+        authority_link=authority_link,
+        user_scope_hash=user_scope_hash,
+    )
+    if link["ownerKind"] != "contact_optout":
+        raise RowAuthorityConfigError("contact fan-out requires verified opt-out")
+    work_key = _require_opaque(
+        f"{fanout}--{row_bindings[0]['rowId']}",
+        field_name="contact fan-out work key",
+    )
+    return {
+        "authorityLink": link,
+        "authorityLinkHash": link["authorityLinkHash"],
+        "operatorActionHash": None,
+        "fanoutId": fanout,
+        "ownerKind": link["ownerKind"],
+        "ownerKey": canonical_mailbox,
+        "workKey": work_key,
+        "payloadHash": contact_settlement,
+    }
+
+
+def _request_id_payload(document):
+    return {
+        key: document[key]
+        for key in (
+            "authorityOrigin",
+            "authorityLinkHash",
+            "operatorActionHash",
+            "fanoutId",
+            "rowBindingsHash",
+            "ownerKind",
+            "ownerKey",
+            "workKey",
+            "payloadHash",
+        )
+    }
+
+
+def _claim_set_hash_payload(document):
+    return {
+        key: _defensive_copy(document[key])
+        for key in (
+            "requestId",
+            "authorityOrigin",
+            "authorityLinkHash",
+            "operatorActionHash",
+            "fanoutId",
+            "rowBindingsHash",
+            "ownerKind",
+            "ownerKey",
+            "derivedPriority",
+            "plannedWrites",
+            "outcome",
+            "rowDecisions",
+            "createdAt",
+        )
+    }
+
+
+def build_claim_set_document(
+    *,
+    user_scope_hash,
+    authority_origin,
+    authority_link,
+    operator_action_document,
+    fanout_id,
+    row_ids,
+    primary_row_id,
+    planned_writes,
+    outcome,
+    row_decisions,
+    created_at,
+    canonical_mailbox_identity_hash=None,
+    contact_settlement_hash=None,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    bindings, primary, count, bindings_hash = _canonical_claim_bindings(
+        user_scope_hash=scope,
+        row_ids=row_ids,
+        primary_row_id=primary_row_id,
+    )
+    origin = _claim_origin_from_inputs(
+        user_scope_hash=scope,
+        authority_origin=authority_origin,
+        authority_link=authority_link,
+        operator_action_document=operator_action_document,
+        fanout_id=fanout_id,
+        row_bindings=bindings,
+        canonical_mailbox_identity_hash=canonical_mailbox_identity_hash,
+        contact_settlement_hash=contact_settlement_hash,
+    )
+    if authority_origin == "authenticated_operator":
+        action = validate_operator_action_document(
+            document=operator_action_document
+        )
+        if action["rowBindingsHash"] != bindings_hash:
+            raise RowAuthorityConfigError("operator action bindings conflict")
+    decisions = _validated_claim_decisions(
+        row_decisions=row_decisions,
+        row_bindings=bindings,
+        outcome=outcome,
+    )
+    writes = _require_row_authority_planned_writes(planned_writes)
+    created = _require_timestamp(created_at, field_name="created_at")
+    document = {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        "requestId": None,
+        "authorityOrigin": authority_origin,
+        **origin,
+        "rowBindings": bindings,
+        "primaryRowId": primary,
+        "bindingCount": count,
+        "rowBindingsHash": bindings_hash,
+        "derivedPriority": derive_owner_priority(origin["ownerKind"]),
+        "plannedWrites": writes,
+        "outcome": outcome,
+        "rowDecisions": decisions,
+        "claimSetHash": None,
+        "createdAt": created,
+    }
+    document["requestId"] = domain_hash(
+        CLAIM_REQUEST_ID_DOMAIN,
+        _request_id_payload(document),
+        user_scope_hash=scope,
+    )
+    document["claimSetHash"] = domain_hash(
+        CLAIM_SET_HASH_DOMAIN,
+        _claim_set_hash_payload(document),
+        user_scope_hash=scope,
+    )
+    return _defensive_copy(document)
+
+
+def _validate_claim_origin_document(document):
+    origin = document["authorityOrigin"]
+    if type(origin) is not str or origin not in _CLAIM_ORIGINS:
+        raise RowAuthorityConfigError("claim authorityOrigin is unsupported")
+    scope = document["userScopeHash"]
+    link = document["authorityLink"]
+    link_hash = document["authorityLinkHash"]
+    operator_hash = document["operatorActionHash"]
+    fanout_id = document["fanoutId"]
+    if origin == "b1_source":
+        if operator_hash is not None or fanout_id is not None:
+            raise RowAuthorityConfigError("b1_source claim fields conflict")
+        validated_link = validate_b1_authority_link(
+            authority_link=link,
+            user_scope_hash=scope,
+        )
+        if (
+            validated_link["ownerKind"] not in {"terminal", "human_decision"}
+            or link_hash != validated_link["authorityLinkHash"]
+        ):
+            raise RowAuthorityConfigError("b1_source claim link conflicts")
+        expected = {
+            "ownerKind": validated_link["ownerKind"],
+            "ownerKey": validated_link["ownerKey"],
+            "workKey": validated_link["workKey"],
+            "payloadHash": validated_link["payloadHash"],
+        }
+    elif origin == "authenticated_operator":
+        if link is not None or link_hash is not None or fanout_id is not None:
+            raise RowAuthorityConfigError("operator claim fields conflict")
+        _require_sha256(operator_hash, field_name="operatorActionHash")
+        _require_sha256(document["ownerKey"], field_name="ownerKey")
+        _require_sha256(document["workKey"], field_name="workKey")
+        expected = {
+            "ownerKind": "human_decision",
+            "payloadHash": operator_hash,
+        }
+    else:
+        if operator_hash is not None:
+            raise RowAuthorityConfigError("contact fan-out claim fields conflict")
+        _require_sha256(fanout_id, field_name="fanoutId")
+        validated_link = validate_b1_authority_link(
+            authority_link=link,
+            user_scope_hash=scope,
+        )
+        if (
+            validated_link["ownerKind"] != "contact_optout"
+            or link_hash != validated_link["authorityLinkHash"]
+            or len(document["rowBindings"]) != 1
+        ):
+            raise RowAuthorityConfigError("contact fan-out link conflicts")
+        _require_sha256(document["ownerKey"], field_name="ownerKey")
+        _require_sha256(document["payloadHash"], field_name="payloadHash")
+        expected = {
+            "ownerKind": validated_link["ownerKind"],
+            "workKey": (
+                f"{fanout_id}--{document['rowBindings'][0]['rowId']}"
+            ),
+        }
+    if any(document[field] != value for field, value in expected.items()):
+        raise RowAuthorityConfigError("claim origin correlations conflict")
+
+
+def validate_claim_set_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_CLAIM_SET_KEYS,
+        field_name="claim set",
+    )
+    if type(checked["schemaVersion"]) is not int or checked["schemaVersion"] != SCHEMA_VERSION:
+        raise RowAuthorityConfigError("claim set schemaVersion must be 1")
+    scope = _require_sha256(checked["userScopeHash"], field_name="userScopeHash")
+    _require_sha256(checked["requestId"], field_name="requestId")
+    _require_sha256(checked["rowBindingsHash"], field_name="rowBindingsHash")
+    _require_opaque(checked["ownerKey"], field_name="ownerKey")
+    _require_opaque(checked["workKey"], field_name="workKey")
+    _require_sha256(checked["payloadHash"], field_name="payloadHash")
+    _require_sha256(checked["claimSetHash"], field_name="claimSetHash")
+    if type(checked["rowBindings"]) is not list:
+        raise RowAuthorityConfigError("claim rowBindings must be an exact list")
+    row_ids = []
+    for binding in checked["rowBindings"]:
+        item = _require_exact_dict(
+            binding,
+            keys=_ROW_BINDING_KEYS,
+            field_name="claim row binding",
+        )
+        if type(item["role"]) is not str or item["role"] not in {"primary", "related"}:
+            raise RowAuthorityConfigError("claim row binding role is unsupported")
+        row_ids.append(validate_row_id(item["rowId"]))
+    bindings, primary, count, bindings_hash = _canonical_claim_bindings(
+        user_scope_hash=scope,
+        row_ids=row_ids,
+        primary_row_id=checked["primaryRowId"],
+    )
+    if (
+        checked["rowBindings"] != bindings
+        or checked["bindingCount"] != count
+        or type(checked["bindingCount"]) is not int
+        or checked["rowBindingsHash"] != bindings_hash
+        or checked["primaryRowId"] != primary
+    ):
+        raise RowAuthorityConfigError("claim row binding material conflicts")
+    _validate_claim_origin_document(checked)
+    priority = derive_owner_priority(checked["ownerKind"])
+    if type(checked["derivedPriority"]) is not int or checked["derivedPriority"] != priority:
+        raise RowAuthorityConfigError("claim priority is not derived")
+    _require_row_authority_planned_writes(checked["plannedWrites"])
+    decisions = _validated_claim_decisions(
+        row_decisions=checked["rowDecisions"],
+        row_bindings=bindings,
+        outcome=checked["outcome"],
+    )
+    if checked["rowDecisions"] != decisions:
+        raise RowAuthorityConfigError("claim row decisions are not canonical")
+    _require_timestamp(checked["createdAt"], field_name="createdAt")
+    if checked["requestId"] != domain_hash(
+        CLAIM_REQUEST_ID_DOMAIN,
+        _request_id_payload(checked),
+        user_scope_hash=scope,
+    ):
+        raise RowAuthorityConfigError("claim requestId does not recompute")
+    if checked["claimSetHash"] != domain_hash(
+        CLAIM_SET_HASH_DOMAIN,
+        _claim_set_hash_payload(checked),
+        user_scope_hash=scope,
+    ):
+        raise RowAuthorityConfigError("claimSetHash does not recompute")
+    return _defensive_copy(checked)
+
+
+def _generation_hash_payload(document):
+    return {
+        key: document[key]
+        for key in (
+            "rowId",
+            "generation",
+            "requestId",
+            "claimSetHash",
+            "predecessorHeadHash",
+            "predecessorSettlementHash",
+            "ownerKind",
+            "ownerKey",
+            "priority",
+            "leaseEpoch",
+            "firstFencingToken",
+            "createdAt",
+        )
+    }
+
+
+def build_owner_generation_document(
+    *,
+    claim_set_document,
+    row_id,
+    generation,
+    predecessor_head_hash,
+    predecessor_settlement_hash,
+    lease_epoch,
+    first_fencing_token,
+    created_at,
+):
+    claim = validate_claim_set_document(document=claim_set_document)
+    checked_row = validate_row_id(row_id)
+    checked_generation = _require_pos(generation, field_name="generation")
+    if claim["outcome"] != "accepted":
+        raise RowAuthorityConfigError("generation requires an accepted claim")
+    matches = [item for item in claim["rowDecisions"] if item["rowId"] == checked_row]
+    if (
+        len(matches) != 1
+        or matches[0]["decision"] != "accepted"
+        or matches[0]["plannedGeneration"] != checked_generation
+    ):
+        raise RowAuthorityConfigError("generation conflicts with claim decision")
+    predecessor_head = _require_sha256(
+        predecessor_head_hash,
+        field_name="predecessor_head_hash",
+    )
+    predecessor_settlement = _require_optional_hash(
+        predecessor_settlement_hash,
+        field_name="predecessor_settlement_hash",
+    )
+    if type(lease_epoch) is not int or lease_epoch != 1:
+        raise RowAuthorityConfigError("new generations require leaseEpoch 1")
+    fence = _require_pos(first_fencing_token, field_name="first_fencing_token")
+    created = _require_timestamp(created_at, field_name="created_at")
+    if created < claim["createdAt"]:
+        raise RowAuthorityConfigError("generation cannot predate its claim")
+    document = {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": claim["userScopeHash"],
+        "rowId": checked_row,
+        "generation": checked_generation,
+        "requestId": claim["requestId"],
+        "claimSetHash": claim["claimSetHash"],
+        "predecessorHeadHash": predecessor_head,
+        "predecessorSettlementHash": predecessor_settlement,
+        "ownerKind": claim["ownerKind"],
+        "ownerKey": claim["ownerKey"],
+        "priority": derive_owner_priority(claim["ownerKind"]),
+        "leaseEpoch": 1,
+        "firstFencingToken": fence,
+        "createdAt": created,
+    }
+    document["generationHash"] = domain_hash(
+        OWNER_GENERATION_HASH_DOMAIN,
+        _generation_hash_payload(document),
+        user_scope_hash=document["userScopeHash"],
+    )
+    return document
+
+
+def validate_owner_generation_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_OWNER_GENERATION_KEYS,
+        field_name="owner generation",
+    )
+    if type(checked["schemaVersion"]) is not int or checked["schemaVersion"] != SCHEMA_VERSION:
+        raise RowAuthorityConfigError("generation schemaVersion must be 1")
+    scope = _require_sha256(checked["userScopeHash"], field_name="userScopeHash")
+    validate_row_id(checked["rowId"])
+    _require_pos(checked["generation"], field_name="generation")
+    for field in (
+        "requestId",
+        "claimSetHash",
+        "predecessorHeadHash",
+        "generationHash",
+    ):
+        _require_sha256(checked[field], field_name=field)
+    _require_opaque(checked["ownerKey"], field_name="ownerKey")
+    _require_optional_hash(
+        checked["predecessorSettlementHash"],
+        field_name="predecessorSettlementHash",
+    )
+    priority = derive_owner_priority(checked["ownerKind"])
+    if type(checked["priority"]) is not int or checked["priority"] != priority:
+        raise RowAuthorityConfigError("generation priority is not derived")
+    if type(checked["leaseEpoch"]) is not int or checked["leaseEpoch"] != 1:
+        raise RowAuthorityConfigError("generation leaseEpoch must be 1")
+    _require_pos(checked["firstFencingToken"], field_name="firstFencingToken")
+    _require_timestamp(checked["createdAt"], field_name="createdAt")
+    if checked["generationHash"] != domain_hash(
+        OWNER_GENERATION_HASH_DOMAIN,
+        _generation_hash_payload(checked),
+        user_scope_hash=scope,
+    ):
+        raise RowAuthorityConfigError("generationHash does not recompute")
+    return _defensive_copy(checked)
+
+
+def _outcome_evidence_hash(
+    *,
+    user_scope_hash,
+    authority_link_hash,
+    operator_action_hash,
+    fanout_id,
+    payload_hash,
+    outcome_reason_code,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    authority = _require_optional_hash(
+        authority_link_hash,
+        field_name="authority_link_hash",
+    )
+    operator = _require_optional_hash(
+        operator_action_hash,
+        field_name="operator_action_hash",
+    )
+    fanout = _require_optional_hash(fanout_id, field_name="fanout_id")
+    payload = _require_sha256(payload_hash, field_name="payload_hash")
+    if type(outcome_reason_code) is not str or outcome_reason_code not in set(
+        _SETTLEMENT_REASON_BY_OUTCOME.values()
+    ):
+        raise RowAuthorityConfigError("outcome reason code is unsupported")
+    return domain_hash(
+        OUTCOME_EVIDENCE_HASH_DOMAIN,
+        {
+            "authorityLinkHash": authority,
+            "operatorActionHash": operator,
+            "fanoutId": fanout,
+            "payloadHash": payload,
+            "outcomeReasonCode": outcome_reason_code,
+        },
+        user_scope_hash=scope,
+    )
+
+
+def _logical_outcome_hash(
+    *,
+    user_scope_hash,
+    row_id,
+    generation,
+    owner_kind,
+    owner_key,
+    outcome,
+    outcome_reason_code,
+    outcome_evidence_hash,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    checked_row = validate_row_id(row_id)
+    checked_generation = _require_pos(generation, field_name="generation")
+    derive_owner_priority(owner_kind)
+    checked_owner_key = _require_opaque(owner_key, field_name="owner_key")
+    if type(outcome) is not str or outcome not in _SETTLEMENT_REASON_BY_OUTCOME:
+        raise RowAuthorityConfigError("logical outcome is unsupported")
+    if _SETTLEMENT_REASON_BY_OUTCOME[outcome] != outcome_reason_code:
+        raise RowAuthorityConfigError("logical outcome reason conflicts")
+    evidence_hash = _require_sha256(
+        outcome_evidence_hash,
+        field_name="outcome_evidence_hash",
+    )
+    return domain_hash(
+        LOGICAL_OUTCOME_HASH_DOMAIN,
+        {
+            "rowId": checked_row,
+            "generation": checked_generation,
+            "ownerKind": owner_kind,
+            "ownerKey": checked_owner_key,
+            "outcome": outcome,
+            "outcomeReasonCode": outcome_reason_code,
+            "outcomeEvidenceHash": evidence_hash,
+        },
+        user_scope_hash=scope,
+    )
+
+
+def _settlement_hash_payload(document):
+    return {
+        key: document[key]
+        for key in (
+            "rowId",
+            "generation",
+            "generationHash",
+            "fencingToken",
+            "outcome",
+            "dominantGenerationHash",
+            "supersededEffectiveSettlementHash",
+            "operatorActionHash",
+            "outcomeReasonCode",
+            "outcomeEvidenceHash",
+            "logicalOutcomeHash",
+            "settledAt",
+        )
+    }
+
+
+def build_owner_settlement_document(
+    *,
+    generation_document,
+    claim_set_document,
+    fencing_token,
+    outcome,
+    settled_at,
+    dominant_generation_hash=None,
+    superseded_effective_settlement_hash=None,
+    operator_action_document=None,
+):
+    generation = validate_owner_generation_document(document=generation_document)
+    claim = validate_claim_set_document(document=claim_set_document)
+    if (
+        generation["userScopeHash"] != claim["userScopeHash"]
+        or generation["requestId"] != claim["requestId"]
+        or generation["claimSetHash"] != claim["claimSetHash"]
+        or generation["ownerKind"] != claim["ownerKind"]
+        or generation["ownerKey"] != claim["ownerKey"]
+    ):
+        raise RowAuthorityConfigError("settlement generation and claim conflict")
+    matching_decisions = [
+        decision
+        for decision in claim["rowDecisions"]
+        if decision["rowId"] == generation["rowId"]
+    ]
+    if (
+        claim["outcome"] != "accepted"
+        or len(matching_decisions) != 1
+        or matching_decisions[0]["decision"] != "accepted"
+        or matching_decisions[0]["plannedGeneration"]
+        != generation["generation"]
+    ):
+        raise RowAuthorityConfigError(
+            "settlement generation is not accepted by the claim"
+        )
+    if type(outcome) is not str or outcome not in _SETTLEMENT_REASON_BY_OUTCOME:
+        raise RowAuthorityConfigError("settlement outcome is unsupported")
+    fence = _require_pos(fencing_token, field_name="fencing_token")
+    if fence < generation["firstFencingToken"]:
+        raise RowAuthorityConfigError(
+            "settlement fence predates the generation's first fence"
+        )
+    dominant = _require_optional_hash(
+        dominant_generation_hash,
+        field_name="dominant_generation_hash",
+    )
+    superseded = _require_optional_hash(
+        superseded_effective_settlement_hash,
+        field_name="superseded_effective_settlement_hash",
+    )
+    action_hash = None
+    if operator_action_document is not None:
+        action = validate_operator_action_document(document=operator_action_document)
+        if (
+            action["userScopeHash"] != claim["userScopeHash"]
+            or action["rowBindingsHash"] != claim["rowBindingsHash"]
+        ):
+            raise RowAuthorityConfigError("settlement operator action conflicts")
+        action_hash = action["operatorActionHash"]
+    if outcome == "contact_optout":
+        valid = (
+            generation["ownerKind"] == "contact_optout"
+            and dominant is None
+            and superseded == generation["predecessorSettlementHash"]
+            and action_hash is None
+        )
+    elif outcome == "terminal":
+        valid = (
+            generation["ownerKind"] == "terminal"
+            and dominant is None
+            and superseded is None
+            and action_hash is None
+        )
+    elif outcome == "human_declined":
+        valid = (
+            generation["ownerKind"] == "human_decision"
+            and dominant is None
+            and superseded is None
+            and action_hash is not None
+            and (
+                claim["authorityOrigin"] != "authenticated_operator"
+                or claim["operatorActionHash"] == action_hash
+            )
+        )
+    else:
+        valid = (
+            generation["ownerKind"] in {"human_decision", "terminal"}
+            and dominant is not None
+            and dominant != generation["generationHash"]
+            and superseded is None
+            and action_hash is None
+        )
+    if not valid:
+        raise RowAuthorityConfigError("settlement conditional fields conflict")
+    settled = _require_timestamp(settled_at, field_name="settled_at")
+    if settled < generation["createdAt"]:
+        raise RowAuthorityConfigError("settlement cannot predate its generation")
+    reason = _SETTLEMENT_REASON_BY_OUTCOME[outcome]
+    effective_action_hash = action_hash or claim["operatorActionHash"]
+    evidence_hash = _outcome_evidence_hash(
+        user_scope_hash=claim["userScopeHash"],
+        authority_link_hash=claim["authorityLinkHash"],
+        operator_action_hash=effective_action_hash,
+        fanout_id=claim["fanoutId"],
+        payload_hash=claim["payloadHash"],
+        outcome_reason_code=reason,
+    )
+    logical_hash = _logical_outcome_hash(
+        user_scope_hash=claim["userScopeHash"],
+        row_id=generation["rowId"],
+        generation=generation["generation"],
+        owner_kind=generation["ownerKind"],
+        owner_key=generation["ownerKey"],
+        outcome=outcome,
+        outcome_reason_code=reason,
+        outcome_evidence_hash=evidence_hash,
+    )
+    document = {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": claim["userScopeHash"],
+        "rowId": generation["rowId"],
+        "generation": generation["generation"],
+        "generationHash": generation["generationHash"],
+        "fencingToken": fence,
+        "outcome": outcome,
+        "dominantGenerationHash": dominant,
+        "supersededEffectiveSettlementHash": superseded,
+        "operatorActionHash": action_hash,
+        "outcomeReasonCode": reason,
+        "outcomeEvidenceHash": evidence_hash,
+        "logicalOutcomeHash": logical_hash,
+        "settledAt": settled,
+    }
+    document["settlementHash"] = domain_hash(
+        OWNER_SETTLEMENT_HASH_DOMAIN,
+        _settlement_hash_payload(document),
+        user_scope_hash=document["userScopeHash"],
+    )
+    return document
+
+
+def validate_owner_settlement_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_OWNER_SETTLEMENT_KEYS,
+        field_name="owner settlement",
+    )
+    if type(checked["schemaVersion"]) is not int or checked["schemaVersion"] != SCHEMA_VERSION:
+        raise RowAuthorityConfigError("settlement schemaVersion must be 1")
+    scope = _require_sha256(checked["userScopeHash"], field_name="userScopeHash")
+    validate_row_id(checked["rowId"])
+    _require_pos(checked["generation"], field_name="generation")
+    _require_sha256(checked["generationHash"], field_name="generationHash")
+    _require_pos(checked["fencingToken"], field_name="fencingToken")
+    outcome = checked["outcome"]
+    if type(outcome) is not str or outcome not in _SETTLEMENT_REASON_BY_OUTCOME:
+        raise RowAuthorityConfigError("settlement outcome is unsupported")
+    dominant = _require_optional_hash(
+        checked["dominantGenerationHash"],
+        field_name="dominantGenerationHash",
+    )
+    superseded = _require_optional_hash(
+        checked["supersededEffectiveSettlementHash"],
+        field_name="supersededEffectiveSettlementHash",
+    )
+    operator = _require_optional_hash(
+        checked["operatorActionHash"],
+        field_name="operatorActionHash",
+    )
+    valid = {
+        "contact_optout": dominant is None and operator is None,
+        "terminal": dominant is None and superseded is None and operator is None,
+        "human_declined": dominant is None and superseded is None and operator is not None,
+        "dominated": dominant is not None and superseded is None and operator is None,
+    }[outcome]
+    if not valid or checked["outcomeReasonCode"] != _SETTLEMENT_REASON_BY_OUTCOME[outcome]:
+        raise RowAuthorityConfigError("settlement conditional fields conflict")
+    for field in ("outcomeEvidenceHash", "logicalOutcomeHash", "settlementHash"):
+        _require_sha256(checked[field], field_name=field)
+    _require_timestamp(checked["settledAt"], field_name="settledAt")
+    if checked["settlementHash"] != domain_hash(
+        OWNER_SETTLEMENT_HASH_DOMAIN,
+        _settlement_hash_payload(checked),
+        user_scope_hash=scope,
+    ):
+        raise RowAuthorityConfigError("settlementHash does not recompute")
+    return _defensive_copy(checked)
+
+
+def _source_settlement_link_hash_payload(document):
+    return {
+        key: document[key]
+        for key in (
+            "rowId",
+            "generation",
+            "generationHash",
+            "authorityLinkHash",
+            "b1IdentityHash",
+            "b1FinalLedgerEvidenceHash",
+            "b1SettlementRevision",
+            "b1SettlementHash",
+            "b2SettlementHash",
+            "linkedAt",
+        )
+    }
+
+
+def build_source_settlement_link_document(
+    *,
+    user_scope_hash,
+    row_id,
+    generation,
+    generation_hash,
+    authority_link_hash,
+    b1_identity_hash,
+    b1_final_ledger_evidence_hash,
+    b1_settlement_revision,
+    b1_settlement_hash,
+    b2_settlement_hash,
+    linked_at,
+):
+    scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
+    document = {
+        "schemaVersion": SCHEMA_VERSION,
+        "userScopeHash": scope,
+        "rowId": validate_row_id(row_id),
+        "generation": _require_pos(generation, field_name="generation"),
+        "generationHash": _require_sha256(generation_hash, field_name="generation_hash"),
+        "authorityLinkHash": _require_sha256(authority_link_hash, field_name="authority_link_hash"),
+        "b1IdentityHash": _require_sha256(b1_identity_hash, field_name="b1_identity_hash"),
+        "b1FinalLedgerEvidenceHash": _require_sha256(
+            b1_final_ledger_evidence_hash,
+            field_name="b1_final_ledger_evidence_hash",
+        ),
+        "b1SettlementRevision": _require_pos(
+            b1_settlement_revision,
+            field_name="b1_settlement_revision",
+        ),
+        "b1SettlementHash": _require_sha256(b1_settlement_hash, field_name="b1_settlement_hash"),
+        "b2SettlementHash": _require_sha256(b2_settlement_hash, field_name="b2_settlement_hash"),
+        "linkedAt": _require_timestamp(linked_at, field_name="linked_at"),
+    }
+    document["sourceSettlementLinkHash"] = domain_hash(
+        SOURCE_SETTLEMENT_LINK_HASH_DOMAIN,
+        _source_settlement_link_hash_payload(document),
+        user_scope_hash=scope,
+    )
+    return document
+
+
+def validate_source_settlement_link_document(*, document):
+    checked = _require_exact_dict(
+        document,
+        keys=_SOURCE_SETTLEMENT_LINK_KEYS,
+        field_name="source settlement link",
+    )
+    if type(checked["schemaVersion"]) is not int or checked["schemaVersion"] != SCHEMA_VERSION:
+        raise RowAuthorityConfigError("source link schemaVersion must be 1")
+    scope = _require_sha256(checked["userScopeHash"], field_name="userScopeHash")
+    validate_row_id(checked["rowId"])
+    _require_pos(checked["generation"], field_name="generation")
+    _require_pos(checked["b1SettlementRevision"], field_name="b1SettlementRevision")
+    for field in (
+        "generationHash",
+        "authorityLinkHash",
+        "b1IdentityHash",
+        "b1FinalLedgerEvidenceHash",
+        "b1SettlementHash",
+        "b2SettlementHash",
+        "sourceSettlementLinkHash",
+    ):
+        _require_sha256(checked[field], field_name=field)
+    _require_timestamp(checked["linkedAt"], field_name="linkedAt")
+    if checked["sourceSettlementLinkHash"] != domain_hash(
+        SOURCE_SETTLEMENT_LINK_HASH_DOMAIN,
+        _source_settlement_link_hash_payload(checked),
+        user_scope_hash=scope,
+    ):
+        raise RowAuthorityConfigError("sourceSettlementLinkHash does not recompute")
+    return _defensive_copy(checked)
 
 
 _ROW_BINDING_KEYS = frozenset({"rowId", "role"})
@@ -2003,7 +4202,7 @@ def _head_hash_payload(document):
 def _with_head_hash(document):
     result = dict(document)
     result["headHash"] = domain_hash(
-        "sitesift.row.authority_head.v1",
+        ROW_AUTHORITY_HEAD_HASH_DOMAIN,
         _head_hash_payload(result),
         user_scope_hash=result["userScopeHash"],
     )
@@ -2178,10 +4377,17 @@ def validate_row_authority_head(*, document):
             raise RowAuthorityConfigError(
                 "claimed and review-pending heads require owner, lease, and fence"
             )
+        if (state == "review_pending") != (
+            owner_kind == "human_decision"
+        ):
+            raise RowAuthorityConfigError(
+                "head state does not match its effective owner kind"
+            )
     elif state == "settled":
         if (
             not has_owner
             or has_lease
+            or fencing_token is None
             or latest_settlement is None
             or effective_settlement is None
         ):
@@ -2198,7 +4404,7 @@ def validate_row_authority_head(*, document):
     if updated_at < created_at:
         raise RowAuthorityConfigError("head updatedAt cannot predate createdAt")
     expected_hash = domain_hash(
-        "sitesift.row.authority_head.v1",
+        ROW_AUTHORITY_HEAD_HASH_DOMAIN,
         _head_hash_payload(checked),
         user_scope_hash=scope,
     )
@@ -2246,6 +4452,270 @@ def build_location_advanced_head(*, expected_head, location_revision_document):
     )
     advanced = _with_head_hash(result)
     return validate_row_authority_head(document=advanced)
+
+
+def _build_claim_advanced_head(
+    *,
+    expected_head,
+    generation_document,
+    lease_owner_hash,
+    lease_until,
+    dominated_predecessor_settlement_hash,
+    claimed_at,
+):
+    head = validate_row_authority_head(document=expected_head)
+    generation = validate_owner_generation_document(
+        document=generation_document
+    )
+    lease_owner = _require_sha256(
+        lease_owner_hash,
+        field_name="lease_owner_hash",
+    )
+    deadline = _require_timestamp(lease_until, field_name="lease_until")
+    event_time = _require_timestamp(claimed_at, field_name="claimed_at")
+    dominated_hash = _require_optional_hash(
+        dominated_predecessor_settlement_hash,
+        field_name="dominated_predecessor_settlement_hash",
+    )
+    if (
+        head["userScopeHash"] != generation["userScopeHash"]
+        or head["rowId"] != generation["rowId"]
+        or generation["predecessorHeadHash"] != head["headHash"]
+        or generation["predecessorSettlementHash"]
+        != head["effectiveSettlementHash"]
+    ):
+        raise RowAuthorityConfigError(
+            "claim generation conflicts with the expected head"
+        )
+    if head["currentLocationLifecycle"] not in {"active", "nonviable"}:
+        raise RowAuthorityConfigError(
+            "claims require active or nonviable row identity"
+        )
+    if event_time < head["updatedAt"] or event_time < generation["createdAt"]:
+        raise RowAuthorityConfigError(
+            "claim event cannot predate head or generation readiness"
+        )
+    if deadline <= event_time:
+        raise RowAuthorityConfigError("claim lease must end after claimed_at")
+    current_generation = head["effectiveOwnerGeneration"]
+    prior_fence = head["fencingToken"]
+    if current_generation is None:
+        expected_first_fence = 1
+    else:
+        if prior_fence is None:
+            raise RowAuthorityConfigError(
+                "owned head is missing its retained fencing token"
+            )
+        expected_first_fence = prior_fence + 1
+    if generation["firstFencingToken"] != expected_first_fence:
+        raise RowAuthorityConfigError(
+            "generation first fence does not immediately follow the head"
+        )
+    if current_generation is None:
+        if (
+            head["state"] != "clear"
+            or head["latestSettlementHash"] is not None
+            or head["effectiveSettlementHash"] is not None
+            or generation["generation"] != 1
+            or dominated_hash is not None
+        ):
+            raise RowAuthorityConfigError(
+                "first claim requires a clear ownerless head"
+            )
+    else:
+        if (
+            generation["generation"] != current_generation + 1
+            or generation["priority"] <= head["effectivePriority"]
+        ):
+            raise RowAuthorityConfigError(
+                "superseding claim must allocate a higher-priority generation"
+            )
+        if head["state"] in {"claimed", "review_pending"}:
+            if dominated_hash is None:
+                raise RowAuthorityConfigError(
+                    "unsettled predecessor requires dominated settlement"
+                )
+        elif dominated_hash is not None:
+            raise RowAuthorityConfigError(
+                "settled predecessor cannot be dominated again"
+            )
+    result = {
+        key: value for key, value in head.items() if key != "headHash"
+    }
+    result.update(
+        {
+            "stateRevision": head["stateRevision"] + 1,
+            "effectiveOwnerGeneration": generation["generation"],
+            "effectiveOwnerGenerationHash": generation["generationHash"],
+            "effectiveOwnerKind": generation["ownerKind"],
+            "effectivePriority": generation["priority"],
+            "state": (
+                "review_pending"
+                if generation["ownerKind"] == "human_decision"
+                else "claimed"
+            ),
+            "leaseOwnerHash": lease_owner,
+            "leaseUntil": deadline,
+            "fencingToken": generation["firstFencingToken"],
+            "latestSettlementHash": (
+                dominated_hash
+                if dominated_hash is not None
+                else head["latestSettlementHash"]
+            ),
+            "updatedAt": event_time,
+        }
+    )
+    return validate_row_authority_head(document=_with_head_hash(result))
+
+
+def _build_lease_takeover_head(
+    *,
+    expected_head,
+    generation_document,
+    new_lease_owner_hash,
+    new_lease_until,
+    taken_at,
+):
+    head = validate_row_authority_head(document=expected_head)
+    generation = validate_owner_generation_document(
+        document=generation_document
+    )
+    new_owner = _require_sha256(
+        new_lease_owner_hash,
+        field_name="new_lease_owner_hash",
+    )
+    deadline = _require_timestamp(
+        new_lease_until,
+        field_name="new_lease_until",
+    )
+    event_time = _require_timestamp(taken_at, field_name="taken_at")
+    if head["state"] not in {"claimed", "review_pending"}:
+        raise RowAuthorityConfigError("lease takeover requires an active claim")
+    if (
+        head["userScopeHash"] != generation["userScopeHash"]
+        or head["rowId"] != generation["rowId"]
+        or head["effectiveOwnerGeneration"] != generation["generation"]
+        or head["effectiveOwnerGenerationHash"] != generation["generationHash"]
+        or head["effectiveOwnerKind"] != generation["ownerKind"]
+        or head["effectivePriority"] != generation["priority"]
+        or head["fencingToken"] < generation["firstFencingToken"]
+    ):
+        raise RowAuthorityConfigError(
+            "lease takeover generation conflicts with the expected head"
+        )
+    if event_time < head["updatedAt"]:
+        raise RowAuthorityConfigError("takeover cannot predate the expected head")
+    if head["leaseUntil"] >= event_time:
+        raise RowAuthorityConfigError("lease must expire before takeover")
+    if deadline <= event_time:
+        raise RowAuthorityConfigError("new lease must end after takeover")
+    result = {
+        key: value for key, value in head.items() if key != "headHash"
+    }
+    result.update(
+        {
+            "stateRevision": head["stateRevision"] + 1,
+            "leaseOwnerHash": new_owner,
+            "leaseUntil": deadline,
+            "fencingToken": head["fencingToken"] + 1,
+            "updatedAt": event_time,
+        }
+    )
+    return validate_row_authority_head(document=_with_head_hash(result))
+
+
+def _build_settlement_advanced_head(
+    *, expected_head, generation_document, settlement_document
+):
+    head = validate_row_authority_head(document=expected_head)
+    generation = validate_owner_generation_document(
+        document=generation_document
+    )
+    settlement = validate_owner_settlement_document(
+        document=settlement_document
+    )
+    if head["state"] not in {"claimed", "review_pending"}:
+        raise RowAuthorityConfigError("settlement requires an active claim")
+    if (
+        head["userScopeHash"] != generation["userScopeHash"]
+        or settlement["userScopeHash"] != generation["userScopeHash"]
+        or head["rowId"] != generation["rowId"]
+        or settlement["rowId"] != generation["rowId"]
+        or head["effectiveOwnerGeneration"] != generation["generation"]
+        or settlement["generation"] != generation["generation"]
+        or head["effectiveOwnerGenerationHash"] != generation["generationHash"]
+        or settlement["generationHash"] != generation["generationHash"]
+        or generation["predecessorSettlementHash"]
+        != head["effectiveSettlementHash"]
+        or head["effectiveOwnerKind"] != generation["ownerKind"]
+        or head["effectivePriority"] != generation["priority"]
+        or settlement["fencingToken"] != head["fencingToken"]
+        or head["fencingToken"] < generation["firstFencingToken"]
+    ):
+        raise RowAuthorityConfigError(
+            "settlement conflicts with generation or expected head"
+        )
+    allowed_outcome = {
+        "contact_optout": "contact_optout",
+        "terminal": "terminal",
+        "human_decision": "human_declined",
+    }[generation["ownerKind"]]
+    if settlement["outcome"] != allowed_outcome:
+        raise RowAuthorityConfigError(
+            "settlement outcome conflicts with owner kind"
+        )
+    if settlement["settledAt"] < head["updatedAt"]:
+        raise RowAuthorityConfigError(
+            "settlement cannot predate the expected head"
+        )
+    result = {
+        key: value for key, value in head.items() if key != "headHash"
+    }
+    result.update(
+        {
+            "stateRevision": head["stateRevision"] + 1,
+            "state": "settled",
+            "leaseOwnerHash": None,
+            "leaseUntil": None,
+            "latestSettlementHash": settlement["settlementHash"],
+            "effectiveSettlementHash": settlement["settlementHash"],
+            "updatedAt": settlement["settledAt"],
+        }
+    )
+    return validate_row_authority_head(document=_with_head_hash(result))
+
+
+def _build_source_link_advanced_head(
+    *, expected_head, source_link_document
+):
+    head = validate_row_authority_head(document=expected_head)
+    source_link = validate_source_settlement_link_document(
+        document=source_link_document
+    )
+    if (
+        head["userScopeHash"] != source_link["userScopeHash"]
+        or head["rowId"] != source_link["rowId"]
+    ):
+        raise RowAuthorityConfigError(
+            "source settlement link conflicts with the expected head"
+        )
+    if source_link["linkedAt"] < head["updatedAt"]:
+        raise RowAuthorityConfigError(
+            "source link cannot predate the expected head"
+        )
+    result = {
+        key: value for key, value in head.items() if key != "headHash"
+    }
+    result.update(
+        {
+            "stateRevision": head["stateRevision"] + 1,
+            "latestSourceSettlementLinkHash": source_link[
+                "sourceSettlementLinkHash"
+            ],
+            "updatedAt": source_link["linkedAt"],
+        }
+    )
+    return validate_row_authority_head(document=_with_head_hash(result))
 
 
 def _initialization_result(*, disposition, identity, revision, head):

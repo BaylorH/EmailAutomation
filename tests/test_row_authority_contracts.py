@@ -100,7 +100,15 @@ from uuid import UUID
 ROW_AUTHORITY_PATH = REPO_ROOT / "email_automation" / "row_authority.py"
 ROW_METADATA_PATH = REPO_ROOT / "email_automation" / "row_metadata.py"
 ROW_AUTHORITY_STANDARD_LIBRARY_IMPORTS = frozenset(
-    {"__future__", "hashlib", "json", "re", "unicodedata", "uuid"}
+    {
+        "__future__",
+        "datetime",
+        "hashlib",
+        "json",
+        "re",
+        "unicodedata",
+        "uuid",
+    }
 )
 ROW_METADATA_STANDARD_LIBRARY_IMPORTS = frozenset({"__future__"})
 ROW_METADATA_APPLICATION_IMPORT = (
@@ -126,6 +134,26 @@ B2_B_TASK_0_DOMAIN_REGISTRY = {
     ),
     "CONTACT_ROW_BINDING_HEAD_HASH_DOMAIN": (
         "sitesift.contact.row_binding_head.v1"
+    ),
+}
+B2_B_TASK_3_DOMAIN_REGISTRY = {
+    "B1_AUTHORITY_LINK_HASH_DOMAIN": (
+        "sitesift.row.b1_authority_link.v1"
+    ),
+    "OPERATOR_ACTION_ID_DOMAIN": "sitesift.row.operator_action_id.v1",
+    "OPERATOR_CLIENT_REQUEST_HASH_DOMAIN": (
+        "sitesift.row.operator_client_request.v1"
+    ),
+    "OPERATOR_ACTION_HASH_DOMAIN": "sitesift.row.operator_action.v1",
+    "CLAIM_REQUEST_ID_DOMAIN": "sitesift.row.claim_request_id.v1",
+    "CLAIM_SET_HASH_DOMAIN": "sitesift.row.claim_set.v1",
+    "OWNER_GENERATION_HASH_DOMAIN": "sitesift.row.owner_generation.v1",
+    "LOGICAL_OUTCOME_HASH_DOMAIN": "sitesift.row.logical_outcome.v1",
+    "OUTCOME_EVIDENCE_HASH_DOMAIN": "sitesift.row.outcome_evidence.v1",
+    "OWNER_SETTLEMENT_HASH_DOMAIN": "sitesift.row.owner_settlement.v1",
+    "ROW_AUTHORITY_HEAD_HASH_DOMAIN": "sitesift.row.authority_head.v1",
+    "SOURCE_SETTLEMENT_LINK_HASH_DOMAIN": (
+        "sitesift.row.source_settlement_link.v1"
     ),
 }
 _APPLICATION_SCAN_EXCLUDED_PARTS = frozenset(
@@ -276,6 +304,14 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
             for name in B2_B_TASK_0_DOMAIN_REGISTRY
         }
         self.assertEqual(B2_B_TASK_0_DOMAIN_REGISTRY, actual)
+
+    def test_b2_b_task_3_ownership_domain_registry_is_exact(self):
+        module = self._require_module()
+        actual = {
+            name: getattr(module, name, None)
+            for name in B2_B_TASK_3_DOMAIN_REGISTRY
+        }
+        self.assertEqual(B2_B_TASK_3_DOMAIN_REGISTRY, actual)
 
     def test_row_authority_is_not_imported_by_runtime(self):
         synthetic_dynamic_imports = (

@@ -9,6 +9,7 @@ import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timezone
 from threading import Barrier
 from unittest.mock import patch
 
@@ -33,6 +34,20 @@ def _independent_hash(domain, payload, *, user_scope_hash):
     return hashlib.sha256(
         domain.encode("utf-8") + b"\0" + canonical
     ).hexdigest()
+
+
+def _independent_b1_hash(value):
+    canonical = _independent_b1_bytes(value)
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _independent_b1_bytes(value):
+    return json.dumps(
+        value,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 class RowBindingContractTests(unittest.TestCase):
@@ -779,6 +794,1959 @@ class ContactRowBindingContractTests(unittest.TestCase):
             validated = validator(document=document)
             validated[next(iter(validated))] = "mutated"
             self.assertEqual(original, document)
+
+
+class RowOwnershipContractTests(unittest.TestCase):
+    OWNERSHIP_DOMAINS = {
+        "B1_AUTHORITY_LINK_HASH_DOMAIN": (
+            "sitesift.row.b1_authority_link.v1"
+        ),
+        "OPERATOR_ACTION_ID_DOMAIN": "sitesift.row.operator_action_id.v1",
+        "OPERATOR_CLIENT_REQUEST_HASH_DOMAIN": (
+            "sitesift.row.operator_client_request.v1"
+        ),
+        "OPERATOR_ACTION_HASH_DOMAIN": "sitesift.row.operator_action.v1",
+        "CLAIM_REQUEST_ID_DOMAIN": "sitesift.row.claim_request_id.v1",
+        "CLAIM_SET_HASH_DOMAIN": "sitesift.row.claim_set.v1",
+        "OWNER_GENERATION_HASH_DOMAIN": (
+            "sitesift.row.owner_generation.v1"
+        ),
+        "LOGICAL_OUTCOME_HASH_DOMAIN": "sitesift.row.logical_outcome.v1",
+        "OUTCOME_EVIDENCE_HASH_DOMAIN": (
+            "sitesift.row.outcome_evidence.v1"
+        ),
+        "OWNER_SETTLEMENT_HASH_DOMAIN": (
+            "sitesift.row.owner_settlement.v1"
+        ),
+        "ROW_AUTHORITY_HEAD_HASH_DOMAIN": (
+            "sitesift.row.authority_head.v1"
+        ),
+        "SOURCE_SETTLEMENT_LINK_HASH_DOMAIN": (
+            "sitesift.row.source_settlement_link.v1"
+        ),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+
+    def setUp(self):
+        self.scope = "a" * 64
+        self.other_scope = "b" * 64
+        self.first = _row_id(1)
+        self.second = _row_id(2)
+        self.created_at = "2026-08-04T12:00:00.000000Z"
+        self.later_at = "2026-08-04T12:00:01.000000Z"
+
+    def _b1_bundle(
+        self,
+        *,
+        owner_kind="terminal",
+        model_contact_optout=False,
+    ):
+        source_id = "source-1"
+        b1_created = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
+        snapshot_at = datetime(2026, 8, 4, 11, 1, tzinfo=timezone.utc)
+        if owner_kind == "contact_optout":
+            deterministic_evidence = {
+                "schemaVersion": 1,
+                "evidenceKind": "header_list_unsubscribe",
+                "evidenceHash": "7" * 64,
+            }
+            deterministic_hash = _independent_b1_hash(
+                deterministic_evidence
+            )
+            candidate = {
+                "type": "contact_optout",
+                "evidenceHash": deterministic_hash,
+            }
+            proposal_candidate = deepcopy(candidate)
+            model_request_key = None
+            model_request_state = "not_applicable"
+            request_start_fence = None
+            proposal_evidence = None
+            proposal_evidence_hash = None
+        else:
+            deterministic_evidence = None
+            deterministic_hash = None
+            if owner_kind == "terminal":
+                candidate = {
+                    "type": "property_unavailable",
+                    "property": "A",
+                }
+            elif owner_kind == "human_decision":
+                candidate = {
+                    "type": "needs_user_input",
+                    "reason": "availability_review",
+                }
+            else:
+                raise AssertionError(f"unsupported fixture owner {owner_kind}")
+            model_request_key = "model-request-1"
+            model_request_state = "captured"
+            request_start_fence = "request-fence-1"
+            proposal_evidence = {
+                "schemaVersion": 1,
+                "evidenceKind": "model_capture",
+                "responseHash": "8" * 64,
+            }
+            proposal_evidence_hash = _independent_b1_hash(
+                proposal_evidence
+            )
+            if model_contact_optout:
+                if owner_kind != "human_decision":
+                    raise AssertionError(
+                        "model opt-out fixture must resolve to human review"
+                    )
+                proposal_candidate = {
+                    "type": "contact_optout",
+                    "claimed": True,
+                }
+                candidate = {
+                    "type": "needs_user_input",
+                    "reason": "unverified_optout_review",
+                    "sourceCandidateHash": _independent_b1_hash(
+                        proposal_candidate
+                    ),
+                }
+            else:
+                proposal_candidate = deepcopy(candidate)
+
+        transition_candidates = [deepcopy(candidate)]
+        ordinary_obligations = []
+        complete_proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [deepcopy(proposal_candidate)],
+            "ordinaryObligations": deepcopy(ordinary_obligations),
+        }
+        selected_candidates = [deepcopy(candidate)]
+        owner_key = _independent_b1_hash(
+            {
+                "hashKind": "source-selection-v1",
+                "canonicalSourceId": source_id,
+                "ownerKind": owner_kind,
+                "selectedCandidates": selected_candidates,
+            }
+        )
+        selection_snapshot = {
+            "candidateTaxonomyVersion": "source-candidate-taxonomy-v1",
+            "ownerKind": owner_kind,
+            "ownerKey": owner_key,
+            "selectedCandidates": deepcopy(selected_candidates),
+            "candidateDominance": [
+                {
+                    "candidateHash": _independent_b1_hash(candidate),
+                    "outcome": "selected",
+                }
+            ],
+            "transitionCandidatesHash": _independent_b1_hash(
+                transition_candidates
+            ),
+            "ordinaryObligationsHash": _independent_b1_hash(
+                ordinary_obligations
+            ),
+        }
+        selection_hash = _independent_b1_hash(selection_snapshot)
+        complete_proposal_hash = _independent_b1_hash(complete_proposal)
+        classification_input_hash = "9" * 64
+        snapshot_material = {
+            "schemaVersion": 1,
+            "hashKind": "source-classification-snapshot-v1",
+            "canonicalSourceId": source_id,
+            "classificationInputSchemaVersion": 1,
+            "classificationInputHash": classification_input_hash,
+            "modelRequestKey": model_request_key,
+            "completeProposalSnapshot": deepcopy(complete_proposal),
+            "completeProposalHash": complete_proposal_hash,
+            "transitionCandidates": deepcopy(transition_candidates),
+            "ordinaryObligations": deepcopy(ordinary_obligations),
+            "selectionSnapshot": deepcopy(selection_snapshot),
+            "selectionHash": selection_hash,
+            "proposalEvidence": deepcopy(proposal_evidence),
+            "proposalEvidenceHash": proposal_evidence_hash,
+            "deterministicEvidence": deepcopy(deterministic_evidence),
+            "deterministicEvidenceHash": deterministic_hash,
+        }
+        snapshot_hash = _independent_b1_hash(snapshot_material)
+        classification = {
+            "schemaVersion": 1,
+            "canonicalSourceId": source_id,
+            "classificationState": "snapshot_ready",
+            "classificationEpoch": 1,
+            "classificationClaimId": "classification-claim-1",
+            "leaseExpiresAt": datetime(
+                2026,
+                8,
+                4,
+                12,
+                0,
+                tzinfo=timezone.utc,
+            ),
+            "classificationInputSchemaVersion": 1,
+            "classificationInputHash": classification_input_hash,
+            "modelRequestKey": model_request_key,
+            "modelRequestState": model_request_state,
+            "requestStartFence": request_start_fence,
+            "completeProposalSnapshot": deepcopy(complete_proposal),
+            "completeProposalHash": complete_proposal_hash,
+            "transitionCandidates": deepcopy(transition_candidates),
+            "ordinaryObligations": deepcopy(ordinary_obligations),
+            "selectionSnapshot": deepcopy(selection_snapshot),
+            "selectionHash": selection_hash,
+            "snapshotImmutableHash": snapshot_hash,
+            "proposalEvidence": deepcopy(proposal_evidence),
+            "proposalEvidenceHash": proposal_evidence_hash,
+            "deterministicEvidence": deepcopy(deterministic_evidence),
+            "deterministicEvidenceHash": deterministic_hash,
+            "snapshotPersistedAt": snapshot_at,
+            "retainedTerminalKind": None,
+            "retainedTerminalImmutableHash": None,
+            "retainedTerminalRecordHash": None,
+            "retainedTerminalBindingHash": None,
+            "createdAt": b1_created,
+            "updatedAt": snapshot_at,
+        }
+        owner_immutable = {
+            "schemaVersion": 1,
+            "canonicalSourceId": source_id,
+            "snapshotImmutableHash": snapshot_hash,
+            "selectionHash": selection_hash,
+            "ownerKind": owner_kind,
+            "ownerKey": owner_key,
+        }
+        owner_hash = _independent_b1_hash(
+            {
+                "hashKind": "source-transition-owner-v1",
+                **owner_immutable,
+            }
+        )
+        owner = {
+            **owner_immutable,
+            "ownerDecisionHash": owner_hash,
+            "revision": 1,
+            "createdAt": snapshot_at,
+            "updatedAt": snapshot_at,
+        }
+        payload_hash = _independent_b1_hash(candidate)
+        work_key = _independent_b1_hash(
+            {
+                "hashKind": "source-work-key-v1",
+                "canonicalSourceId": source_id,
+                "snapshotImmutableHash": snapshot_hash,
+                "selectionHash": selection_hash,
+                "lane": "transition",
+                "payloadHash": payload_hash,
+                "occurrenceOrdinal": 1,
+            }
+        )
+        entry = {
+            "workKey": work_key,
+            "lane": "transition",
+            "kind": candidate["type"],
+            "payload": deepcopy(candidate),
+            "payloadHash": payload_hash,
+            "occurrenceOrdinal": 1,
+            "selectedOwnerKind": owner_kind,
+            "selectedOwnerKey": owner_key,
+            "dominanceOutcome": "delegate_owner",
+            "completionContract": {
+                "schemaVersion": 1,
+                "evidenceKind": "owner_delegation",
+                "workKind": candidate["type"],
+            },
+            "state": "pending",
+            "resolutionEvidence": None,
+            "resolutionEvidenceHash": None,
+        }
+        immutable_entry_fields = {
+            "workKey",
+            "lane",
+            "kind",
+            "payload",
+            "payloadHash",
+            "occurrenceOrdinal",
+            "selectedOwnerKind",
+            "selectedOwnerKey",
+            "dominanceOutcome",
+            "completionContract",
+        }
+        immutable_entry = {
+            field: deepcopy(entry[field])
+            for field in sorted(immutable_entry_fields)
+        }
+        ledger_hash = _independent_b1_hash(
+            {
+                "hashKind": "source-work-ledger-v1",
+                "canonicalSourceId": source_id,
+                "completeProposalHash": complete_proposal_hash,
+                "snapshotImmutableHash": snapshot_hash,
+                "selectionHash": selection_hash,
+                "ownerDecisionHash": owner_hash,
+                "entries": [immutable_entry],
+            }
+        )
+        ledger = {
+            "schemaVersion": 1,
+            "canonicalSourceId": source_id,
+            "completeProposalHash": complete_proposal_hash,
+            "snapshotImmutableHash": snapshot_hash,
+            "selectionHash": selection_hash,
+            "ownerDecisionHash": owner_hash,
+            "entries": [entry],
+            "entryCount": 1,
+            "ledgerHash": ledger_hash,
+            "revision": 1,
+            "createdAt": snapshot_at,
+            "updatedAt": snapshot_at,
+        }
+        identity = {
+            "schemaVersion": 1,
+            "canonicalSourceId": source_id,
+            "creationHash": "1" * 64,
+            "verifiedAliases": [
+                {
+                    "sourceAliasKey": "2" * 64,
+                    "aliasType": "graph",
+                    "normalizedValueHash": "3" * 64,
+                }
+            ],
+            "threadId": "thread-1",
+            "lifecycleState": "pending",
+            "createdAt": b1_created,
+            "updatedAt": snapshot_at,
+        }
+        return {
+            "identity": identity,
+            "classification": classification,
+            "owner": owner,
+            "ledger": ledger,
+            "work_key": work_key,
+            "payload_hash": payload_hash,
+            "hard_optout_hash": deterministic_hash,
+        }
+
+    def _link(self, owner_kind="terminal", **overrides):
+        bundle = self._b1_bundle(owner_kind=owner_kind)
+        arguments = {
+            "user_scope_hash": self.scope,
+            "source_identity_document": bundle["identity"],
+            "source_classification_document": bundle["classification"],
+            "source_owner_document": bundle["owner"],
+            "source_ledger_document": bundle["ledger"],
+            "work_key": bundle["work_key"],
+        }
+        arguments.update(overrides)
+        return self.module.build_b1_authority_link(**arguments), bundle
+
+    def _operator(self, **overrides):
+        bindings = [
+            {
+                "rowId": self.first,
+                "role": "primary",
+            }
+        ]
+        row_bindings_hash = _independent_hash(
+            "sitesift.row.bindings.v1",
+            {
+                "rowBindings": bindings,
+                "primaryRowId": self.first,
+                "bindingCount": 1,
+            },
+            user_scope_hash=self.scope,
+        )
+        arguments = {
+            "user_scope_hash": self.scope,
+            "actor_scope_hash": "c" * 64,
+            "row_bindings_hash": row_bindings_hash,
+            "client_request_id": "request-1",
+            "issued_at": self.created_at,
+        }
+        arguments.update(overrides)
+        return self.module.build_operator_action_document(**arguments)
+
+    def _claim(
+        self,
+        *,
+        origin="b1_source",
+        outcome="accepted",
+        planned_generation=1,
+    ):
+        if origin == "b1_source":
+            link, _bundle = self._link("terminal")
+            operator = None
+            fanout_id = None
+        elif origin == "authenticated_operator":
+            link = None
+            operator = self._operator()
+            fanout_id = None
+        elif origin == "contact_fanout":
+            link, _bundle = self._link("contact_optout")
+            operator = None
+            fanout_id = "e" * 64
+        else:
+            link = None
+            operator = None
+            fanout_id = None
+        if outcome == "accepted":
+            decisions = [
+                {
+                    "rowId": self.first,
+                    "decision": "accepted",
+                    "plannedGeneration": planned_generation,
+                    "winnerGenerationHash": None,
+                    "winnerSettlementHash": None,
+                }
+            ]
+            planned_writes = 3
+        else:
+            decisions = [
+                {
+                    "rowId": self.first,
+                    "decision": "dominated",
+                    "plannedGeneration": None,
+                    "winnerGenerationHash": "6" * 64,
+                    "winnerSettlementHash": None,
+                }
+            ]
+            planned_writes = 1
+        return self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin=origin,
+            authority_link=link,
+            operator_action_document=operator,
+            fanout_id=fanout_id,
+            row_ids=(self.first,),
+            primary_row_id=self.first,
+            planned_writes=planned_writes,
+            outcome=outcome,
+            row_decisions=decisions,
+            created_at=self.created_at,
+            canonical_mailbox_identity_hash=(
+                "d" * 64 if origin == "contact_fanout" else None
+            ),
+            contact_settlement_hash=(
+                "4" * 64 if origin == "contact_fanout" else None
+            ),
+        )
+
+    def _generation(self, *, claim=None, row_id=None, generation=1):
+        return self.module.build_owner_generation_document(
+            claim_set_document=claim or self._claim(),
+            row_id=row_id or self.first,
+            generation=generation,
+            predecessor_head_hash="7" * 64,
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.created_at,
+        )
+
+    def _row_head(self):
+        identity = self.module.build_row_identity_document(
+            user_scope_hash=self.scope,
+            row_id=self.first,
+            client_id="client-1",
+            spreadsheet_id="spreadsheet-1",
+            sheet_id=0,
+            creation_kind="fresh",
+            creation_source_hash="1" * 64,
+            created_at=self.created_at,
+        )
+        observation = self.module.build_row_observation(
+            spreadsheet_id="spreadsheet-1",
+            marker_observation={
+                "rowId": self.first,
+                "sheetId": 0,
+                "providerRowIndex": 0,
+                "displayRowNumber": 1,
+                "metadataId": 1,
+            },
+            ordered_headers=("Email",),
+            ordered_cell_values=("row@example.test",),
+            user_scope_hash=self.scope,
+        )
+        revision = self.module.build_row_location_revision_document(
+            identity_document=identity,
+            revision=1,
+            lifecycle="active",
+            observations=(observation,),
+            previous_revision_hash=None,
+            observed_at=self.created_at,
+        )
+        return self.module.build_initial_row_authority_head(
+            identity_document=identity,
+            location_revision_document=revision,
+            created_at=self.created_at,
+        )
+
+    def _ownership_hash_vectors(self):
+        authority_link, _bundle = self._link("terminal")
+        action = self._operator()
+        claim = self._claim()
+        generation = self._generation(claim=claim)
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=1,
+            outcome="terminal",
+            settled_at=self.later_at,
+        )
+        head = self._row_head()
+        source_link = self.module.build_source_settlement_link_document(
+            user_scope_hash=self.scope,
+            row_id=self.first,
+            generation=1,
+            generation_hash=generation["generationHash"],
+            authority_link_hash=claim["authorityLinkHash"],
+            b1_identity_hash="6" * 64,
+            b1_final_ledger_evidence_hash="7" * 64,
+            b1_settlement_revision=1,
+            b1_settlement_hash="8" * 64,
+            b2_settlement_hash=settlement["settlementHash"],
+            linked_at=self.later_at,
+        )
+        return {
+            "B1_AUTHORITY_LINK_HASH_DOMAIN": (
+                {
+                    "canonicalSourceId": authority_link["canonicalSourceId"],
+                    "snapshotImmutableHash": authority_link[
+                        "snapshotImmutableHash"
+                    ],
+                    "selectionHash": authority_link["selectionHash"],
+                    "ownerDecisionHash": authority_link["ownerDecisionHash"],
+                    "ledgerHash": authority_link["ledgerHash"],
+                    "ownerKind": authority_link["ownerKind"],
+                    "ownerKey": authority_link["ownerKey"],
+                    "workKey": authority_link["workKey"],
+                    "payloadHash": authority_link["payloadHash"],
+                    "hardOptOutEvidenceHash": authority_link[
+                        "hardOptOutEvidenceHash"
+                    ],
+                },
+                authority_link["authorityLinkHash"],
+            ),
+            "OPERATOR_ACTION_ID_DOMAIN": (
+                {
+                    "actorScopeHash": action["actorScopeHash"],
+                    "rowBindingsHash": action["rowBindingsHash"],
+                    "clientRequestHash": action["clientRequestHash"],
+                    "actionKind": action["actionKind"],
+                    "reasonCode": action["reasonCode"],
+                    "issuedAt": action["issuedAt"],
+                },
+                action["actionId"],
+            ),
+            "OPERATOR_CLIENT_REQUEST_HASH_DOMAIN": (
+                {"clientRequestId": "request-1"},
+                action["clientRequestHash"],
+            ),
+            "OPERATOR_ACTION_HASH_DOMAIN": (
+                {
+                    "actionId": action["actionId"],
+                    "actorScopeHash": action["actorScopeHash"],
+                    "rowBindingsHash": action["rowBindingsHash"],
+                    "clientRequestHash": action["clientRequestHash"],
+                    "actionKind": action["actionKind"],
+                    "reasonCode": action["reasonCode"],
+                    "issuedAt": action["issuedAt"],
+                },
+                action["operatorActionHash"],
+            ),
+            "CLAIM_REQUEST_ID_DOMAIN": (
+                {
+                    "authorityOrigin": claim["authorityOrigin"],
+                    "authorityLinkHash": claim["authorityLinkHash"],
+                    "operatorActionHash": claim["operatorActionHash"],
+                    "fanoutId": claim["fanoutId"],
+                    "rowBindingsHash": claim["rowBindingsHash"],
+                    "ownerKind": claim["ownerKind"],
+                    "ownerKey": claim["ownerKey"],
+                    "workKey": claim["workKey"],
+                    "payloadHash": claim["payloadHash"],
+                },
+                claim["requestId"],
+            ),
+            "CLAIM_SET_HASH_DOMAIN": (
+                {
+                    "requestId": claim["requestId"],
+                    "authorityOrigin": claim["authorityOrigin"],
+                    "authorityLinkHash": claim["authorityLinkHash"],
+                    "operatorActionHash": claim["operatorActionHash"],
+                    "fanoutId": claim["fanoutId"],
+                    "rowBindingsHash": claim["rowBindingsHash"],
+                    "ownerKind": claim["ownerKind"],
+                    "ownerKey": claim["ownerKey"],
+                    "derivedPriority": claim["derivedPriority"],
+                    "plannedWrites": claim["plannedWrites"],
+                    "outcome": claim["outcome"],
+                    "rowDecisions": deepcopy(claim["rowDecisions"]),
+                    "createdAt": claim["createdAt"],
+                },
+                claim["claimSetHash"],
+            ),
+            "OWNER_GENERATION_HASH_DOMAIN": (
+                {
+                    "rowId": generation["rowId"],
+                    "generation": generation["generation"],
+                    "requestId": generation["requestId"],
+                    "claimSetHash": generation["claimSetHash"],
+                    "predecessorHeadHash": generation["predecessorHeadHash"],
+                    "predecessorSettlementHash": generation[
+                        "predecessorSettlementHash"
+                    ],
+                    "ownerKind": generation["ownerKind"],
+                    "ownerKey": generation["ownerKey"],
+                    "priority": generation["priority"],
+                    "leaseEpoch": generation["leaseEpoch"],
+                    "firstFencingToken": generation["firstFencingToken"],
+                    "createdAt": generation["createdAt"],
+                },
+                generation["generationHash"],
+            ),
+            "LOGICAL_OUTCOME_HASH_DOMAIN": (
+                {
+                    "rowId": settlement["rowId"],
+                    "generation": settlement["generation"],
+                    "ownerKind": generation["ownerKind"],
+                    "ownerKey": generation["ownerKey"],
+                    "outcome": settlement["outcome"],
+                    "outcomeReasonCode": settlement["outcomeReasonCode"],
+                    "outcomeEvidenceHash": settlement["outcomeEvidenceHash"],
+                },
+                settlement["logicalOutcomeHash"],
+            ),
+            "OUTCOME_EVIDENCE_HASH_DOMAIN": (
+                {
+                    "authorityLinkHash": claim["authorityLinkHash"],
+                    "operatorActionHash": claim["operatorActionHash"],
+                    "fanoutId": claim["fanoutId"],
+                    "payloadHash": claim["payloadHash"],
+                    "outcomeReasonCode": settlement["outcomeReasonCode"],
+                },
+                settlement["outcomeEvidenceHash"],
+            ),
+            "OWNER_SETTLEMENT_HASH_DOMAIN": (
+                {
+                    "rowId": settlement["rowId"],
+                    "generation": settlement["generation"],
+                    "generationHash": settlement["generationHash"],
+                    "fencingToken": settlement["fencingToken"],
+                    "outcome": settlement["outcome"],
+                    "dominantGenerationHash": settlement[
+                        "dominantGenerationHash"
+                    ],
+                    "supersededEffectiveSettlementHash": settlement[
+                        "supersededEffectiveSettlementHash"
+                    ],
+                    "operatorActionHash": settlement["operatorActionHash"],
+                    "outcomeReasonCode": settlement["outcomeReasonCode"],
+                    "outcomeEvidenceHash": settlement["outcomeEvidenceHash"],
+                    "logicalOutcomeHash": settlement["logicalOutcomeHash"],
+                    "settledAt": settlement["settledAt"],
+                },
+                settlement["settlementHash"],
+            ),
+            "ROW_AUTHORITY_HEAD_HASH_DOMAIN": (
+                {
+                    "rowId": head["rowId"],
+                    "stateRevision": head["stateRevision"],
+                    "currentLocationRevision": head[
+                        "currentLocationRevision"
+                    ],
+                    "currentLocationHash": head["currentLocationHash"],
+                    "currentLocationLifecycle": head[
+                        "currentLocationLifecycle"
+                    ],
+                    "effectiveOwnerGeneration": head[
+                        "effectiveOwnerGeneration"
+                    ],
+                    "effectiveOwnerGenerationHash": head[
+                        "effectiveOwnerGenerationHash"
+                    ],
+                    "effectiveOwnerKind": head["effectiveOwnerKind"],
+                    "effectivePriority": head["effectivePriority"],
+                    "state": head["state"],
+                    "leaseOwnerHash": head["leaseOwnerHash"],
+                    "leaseUntil": head["leaseUntil"],
+                    "fencingToken": head["fencingToken"],
+                    "latestSettlementHash": head["latestSettlementHash"],
+                    "effectiveSettlementHash": head[
+                        "effectiveSettlementHash"
+                    ],
+                    "latestSourceSettlementLinkHash": head[
+                        "latestSourceSettlementLinkHash"
+                    ],
+                    "latestOptOutReleaseResultHash": head[
+                        "latestOptOutReleaseResultHash"
+                    ],
+                    "projectionBacklogCount": head[
+                        "projectionBacklogCount"
+                    ],
+                    "createdAt": head["createdAt"],
+                    "updatedAt": head["updatedAt"],
+                },
+                head["headHash"],
+            ),
+            "SOURCE_SETTLEMENT_LINK_HASH_DOMAIN": (
+                {
+                    "rowId": source_link["rowId"],
+                    "generation": source_link["generation"],
+                    "generationHash": source_link["generationHash"],
+                    "authorityLinkHash": source_link["authorityLinkHash"],
+                    "b1IdentityHash": source_link["b1IdentityHash"],
+                    "b1FinalLedgerEvidenceHash": source_link[
+                        "b1FinalLedgerEvidenceHash"
+                    ],
+                    "b1SettlementRevision": source_link[
+                        "b1SettlementRevision"
+                    ],
+                    "b1SettlementHash": source_link["b1SettlementHash"],
+                    "b2SettlementHash": source_link["b2SettlementHash"],
+                    "linkedAt": source_link["linkedAt"],
+                },
+                source_link["sourceSettlementLinkHash"],
+            ),
+        }
+
+    def test_all_ownership_domains_are_registered_and_match_independent_vectors(self):
+        actual = {
+            name: getattr(self.module, name, None)
+            for name in self.OWNERSHIP_DOMAINS
+        }
+        self.assertEqual(self.OWNERSHIP_DOMAINS, actual)
+        for index, domain in enumerate(self.OWNERSHIP_DOMAINS.values()):
+            payload = {"field": index, "nullable": None}
+            expected = _independent_hash(
+                domain,
+                payload,
+                user_scope_hash=self.scope,
+            )
+            with self.subTest(domain=domain):
+                self.assertEqual(
+                    expected,
+                    self.module.domain_hash(
+                        domain,
+                        payload,
+                        user_scope_hash=self.scope,
+                    ),
+                )
+
+    def test_every_ownership_hash_changes_for_field_scope_null_time_and_domain_drift(self):
+        vectors = self._ownership_hash_vectors()
+        self.assertEqual(set(self.OWNERSHIP_DOMAINS), set(vectors))
+        self.assertTrue(
+            any(
+                value is None
+                for payload, _actual in vectors.values()
+                for value in payload.values()
+            )
+        )
+        self.assertTrue(
+            any(
+                field.endswith("At")
+                for payload, _actual in vectors.values()
+                for field in payload
+            )
+        )
+
+        def drift(value):
+            if value is None:
+                return "f" * 64
+            if type(value) is int:
+                return value + 1
+            if type(value) is str:
+                return f"{value}-drift"
+            if type(value) is list:
+                return [*deepcopy(value), {"drift": True}]
+            if type(value) is dict:
+                return {**deepcopy(value), "drift": True}
+            raise AssertionError(f"unsupported vector value: {value!r}")
+
+        for name, (payload, actual) in vectors.items():
+            domain = self.OWNERSHIP_DOMAINS[name]
+            expected = _independent_hash(
+                domain,
+                payload,
+                user_scope_hash=self.scope,
+            )
+            with self.subTest(name=name, mutation="exact-vector"):
+                self.assertEqual(expected, actual)
+            for field, value in payload.items():
+                mutated = deepcopy(payload)
+                mutated[field] = drift(value)
+                with self.subTest(name=name, field=field):
+                    self.assertNotEqual(
+                        actual,
+                        _independent_hash(
+                            domain,
+                            mutated,
+                            user_scope_hash=self.scope,
+                        ),
+                    )
+            with self.subTest(name=name, mutation="scope"):
+                self.assertNotEqual(
+                    actual,
+                    _independent_hash(
+                        domain,
+                        payload,
+                        user_scope_hash=self.other_scope,
+                    ),
+                )
+            with self.subTest(name=name, mutation="domain"):
+                self.assertNotEqual(
+                    actual,
+                    _independent_hash(
+                        "sitesift.row.domain_drift.v1",
+                        payload,
+                        user_scope_hash=self.scope,
+                    ),
+                )
+
+    def test_b1_link_is_derived_from_exact_identity_classification_owner_ledger_bundle(self):
+        bundle = self._b1_bundle(owner_kind="terminal")
+        original = deepcopy(bundle)
+
+        link, returned_bundle = self._link("terminal")
+
+        expected_without_hash = {
+            "canonicalSourceId": "source-1",
+            "snapshotImmutableHash": bundle["classification"][
+                "snapshotImmutableHash"
+            ],
+            "selectionHash": bundle["classification"]["selectionHash"],
+            "ownerDecisionHash": bundle["owner"]["ownerDecisionHash"],
+            "ledgerHash": bundle["ledger"]["ledgerHash"],
+            "ownerKind": "terminal",
+            "ownerKey": bundle["owner"]["ownerKey"],
+            "workKey": bundle["work_key"],
+            "payloadHash": bundle["payload_hash"],
+            "hardOptOutEvidenceHash": None,
+        }
+        self.assertEqual(
+            {
+                **expected_without_hash,
+                "authorityLinkHash": _independent_hash(
+                    self.OWNERSHIP_DOMAINS[
+                        "B1_AUTHORITY_LINK_HASH_DOMAIN"
+                    ],
+                    expected_without_hash,
+                    user_scope_hash=self.scope,
+                ),
+            },
+            link,
+        )
+        self.assertEqual(original, returned_bundle)
+
+    def test_b1_link_exact_schema_owner_correlations_and_hard_optout_requirement(self):
+        terminal, _bundle = self._link("terminal")
+        validated = self.module.validate_b1_authority_link(
+            authority_link=terminal,
+            user_scope_hash=self.scope,
+        )
+        self.assertEqual(terminal, validated)
+        invalid = []
+        unknown = deepcopy(terminal)
+        unknown["unknown"] = None
+        invalid.append(unknown)
+        wrong_priority_evidence = deepcopy(terminal)
+        wrong_priority_evidence["hardOptOutEvidenceHash"] = "f" * 64
+        invalid.append(wrong_priority_evidence)
+        contact, _contact_bundle = self._link("contact_optout")
+        missing_contact_evidence = deepcopy(contact)
+        missing_contact_evidence["hardOptOutEvidenceHash"] = None
+        invalid.append(missing_contact_evidence)
+        wrong_owner_key = deepcopy(terminal)
+        wrong_owner_key["ownerKey"] = "f" * 64
+        invalid.append(wrong_owner_key)
+        for candidate in invalid:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.validate_b1_authority_link(
+                    authority_link=candidate,
+                    user_scope_hash=self.scope,
+                )
+
+    def test_b1_link_hash_changes_with_user_scope_and_cross_scope_validation_fails(self):
+        link, bundle = self._link("terminal")
+        other = self.module.build_b1_authority_link(
+            user_scope_hash=self.other_scope,
+            source_identity_document=bundle["identity"],
+            source_classification_document=bundle["classification"],
+            source_owner_document=bundle["owner"],
+            source_ledger_document=bundle["ledger"],
+            work_key=bundle["work_key"],
+        )
+        self.assertNotEqual(
+            link["authorityLinkHash"],
+            other["authorityLinkHash"],
+        )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module.validate_b1_authority_link(
+                authority_link=link,
+                user_scope_hash=self.other_scope,
+            )
+
+    def test_hard_optout_link_uses_validated_nonlocal_deterministic_evidence_hash(self):
+        link, bundle = self._link("contact_optout")
+        self.assertEqual(
+            bundle["hard_optout_hash"],
+            link["hardOptOutEvidenceHash"],
+        )
+        self.assertNotEqual(
+            bundle["classification"]["deterministicEvidence"][
+                "evidenceHash"
+            ],
+            link["hardOptOutEvidenceHash"],
+        )
+        self.assertEqual(
+            link["hardOptOutEvidenceHash"],
+            bundle["ledger"]["entries"][0]["payload"]["evidenceHash"],
+        )
+
+    def test_forged_or_model_only_optout_bundle_cannot_build_priority_three_link(self):
+        link, bundle = self._link("human_decision")
+        self.assertEqual("human_decision", link["ownerKind"])
+        forged_classification = deepcopy(bundle["classification"])
+        forged_classification["transitionCandidates"] = [
+            {"type": "contact_optout", "claimed": True}
+        ]
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module.build_b1_authority_link(
+                user_scope_hash=self.scope,
+                source_identity_document=bundle["identity"],
+                source_classification_document=forged_classification,
+                source_owner_document=bundle["owner"],
+                source_ledger_document=bundle["ledger"],
+                work_key=bundle["work_key"],
+            )
+
+        model_bundle = self._b1_bundle(
+            owner_kind="human_decision",
+            model_contact_optout=True,
+        )
+        model_link = self.module.build_b1_authority_link(
+            user_scope_hash=self.scope,
+            source_identity_document=model_bundle["identity"],
+            source_classification_document=model_bundle["classification"],
+            source_owner_document=model_bundle["owner"],
+            source_ledger_document=model_bundle["ledger"],
+            work_key=model_bundle["work_key"],
+        )
+        self.assertEqual(
+            "contact_optout",
+            model_bundle["classification"]["completeProposalSnapshot"][
+                "transitionCandidates"
+            ][0]["type"],
+        )
+        self.assertEqual(
+            "needs_user_input",
+            model_bundle["classification"]["transitionCandidates"][0][
+                "type"
+            ],
+        )
+        self.assertEqual("human_decision", model_link["ownerKind"])
+        self.assertIsNone(model_link["hardOptOutEvidenceHash"])
+
+    def test_b1_canonical_material_rejects_invalid_utf8_dictionary_keys(self):
+        for value in (
+            {"\ud800": "value"},
+            {"nested": [{"\udfff": "value"}]},
+        ):
+            with self.subTest(value=value), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module._b1_canonical_hash(value)
+
+    def test_planned_write_validator_accepts_nonboolean_uint_0_through_400_and_rejects_401(self):
+        self.assertEqual(
+            0,
+            self.module._require_row_authority_planned_writes(0),
+        )
+        self.assertEqual(
+            400,
+            self.module._require_row_authority_planned_writes(400),
+        )
+
+        class IntSubclass(int):
+            pass
+
+        for value in (
+            True,
+            False,
+            -1,
+            401,
+            1.0,
+            "1",
+            None,
+            IntSubclass(1),
+        ):
+            with self.subTest(value=value), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module._require_row_authority_planned_writes(value)
+
+    def test_priority_is_derived_and_cannot_be_supplied(self):
+        self.assertEqual(
+            {
+                "contact_optout": 3,
+                "terminal": 2,
+                "human_decision": 1,
+            },
+            {
+                owner: self.module.derive_owner_priority(owner)
+                for owner in (
+                    "contact_optout",
+                    "terminal",
+                    "human_decision",
+                )
+            },
+        )
+        for value in (None, True, 3, "", "operator", "CONTACT_OPTOUT"):
+            with self.subTest(value=value), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.derive_owner_priority(value)
+        self.assertNotIn(
+            "priority",
+            inspect.signature(
+                self.module.build_owner_generation_document
+            ).parameters,
+        )
+
+    def test_claim_and_settlement_fences_are_exactly_monotonic(self):
+        head = self._row_head()
+        terminal_claim = self._claim()
+        invalid_first_generation = self.module.build_owner_generation_document(
+            claim_set_document=terminal_claim,
+            row_id=self.first,
+            generation=1,
+            predecessor_head_hash=head["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=7,
+            created_at=self.created_at,
+        )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module._build_claim_advanced_head(
+                expected_head=head,
+                generation_document=invalid_first_generation,
+                lease_owner_hash="9" * 64,
+                lease_until="2026-08-04T12:00:02.000000Z",
+                dominated_predecessor_settlement_hash=None,
+                claimed_at=self.created_at,
+            )
+
+        human_claim = self._claim(origin="authenticated_operator")
+        human_generation = self.module.build_owner_generation_document(
+            claim_set_document=human_claim,
+            row_id=self.first,
+            generation=1,
+            predecessor_head_hash=head["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.created_at,
+        )
+        pending = self.module._build_claim_advanced_head(
+            expected_head=head,
+            generation_document=human_generation,
+            lease_owner_hash="9" * 64,
+            lease_until="2026-08-04T12:00:02.000000Z",
+            dominated_predecessor_settlement_hash=None,
+            claimed_at=self.created_at,
+        )
+        taken_over = self.module._build_lease_takeover_head(
+            expected_head=pending,
+            generation_document=human_generation,
+            new_lease_owner_hash="8" * 64,
+            new_lease_until="2026-08-04T12:00:04.000000Z",
+            taken_at="2026-08-04T12:00:03.000000Z",
+        )
+        terminal_claim = self._claim(planned_generation=2)
+        for first_fence in (2, 4):
+            invalid_generation = self.module.build_owner_generation_document(
+                claim_set_document=terminal_claim,
+                row_id=self.first,
+                generation=2,
+                predecessor_head_hash=taken_over["headHash"],
+                predecessor_settlement_hash=None,
+                lease_epoch=1,
+                first_fencing_token=first_fence,
+                created_at="2026-08-04T12:00:03.000000Z",
+            )
+            with self.subTest(first_fence=first_fence), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module._build_claim_advanced_head(
+                    expected_head=taken_over,
+                    generation_document=invalid_generation,
+                    lease_owner_hash="7" * 64,
+                    lease_until="2026-08-04T12:00:05.000000Z",
+                    dominated_predecessor_settlement_hash="6" * 64,
+                    claimed_at="2026-08-04T12:00:03.000000Z",
+                )
+
+        next_generation = self.module.build_owner_generation_document(
+            claim_set_document=terminal_claim,
+            row_id=self.first,
+            generation=2,
+            predecessor_head_hash=taken_over["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=3,
+            created_at="2026-08-04T12:00:03.000000Z",
+        )
+        superseding = self.module._build_claim_advanced_head(
+            expected_head=taken_over,
+            generation_document=next_generation,
+            lease_owner_hash="7" * 64,
+            lease_until="2026-08-04T12:00:05.000000Z",
+            dominated_predecessor_settlement_hash="6" * 64,
+            claimed_at="2026-08-04T12:00:03.000000Z",
+        )
+        self.assertEqual(3, superseding["fencingToken"])
+
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module.build_owner_settlement_document(
+                generation_document=next_generation,
+                claim_set_document=terminal_claim,
+                fencing_token=2,
+                outcome="terminal",
+                settled_at="2026-08-04T12:00:04.000000Z",
+            )
+
+    def test_takeover_and_settlement_reject_heads_below_generation_fence_floor(self):
+        initial_head = self._row_head()
+        claim = self._claim()
+        generation = self.module.build_owner_generation_document(
+            claim_set_document=claim,
+            row_id=self.first,
+            generation=1,
+            predecessor_head_hash=initial_head["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=7,
+            created_at=self.created_at,
+        )
+        malformed_head_material = {
+            key: deepcopy(value)
+            for key, value in initial_head.items()
+            if key != "headHash"
+        }
+        malformed_head_material.update(
+            {
+                "stateRevision": 2,
+                "effectiveOwnerGeneration": 1,
+                "effectiveOwnerGenerationHash": generation["generationHash"],
+                "effectiveOwnerKind": generation["ownerKind"],
+                "effectivePriority": generation["priority"],
+                "state": "claimed",
+                "leaseOwnerHash": "9" * 64,
+                "leaseUntil": "2026-08-04T12:00:02.000000Z",
+                "fencingToken": 1,
+            }
+        )
+        malformed_head = self.module._with_head_hash(malformed_head_material)
+        self.assertEqual(
+            malformed_head,
+            self.module.validate_row_authority_head(document=malformed_head),
+        )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module._build_lease_takeover_head(
+                expected_head=malformed_head,
+                generation_document=generation,
+                new_lease_owner_hash="8" * 64,
+                new_lease_until="2026-08-04T12:00:04.000000Z",
+                taken_at="2026-08-04T12:00:03.000000Z",
+            )
+
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=7,
+            outcome="terminal",
+            settled_at=self.later_at,
+        )
+        settlement["fencingToken"] = 1
+        settlement_payload = {
+            "rowId": settlement["rowId"],
+            "generation": settlement["generation"],
+            "generationHash": settlement["generationHash"],
+            "fencingToken": settlement["fencingToken"],
+            "outcome": settlement["outcome"],
+            "dominantGenerationHash": settlement[
+                "dominantGenerationHash"
+            ],
+            "supersededEffectiveSettlementHash": settlement[
+                "supersededEffectiveSettlementHash"
+            ],
+            "operatorActionHash": settlement["operatorActionHash"],
+            "outcomeReasonCode": settlement["outcomeReasonCode"],
+            "outcomeEvidenceHash": settlement["outcomeEvidenceHash"],
+            "logicalOutcomeHash": settlement["logicalOutcomeHash"],
+            "settledAt": settlement["settledAt"],
+        }
+        settlement["settlementHash"] = _independent_hash(
+            self.OWNERSHIP_DOMAINS["OWNER_SETTLEMENT_HASH_DOMAIN"],
+            settlement_payload,
+            user_scope_hash=self.scope,
+        )
+        self.assertEqual(
+            settlement,
+            self.module.validate_owner_settlement_document(
+                document=settlement
+            ),
+        )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module._build_settlement_advanced_head(
+                expected_head=malformed_head,
+                generation_document=generation,
+                settlement_document=settlement,
+            )
+
+    def test_head_state_matches_owner_kind_and_settled_heads_retain_fence(self):
+        initial = self._row_head()
+
+        def rehash(head, **changes):
+            material = {
+                key: deepcopy(value)
+                for key, value in head.items()
+                if key != "headHash"
+            }
+            material.update(changes)
+            return self.module._with_head_hash(material)
+
+        terminal_claim = self._claim()
+        terminal_generation = self.module.build_owner_generation_document(
+            claim_set_document=terminal_claim,
+            row_id=self.first,
+            generation=1,
+            predecessor_head_hash=initial["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.created_at,
+        )
+        claimed = self.module._build_claim_advanced_head(
+            expected_head=initial,
+            generation_document=terminal_generation,
+            lease_owner_hash="9" * 64,
+            lease_until="2026-08-04T12:00:02.000000Z",
+            dominated_predecessor_settlement_hash=None,
+            claimed_at=self.created_at,
+        )
+        terminal_as_pending = rehash(claimed, state="review_pending")
+
+        human_claim = self._claim(origin="authenticated_operator")
+        human_generation = self.module.build_owner_generation_document(
+            claim_set_document=human_claim,
+            row_id=self.first,
+            generation=1,
+            predecessor_head_hash=initial["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.created_at,
+        )
+        pending = self.module._build_claim_advanced_head(
+            expected_head=initial,
+            generation_document=human_generation,
+            lease_owner_hash="9" * 64,
+            lease_until="2026-08-04T12:00:02.000000Z",
+            dominated_predecessor_settlement_hash=None,
+            claimed_at=self.created_at,
+        )
+        human_as_claimed = rehash(pending, state="claimed")
+
+        terminal_settlement = self.module.build_owner_settlement_document(
+            generation_document=terminal_generation,
+            claim_set_document=terminal_claim,
+            fencing_token=1,
+            outcome="terminal",
+            settled_at=self.later_at,
+        )
+        settled = self.module._build_settlement_advanced_head(
+            expected_head=claimed,
+            generation_document=terminal_generation,
+            settlement_document=terminal_settlement,
+        )
+        settled_without_fence = rehash(settled, fencingToken=None)
+
+        for invalid in (
+            terminal_as_pending,
+            human_as_claimed,
+            settled_without_fence,
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.validate_row_authority_head(document=invalid)
+
+    def test_operator_action_id_request_hash_and_action_hash_are_deterministic(self):
+        action = self._operator()
+        expected_request = _independent_hash(
+            self.OWNERSHIP_DOMAINS[
+                "OPERATOR_CLIENT_REQUEST_HASH_DOMAIN"
+            ],
+            {"clientRequestId": "request-1"},
+            user_scope_hash=self.scope,
+        )
+        id_payload = {
+            "actorScopeHash": action["actorScopeHash"],
+            "rowBindingsHash": action["rowBindingsHash"],
+            "clientRequestHash": expected_request,
+            "actionKind": "decline",
+            "reasonCode": "decline_property",
+            "issuedAt": self.created_at,
+        }
+        expected_id = _independent_hash(
+            self.OWNERSHIP_DOMAINS["OPERATOR_ACTION_ID_DOMAIN"],
+            id_payload,
+            user_scope_hash=self.scope,
+        )
+        expected_hash = _independent_hash(
+            self.OWNERSHIP_DOMAINS["OPERATOR_ACTION_HASH_DOMAIN"],
+            {"actionId": expected_id, **id_payload},
+            user_scope_hash=self.scope,
+        )
+        self.assertEqual(expected_request, action["clientRequestHash"])
+        self.assertEqual(expected_id, action["actionId"])
+        self.assertEqual(expected_hash, action["operatorActionHash"])
+        self.assertEqual(
+            action,
+            self.module.validate_operator_action_document(document=action),
+        )
+        for overrides in (
+            {"client_request_id": "request-2"},
+            {"issued_at": self.later_at},
+            {"actor_scope_hash": "f" * 64},
+            {"user_scope_hash": self.other_scope},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertNotEqual(action, self._operator(**overrides))
+
+    def test_claim_origin_union_rejects_every_invalid_cross_field_combination(self):
+        b1 = self._claim(origin="b1_source")
+        operator = self._claim(origin="authenticated_operator")
+        fanout = self._claim(origin="contact_fanout")
+        self.assertIsNotNone(b1["authorityLink"])
+        self.assertIsNone(b1["operatorActionHash"])
+        self.assertIsNone(b1["fanoutId"])
+        self.assertIsNone(operator["authorityLink"])
+        self.assertIsNotNone(operator["operatorActionHash"])
+        self.assertEqual("human_decision", operator["ownerKind"])
+        self.assertEqual(operator["operatorActionHash"], operator["payloadHash"])
+        self.assertEqual("contact_optout", fanout["ownerKind"])
+        self.assertIsNotNone(fanout["fanoutId"])
+        self.assertEqual("d" * 64, fanout["ownerKey"])
+        self.assertEqual(
+            f"{'e' * 64}--{self.first}",
+            fanout["workKey"],
+        )
+        self.assertEqual("4" * 64, fanout["payloadHash"])
+        self.assertNotEqual(
+            fanout["authorityLink"]["ownerKey"],
+            fanout["ownerKey"],
+        )
+        self.assertNotEqual(
+            fanout["authorityLink"]["workKey"],
+            fanout["workKey"],
+        )
+        self.assertNotEqual(
+            fanout["authorityLink"]["payloadHash"],
+            fanout["payloadHash"],
+        )
+        for document in (b1, operator, fanout):
+            self.assertEqual(
+                document,
+                self.module.validate_claim_set_document(document=document),
+            )
+
+        terminal_link, _bundle = self._link("terminal")
+        invalid_arguments = (
+            {
+                "authority_origin": "b1_source",
+                "authority_link": terminal_link,
+                "operator_action_document": self._operator(),
+                "fanout_id": None,
+            },
+            {
+                "authority_origin": "authenticated_operator",
+                "authority_link": terminal_link,
+                "operator_action_document": self._operator(),
+                "fanout_id": None,
+            },
+            {
+                "authority_origin": "contact_fanout",
+                "authority_link": terminal_link,
+                "operator_action_document": None,
+                "fanout_id": "e" * 64,
+            },
+            {
+                "authority_origin": "contact_fanout",
+                "authority_link": self._link("contact_optout")[0],
+                "operator_action_document": None,
+                "fanout_id": None,
+            },
+            {
+                "authority_origin": "invented",
+                "authority_link": None,
+                "operator_action_document": None,
+                "fanout_id": None,
+            },
+        )
+        decisions = [
+            {
+                "rowId": self.first,
+                "decision": "accepted",
+                "plannedGeneration": 1,
+                "winnerGenerationHash": None,
+                "winnerSettlementHash": None,
+            }
+        ]
+        for origin in invalid_arguments:
+            with self.subTest(origin=origin), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.build_claim_set_document(
+                    user_scope_hash=self.scope,
+                    row_ids=(self.first,),
+                    primary_row_id=self.first,
+                    planned_writes=3,
+                    outcome="accepted",
+                    row_decisions=decisions,
+                    created_at=self.created_at,
+                    **origin,
+                )
+
+    def test_accepted_and_dominated_claim_decisions_enforce_exact_nullability(self):
+        accepted = self._claim(outcome="accepted")
+        dominated = self._claim(outcome="dominated")
+        self.assertEqual("accepted", accepted["rowDecisions"][0]["decision"])
+        self.assertEqual(
+            "dominated",
+            dominated["rowDecisions"][0]["decision"],
+        )
+        self.assertIsNone(
+            dominated["rowDecisions"][0]["winnerSettlementHash"]
+        )
+
+        link, _bundle = self._link("terminal")
+        blocked = {
+            "rowId": self.second,
+            "decision": "blocked_by_claim_set",
+            "plannedGeneration": None,
+            "winnerGenerationHash": None,
+            "winnerSettlementHash": None,
+        }
+        multi = self.module.build_claim_set_document(
+            user_scope_hash=self.scope,
+            authority_origin="b1_source",
+            authority_link=link,
+            operator_action_document=None,
+            fanout_id=None,
+            row_ids=(self.second, self.first),
+            primary_row_id=self.first,
+            planned_writes=1,
+            outcome="dominated",
+            row_decisions=(dominated["rowDecisions"][0], blocked),
+            created_at=self.created_at,
+        )
+        self.assertEqual(
+            [self.first, self.second],
+            [decision["rowId"] for decision in multi["rowDecisions"]],
+        )
+
+        invalid_decisions = (
+            {
+                "rowId": self.first,
+                "decision": "accepted",
+                "plannedGeneration": 1,
+                "winnerGenerationHash": "f" * 64,
+                "winnerSettlementHash": None,
+            },
+            {
+                "rowId": self.first,
+                "decision": "dominated",
+                "plannedGeneration": 1,
+                "winnerGenerationHash": "f" * 64,
+                "winnerSettlementHash": None,
+            },
+            {
+                "rowId": self.first,
+                "decision": "blocked_by_claim_set",
+                "plannedGeneration": None,
+                "winnerGenerationHash": None,
+                "winnerSettlementHash": "f" * 64,
+            },
+        )
+        for decision in invalid_decisions:
+            with self.subTest(decision=decision), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.build_claim_set_document(
+                    user_scope_hash=self.scope,
+                    authority_origin="b1_source",
+                    authority_link=link,
+                    operator_action_document=None,
+                    fanout_id=None,
+                    row_ids=(self.first,),
+                    primary_row_id=self.first,
+                    planned_writes=3,
+                    outcome="accepted",
+                    row_decisions=(decision,),
+                    created_at=self.created_at,
+                )
+
+    def test_generation_settlement_and_source_link_schemas_enforce_correlated_nulls(self):
+        terminal_claim = self._claim()
+        generation = self._generation(claim=terminal_claim)
+        self.assertEqual(2, generation["priority"])
+        self.assertEqual(
+            generation,
+            self.module.validate_owner_generation_document(
+                document=generation
+            ),
+        )
+        terminal = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=terminal_claim,
+            fencing_token=1,
+            outcome="terminal",
+            settled_at=self.later_at,
+        )
+        self.assertEqual("terminal_source", terminal["outcomeReasonCode"])
+        self.assertIsNone(terminal["dominantGenerationHash"])
+        self.assertIsNone(terminal["supersededEffectiveSettlementHash"])
+        self.assertIsNone(terminal["operatorActionHash"])
+        self.assertEqual(
+            terminal,
+            self.module.validate_owner_settlement_document(
+                document=terminal
+            ),
+        )
+
+        contact_claim = self._claim(
+            origin="contact_fanout",
+            planned_generation=2,
+        )
+        contact_generation = self.module.build_owner_generation_document(
+            claim_set_document=contact_claim,
+            row_id=self.first,
+            generation=2,
+            predecessor_head_hash="7" * 64,
+            predecessor_settlement_hash="4" * 64,
+            lease_epoch=1,
+            first_fencing_token=2,
+            created_at=self.created_at,
+        )
+        contact = self.module.build_owner_settlement_document(
+            generation_document=contact_generation,
+            claim_set_document=contact_claim,
+            fencing_token=2,
+            outcome="contact_optout",
+            superseded_effective_settlement_hash="4" * 64,
+            settled_at=self.later_at,
+        )
+        self.assertEqual("verified_optout", contact["outcomeReasonCode"])
+        self.assertEqual(
+            "4" * 64,
+            contact["supersededEffectiveSettlementHash"],
+        )
+        for predecessor in (None, "5" * 64):
+            with self.subTest(predecessor=predecessor), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.build_owner_settlement_document(
+                    generation_document=contact_generation,
+                    claim_set_document=contact_claim,
+                    fencing_token=2,
+                    outcome="contact_optout",
+                    superseded_effective_settlement_hash=predecessor,
+                    settled_at=self.later_at,
+                )
+
+        first_contact_claim = self._claim(origin="contact_fanout")
+        first_contact_generation = self._generation(
+            claim=first_contact_claim
+        )
+        first_contact = self.module.build_owner_settlement_document(
+            generation_document=first_contact_generation,
+            claim_set_document=first_contact_claim,
+            fencing_token=1,
+            outcome="contact_optout",
+            superseded_effective_settlement_hash=None,
+            settled_at=self.later_at,
+        )
+        self.assertIsNone(
+            first_contact["supersededEffectiveSettlementHash"]
+        )
+
+        operator_claim = self._claim(origin="authenticated_operator")
+        operator_generation = self._generation(claim=operator_claim)
+        action = self._operator()
+        human = self.module.build_owner_settlement_document(
+            generation_document=operator_generation,
+            claim_set_document=operator_claim,
+            fencing_token=1,
+            outcome="human_declined",
+            operator_action_document=action,
+            settled_at=self.later_at,
+        )
+        self.assertEqual("operator_decline", human["outcomeReasonCode"])
+        self.assertEqual(action["operatorActionHash"], human["operatorActionHash"])
+
+        dominated = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=terminal_claim,
+            fencing_token=1,
+            outcome="dominated",
+            dominant_generation_hash="5" * 64,
+            settled_at=self.later_at,
+        )
+        self.assertEqual(
+            "superseded_by_higher_priority",
+            dominated["outcomeReasonCode"],
+        )
+        self.assertEqual("5" * 64, dominated["dominantGenerationHash"])
+        for dominated_generation, dominated_claim, dominant_hash in (
+            (
+                first_contact_generation,
+                first_contact_claim,
+                "5" * 64,
+            ),
+            (generation, terminal_claim, generation["generationHash"]),
+        ):
+            with self.subTest(
+                owner=dominated_generation["ownerKind"],
+                dominant_hash=dominant_hash,
+            ), self.assertRaises(self.module.RowAuthorityConfigError):
+                self.module.build_owner_settlement_document(
+                    generation_document=dominated_generation,
+                    claim_set_document=dominated_claim,
+                    fencing_token=dominated_generation[
+                        "firstFencingToken"
+                    ],
+                    outcome="dominated",
+                    dominant_generation_hash=dominant_hash,
+                    settled_at=self.later_at,
+                )
+
+        link = self.module.build_source_settlement_link_document(
+            user_scope_hash=self.scope,
+            row_id=self.first,
+            generation=1,
+            generation_hash=generation["generationHash"],
+            authority_link_hash=terminal_claim["authorityLinkHash"],
+            b1_identity_hash="6" * 64,
+            b1_final_ledger_evidence_hash="7" * 64,
+            b1_settlement_revision=1,
+            b1_settlement_hash="8" * 64,
+            b2_settlement_hash=terminal["settlementHash"],
+            linked_at=self.later_at,
+        )
+        self.assertEqual(
+            link,
+            self.module.validate_source_settlement_link_document(
+                document=link
+            ),
+        )
+
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module.build_owner_generation_document(
+                claim_set_document=terminal_claim,
+                row_id=self.first,
+                generation=1,
+                predecessor_head_hash="7" * 64,
+                predecessor_settlement_hash=None,
+                lease_epoch=2,
+                first_fencing_token=1,
+                created_at=self.created_at,
+            )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module.build_owner_settlement_document(
+                generation_document=generation,
+                claim_set_document=terminal_claim,
+                fencing_token=1,
+                outcome="terminal",
+                dominant_generation_hash="5" * 64,
+                settled_at=self.later_at,
+            )
+
+    def test_settlement_requires_the_claims_exact_accepted_row_generation(self):
+        accepted_claim = self._claim()
+        valid_generation = self._generation(claim=accepted_claim)
+        dominated_claim = self._claim(outcome="dominated")
+
+        def rehash_generation(document):
+            payload = {
+                "rowId": document["rowId"],
+                "generation": document["generation"],
+                "requestId": document["requestId"],
+                "claimSetHash": document["claimSetHash"],
+                "predecessorHeadHash": document["predecessorHeadHash"],
+                "predecessorSettlementHash": document[
+                    "predecessorSettlementHash"
+                ],
+                "ownerKind": document["ownerKind"],
+                "ownerKey": document["ownerKey"],
+                "priority": document["priority"],
+                "leaseEpoch": document["leaseEpoch"],
+                "firstFencingToken": document["firstFencingToken"],
+                "createdAt": document["createdAt"],
+            }
+            document["generationHash"] = _independent_hash(
+                self.OWNERSHIP_DOMAINS["OWNER_GENERATION_HASH_DOMAIN"],
+                payload,
+                user_scope_hash=self.scope,
+            )
+            return document
+
+        wrong_row = rehash_generation(
+            {**deepcopy(valid_generation), "rowId": self.second}
+        )
+        wrong_generation = rehash_generation(
+            {**deepcopy(valid_generation), "generation": 999}
+        )
+        dominated_origin = rehash_generation(
+            {
+                **deepcopy(valid_generation),
+                "requestId": dominated_claim["requestId"],
+                "claimSetHash": dominated_claim["claimSetHash"],
+            }
+        )
+        for generation, claim in (
+            (wrong_row, accepted_claim),
+            (wrong_generation, accepted_claim),
+            (dominated_origin, dominated_claim),
+        ):
+            self.assertEqual(
+                generation,
+                self.module.validate_owner_generation_document(
+                    document=generation
+                ),
+            )
+            with self.subTest(generation=generation), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.build_owner_settlement_document(
+                    generation_document=generation,
+                    claim_set_document=claim,
+                    fencing_token=1,
+                    outcome="terminal",
+                    settled_at=self.later_at,
+                )
+
+    def test_all_ownership_builders_and_validators_are_defensive(self):
+        link, bundle = self._link("terminal")
+        claim = self._claim()
+        generation = self._generation(claim=claim)
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=1,
+            outcome="terminal",
+            settled_at=self.later_at,
+        )
+        originals = (
+            deepcopy(bundle),
+            deepcopy(link),
+            deepcopy(claim),
+            deepcopy(generation),
+            deepcopy(settlement),
+        )
+        validated_link = self.module.validate_b1_authority_link(
+            authority_link=link,
+            user_scope_hash=self.scope,
+        )
+        validated_claim = self.module.validate_claim_set_document(
+            document=claim
+        )
+        validated_generation = self.module.validate_owner_generation_document(
+            document=generation
+        )
+        validated_settlement = self.module.validate_owner_settlement_document(
+            document=settlement
+        )
+        validated_link["ownerKind"] = "mutated"
+        validated_claim["rowBindings"][0]["role"] = "mutated"
+        validated_claim["rowDecisions"][0]["decision"] = "mutated"
+        validated_generation["ownerKind"] = "mutated"
+        validated_settlement["outcome"] = "mutated"
+        self.assertEqual(originals[0], bundle)
+        self.assertEqual(originals[1], link)
+        self.assertEqual(originals[2], claim)
+        self.assertEqual(originals[3], generation)
+        self.assertEqual(originals[4], settlement)
+
+    def test_ownership_head_transition_helpers_preserve_unrelated_state(self):
+        head = self._row_head()
+        claim = self._claim()
+        generation = self.module.build_owner_generation_document(
+            claim_set_document=claim,
+            row_id=self.first,
+            generation=1,
+            predecessor_head_hash=head["headHash"],
+            predecessor_settlement_hash=None,
+            lease_epoch=1,
+            first_fencing_token=1,
+            created_at=self.created_at,
+        )
+        claimed = self.module._build_claim_advanced_head(
+            expected_head=head,
+            generation_document=generation,
+            lease_owner_hash="9" * 64,
+            lease_until="2026-08-04T12:00:02.000000Z",
+            dominated_predecessor_settlement_hash=None,
+            claimed_at=self.created_at,
+        )
+        self.assertEqual(head["stateRevision"] + 1, claimed["stateRevision"])
+        self.assertEqual("claimed", claimed["state"])
+        self.assertEqual(1, claimed["effectiveOwnerGeneration"])
+        for field in (
+            "currentLocationRevision",
+            "currentLocationHash",
+            "currentLocationLifecycle",
+            "createdAt",
+            "latestSourceSettlementLinkHash",
+            "latestOptOutReleaseResultHash",
+            "projectionBacklogCount",
+        ):
+            self.assertEqual(head[field], claimed[field])
+
+        takeover = self.module._build_lease_takeover_head(
+            expected_head=claimed,
+            generation_document=generation,
+            new_lease_owner_hash="8" * 64,
+            new_lease_until="2026-08-04T12:00:04.000000Z",
+            taken_at="2026-08-04T12:00:03.000000Z",
+        )
+        self.assertEqual(claimed["stateRevision"] + 1, takeover["stateRevision"])
+        self.assertEqual(claimed["fencingToken"] + 1, takeover["fencingToken"])
+        self.assertEqual("8" * 64, takeover["leaseOwnerHash"])
+
+        equal_time_settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=takeover["fencingToken"],
+            outcome="terminal",
+            settled_at=takeover["updatedAt"],
+        )
+        self.assertEqual(
+            takeover["updatedAt"],
+            self.module._build_settlement_advanced_head(
+                expected_head=takeover,
+                generation_document=generation,
+                settlement_document=equal_time_settlement,
+            )["updatedAt"],
+        )
+        backward_settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=takeover["fencingToken"],
+            outcome="terminal",
+            settled_at="2026-08-04T12:00:02.000000Z",
+        )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module._build_settlement_advanced_head(
+                expected_head=takeover,
+                generation_document=generation,
+                settlement_document=backward_settlement,
+            )
+
+        settlement = self.module.build_owner_settlement_document(
+            generation_document=generation,
+            claim_set_document=claim,
+            fencing_token=takeover["fencingToken"],
+            outcome="terminal",
+            settled_at="2026-08-04T12:00:05.000000Z",
+        )
+        settled = self.module._build_settlement_advanced_head(
+            expected_head=takeover,
+            generation_document=generation,
+            settlement_document=settlement,
+        )
+        self.assertEqual("settled", settled["state"])
+        self.assertIsNone(settled["leaseOwnerHash"])
+        self.assertIsNone(settled["leaseUntil"])
+        self.assertEqual(
+            settlement["settlementHash"],
+            settled["effectiveSettlementHash"],
+        )
+        source_link = self.module.build_source_settlement_link_document(
+            user_scope_hash=self.scope,
+            row_id=self.first,
+            generation=1,
+            generation_hash=generation["generationHash"],
+            authority_link_hash=claim["authorityLinkHash"],
+            b1_identity_hash="6" * 64,
+            b1_final_ledger_evidence_hash="7" * 64,
+            b1_settlement_revision=1,
+            b1_settlement_hash="8" * 64,
+            b2_settlement_hash=settlement["settlementHash"],
+            linked_at=settled["updatedAt"],
+        )
+        linked = self.module._build_source_link_advanced_head(
+            expected_head=settled,
+            source_link_document=source_link,
+        )
+        self.assertEqual(settled["stateRevision"] + 1, linked["stateRevision"])
+        self.assertEqual(
+            source_link["sourceSettlementLinkHash"],
+            linked["latestSourceSettlementLinkHash"],
+        )
+        self.assertEqual(
+            self.module.validate_row_authority_head(document=linked),
+            linked,
+        )
+        backward_source_link = self.module.build_source_settlement_link_document(
+            user_scope_hash=self.scope,
+            row_id=self.first,
+            generation=1,
+            generation_hash=generation["generationHash"],
+            authority_link_hash=claim["authorityLinkHash"],
+            b1_identity_hash="6" * 64,
+            b1_final_ledger_evidence_hash="7" * 64,
+            b1_settlement_revision=1,
+            b1_settlement_hash="8" * 64,
+            b2_settlement_hash=settlement["settlementHash"],
+            linked_at="2026-08-04T12:00:04.000000Z",
+        )
+        with self.assertRaises(self.module.RowAuthorityConfigError):
+            self.module._build_source_link_advanced_head(
+                expected_head=settled,
+                source_link_document=backward_source_link,
+            )
+        mutated = deepcopy(linked)
+        mutated["state"] = "mutated"
+        self.assertEqual("settled", linked["state"])
+        for helper, arguments in (
+            (
+                self.module._build_claim_advanced_head,
+                {
+                    "expected_head": head,
+                    "generation_document": generation,
+                    "lease_owner_hash": "9" * 64,
+                    "lease_until": "2026-08-04T12:00:02.000000Z",
+                    "dominated_predecessor_settlement_hash": None,
+                    "claimed_at": "2026-08-04T11:59:59.000000Z",
+                },
+            ),
+            (
+                self.module._build_lease_takeover_head,
+                {
+                    "expected_head": claimed,
+                    "generation_document": generation,
+                    "new_lease_owner_hash": "8" * 64,
+                    "new_lease_until": "2026-08-04T12:00:04.000000Z",
+                    "taken_at": "2026-08-04T11:59:59.000000Z",
+                },
+            ),
+        ):
+            with self.subTest(helper=helper.__name__), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                helper(**arguments)
 
 
 class ThreadRowBindingStoreTests(unittest.TestCase):
