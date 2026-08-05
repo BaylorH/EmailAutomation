@@ -220,7 +220,7 @@ Use this interpreter for every Python command:
 - Modify: `docs/superpowers/specs/2026-08-04-b1-contact-identity-binding-amendment.md`
 - Modify: `docs/superpowers/plans/2026-08-04-stable-row-authority-b2.md`
 
-- [ ] **Step 1: Run structural plan checks**
+- [x] **Step 1: Run structural plan checks**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python - <<'PY'
@@ -257,7 +257,7 @@ git diff --check
   docs/superpowers/specs/2026-08-04-b1-contact-identity-binding-amendment.md
 ```
 
-- [ ] **Step 2: Obtain two independent no-finding approvals**
+- [x] **Step 2: Obtain two independent no-finding approvals**
 
 Reviewer A checks transition idempotency, active-to-active behavior, v2 B1
 provenance, alias/suppression fail-closed behavior, historical row generation,
@@ -267,7 +267,7 @@ restore lineage, late associations, race outcomes, and activation containment.
 Any Critical or Important finding is corrected and all three exact revised
 normative files are re-reviewed.
 
-- [ ] **Step 3: Mark the approved design and roadmap checkpoint**
+- [x] **Step 3: Mark the approved design and roadmap checkpoint**
 
 After two approvals, change the amendment status to
 `Approved by two independent reviewers`. Add a short normative-amendment link
@@ -281,7 +281,7 @@ existing B2-C code checkbox:
 
 Do not mark B2-C code green.
 
-- [ ] **Step 4: Commit only the reviewed documentation milestone**
+- [x] **Step 4: Commit only the reviewed documentation milestone**
 
 ```bash
 git add \
@@ -296,7 +296,7 @@ git diff --cached
 git commit -m "docs: freeze B2-C contact compliance"
 ```
 
-- [ ] **Step 5: Push and prove exact-SHA plan CI**
+- [x] **Step 5: Push and prove exact-SHA plan CI**
 
 Use the exact publication protocol in the program roadmap. Record the exact
 local/remote SHA and successful `production-clearance-ci.yml` run/job URL in
@@ -960,6 +960,11 @@ or merge `main`, deploy, launch a campaign, or contact a user under this plan.
   remote branch when planning began.
 - Plan review: executor reviewer and contract-audit reviewer independently
   returned APPROVE with no Critical or Important findings after all corrections.
+- Plan publication: local HEAD, owned remote branch, and workflow head SHA were
+  `ac2563709e607d6d682457c1a51db3d5e91730a2`; Production Clearance CI
+  [run 31010099996](https://github.com/BaylorH/EmailAutomation/actions/runs/31010099996),
+  [job 92319757381](https://github.com/BaylorH/EmailAutomation/actions/runs/31010099996/job/92319757381)
+  completed successfully.
 - Plan reviews, publication SHA/run, selected RED outputs, code milestone
   SHAs/runs, final diff digest, final review outcomes, and evidence SHA/run are
   appended here only after they exist and are independently verified.
