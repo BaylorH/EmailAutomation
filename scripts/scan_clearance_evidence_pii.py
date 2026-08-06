@@ -14,25 +14,44 @@ from typing import Any, Iterable, Sequence
 
 
 EMAIL_RE = re.compile(
-    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9.-])"
+    r"(?<![A-Za-z0-9.!#$%&'*+/=?^_{|}~-])"
+    r"(?:\"(?:[^\"\\\r\n]|\\.)+\"|[A-Za-z0-9.!#$%&'*+/=?^_{|}~-]+)"
+    r"@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63}(?![A-Za-z0-9.-])"
 )
 PROPERTY_ADDRESS_RE = re.compile(
-    r"\b\d{1,6}\s+(?:[A-Za-z0-9.-]+\s+){0,5}"
+    r"(?<![\d,])\b\d{1,6}\s+(?:[A-Za-z0-9.-]+\s+){0,5}"
     r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|"
-    r"Court|Ct|Parkway|Pkwy|Highway|Hwy|Way|Circle|Cir|Trail|Trl)\b\.?",
+    r"Court|Ct|Parkway|Pkwy|Highway|Hwy|Way|Circle|Cir|Trail|Trl|"
+    r"Plaza|Plz|Terrace|Ter|Place|Pl|Square|Sq|Alley|Aly|Center|Ctr|"
+    r"Cove|Cv|Crescent|Cres|Expressway|Expy|Gardens|Gdns|Glen|Gln|"
+    r"Loop|Manor|Mnr|Point|Pt|Ridge|Rdg|Row|Run|View|Vw)\b"
+    r"(?!\.?\s+(?:feet|foot|footage|ft)\b)\.?",
     re.IGNORECASE,
 )
 RAW_MESSAGE_KEYS = {
     "body",
+    "bodypreview",
+    "brokerreplybody",
+    "emailbody",
+    "htmlbody",
     "inboundbody",
     "messagebody",
     "messagecontent",
     "messagetext",
     "outboundbody",
+    "plaintextbody",
     "rawbody",
     "rawmessage",
     "rawmessagebody",
+    "textbody",
 }
+MARKDOWN_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s+(?P<label>.+?)\s*#*\s*$"
+)
+MARKDOWN_LABEL_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?(?P<label>[^:\r\n]{1,80})\s*:"
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -53,6 +72,10 @@ def _reject_duplicate_keys(pairs: Iterable[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def _reject_nonstandard_constant(value: str) -> None:
+    raise ValueError(f"nonstandard JSON constant: {value}")
 
 
 def _normalize_key(key: str) -> str:
@@ -116,6 +139,51 @@ def _child_path(parent: str, key: str) -> str:
 def _redacted_child_path(parent: str, key: str) -> str:
     key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
     return f"{parent}.<redacted-key-{key_hash}>"
+
+
+def _safe_source_label(
+    path: Path,
+    *,
+    denied_names: tuple[str, ...],
+    approved_addresses: frozenset[str],
+) -> str:
+    filename = path.name or "evidence"
+    if _string_pii_kinds(
+        filename,
+        denied_names=denied_names,
+        approved_addresses=approved_addresses,
+    ):
+        filename_hash = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:12]
+        return f"source-{filename_hash}{path.suffix.casefold()}"
+    return filename
+
+
+def _markdown_has_raw_body_label(line: str) -> bool:
+    for pattern in (MARKDOWN_HEADING_RE, MARKDOWN_LABEL_RE):
+        match = pattern.match(line)
+        if match and _normalize_key(match.group("label")) in RAW_MESSAGE_KEYS:
+            return True
+    return False
+
+
+def _scan_markdown(
+    text: str,
+    *,
+    source: str,
+    denied_names: tuple[str, ...],
+    approved_addresses: frozenset[str],
+    findings: set[ScanFinding],
+) -> None:
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line_path = f"$[line:{line_number}]"
+        for kind in _string_pii_kinds(
+            line,
+            denied_names=denied_names,
+            approved_addresses=approved_addresses,
+        ):
+            findings.add(ScanFinding(source, line_path, kind))
+        if _markdown_has_raw_body_label(line):
+            findings.add(ScanFinding(source, line_path, "raw_message_body"))
 
 
 def _scan_node(
@@ -217,9 +285,14 @@ def scan_evidence_paths(
 
     for raw_path in paths:
         path = Path(raw_path)
-        source = str(path)
+        suffix = path.suffix.casefold()
+        source = _safe_source_label(
+            path,
+            denied_names=normalized_names,
+            approved_addresses=normalized_addresses,
+        )
         try:
-            if path.suffix == ".jsonl":
+            if suffix == ".jsonl":
                 with path.open(encoding="utf-8") as handle:
                     for line_number, raw_line in enumerate(handle, start=1):
                         if not raw_line.strip():
@@ -229,6 +302,7 @@ def scan_evidence_paths(
                             document = json.loads(
                                 raw_line,
                                 object_pairs_hook=_reject_duplicate_keys,
+                                parse_constant=_reject_nonstandard_constant,
                             )
                         except (json.JSONDecodeError, ValueError):
                             findings.add(ScanFinding(source, line_path, "parse_error"))
@@ -241,12 +315,13 @@ def scan_evidence_paths(
                             approved_addresses=normalized_addresses,
                             findings=findings,
                         )
-            elif path.suffix == ".json":
+            elif suffix == ".json":
                 with path.open(encoding="utf-8") as handle:
                     try:
                         document = json.load(
                             handle,
                             object_pairs_hook=_reject_duplicate_keys,
+                            parse_constant=_reject_nonstandard_constant,
                         )
                     except (json.JSONDecodeError, ValueError):
                         findings.add(ScanFinding(source, "$", "parse_error"))
@@ -259,9 +334,18 @@ def scan_evidence_paths(
                     approved_addresses=normalized_addresses,
                     findings=findings,
                 )
+            elif suffix == ".md":
+                markdown = path.read_text(encoding="utf-8")
+                _scan_markdown(
+                    markdown,
+                    source=source,
+                    denied_names=normalized_names,
+                    approved_addresses=normalized_addresses,
+                    findings=findings,
+                )
             else:
                 findings.add(ScanFinding(source, "$", "unsupported_file_type"))
-        except OSError:
+        except (OSError, UnicodeError):
             findings.add(ScanFinding(source, "$", "read_error"))
 
     return sorted(findings)
@@ -280,7 +364,7 @@ def _load_runtime_list(path: Path | None) -> list[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Reject PII in production-clearance JSON/JSONL evidence."
+        description="Reject PII in production-clearance JSON, JSONL, or Markdown."
     )
     parser.add_argument(
         "--deny-names-file",

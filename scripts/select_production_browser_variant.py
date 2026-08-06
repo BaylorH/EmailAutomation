@@ -35,6 +35,26 @@ EXPECTED_VARIANT_KEYS = {
     "bodySha256",
     "lastProductionUse",
 }
+EXPECTED_HISTORICAL_SOURCE_KEYS = {
+    "sourceId",
+    "sourceClass",
+    "path",
+    "sanitizationPolicy",
+}
+EXPECTED_AXIS_KEYS = {
+    "tone",
+    "register",
+    "informationOrder",
+    "quoteStyle",
+    "attachmentBundle",
+    "turnTiming",
+}
+SOURCE_CLASSES = {
+    "production_report",
+    "production_history",
+    "production_model_misread",
+    "synthetic_near_miss",
+}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -49,7 +69,73 @@ def _reject_duplicate_keys(pairs: Iterable[tuple[str, Any]]) -> dict[str, Any]:
 
 def _load_json(path: Path) -> Any:
     with path.open(encoding="utf-8") as handle:
-        return json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+        return json.load(
+            handle,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonstandard_constant,
+        )
+
+
+def _reject_nonstandard_constant(value: str) -> None:
+    raise ValueError(f"nonstandard JSON constant: {value}")
+
+
+def _is_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_string_list(value: Any, field: str, index: int) -> None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not _is_nonempty_string(item) for item in value)
+    ):
+        raise ValueError(f"variant {index} has invalid {field}")
+
+
+def _validate_historical_source(source: Any, index: int) -> None:
+    if not isinstance(source, dict) or set(source) != EXPECTED_HISTORICAL_SOURCE_KEYS:
+        raise ValueError(f"historical source {index} has an unexpected schema")
+    for field in ("sourceId", "path"):
+        if not _is_nonempty_string(source[field]):
+            raise ValueError(f"historical source {index} has invalid {field}")
+    if (
+        not _is_nonempty_string(source["sourceClass"])
+        or source["sourceClass"] not in SOURCE_CLASSES
+    ):
+        raise ValueError(f"historical source {index} has invalid sourceClass")
+    if source["sanitizationPolicy"] != "semantic_facts_only":
+        raise ValueError(
+            f"historical source {index} has invalid sanitizationPolicy"
+        )
+
+
+def _validate_complete_variant(record: Any, index: int) -> None:
+    _validate_selection_record(record, index)
+    if set(record) != EXPECTED_VARIANT_KEYS:
+        raise ValueError(f"variant {index} has an unexpected schema")
+    if (
+        not _is_nonempty_string(record["sourceClass"])
+        or record["sourceClass"] not in SOURCE_CLASSES
+    ):
+        raise ValueError(f"variant {index} has invalid sourceClass")
+    if not isinstance(record["semanticFacts"], dict) or not record["semanticFacts"]:
+        raise ValueError(f"variant {index} has invalid semanticFacts")
+    _validate_string_list(record["expectedEvents"], "expectedEvents", index)
+    _validate_string_list(record["forbiddenEvents"], "forbiddenEvents", index)
+    if not _is_nonempty_string(record["expectedReplyPolicy"]):
+        raise ValueError(f"variant {index} has invalid expectedReplyPolicy")
+    axes = record["axes"]
+    if (
+        not isinstance(axes, dict)
+        or set(axes) != EXPECTED_AXIS_KEYS
+        or any(not _is_nonempty_string(value) for value in axes.values())
+    ):
+        raise ValueError(f"variant {index} has invalid axes")
+    if not _is_nonempty_string(record["body"]):
+        raise ValueError(f"variant {index} has invalid body")
+    if record["lastProductionUse"] is not None:
+        raise ValueError(f"variant {index} has invalid lastProductionUse")
 
 
 def _validate_selection_record(record: Any, index: int) -> None:
@@ -67,8 +153,17 @@ def load_variants(path: Path) -> list[dict[str, Any]]:
     root = _load_json(path)
     if not isinstance(root, dict) or set(root) != EXPECTED_ROOT_KEYS:
         raise ValueError("variant fixture has an unexpected root schema")
-    if root.get("schemaVersion") != 1:
+    if type(root.get("schemaVersion")) is not int or root["schemaVersion"] != 1:
         raise ValueError("variant fixture schemaVersion must be 1")
+    historical_sources = root.get("historicalSources")
+    if not isinstance(historical_sources, list) or not historical_sources:
+        raise ValueError(
+            "variant fixture historicalSources must be a non-empty list"
+        )
+    for index, source in enumerate(historical_sources):
+        _validate_historical_source(source, index)
+    if not isinstance(root.get("productionUse"), list):
+        raise ValueError("variant fixture productionUse must be a list")
     variants = root.get("scenarioFamilies")
     if not isinstance(variants, list) or not variants:
         raise ValueError("variant fixture scenarioFamilies must be a non-empty list")
@@ -76,11 +171,7 @@ def load_variants(path: Path) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
     seen_hashes: set[str] = set()
     for index, record in enumerate(variants):
-        _validate_selection_record(record, index)
-        if set(record) != EXPECTED_VARIANT_KEYS:
-            raise ValueError(f"variant {index} has an unexpected schema")
-        if not isinstance(record.get("body"), str) or not record["body"]:
-            raise ValueError(f"variant {index} has invalid body")
+        _validate_complete_variant(record, index)
         expected_hash = hashlib.sha256(record["body"].encode("utf-8")).hexdigest()
         if record["bodySha256"] != expected_hash:
             raise ValueError(f"variant {index} bodySha256 does not match body")
@@ -105,6 +196,7 @@ def load_used_hashes(path: Path) -> set[str]:
                 checkpoint = json.loads(
                     raw_line,
                     object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_nonstandard_constant,
                 )
             except (json.JSONDecodeError, ValueError) as exc:
                 raise ValueError(
