@@ -13,6 +13,7 @@ from uuid import RFC_4122, UUID, uuid4
 SCHEMA_VERSION = 1
 MAX_ROW_BINDINGS = 128
 MAX_ROW_AUTHORITY_PLANNED_WRITES = 400
+MAX_CONTACT_SETTLEMENT_CHAIN = 128
 ROW_BINDINGS_HASH_DOMAIN = "sitesift.row.bindings.v1"
 THREAD_ROW_BINDING_HASH_DOMAIN = "sitesift.thread.row_binding.v1"
 ROW_THREAD_EDGE_ID_DOMAIN = "sitesift.row.thread_edge_id.v1"
@@ -5824,6 +5825,89 @@ def _validate_contact_fanout_receipt_successor(
             "unleased contact fan-out skipped a reachable revision"
         )
     return current
+
+
+def _validate_contact_fanout_receipt_creation_afterimage(
+    *,
+    current_document,
+    frozen_fanout_head_hash,
+    receipt_requested_at,
+    creation_binding_revision,
+    creation_binding_head_hash,
+    creation_binding_association_count,
+):
+    """Witness a receipt's exact fan-out creation image fail closed.
+
+    The caller supplies an independently proven live binding snapshot copied
+    atomically into the new fan-out.  Rebuild the creation head from that
+    snapshot, then separately prove the currently stored fan-out is a
+    structurally reachable advance.
+    """
+    current = validate_contact_fanout_head_document(
+        document=current_document
+    )
+    frozen_hash = _require_sha256(
+        frozen_fanout_head_hash,
+        field_name="frozen_fanout_head_hash",
+    )
+    requested = _require_timestamp(
+        receipt_requested_at,
+        field_name="receipt_requested_at",
+    )
+    binding_revision = _require_pos(
+        creation_binding_revision,
+        field_name="creation_binding_revision",
+    )
+    binding_head_hash = _require_sha256(
+        creation_binding_head_hash,
+        field_name="creation_binding_head_hash",
+    )
+    binding_association_count = _require_pos(
+        creation_binding_association_count,
+        field_name="creation_binding_association_count",
+    )
+    if current["createdAt"] != requested:
+        raise RowAuthorityConfigError(
+            "contact fan-out creation image predates or postdates its receipt"
+        )
+    creation = build_contact_fanout_head_document(
+        user_scope_hash=current["userScopeHash"],
+        fanout_id=current["fanoutId"],
+        outcome=current["outcome"],
+        expected_contact_settlement_hash=current[
+            "expectedContactSettlementHash"
+        ],
+        state_revision=1,
+        state="discovering",
+        binding_revision=binding_revision,
+        binding_head_hash=binding_head_hash,
+        binding_association_count=binding_association_count,
+        discovery_cursor_row_id=None,
+        obligation_count=0,
+        result_count=0,
+        cursor_processed_count=0,
+        lease_owner_hash=None,
+        lease_until=None,
+        fencing_token=1,
+        superseding_contact_settlement_hash=None,
+        completion_binding_revision=None,
+        completion_binding_head_hash=None,
+        completion_binding_association_count=None,
+        completion_obligation_count=None,
+        completion_result_count=None,
+        completed_at=None,
+        created_at=requested,
+        updated_at=requested,
+    )
+    if creation["contactFanoutHeadHash"] != frozen_hash:
+        raise RowAuthorityConfigError(
+            "contact receipt fan-out hash is not its reconstructible after-image"
+        )
+    return _validate_contact_fanout_receipt_successor(
+        current_document=current,
+        frozen_fanout_head_hash=frozen_hash,
+        receipt_requested_at=requested,
+    )
 
 
 def build_contact_fanout_obligation_document(
@@ -12910,6 +12994,9 @@ def _read_contact_release_row_state(
     results = user_ref.collection("contactOptOutFanoutResults")
     contact_settlements = user_ref.collection("contactOptOutSettlements")
     receipts = user_ref.collection("contactOptOutTransitionRequests")
+    aliases = user_ref.collection("contactOptOutAliases")
+    contact_binding_heads = user_ref.collection("contactRowBindingHeads")
+    contact_bindings = user_ref.collection("contactRowBindings")
 
     def read_bounded_history_query(
         query,
@@ -12977,6 +13064,8 @@ def _read_contact_release_row_state(
         }
 
     origin_cache = {}
+    canonical_alias_ref = aliases.document(canonical_hash)
+    canonical_alias_exists, canonical_alias_payload = read(canonical_alias_ref)
 
     def load_origin(fanout_id):
         checked_origin_id = _require_sha256(
@@ -13008,6 +13097,16 @@ def _read_contact_release_row_state(
             "contactSettlementMatches": (),
             "receiptPath": None,
             "receipt": None,
+            "canonicalAliasPath": canonical_alias_ref.path,
+            "canonicalAlias": (
+                canonical_alias_payload if canonical_alias_exists else None
+            ),
+            "successorSettlementPath": None,
+            "successorSettlement": None,
+            "successorReceiptPath": None,
+            "successorReceipt": None,
+            "successorFanoutPath": None,
+            "successorFanout": None,
             "winnerSettlementMatches": (),
             "winnerAuthority": None,
             "winnerReleaseMatches": (),
@@ -13076,6 +13175,62 @@ def _read_contact_release_row_state(
                     origin["receipt"] = (
                         receipt_payload if receipt_exists else None
                     )
+                    successor_ref = contact_settlements.document(
+                        f"{canonical_hash}--"
+                        f"{checked_contact_settlement['generation'] + 1}"
+                    )
+                    successor_exists, successor_payload = read(successor_ref)
+                    origin["successorSettlementPath"] = successor_ref.path
+                    origin["successorSettlement"] = (
+                        successor_payload if successor_exists else None
+                    )
+                    successor_receipt_ref = None
+                    if successor_exists:
+                        try:
+                            checked_successor = (
+                                validate_contact_settlement_document(
+                                    document=successor_payload
+                                )
+                            )
+                            successor_receipt_ref = receipts.document(
+                                checked_successor["contactTransitionId"]
+                            )
+                        except Exception:
+                            successor_receipt_ref = None
+                    if successor_receipt_ref is not None:
+                        (
+                            successor_receipt_exists,
+                            successor_receipt_payload,
+                        ) = read(successor_receipt_ref)
+                        origin["successorReceiptPath"] = (
+                            successor_receipt_ref.path
+                        )
+                        origin["successorReceipt"] = (
+                            successor_receipt_payload
+                            if successor_receipt_exists
+                            else None
+                        )
+                        successor_fanout_ref = fanouts.document(
+                            _derive_contact_fanout_id(
+                                user_scope_hash=scope,
+                                settlement_hash=checked_successor[
+                                    "contactSettlementHash"
+                                ],
+                                outcome="release",
+                            )
+                        )
+                        (
+                            successor_fanout_exists,
+                            successor_fanout_payload,
+                        ) = read(successor_fanout_ref)
+                        origin["successorFanoutPath"] = (
+                            successor_fanout_ref.path
+                        )
+                        origin["successorFanout"] = (
+                            successor_fanout_payload
+                            if successor_fanout_exists
+                            else None
+                        )
         if (
             checked_result is not None
             and checked_result["rowGeneration"] is not None
@@ -13318,6 +13473,149 @@ def _read_contact_release_row_state(
         except Exception:
             selected_origin = None
 
+    selected_contact_settlement_chain = None
+    selected_contact_binding_head_path = None
+    selected_contact_binding_head = None
+    selected_contact_binding_edges = None
+    checked_selected_contact_settlement = None
+    if selected_origin is not None:
+        try:
+            selected_matches = selected_origin["contactSettlementMatches"]
+            if type(selected_matches) not in {tuple, list} or len(
+                selected_matches
+            ) != 1:
+                raise RowAuthorityConfigError(
+                    "selected contact origin lacks one settlement"
+                )
+            selected_entry = selected_matches[0]
+            checked_selected_contact_settlement = (
+                validate_contact_settlement_document(
+                    document=selected_entry["document"]
+                )
+            )
+            generation_gap = (
+                release_settlement["generation"]
+                - checked_selected_contact_settlement["generation"]
+            )
+            if (
+                type(selected_entry) is not dict
+                or set(selected_entry) != {"path", "document"}
+                or checked_selected_contact_settlement["userScopeHash"]
+                != scope
+                or checked_selected_contact_settlement[
+                    "canonicalMailboxIdentityHash"
+                ]
+                != canonical_hash
+                or checked_selected_contact_settlement[
+                    "contactSettlementHash"
+                ]
+                != selected_claim["payloadHash"]
+                or generation_gap < 1
+                or generation_gap > MAX_CONTACT_SETTLEMENT_CHAIN
+            ):
+                raise RowAuthorityConfigError(
+                    "selected contact origin cannot bound its settlement chain"
+                )
+        except Exception:
+            checked_selected_contact_settlement = None
+    if checked_selected_contact_settlement is not None:
+        chain = []
+        for generation_number in range(
+            checked_selected_contact_settlement["generation"] + 1,
+            release_settlement["generation"],
+        ):
+            settlement_ref = contact_settlements.document(
+                f"{canonical_hash}--{generation_number}"
+            )
+            settlement_exists, settlement_payload = read(settlement_ref)
+            receipt_ref = None
+            receipt_payload = None
+            fanout_ref = None
+            fanout_payload = None
+            if settlement_exists:
+                try:
+                    checked_chain_settlement = (
+                        validate_contact_settlement_document(
+                            document=settlement_payload
+                        )
+                    )
+                    receipt_ref = receipts.document(
+                        checked_chain_settlement["contactTransitionId"]
+                    )
+                    chain_outcome = (
+                        "apply"
+                        if checked_chain_settlement["transitionKind"]
+                        == "verified_optout"
+                        else "release"
+                    )
+                    fanout_ref = fanouts.document(
+                        _derive_contact_fanout_id(
+                            user_scope_hash=scope,
+                            settlement_hash=checked_chain_settlement[
+                                "contactSettlementHash"
+                            ],
+                            outcome=chain_outcome,
+                        )
+                    )
+                except Exception:
+                    receipt_ref = None
+                    fanout_ref = None
+            if receipt_ref is not None:
+                receipt_exists, observed_receipt = read(receipt_ref)
+                if receipt_exists:
+                    receipt_payload = observed_receipt
+            if fanout_ref is not None:
+                fanout_exists, observed_fanout = read(fanout_ref)
+                if fanout_exists:
+                    fanout_payload = observed_fanout
+            chain.append(
+                {
+                    "settlementPath": settlement_ref.path,
+                    "settlement": (
+                        settlement_payload if settlement_exists else None
+                    ),
+                    "receiptPath": (
+                        None if receipt_ref is None else receipt_ref.path
+                    ),
+                    "receipt": receipt_payload,
+                    "fanoutPath": (
+                        None if fanout_ref is None else fanout_ref.path
+                    ),
+                    "fanout": fanout_payload,
+                }
+            )
+        selected_contact_settlement_chain = tuple(chain)
+        if len(chain) > 2:
+            binding_head_ref = contact_binding_heads.document(canonical_hash)
+            binding_head_exists, binding_head_payload = read(binding_head_ref)
+            selected_contact_binding_head_path = binding_head_ref.path
+            selected_contact_binding_head = (
+                binding_head_payload if binding_head_exists else None
+            )
+            try:
+                binding_query = (
+                    contact_bindings.where(
+                        "canonicalMailboxIdentityHash",
+                        "==",
+                        canonical_hash,
+                    )
+                    .order_by("rowId", direction="ASCENDING")
+                    .limit(MAX_ROW_BINDINGS + 1)
+                )
+            except Exception as exc:
+                raise RowAuthorityConfigError(
+                    "contact release cannot form selected binding history query"
+                ) from exc
+            binding_edges = []
+            for reference, payload in read_query(
+                binding_query,
+                description="selected contact binding history",
+            ):
+                binding_edges.append(
+                    {"path": reference.path, "document": payload}
+                )
+            selected_contact_binding_edges = tuple(binding_edges)
+
     predecessor_matches = []
     predecessor_authority = None
     if selected_authority is not None:
@@ -13373,6 +13671,14 @@ def _read_contact_release_row_state(
         "currentEpochOrigin": current_epoch_origin,
         "selectedAuthority": selected_authority,
         "selectedOrigin": selected_origin,
+        "selectedContactSettlementChain": (
+            selected_contact_settlement_chain
+        ),
+        "selectedContactBindingHeadPath": (
+            selected_contact_binding_head_path
+        ),
+        "selectedContactBindingHead": selected_contact_binding_head,
+        "selectedContactBindingEdges": selected_contact_binding_edges,
         "predecessorMatches": tuple(predecessor_matches),
         "predecessorAuthority": predecessor_authority,
         "boundedRowState": bounded_apply_state["rowState"],
@@ -13519,6 +13825,7 @@ def _validate_contact_release_apply_origin(
     expected_authority=None,
     expected_successor_settlement_hash=None,
     expected_successor_settled_at=None,
+    successor_not_after=None,
     current_effective_generation_hash=None,
     current_effective_settlement_hash=None,
 ):
@@ -13536,6 +13843,14 @@ def _validate_contact_release_apply_origin(
         "contactSettlementMatches",
         "receiptPath",
         "receipt",
+        "canonicalAliasPath",
+        "canonicalAlias",
+        "successorSettlementPath",
+        "successorSettlement",
+        "successorReceiptPath",
+        "successorReceipt",
+        "successorFanoutPath",
+        "successorFanout",
         "winnerSettlementMatches",
         "winnerAuthority",
         "winnerReleaseMatches",
@@ -13586,6 +13901,18 @@ def _validate_contact_release_apply_origin(
     if fanout_deadline < evidence_deadline:
         raise RowAuthorityConfigError(
             "contact release origin fan-out deadline predates evidence deadline"
+        )
+    successor_deadline = (
+        evidence_deadline
+        if successor_not_after is None
+        else _require_timestamp(
+            successor_not_after,
+            field_name="successor_not_after",
+        )
+    )
+    if successor_deadline > fanout_deadline:
+        raise RowAuthorityConfigError(
+            "contact release successor deadline exceeds its fan-out deadline"
         )
     if (expected_successor_settlement_hash is None) != (
         expected_successor_settled_at is None
@@ -13669,24 +13996,6 @@ def _validate_contact_release_apply_origin(
         raise RowAuthorityAmbiguous(
             "contact release originating apply fan-out pair is crossed"
         )
-    if successor_hash is not None:
-        if fanout["state"] == "complete":
-            if (
-                fanout["completedAt"] is None
-                or fanout["completedAt"] > successor_settled_at
-                or fanout["updatedAt"] > successor_settled_at
-            ):
-                raise RowAuthorityAmbiguous(
-                    "contact release completed origin postdates its release successor"
-                )
-        elif (
-            fanout["supersedingContactSettlementHash"] != successor_hash
-            or fanout["updatedAt"] < successor_settled_at
-        ):
-            raise RowAuthorityAmbiguous(
-                "contact release current origin fan-out lacks its exact release successor"
-            )
-
     raw_matches = raw_origin["contactSettlementMatches"]
     if type(raw_matches) not in {tuple, list} or len(raw_matches) != 1:
         raise RowAuthorityAmbiguous(
@@ -13759,6 +14068,157 @@ def _validate_contact_release_apply_origin(
         raise RowAuthorityAmbiguous(
             "contact release origin fan-out is not a receipt successor"
         ) from exc
+
+    try:
+        release_successor = validate_contact_settlement_document(
+            document=raw_origin["successorSettlement"]
+        )
+        release_successor_receipt = (
+            validate_contact_transition_request_document(
+                document=raw_origin["successorReceipt"]
+            )
+        )
+        canonical_alias = validate_contact_alias_document(
+            document=raw_origin["canonicalAlias"]
+        )
+        release_successor_fanout = validate_contact_fanout_head_document(
+            document=raw_origin["successorFanout"]
+        )
+        expected_successor_id = (
+            f"{canonical_hash}--{contact_settlement['generation'] + 1}"
+        )
+        expected_successor_fanout_id = _derive_contact_fanout_id(
+            user_scope_hash=scope,
+            settlement_hash=release_successor["contactSettlementHash"],
+            outcome="release",
+        )
+    except Exception as exc:
+        raise RowAuthorityAmbiguous(
+            "contact release origin lacks its immediate release successor"
+        ) from exc
+    if (
+        type(raw_origin["successorSettlementPath"]) is not str
+        or raw_origin["successorSettlementPath"].split("/")[-2:]
+        != ["contactOptOutSettlements", expected_successor_id]
+        or type(raw_origin["successorReceiptPath"]) is not str
+        or raw_origin["successorReceiptPath"].split("/")[-2:]
+        != [
+            "contactOptOutTransitionRequests",
+            release_successor["contactTransitionId"],
+        ]
+        or type(raw_origin["canonicalAliasPath"]) is not str
+        or raw_origin["canonicalAliasPath"].split("/")[-2:]
+        != ["contactOptOutAliases", canonical_hash]
+        or canonical_alias["userScopeHash"] != scope
+        or canonical_alias["exactIdentityHash"] != canonical_hash
+        or canonical_alias["canonicalMailboxIdentityHash"] != canonical_hash
+        or type(raw_origin["successorFanoutPath"]) is not str
+        or raw_origin["successorFanoutPath"].split("/")[-2:]
+        != ["contactOptOutFanoutHeads", expected_successor_fanout_id]
+        or release_successor["userScopeHash"] != scope
+        or release_successor["canonicalMailboxIdentityHash"]
+        != canonical_hash
+        or release_successor["generation"]
+        != contact_settlement["generation"] + 1
+        or release_successor["predecessorSettlementHash"]
+        != contact_settlement["contactSettlementHash"]
+        or release_successor["transitionKind"] != "authenticated_release"
+        or release_successor["exactIdentityHash"]
+        != contact_settlement["exactIdentityHash"]
+        or release_successor["settledAt"]
+        < contact_settlement["settledAt"]
+        or release_successor["settledAt"] > successor_deadline
+        or release_successor_receipt["userScopeHash"] != scope
+        or release_successor_receipt["outcome"] != "created"
+        or release_successor_receipt["contactTransitionId"]
+        != release_successor["contactTransitionId"]
+        or release_successor_receipt["transitionKind"]
+        != "authenticated_release"
+        or release_successor_receipt["exactIdentityHash"]
+        != release_successor["exactIdentityHash"]
+        or release_successor_receipt["canonicalMailboxIdentityHash"]
+        != canonical_hash
+        or release_successor_receipt["authorityLinkHash"]
+        != release_successor["authorityLinkHash"]
+        or release_successor_receipt["hardOptOutEvidenceHash"]
+        != release_successor["hardOptOutEvidenceHash"]
+        or release_successor_receipt["actorScopeHash"]
+        != release_successor["actorScopeHash"]
+        or release_successor_receipt["reasonCode"]
+        != release_successor["reasonCode"]
+        or release_successor_receipt[
+            "expectedActiveOptOutSettlementHash"
+        ]
+        != contact_settlement["contactSettlementHash"]
+        or release_successor_receipt["resultingContactGeneration"]
+        != release_successor["generation"]
+        or release_successor_receipt["resultingContactSettlementHash"]
+        != release_successor["contactSettlementHash"]
+        or release_successor_receipt["resultingFanoutId"]
+        != expected_successor_fanout_id
+        or release_successor_receipt["requestedAt"]
+        != release_successor["settledAt"]
+        or release_successor_fanout["userScopeHash"] != scope
+        or release_successor_fanout["fanoutId"]
+        != expected_successor_fanout_id
+        or release_successor_fanout["outcome"] != "release"
+        or release_successor_fanout["expectedContactSettlementHash"]
+        != release_successor["contactSettlementHash"]
+        or release_successor_fanout["createdAt"]
+        != release_successor["settledAt"]
+        or release_successor_fanout["updatedAt"] > fanout_deadline
+        or (
+            successor_hash is not None
+            and (
+                successor_hash
+                != release_successor["contactSettlementHash"]
+                or successor_settled_at != release_successor["settledAt"]
+            )
+        )
+    ):
+        raise RowAuthorityAmbiguous(
+            "contact release origin immediate successor is crossed"
+        )
+    try:
+        _validate_contact_receipt_head_afterimage(
+            settlement_document=release_successor,
+            receipt_document=release_successor_receipt,
+            canonical_self_alias_document=canonical_alias,
+        )
+        _validate_contact_fanout_receipt_creation_afterimage(
+            current_document=release_successor_fanout,
+            frozen_fanout_head_hash=release_successor_receipt[
+                "resultingFanoutHeadHash"
+            ],
+            receipt_requested_at=release_successor_receipt["requestedAt"],
+            creation_binding_revision=fanout["bindingRevision"],
+            creation_binding_head_hash=fanout["bindingHeadHash"],
+            creation_binding_association_count=fanout[
+                "bindingAssociationCount"
+            ],
+        )
+    except Exception as exc:
+        raise RowAuthorityAmbiguous(
+            "contact release origin successor receipt after-image is crossed"
+        ) from exc
+    successor_hash = release_successor["contactSettlementHash"]
+    successor_settled_at = release_successor["settledAt"]
+    if fanout["state"] == "complete":
+        if (
+            fanout["completedAt"] is None
+            or fanout["completedAt"] > successor_settled_at
+            or fanout["updatedAt"] > successor_settled_at
+        ):
+            raise RowAuthorityAmbiguous(
+                "contact release completed origin postdates its release successor"
+            )
+    elif (
+        fanout["supersedingContactSettlementHash"] != successor_hash
+        or fanout["updatedAt"] < successor_settled_at
+    ):
+        raise RowAuthorityAmbiguous(
+            "contact release origin fan-out lacks its exact release successor"
+        )
 
     def validate_result_claim():
         try:
@@ -13834,7 +14294,13 @@ def _validate_contact_release_apply_origin(
             raise RowAuthorityAmbiguous(
                 "contact release row-deleted origin is not bounded by deletion"
             )
-        return {"result": result, "authority": None}
+        return {
+            "result": result,
+            "contactSettlement": contact_settlement,
+            "receipt": receipt,
+            "successorSettlement": release_successor,
+            "authority": None,
+        }
 
     if result["disposition"] == "dominated":
         if result["reasonCode"] != "claim_dominated":
@@ -13955,7 +14421,14 @@ def _validate_contact_release_apply_origin(
                 raise RowAuthorityAmbiguous(
                     "contact release dominated winner exited before the claim"
                 )
-        return {"result": result, "authority": None, "claimSet": claim}
+        return {
+            "result": result,
+            "contactSettlement": contact_settlement,
+            "receipt": receipt,
+            "successorSettlement": release_successor,
+            "authority": None,
+            "claimSet": claim,
+        }
 
     if result["disposition"] == "superseded":
         if (
@@ -13978,7 +14451,13 @@ def _validate_contact_release_apply_origin(
             raise RowAuthorityAmbiguous(
                 "contact release superseded origin is not an exact current-epoch exit"
             )
-        return {"result": result, "authority": None}
+        return {
+            "result": result,
+            "contactSettlement": contact_settlement,
+            "receipt": receipt,
+            "successorSettlement": release_successor,
+            "authority": None,
+        }
 
     if result["disposition"] != "applied":
         raise RowAuthorityAmbiguous(
@@ -14054,6 +14533,10 @@ def _validate_contact_release_apply_origin(
         "result": result,
         "contactSettlement": contact_settlement,
         "receipt": receipt,
+        "canonicalAlias": canonical_alias,
+        "successorSettlement": release_successor,
+        "successorReceipt": release_successor_receipt,
+        "successorFanout": release_successor_fanout,
         "authority": authority,
     }
 
@@ -14445,6 +14928,7 @@ def _plan_contact_fanout_release_row(
                 "contactSettlementHash"
             ],
             expected_successor_settled_at=contact_settlement["settledAt"],
+            successor_not_after=contact_settlement["settledAt"],
             current_effective_generation_hash=head[
                 "effectiveOwnerGenerationHash"
             ],
@@ -14452,6 +14936,491 @@ def _plan_contact_fanout_release_row(
                 "effectiveSettlementHash"
             ],
         )
+
+    def validate_selected_origin_contact_chain(selected_origin):
+        """Connect any bounded older APPLY epoch to this release exactly."""
+        selected_settlement = selected_origin["contactSettlement"]
+        immediate_release = selected_origin["successorSettlement"]
+        raw_chain = row_state["selectedContactSettlementChain"]
+        expected_count = (
+            contact_settlement["generation"]
+            - selected_settlement["generation"]
+            - 1
+        )
+        if (
+            expected_count < 0
+            or expected_count >= MAX_CONTACT_SETTLEMENT_CHAIN
+            or type(raw_chain) not in {tuple, list}
+            or len(raw_chain) != expected_count
+        ):
+            raise RowAuthorityAmbiguous(
+                "contact release selected origin chain is incomplete or unbounded"
+            )
+
+        def binding_head_candidates_for_count(checked_edges, prefix_count):
+            count = _require_uint(
+                prefix_count,
+                field_name="selected contact binding prefix count",
+            )
+            if count == 0 or count > len(checked_edges):
+                return ()
+            ordered_times = sorted(
+                candidate["createdAt"] for candidate in checked_edges
+            )
+            boundary_at = ordered_times[count - 1]
+            created_at = ordered_times[0]
+            last_hashes = sorted(
+                {
+                    candidate["contactRowEdgeHash"]
+                    for candidate in checked_edges
+                    if candidate["createdAt"] == boundary_at
+                }
+            )
+            return tuple(
+                build_contact_row_binding_head_document(
+                    user_scope_hash=scope,
+                    canonical_mailbox_identity_hash=canonical_hash,
+                    state_revision=count,
+                    association_count=count,
+                    last_association_hash=last_hash,
+                    created_at=created_at,
+                    updated_at=boundary_at,
+                )
+                for last_hash in last_hashes
+            )
+
+        def creation_binding_head_candidates_at(
+            checked_edges,
+            requested_at,
+        ):
+            requested = _require_timestamp(
+                requested_at,
+                field_name="selected contact binding snapshot time",
+            )
+            if any(
+                candidate["createdAt"] == requested
+                for candidate in checked_edges
+            ):
+                raise RowAuthorityConfigError(
+                    "contact binding receipt-time ordering is ambiguous"
+                )
+            strict_prefix_count = sum(
+                candidate["createdAt"] < requested
+                for candidate in checked_edges
+            )
+            return binding_head_candidates_for_count(
+                checked_edges,
+                strict_prefix_count,
+            )
+
+        def matching_binding_prefix(
+            checked_edges,
+            *,
+            revision,
+            head_hash,
+            association_count,
+            not_after,
+        ):
+            if (
+                type(revision) is not int
+                or type(association_count) is not int
+                or revision != association_count
+                or association_count <= 0
+            ):
+                return None
+            matches = [
+                candidate
+                for candidate in binding_head_candidates_for_count(
+                    checked_edges,
+                    association_count,
+                )
+                if candidate["contactRowBindingHeadHash"] == head_hash
+                and candidate["updatedAt"] <= not_after
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        def fanout_binding_is_reachable(
+            checked_edges,
+            *,
+            current_fanout,
+            creation_head,
+            receipt_requested_at,
+            cutover_at,
+        ):
+            creation_count = creation_head["associationCount"]
+            current_count = current_fanout["bindingAssociationCount"]
+            current_binding = matching_binding_prefix(
+                checked_edges,
+                revision=current_fanout["bindingRevision"],
+                head_hash=current_fanout["bindingHeadHash"],
+                association_count=current_count,
+                not_after=current_fanout["updatedAt"],
+            )
+            if (
+                current_binding is None
+                or current_count < creation_count
+                or (
+                    current_count == creation_count
+                    and current_fanout["bindingHeadHash"]
+                    != creation_head["contactRowBindingHeadHash"]
+                )
+                or (
+                    current_count > creation_count
+                    and current_binding["updatedAt"]
+                    <= receipt_requested_at
+                )
+                or current_binding["updatedAt"] > cutover_at
+            ):
+                return False
+            if current_fanout["state"] != "complete":
+                return True
+
+            completion_count = current_fanout[
+                "completionBindingAssociationCount"
+            ]
+            completion_binding = matching_binding_prefix(
+                checked_edges,
+                revision=current_fanout["completionBindingRevision"],
+                head_hash=current_fanout["completionBindingHeadHash"],
+                association_count=completion_count,
+                not_after=current_fanout["completedAt"],
+            )
+            if (
+                completion_binding is None
+                or completion_count < creation_count
+                or completion_count > current_count
+                or (
+                    completion_count == creation_count
+                    and current_fanout["completionBindingHeadHash"]
+                    != creation_head["contactRowBindingHeadHash"]
+                )
+                or (
+                    completion_count > creation_count
+                    and completion_binding["updatedAt"]
+                    <= receipt_requested_at
+                )
+                or completion_binding["updatedAt"] > cutover_at
+                or (
+                    current_count == completion_count
+                    and current_fanout["bindingHeadHash"]
+                    != current_fanout["completionBindingHeadHash"]
+                )
+                or (
+                    current_count > completion_count
+                    and current_binding["updatedAt"]
+                    < current_fanout["completedAt"]
+                )
+            ):
+                return False
+            return True
+
+        previous = selected_settlement
+        checked_chain = []
+        canonical_alias = selected_origin["canonicalAlias"]
+        for offset, raw_entry in enumerate(raw_chain, start=1):
+            expected_generation = selected_settlement["generation"] + offset
+            try:
+                if type(raw_entry) is not dict or set(raw_entry) != {
+                    "settlementPath",
+                    "settlement",
+                    "receiptPath",
+                    "receipt",
+                    "fanoutPath",
+                    "fanout",
+                }:
+                    raise RowAuthorityConfigError(
+                        "contact settlement chain entry is incomplete"
+                    )
+                settlement = validate_contact_settlement_document(
+                    document=raw_entry["settlement"]
+                )
+                receipt = validate_contact_transition_request_document(
+                    document=raw_entry["receipt"]
+                )
+                expected_fanout_id = _derive_contact_fanout_id(
+                    user_scope_hash=scope,
+                    settlement_hash=settlement["contactSettlementHash"],
+                    outcome=(
+                        "apply"
+                        if settlement["transitionKind"] == "verified_optout"
+                        else "release"
+                    ),
+                )
+                chain_fanout = validate_contact_fanout_head_document(
+                    document=raw_entry["fanout"]
+                )
+                _validate_contact_receipt_head_afterimage(
+                    settlement_document=settlement,
+                    receipt_document=receipt,
+                    canonical_self_alias_document=canonical_alias,
+                )
+            except Exception as exc:
+                raise RowAuthorityAmbiguous(
+                    "contact release selected origin chain entry is malformed"
+                ) from exc
+            expected_active_hash = (
+                previous["contactSettlementHash"]
+                if settlement["transitionKind"]
+                == "authenticated_release"
+                else None
+            )
+            if (
+                type(raw_entry["settlementPath"]) is not str
+                or raw_entry["settlementPath"].split("/")[-2:]
+                != [
+                    "contactOptOutSettlements",
+                    f"{canonical_hash}--{expected_generation}",
+                ]
+                or type(raw_entry["receiptPath"]) is not str
+                or raw_entry["receiptPath"].split("/")[-2:]
+                != [
+                    "contactOptOutTransitionRequests",
+                    settlement["contactTransitionId"],
+                ]
+                or settlement["userScopeHash"] != scope
+                or settlement["canonicalMailboxIdentityHash"]
+                != canonical_hash
+                or settlement["generation"] != expected_generation
+                or settlement["predecessorSettlementHash"]
+                != previous["contactSettlementHash"]
+                or settlement["settledAt"] < previous["settledAt"]
+                or (
+                    settlement["transitionKind"]
+                    == "authenticated_release"
+                    and settlement["exactIdentityHash"]
+                    != previous["exactIdentityHash"]
+                )
+                or receipt["userScopeHash"] != scope
+                or receipt["outcome"] != "created"
+                or receipt["contactTransitionId"]
+                != settlement["contactTransitionId"]
+                or receipt["transitionKind"]
+                != settlement["transitionKind"]
+                or receipt["exactIdentityHash"]
+                != settlement["exactIdentityHash"]
+                or receipt["canonicalMailboxIdentityHash"]
+                != canonical_hash
+                or receipt["authorityLinkHash"]
+                != settlement["authorityLinkHash"]
+                or receipt["hardOptOutEvidenceHash"]
+                != settlement["hardOptOutEvidenceHash"]
+                or receipt["actorScopeHash"] != settlement["actorScopeHash"]
+                or receipt["reasonCode"] != settlement["reasonCode"]
+                or receipt["expectedActiveOptOutSettlementHash"]
+                != expected_active_hash
+                or receipt["resultingContactGeneration"]
+                != settlement["generation"]
+                or receipt["resultingContactSettlementHash"]
+                != settlement["contactSettlementHash"]
+                or receipt["resultingFanoutId"] != expected_fanout_id
+                or receipt["requestedAt"] != settlement["settledAt"]
+                or type(raw_entry["fanoutPath"]) is not str
+                or raw_entry["fanoutPath"].split("/")[-2:]
+                != ["contactOptOutFanoutHeads", expected_fanout_id]
+                or chain_fanout["userScopeHash"] != scope
+                or chain_fanout["fanoutId"] != expected_fanout_id
+                or chain_fanout["outcome"]
+                != (
+                    "apply"
+                    if settlement["transitionKind"] == "verified_optout"
+                    else "release"
+                )
+                or chain_fanout["expectedContactSettlementHash"]
+                != settlement["contactSettlementHash"]
+                or chain_fanout["createdAt"] != settlement["settledAt"]
+                or chain_fanout["updatedAt"] > event_time
+            ):
+                raise RowAuthorityAmbiguous(
+                    "contact release selected origin settlement chain is crossed"
+                )
+            checked_chain.append(
+                {
+                    "settlement": settlement,
+                    "receipt": receipt,
+                    "fanout": chain_fanout,
+                }
+            )
+            previous = settlement
+        if (
+            contact_settlement["generation"] != previous["generation"] + 1
+            or contact_settlement["predecessorSettlementHash"]
+            != previous["contactSettlementHash"]
+            or contact_settlement["settledAt"] < previous["settledAt"]
+            or contact_settlement["exactIdentityHash"]
+            != previous["exactIdentityHash"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "contact release selected origin does not reach the current release"
+            )
+        if checked_chain:
+            first = checked_chain[0]
+            last = checked_chain[-1]
+            if (
+                first["settlement"] != immediate_release
+                or first["receipt"] != selected_origin["successorReceipt"]
+                or current_result is None
+                or last["settlement"]
+                != current_result["contactSettlement"]
+                or last["receipt"] != current_result["receipt"]
+            ):
+                raise RowAuthorityAmbiguous(
+                    "contact release selected origin lacks exact endpoint brackets"
+                )
+        elif (
+            current_result is None
+            or immediate_release != contact_settlement
+            or selected_origin["successorReceipt"]
+            != current_result["successorReceipt"]
+        ):
+            raise RowAuthorityAmbiguous(
+                "contact release selected origin names a different current release"
+            )
+
+        if len(checked_chain) > 2:
+            raw_binding_edges = row_state["selectedContactBindingEdges"]
+            try:
+                raw_binding_head_path = row_state[
+                    "selectedContactBindingHeadPath"
+                ]
+                binding_head = validate_contact_row_binding_head_document(
+                    document=row_state["selectedContactBindingHead"]
+                )
+                if (
+                    type(raw_binding_edges) not in {tuple, list}
+                    or not 1 <= len(raw_binding_edges) <= MAX_ROW_BINDINGS
+                    or type(raw_binding_head_path) is not str
+                    or raw_binding_head_path.split("/")[-2:]
+                    != ["contactRowBindingHeads", canonical_hash]
+                    or binding_head["userScopeHash"] != scope
+                    or binding_head["canonicalMailboxIdentityHash"]
+                    != canonical_hash
+                    or binding_head["updatedAt"] > event_time
+                ):
+                    raise RowAuthorityConfigError(
+                        "selected contact binding history is incomplete or unbounded"
+                    )
+                checked_edges = []
+                previous_row_id = None
+                for raw_edge in raw_binding_edges:
+                    if type(raw_edge) is not dict or set(raw_edge) != {
+                        "path",
+                        "document",
+                    }:
+                        raise RowAuthorityConfigError(
+                            "selected contact binding edge is incomplete"
+                        )
+                    checked_edge = validate_contact_row_binding_document(
+                        document=raw_edge["document"]
+                    )
+                    if (
+                        type(raw_edge["path"]) is not str
+                        or raw_edge["path"].split("/")[-2:]
+                        != ["contactRowBindings", checked_edge["edgeId"]]
+                        or checked_edge["userScopeHash"] != scope
+                        or checked_edge["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                        or checked_edge["createdAt"]
+                        > binding_head["updatedAt"]
+                        or (
+                            previous_row_id is not None
+                            and checked_edge["rowId"] <= previous_row_id
+                        )
+                    ):
+                        raise RowAuthorityConfigError(
+                            "selected contact binding edge is crossed or unordered"
+                        )
+                    previous_row_id = checked_edge["rowId"]
+                    checked_edges.append(checked_edge)
+                current_candidates = binding_head_candidates_for_count(
+                    checked_edges,
+                    len(checked_edges),
+                )
+                if (
+                    binding_head not in current_candidates
+                    or edge not in checked_edges
+                ):
+                    raise RowAuthorityConfigError(
+                        "selected contact binding history does not reconstruct its head"
+                    )
+            except Exception as exc:
+                raise RowAuthorityAmbiguous(
+                    "contact release selected origin binding history is malformed"
+                ) from exc
+
+            for chain_index, chain_entry in enumerate(
+                checked_chain[1:-1],
+                start=1,
+            ):
+                receipt = chain_entry["receipt"]
+                chain_fanout = chain_entry["fanout"]
+                next_settlement = checked_chain[chain_index + 1][
+                    "settlement"
+                ]
+                try:
+                    candidate_heads = creation_binding_head_candidates_at(
+                        checked_edges,
+                        receipt["requestedAt"],
+                    )
+                except Exception as exc:
+                    raise RowAuthorityAmbiguous(
+                        "contact release selected origin binding cutoff is ambiguous"
+                    ) from exc
+                witnessed = []
+                for candidate_head in candidate_heads:
+                    try:
+                        if not fanout_binding_is_reachable(
+                            checked_edges,
+                            current_fanout=chain_fanout,
+                            creation_head=candidate_head,
+                            receipt_requested_at=receipt["requestedAt"],
+                            cutover_at=next_settlement["settledAt"],
+                        ):
+                            continue
+                        if chain_fanout["state"] == "complete":
+                            if (
+                                chain_fanout["completedAt"] is None
+                                or chain_fanout["completedAt"]
+                                > next_settlement["settledAt"]
+                                or chain_fanout["updatedAt"]
+                                > next_settlement["settledAt"]
+                            ):
+                                continue
+                        elif (
+                            chain_fanout["state"]
+                            not in {"superseding", "superseded"}
+                            or chain_fanout[
+                                "supersedingContactSettlementHash"
+                            ]
+                            != next_settlement["contactSettlementHash"]
+                            or chain_fanout["updatedAt"]
+                            < next_settlement["settledAt"]
+                        ):
+                            continue
+                        witnessed.append(
+                            _validate_contact_fanout_receipt_creation_afterimage(
+                                current_document=chain_fanout,
+                                frozen_fanout_head_hash=receipt[
+                                    "resultingFanoutHeadHash"
+                                ],
+                                receipt_requested_at=receipt["requestedAt"],
+                                creation_binding_revision=candidate_head[
+                                    "stateRevision"
+                                ],
+                                creation_binding_head_hash=candidate_head[
+                                    "contactRowBindingHeadHash"
+                                ],
+                                creation_binding_association_count=candidate_head[
+                                    "associationCount"
+                                ],
+                            )
+                        )
+                    except Exception:
+                        continue
+                if len(witnessed) != 1:
+                    raise RowAuthorityAmbiguous(
+                        "contact release selected origin fan-out after-image "
+                        "is not reconstructible"
+                    )
 
     existing = None
     if existing_result_document is not None:
@@ -14501,6 +15470,7 @@ def _plan_contact_fanout_release_row(
                 ]["payloadHash"],
                 not_after=existing["createdAt"],
                 fanout_not_after=event_time,
+                successor_not_after=contact_settlement["settledAt"],
                 expected_authority=row_state["selectedAuthority"],
                 current_effective_generation_hash=head[
                     "effectiveOwnerGenerationHash"
@@ -14509,6 +15479,7 @@ def _plan_contact_fanout_release_row(
                     "effectiveSettlementHash"
                 ],
             )
+            validate_selected_origin_contact_chain(selected_origin)
             if selected_origin["result"]["rowSettlementHash"] != existing[
                 "releasedRowSettlementHash"
             ]:
@@ -14597,6 +15568,7 @@ def _plan_contact_fanout_release_row(
                 "payloadHash"
             ],
             not_after=event_time,
+            successor_not_after=contact_settlement["settledAt"],
             expected_authority=row_state["selectedAuthority"],
             current_effective_generation_hash=head[
                 "effectiveOwnerGenerationHash"
@@ -14605,6 +15577,7 @@ def _plan_contact_fanout_release_row(
                 "effectiveSettlementHash"
             ],
         )
+        validate_selected_origin_contact_chain(selected_origin)
         if released_authority != current_authority:
             raise RowAuthorityAmbiguous(
                 "contact release selected authority is not effective"
@@ -18224,10 +19197,21 @@ class RowAuthorityStore:
             ]
             witnessed_progress_head = expected
             witnessed_progress_valid = True
-            for index in future_indexes:
+            binding_changed = current_binding is not None
+            normal_future_indexes = [
+                index
+                for index in future_indexes
+                if inspected_obligations[index]["createdAt"]
+                <= expected["updatedAt"]
+            ]
+            for index in normal_future_indexes:
                 if any(
                     result is None
-                    for result in inspected_results[:index]
+                    and inspected_obligations[prior_index]["createdAt"]
+                    <= expected["updatedAt"]
+                    for prior_index, result in enumerate(
+                        inspected_results[:index]
+                    )
                 ):
                     witnessed_progress_valid = False
                     break
@@ -18244,8 +19228,14 @@ class RowAuthorityStore:
                             ),
                             cursor_processed_count=(
                                 expected["cursorProcessedCount"]
-                                + index
-                                + 1
+                                + sum(
+                                    1
+                                    for obligation in inspected_obligations[
+                                        : index + 1
+                                    ]
+                                    if obligation["createdAt"]
+                                    <= expected["updatedAt"]
+                                )
                             ),
                             processed_at=inspected_results[index][
                                 "createdAt"
@@ -18255,10 +19245,616 @@ class RowAuthorityStore:
                 except Exception:
                     witnessed_progress_valid = False
                     break
-            binding_changed = current_binding is not None
             witnessed_current_shape = True
             if binding_changed:
-                witnessed_progress_valid = True
+                binding_revision_delta = (
+                    current["bindingRevision"]
+                    - expected["bindingRevision"]
+                )
+                binding_delta = (
+                    current["bindingAssociationCount"]
+                    - expected["bindingAssociationCount"]
+                )
+                binding_head_matches = (
+                    current_binding["stateRevision"]
+                    == current["bindingRevision"]
+                    and current_binding["contactRowBindingHeadHash"]
+                    == current["bindingHeadHash"]
+                    and current_binding["associationCount"]
+                    == current["bindingAssociationCount"]
+                    and binding_revision_delta > 0
+                    and binding_delta == binding_revision_delta
+                    and current_binding["updatedAt"] <= current["updatedAt"]
+                )
+                if current["state"] == "complete":
+                    late_work_delta = (
+                        current["completionBindingAssociationCount"]
+                        - expected["bindingAssociationCount"]
+                    )
+                    binding_count_shape = (
+                        0 <= late_work_delta <= binding_delta
+                        and current["completionObligationCount"]
+                        == expected["obligationCount"] + late_work_delta
+                        and current["completionResultCount"]
+                        == current["completionObligationCount"]
+                        and current["obligationCount"]
+                        == current["completionObligationCount"]
+                    )
+                else:
+                    late_work_delta = binding_delta
+                    binding_count_shape = (
+                        binding_delta > 0
+                        and current["obligationCount"]
+                        == expected["obligationCount"] + late_work_delta
+                    )
+
+                visible_late_count = 0
+                visible_late_times = []
+                late_results_valid = True
+                latest_visible_late_at = None
+
+                def exact_late_release_result(result, obligation):
+                    return (
+                        result is not None
+                        and result["createdAt"] == obligation["createdAt"]
+                        and result["disposition"] == "noop"
+                        and result["reasonCode"]
+                        == "row_optout_not_applied"
+                        and all(
+                            result[field] is None
+                            for field in (
+                                "claimRequestId",
+                                "claimSetHash",
+                                "rowGeneration",
+                                "rowSettlementHash",
+                                "releasedRowGeneration",
+                                "releasedRowSettlementHash",
+                                "restoredEffectiveGeneration",
+                                "restoredEffectiveSettlementHash",
+                            )
+                        )
+                    )
+
+                for index in future_obligation_indexes:
+                    obligation = checked_obligations[index]
+                    if (
+                        checked_obligation_edges[index]["createdAt"]
+                        != obligation["createdAt"]
+                        or obligation["createdAt"]
+                        > current_binding["updatedAt"]
+                    ):
+                        late_results_valid = False
+                        break
+                    if index < len(inspected_results):
+                        late_result = inspected_results[index]
+                    else:
+                        late_result_ref = results.document(
+                            f"{checked_fanout_id}--{obligation['rowId']}"
+                        )
+                        late_result_exists, late_result_payload = read(
+                            late_result_ref
+                        )
+                        late_result = (
+                            validate_existing_result(
+                                obligation=obligation,
+                                payload=late_result_payload,
+                            )
+                            if late_result_exists
+                            else None
+                        )
+                    if not exact_late_release_result(
+                        late_result,
+                        obligation,
+                    ):
+                        late_results_valid = False
+                        break
+                    visible_late_count += 1
+                    visible_late_times.append(obligation["createdAt"])
+                    latest_visible_late_at = obligation["createdAt"]
+
+                hidden_late_count = late_work_delta - visible_late_count
+                hidden_late_work_valid = hidden_late_count == 0
+                hidden_late_work_at = None
+                binding_edge_proof_valid = False
+                if binding_delta == 1:
+                    try:
+                        latest_edge_query = (
+                            contact_edges.where(
+                                "contactRowEdgeHash",
+                                "==",
+                                current_binding["lastAssociationHash"],
+                            )
+                            .order_by("__name__")
+                            .limit(2)
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConfigError(
+                                "contact fan-out release cannot form its latest association query"
+                            )
+                        )
+                    latest_edge_matches = read_query(
+                        latest_edge_query,
+                        description="latest contact association",
+                    )
+                    if len(latest_edge_matches) == 1:
+                        latest_edge_ref, latest_edge_payload = (
+                            latest_edge_matches[0]
+                        )
+                        try:
+                            latest_edge = (
+                                validate_contact_row_binding_document(
+                                    document=latest_edge_payload
+                                )
+                            )
+                            hidden_obligation_ref = obligations.document(
+                                f"{checked_fanout_id}--"
+                                f"{latest_edge['rowId']}"
+                            )
+                            hidden_result_ref = results.document(
+                                f"{checked_fanout_id}--"
+                                f"{latest_edge['rowId']}"
+                            )
+                        except Exception:
+                            latest_edge = None
+                        if latest_edge is not None:
+                            latest_edge_base_valid = (
+                                latest_edge_ref.path
+                                == contact_edges.document(
+                                    latest_edge["edgeId"]
+                                ).path
+                                and latest_edge["userScopeHash"]
+                                == checked_scope
+                                and latest_edge[
+                                    "canonicalMailboxIdentityHash"
+                                ]
+                                == canonical_hash
+                                and latest_edge["contactRowEdgeHash"]
+                                == current_binding["lastAssociationHash"]
+                                and latest_edge["createdAt"]
+                                == current_binding["updatedAt"]
+                            )
+                            if (
+                                latest_edge_base_valid
+                                and late_work_delta == 0
+                                and hidden_late_count == 0
+                                and current["state"] == "complete"
+                                and latest_edge["createdAt"]
+                                >= current["completedAt"]
+                            ):
+                                binding_edge_proof_valid = True
+                            elif (
+                                latest_edge_base_valid
+                                and late_work_delta == 1
+                                and hidden_late_count == 0
+                                and any(
+                                    checked_obligations[index]["rowId"]
+                                    == latest_edge["rowId"]
+                                    for index in future_obligation_indexes
+                                )
+                            ):
+                                binding_edge_proof_valid = True
+                            elif (
+                                latest_edge_base_valid
+                                and late_work_delta == 1
+                                and hidden_late_count == 1
+                            ):
+                                (
+                                    hidden_obligation_exists,
+                                    hidden_obligation_payload,
+                                ) = read(hidden_obligation_ref)
+                                (
+                                    hidden_result_exists,
+                                    hidden_result_payload,
+                                ) = read(hidden_result_ref)
+                                try:
+                                    hidden_obligation = (
+                                        validate_contact_fanout_obligation_document(
+                                            document=(
+                                                hidden_obligation_payload
+                                            )
+                                        )
+                                        if hidden_obligation_exists
+                                        else None
+                                    )
+                                    hidden_result = (
+                                        validate_existing_result(
+                                            obligation=hidden_obligation,
+                                            payload=hidden_result_payload,
+                                        )
+                                        if hidden_result_exists
+                                        and hidden_obligation is not None
+                                        else None
+                                    )
+                                except Exception:
+                                    hidden_obligation = None
+                                    hidden_result = None
+                                if (
+                                    hidden_obligation is not None
+                                    and hidden_obligation["userScopeHash"]
+                                    == checked_scope
+                                    and hidden_obligation["fanoutId"]
+                                    == checked_fanout_id
+                                    and hidden_obligation["rowId"]
+                                    == latest_edge["rowId"]
+                                    and hidden_obligation[
+                                        "contactRowEdgeHash"
+                                    ]
+                                    == latest_edge["contactRowEdgeHash"]
+                                    and hidden_obligation[
+                                        "expectedContactSettlementHash"
+                                    ]
+                                    == expected[
+                                        "expectedContactSettlementHash"
+                                    ]
+                                    and hidden_obligation["outcome"]
+                                    == "release"
+                                    and hidden_obligation["createdAt"]
+                                    == latest_edge["createdAt"]
+                                    and hidden_obligation["createdAt"]
+                                    > expected["updatedAt"]
+                                    and hidden_obligation["createdAt"]
+                                    <= current["updatedAt"]
+                                    and exact_late_release_result(
+                                        hidden_result,
+                                        hidden_obligation,
+                                    )
+                                ):
+                                    hidden_late_work_valid = True
+                                    binding_edge_proof_valid = True
+                                    hidden_late_work_at = hidden_obligation[
+                                        "createdAt"
+                                    ]
+                elif (
+                    binding_delta > 1
+                    and late_work_delta == 0
+                    and visible_late_count == 0
+                    and hidden_late_count == 0
+                    and current["state"] == "complete"
+                ):
+                    try:
+                        binding_history_query = (
+                            contact_edges.where(
+                                "canonicalMailboxIdentityHash",
+                                "==",
+                                canonical_hash,
+                            )
+                            .order_by("rowId", direction="ASCENDING")
+                            .limit(MAX_ROW_BINDINGS + 1)
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityConfigError(
+                                "contact fan-out release cannot form its "
+                                "binding history query"
+                            )
+                        )
+                    binding_history_matches = read_query(
+                        binding_history_query,
+                        description="complete late binding history",
+                    )
+                    checked_binding_history = []
+                    binding_history_valid = (
+                        len(binding_history_matches) <= MAX_ROW_BINDINGS
+                    )
+                    previous_binding_row = None
+                    for binding_edge_ref, binding_edge_payload in (
+                        binding_history_matches
+                    ):
+                        try:
+                            historical_edge = (
+                                validate_contact_row_binding_document(
+                                    document=binding_edge_payload
+                                )
+                            )
+                        except Exception:
+                            binding_history_valid = False
+                            break
+                        if (
+                            binding_edge_ref.path
+                            != contact_edges.document(
+                                historical_edge["edgeId"]
+                            ).path
+                            or historical_edge["userScopeHash"]
+                            != checked_scope
+                            or historical_edge[
+                                "canonicalMailboxIdentityHash"
+                            ]
+                            != canonical_hash
+                            or historical_edge["createdAt"] > event_time
+                            or (
+                                previous_binding_row is not None
+                                and historical_edge["rowId"]
+                                <= previous_binding_row
+                            )
+                        ):
+                            binding_history_valid = False
+                            break
+                        previous_binding_row = historical_edge["rowId"]
+                        checked_binding_history.append(historical_edge)
+
+                    expected_binding_count = expected[
+                        "bindingAssociationCount"
+                    ]
+                    if (
+                        binding_history_valid
+                        and expected_binding_count > 0
+                        and expected["bindingRevision"]
+                        == expected_binding_count
+                        and len(checked_binding_history)
+                        == current["bindingAssociationCount"]
+                        and expected_binding_count
+                        < len(checked_binding_history)
+                    ):
+                        chronological_edges = sorted(
+                            checked_binding_history,
+                            key=lambda candidate: (
+                                candidate["createdAt"],
+                                candidate["rowId"],
+                            ),
+                        )
+                        prefix_boundary = chronological_edges[
+                            expected_binding_count - 1
+                        ]["createdAt"]
+                        first_late_edge = chronological_edges[
+                            expected_binding_count
+                        ]
+                        boundary_is_exact = (
+                            prefix_boundary
+                            < first_late_edge["createdAt"]
+                        )
+                        first_created_at = chronological_edges[0][
+                            "createdAt"
+                        ]
+                        current_updated_at = chronological_edges[-1][
+                            "createdAt"
+                        ]
+                        expected_last_hashes = {
+                            candidate["contactRowEdgeHash"]
+                            for candidate in chronological_edges[
+                                :expected_binding_count
+                            ]
+                            if candidate["createdAt"] == prefix_boundary
+                        }
+                        current_last_hashes = {
+                            candidate["contactRowEdgeHash"]
+                            for candidate in chronological_edges
+                            if candidate["createdAt"] == current_updated_at
+                        }
+                        try:
+                            expected_binding_candidates = tuple(
+                                build_contact_row_binding_head_document(
+                                    user_scope_hash=checked_scope,
+                                    canonical_mailbox_identity_hash=(
+                                        canonical_hash
+                                    ),
+                                    state_revision=expected[
+                                        "bindingRevision"
+                                    ],
+                                    association_count=(
+                                        expected_binding_count
+                                    ),
+                                    last_association_hash=last_hash,
+                                    created_at=first_created_at,
+                                    updated_at=prefix_boundary,
+                                )
+                                for last_hash in sorted(
+                                    expected_last_hashes
+                                )
+                            )
+                            current_binding_candidates = tuple(
+                                build_contact_row_binding_head_document(
+                                    user_scope_hash=checked_scope,
+                                    canonical_mailbox_identity_hash=(
+                                        canonical_hash
+                                    ),
+                                    state_revision=current[
+                                        "bindingRevision"
+                                    ],
+                                    association_count=current[
+                                        "bindingAssociationCount"
+                                    ],
+                                    last_association_hash=last_hash,
+                                    created_at=first_created_at,
+                                    updated_at=current_updated_at,
+                                )
+                                for last_hash in sorted(
+                                    current_last_hashes
+                                )
+                            )
+                        except Exception:
+                            expected_binding_candidates = ()
+                            current_binding_candidates = ()
+                        expected_prefix_matches = [
+                            candidate
+                            for candidate in expected_binding_candidates
+                            if candidate["contactRowBindingHeadHash"]
+                            == expected["bindingHeadHash"]
+                        ]
+                        late_edges = chronological_edges[
+                            expected_binding_count:
+                        ]
+                        late_artifacts_absent = True
+                        for late_edge in late_edges:
+                            late_document_id = (
+                                f"{checked_fanout_id}--"
+                                f"{late_edge['rowId']}"
+                            )
+                            late_obligation_exists, _ = read(
+                                obligations.document(late_document_id)
+                            )
+                            late_result_exists, _ = read(
+                                results.document(late_document_id)
+                            )
+                            if (
+                                late_obligation_exists
+                                or late_result_exists
+                            ):
+                                late_artifacts_absent = False
+                                break
+                        lease_advance_delta = (
+                            current["fencingToken"]
+                            - witnessed_progress_head["fencingToken"]
+                        )
+                        certification_page_count = max(
+                            1,
+                            (
+                                current["completionObligationCount"]
+                                + 31
+                            )
+                            // 32,
+                        )
+                        paired_lease_progress = (
+                            lease_advance_delta >= 0
+                            and current["stateRevision"]
+                            == witnessed_progress_head["stateRevision"]
+                            + certification_page_count
+                            + binding_delta
+                            + lease_advance_delta
+                        )
+                        if (
+                            boundary_is_exact
+                            and len(expected_prefix_matches) == 1
+                            and current_binding
+                            in current_binding_candidates
+                            and len(late_edges) == binding_delta
+                            and all(
+                                late_edge["createdAt"]
+                                >= current["completedAt"]
+                                for late_edge in late_edges
+                            )
+                            and late_artifacts_absent
+                            and current[
+                                "completionBindingRevision"
+                            ]
+                            == expected["bindingRevision"]
+                            and current[
+                                "completionBindingHeadHash"
+                            ]
+                            == expected["bindingHeadHash"]
+                            and current[
+                                "completionBindingAssociationCount"
+                            ]
+                            == expected_binding_count
+                            and current["updatedAt"]
+                            == current_binding["updatedAt"]
+                            and paired_lease_progress
+                        ):
+                            binding_edge_proof_valid = True
+                elif (
+                    binding_delta == late_work_delta
+                    and visible_late_count == late_work_delta
+                ):
+                    latest_visible_edges = [
+                        checked_obligation_edges[index]
+                        for index in future_obligation_indexes
+                        if checked_obligation_edges[index][
+                            "contactRowEdgeHash"
+                        ]
+                        == current_binding["lastAssociationHash"]
+                        and checked_obligation_edges[index]["createdAt"]
+                        == current_binding["updatedAt"]
+                    ]
+                    binding_edge_proof_valid = (
+                        len(latest_visible_edges) == 1
+                    )
+
+                if late_work_delta == 0:
+                    first_late_work_at = None
+                elif binding_delta == 1:
+                    first_late_work_at = current_binding["updatedAt"]
+                elif visible_late_count == late_work_delta:
+                    first_late_work_at = min(visible_late_times)
+                else:
+                    first_late_work_at = None
+                replay_predates_late_work = (
+                    late_work_delta == 0
+                    or (
+                        first_late_work_at is not None
+                        and nominated_result is not None
+                        and nominated_result["createdAt"]
+                        < first_late_work_at
+                    )
+                )
+
+                normal_progress_delta = (
+                    current["resultCount"]
+                    - expected["resultCount"]
+                    - late_work_delta
+                )
+                normal_result_budget_valid = (
+                    normal_progress_delta == len(normal_future_indexes)
+                )
+
+                cursor_witnessed = True
+                if (
+                    current["state"] in {"applying", "superseding"}
+                    and current["discoveryCursorRowId"] is not None
+                ):
+                    cursor_count = current["cursorProcessedCount"]
+                    cursor_witnessed = (
+                        expected["discoveryCursorRowId"] is None
+                        and 0 < cursor_count <= len(inspected_obligations)
+                        and current["discoveryCursorRowId"]
+                        == inspected_obligations[cursor_count - 1]["rowId"]
+                        and all(
+                            result is not None
+                            for result in inspected_results[:cursor_count]
+                        )
+                    )
+                elif (
+                    current["state"] == "applying"
+                    and current["resultCount"]
+                    < current["obligationCount"]
+                ):
+                    cursor_witnessed = all(
+                        inspected_results[index]["createdAt"]
+                        < current_binding["updatedAt"]
+                        for index in normal_future_indexes
+                    )
+
+                latest_visible_result_at = max(
+                    (
+                        result["createdAt"]
+                        for result in inspected_results
+                        if result is not None
+                    ),
+                    default=None,
+                )
+                visible_times = tuple(
+                    value
+                    for value in (
+                        latest_visible_result_at,
+                        latest_visible_late_at,
+                        hidden_late_work_at,
+                    )
+                    if value is not None
+                )
+                visible_time_bound = (
+                    expected["updatedAt"]
+                    if not visible_times
+                    else max(visible_times)
+                )
+                terminal_time_witnessed = (
+                    current["state"] != "complete"
+                    or (
+                        current["completedAt"] is not None
+                        and current["completedAt"] >= visible_time_bound
+                    )
+                )
+                binding_successor_shape = (
+                    binding_head_matches
+                    and binding_count_shape
+                    and binding_edge_proof_valid
+                    and late_results_valid
+                    and hidden_late_work_valid
+                    and normal_result_budget_valid
+                    and cursor_witnessed
+                    and terminal_time_witnessed
+                )
+                witnessed_current_shape = (
+                    binding_successor_shape and replay_predates_late_work
+                )
             elif replay_after_contact_successor:
                 witnessed_current_shape = (
                     current["obligationCount"]
@@ -18295,8 +19891,11 @@ class RowAuthorityStore:
             future_progress_matches_current = (
                 witnessed_progress_valid
                 and witnessed_current_shape
-                and current["resultCount"]
-                == expected["resultCount"] + len(future_indexes)
+                and (
+                    binding_changed
+                    or current["resultCount"]
+                    == expected["resultCount"] + len(future_indexes)
+                )
                 and (
                     not future_indexes
                     or current["updatedAt"]
@@ -18475,21 +20074,56 @@ class RowAuthorityStore:
                                     ],
                                 )
                             )
-                            cursor_replay_successor = (
-                                _contact_fanout_is_bounded_processing_successor(
-                                    expected_document=post_cursor_head,
-                                    current_document=current,
-                                    binding_head_document=current_binding,
+                            if binding_changed:
+                                cursor_binding_successor_shape = (
+                                    binding_head_matches
+                                    and binding_count_shape
+                                    and binding_edge_proof_valid
+                                    and late_results_valid
+                                    and hidden_late_work_valid
+                                    and cursor_witnessed
+                                    and terminal_time_witnessed
+                                    and sentinel["createdAt"]
+                                    <= expected["updatedAt"]
+                                    and sentinel_result["createdAt"]
+                                    > expected["updatedAt"]
+                                    and normal_progress_delta
+                                    == len(normal_future_indexes) + 1
                                 )
-                                and (
-                                    current["state"] != "complete"
-                                    or (
-                                        current["completedAt"] is not None
-                                        and current["completedAt"]
-                                        >= sentinel_result["createdAt"]
+                                cursor_replay_successor = (
+                                    cursor_binding_successor_shape
+                                    and (
+                                        late_work_delta == 0
+                                        or (
+                                            first_late_work_at is not None
+                                            and sentinel_result["createdAt"]
+                                            < first_late_work_at
+                                        )
+                                    )
+                                    and (
+                                        _contact_fanout_is_bounded_processing_successor(
+                                            expected_document=(
+                                                post_cursor_head
+                                            ),
+                                            current_document=current,
+                                            binding_head_document=(
+                                                current_binding
+                                            ),
+                                        )
+                                    )
+                                    and (
+                                        current["state"] != "complete"
+                                        or (
+                                            current["completedAt"] is not None
+                                            and current["completedAt"]
+                                            >= sentinel_result["createdAt"]
+                                        )
                                     )
                                 )
-                            )
+                            else:
+                                cursor_replay_successor = (
+                                    current == post_cursor_head
+                                )
                         except Exception:
                             cursor_replay_successor = False
                     if cursor_replay_successor:

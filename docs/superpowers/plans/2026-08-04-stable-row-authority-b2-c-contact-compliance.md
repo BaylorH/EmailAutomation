@@ -954,21 +954,30 @@ new_ids = [
         )
     )
 ]
-assert len(test_ids) == len(set(test_ids)) == 480, (len(test_ids), len(set(test_ids)))
-assert len(new_ids) == len(set(new_ids)) == 79, (len(new_ids), len(set(new_ids)))
+assert len(test_ids) == len(set(test_ids)) == 508, (len(test_ids), len(set(test_ids)))
+assert len(new_ids) == len(set(new_ids)) == 107, (len(new_ids), len(set(new_ids)))
 PY
 
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m pytest -q \
-  tests/test_row_authority\*.py
+  tests/test_row_authority*.py
 ```
 
 Fresh corrected-candidate evidence: the authoritative seven-module gate passed
-480/480 tests, loader inspection found 480/480 unique total IDs with 79/79
-unique Task 6 IDs, and the complete row-authority discovery passed 642 tests
-plus 1,351 subtests. The worker gates include immutable latest-contact proofs,
+508/508 tests, loader inspection found 508/508 unique total IDs with 107/107
+unique Task 6 IDs, and the complete row-authority discovery passed 670 tests
+plus 1,357 subtests. The worker gates include immutable latest-contact proofs,
 mutable-head rollback rejection, exact replay through later fan-out/contact/
 location successors, frozen obligation chronology, and zero-write corruption
 failures.
+
+Known non-runtime limitation: lease acquire/renew/takeover currently advances
+only the canonical mutable fan-out head. A direct datastore actor able to forge
+a new valid head hash can inflate `stateRevision` and `fencingToken` by the same
+amount in a way that is observationally identical to real lease renewals. The
+public worker operations reject one-sided revision or fence drift, and replay
+remains zero-write, but a future immutable lease ledger is required to
+distinguish paired direct-store forgery. That schema expansion is deferred from
+this frontend-driven production release.
 
 - [ ] **Step 8: Review, commit, push, and prove `B2-C final` code**
 

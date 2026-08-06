@@ -245,6 +245,89 @@ class ContactFanoutReleaseOriginTests(unittest.TestCase):
         context["selectedOrigin"] = origin
         return context
 
+    def _immediate_release_successor(self, context):
+        origin = context["selectedOrigin"]
+        successor_generation = origin["contactSettlement"]["generation"] + 1
+        settlement_id = (
+            f"{context['canonicalHash']}--{successor_generation}"
+        )
+        settlement = deepcopy(
+            self.release._documents(
+                context,
+                "contactOptOutSettlements",
+            )[settlement_id]
+        )
+        receipt = deepcopy(
+            self.release._documents(
+                context,
+                "contactOptOutTransitionRequests",
+            )[settlement["contactTransitionId"]]
+        )
+        self.assertEqual("authenticated_release", settlement["transitionKind"])
+        self.assertEqual(
+            origin["contactSettlement"]["contactSettlementHash"],
+            settlement["predecessorSettlementHash"],
+        )
+        self.assertEqual(
+            settlement,
+            self.module.validate_contact_settlement_document(
+                document=settlement
+            ),
+        )
+        self.assertEqual(
+            receipt,
+            self.module.validate_contact_transition_request_document(
+                document=receipt
+            ),
+        )
+        return settlement_id, settlement, receipt
+
+    def _rebuild_successor_receipt(self, receipt, **overrides):
+        fields = {
+            "user_scope_hash": receipt["userScopeHash"],
+            "transition_kind": receipt["transitionKind"],
+            "exact_identity_hash": receipt["exactIdentityHash"],
+            "canonical_mailbox_identity_hash": receipt[
+                "canonicalMailboxIdentityHash"
+            ],
+            "authority_link_hash": receipt["authorityLinkHash"],
+            "hard_optout_evidence_hash": receipt[
+                "hardOptOutEvidenceHash"
+            ],
+            "actor_scope_hash": receipt["actorScopeHash"],
+            "client_request_hash": receipt["clientRequestHash"],
+            "expected_active_optout_settlement_hash": receipt[
+                "expectedActiveOptOutSettlementHash"
+            ],
+            "reason_code": receipt["reasonCode"],
+            "outcome": receipt["outcome"],
+            "resulting_contact_generation": receipt[
+                "resultingContactGeneration"
+            ],
+            "resulting_contact_settlement_hash": receipt[
+                "resultingContactSettlementHash"
+            ],
+            "resulting_fanout_id": receipt["resultingFanoutId"],
+            "resulting_contact_head_hash": receipt[
+                "resultingContactHeadHash"
+            ],
+            "resulting_fanout_head_hash": receipt[
+                "resultingFanoutHeadHash"
+            ],
+            "requested_at": receipt["requestedAt"],
+        }
+        fields.update(overrides)
+        rebuilt = self.module.build_contact_transition_request_document(
+            **fields
+        )
+        self.assertEqual(
+            rebuilt,
+            self.module.validate_contact_transition_request_document(
+                document=rebuilt
+            ),
+        )
+        return rebuilt
+
     def _crossed_apply_evidence(self, context):
         origin = context["selectedOrigin"]
         obligation = origin["obligation"]
@@ -1112,6 +1195,342 @@ class ContactFanoutReleaseOriginTests(unittest.TestCase):
 
         self._assert_origin_validation_rejected_without_writes(context)
 
+    def test_older_same_canonical_origin_rejects_wrong_superseding_successor(
+        self,
+    ):
+        context = self._seed_older_same_canonical_release_origin()
+        origin = context["selectedOrigin"]
+        stored = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[origin["fanout"]["fanoutId"]]
+        self.assertEqual("superseding", stored["state"])
+        wrong_successor = "f" * 64
+        self.assertNotEqual(
+            wrong_successor,
+            stored["supersedingContactSettlementHash"],
+        )
+        crossed = self.release.discovery._fanout(
+            stored,
+            superseding_contact_settlement_hash=wrong_successor,
+        )
+        self.assertEqual(
+            crossed,
+            self.module.validate_contact_fanout_head_document(
+                document=crossed
+            ),
+        )
+        self.release._replace(
+            context,
+            "contactOptOutFanoutHeads",
+            stored["fanoutId"],
+            crossed,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+
+    def test_older_same_canonical_origin_rejects_completion_after_immediate_release(
+        self,
+    ):
+        context = self._seed_older_same_canonical_release_origin()
+        origin = context["selectedOrigin"]
+        stored = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[origin["fanout"]["fanoutId"]]
+        self.assertEqual("superseding", stored["state"])
+        immediate_releases = [
+            settlement
+            for settlement in self.release._documents(
+                context,
+                "contactOptOutSettlements",
+            ).values()
+            if settlement["transitionKind"] == "authenticated_release"
+            and settlement["predecessorSettlementHash"]
+            == origin["contactSettlement"]["contactSettlementHash"]
+        ]
+        self.assertEqual(1, len(immediate_releases))
+        completed_at = "2026-08-04T12:06:05.000000Z"
+        self.assertGreater(
+            completed_at,
+            immediate_releases[0]["settledAt"],
+        )
+        impossible = self.release.discovery._fanout(
+            stored,
+            state="complete",
+            lease_owner_hash=None,
+            lease_until=None,
+            discovery_cursor_row_id=None,
+            cursor_processed_count=0,
+            superseding_contact_settlement_hash=None,
+            completion_binding_revision=stored["bindingRevision"],
+            completion_binding_head_hash=stored["bindingHeadHash"],
+            completion_binding_association_count=stored[
+                "bindingAssociationCount"
+            ],
+            completion_obligation_count=stored["obligationCount"],
+            completion_result_count=stored["resultCount"],
+            completed_at=completed_at,
+            updated_at=completed_at,
+        )
+        self.assertEqual(
+            impossible,
+            self.module.validate_contact_fanout_head_document(
+                document=impossible
+            ),
+        )
+        self.release._replace(
+            context,
+            "contactOptOutFanoutHeads",
+            stored["fanoutId"],
+            impossible,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+
+    def test_older_same_canonical_origin_rejects_successor_after_current_release(
+        self,
+    ):
+        context = self._seed_older_same_canonical_release_origin()
+        origin = context["selectedOrigin"]
+        settlement_id, successor, receipt = (
+            self._immediate_release_successor(context)
+        )
+        current_release = context["settlement"]
+        forged_at = "2026-08-04T12:07:30.000000Z"
+        self.assertEqual(
+            current_release["contactSettlementHash"],
+            context["obligation"]["expectedContactSettlementHash"],
+        )
+        self.assertGreater(forged_at, current_release["settledAt"])
+        self.assertLess(forged_at, context["releaseProcessedAt"])
+
+        rebuilt_successor = self.module.build_contact_settlement_document(
+            user_scope_hash=successor["userScopeHash"],
+            canonical_mailbox_identity_hash=successor[
+                "canonicalMailboxIdentityHash"
+            ],
+            generation=successor["generation"],
+            predecessor_settlement_hash=successor[
+                "predecessorSettlementHash"
+            ],
+            transition_kind=successor["transitionKind"],
+            contact_transition_id=successor["contactTransitionId"],
+            exact_identity_hash=successor["exactIdentityHash"],
+            authority_link=successor["authorityLink"],
+            actor_scope_hash=successor["actorScopeHash"],
+            reason_code=successor["reasonCode"],
+            settled_at=forged_at,
+        )
+        self.assertEqual(
+            rebuilt_successor,
+            self.module.validate_contact_settlement_document(
+                document=rebuilt_successor
+            ),
+        )
+        self.assertNotEqual(
+            successor["contactSettlementHash"],
+            rebuilt_successor["contactSettlementHash"],
+        )
+        forged_fanout_id = self.module._derive_contact_fanout_id(
+            user_scope_hash=context["scope"],
+            settlement_hash=rebuilt_successor["contactSettlementHash"],
+            outcome="release",
+        )
+        canonical_alias = self.release._documents(
+            context,
+            "contactOptOutAliases",
+        )[context["canonicalHash"]]
+        contact_afterimage = self.module.build_contact_head_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            state_revision=rebuilt_successor["generation"],
+            latest_generation=rebuilt_successor["generation"],
+            latest_settlement_hash=rebuilt_successor[
+                "contactSettlementHash"
+            ],
+            active_optout_settlement_hash=None,
+            state="released",
+            active_fanout_id=forged_fanout_id,
+            created_at=canonical_alias["createdAt"],
+            updated_at=forged_at,
+        )
+        stored_successor_fanout = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[receipt["resultingFanoutId"]]
+        fanout_afterimage = self.module.build_contact_fanout_head_document(
+            user_scope_hash=context["scope"],
+            fanout_id=forged_fanout_id,
+            outcome="release",
+            expected_contact_settlement_hash=rebuilt_successor[
+                "contactSettlementHash"
+            ],
+            state_revision=1,
+            state="discovering",
+            binding_revision=stored_successor_fanout["bindingRevision"],
+            binding_head_hash=stored_successor_fanout["bindingHeadHash"],
+            binding_association_count=stored_successor_fanout[
+                "bindingAssociationCount"
+            ],
+            discovery_cursor_row_id=None,
+            obligation_count=0,
+            result_count=0,
+            cursor_processed_count=0,
+            lease_owner_hash=None,
+            lease_until=None,
+            fencing_token=1,
+            superseding_contact_settlement_hash=None,
+            completion_binding_revision=None,
+            completion_binding_head_hash=None,
+            completion_binding_association_count=None,
+            completion_obligation_count=None,
+            completion_result_count=None,
+            completed_at=None,
+            created_at=forged_at,
+            updated_at=forged_at,
+        )
+        self.assertEqual(
+            contact_afterimage,
+            self.module.validate_contact_head_document(
+                document=contact_afterimage
+            ),
+        )
+        self.assertEqual(
+            fanout_afterimage,
+            self.module.validate_contact_fanout_head_document(
+                document=fanout_afterimage
+            ),
+        )
+        rebuilt_receipt = self._rebuild_successor_receipt(
+            receipt,
+            resulting_contact_settlement_hash=rebuilt_successor[
+                "contactSettlementHash"
+            ],
+            resulting_fanout_id=forged_fanout_id,
+            resulting_contact_head_hash=contact_afterimage[
+                "contactHeadHash"
+            ],
+            resulting_fanout_head_hash=fanout_afterimage[
+                "contactFanoutHeadHash"
+            ],
+            requested_at=forged_at,
+        )
+        self.release._replace(
+            context,
+            "contactOptOutSettlements",
+            settlement_id,
+            rebuilt_successor,
+        )
+        self.release._replace(
+            context,
+            "contactOptOutTransitionRequests",
+            rebuilt_receipt["contactTransitionId"],
+            rebuilt_receipt,
+        )
+        self.assertNotIn(
+            forged_fanout_id,
+            self.release._documents(context, "contactOptOutFanoutHeads"),
+        )
+        self.release._reference(
+            context,
+            "contactOptOutFanoutHeads",
+            forged_fanout_id,
+        ).create(fanout_afterimage)
+        stored_origin_fanout = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[origin["fanout"]["fanoutId"]]
+        crossed_origin_fanout = self.release.discovery._fanout(
+            stored_origin_fanout,
+            superseding_contact_settlement_hash=rebuilt_successor[
+                "contactSettlementHash"
+            ],
+            updated_at=forged_at,
+        )
+        self.assertEqual(
+            crossed_origin_fanout,
+            self.module.validate_contact_fanout_head_document(
+                document=crossed_origin_fanout
+            ),
+        )
+        self.release._replace(
+            context,
+            "contactOptOutFanoutHeads",
+            crossed_origin_fanout["fanoutId"],
+            crossed_origin_fanout,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+
+    def _assert_successor_receipt_afterimage_hash_rejected(
+        self,
+        *,
+        receipt_field,
+        builder_field,
+        forged_hash,
+    ):
+        context = self._seed_older_same_canonical_release_origin()
+        _settlement_id, _successor, receipt = (
+            self._immediate_release_successor(context)
+        )
+        self.assertNotEqual(forged_hash, receipt[receipt_field])
+        rebuilt = self._rebuild_successor_receipt(
+            receipt,
+            **{builder_field: forged_hash},
+        )
+        self.release._replace(
+            context,
+            "contactOptOutTransitionRequests",
+            rebuilt["contactTransitionId"],
+            rebuilt,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+
+    def test_older_same_canonical_origin_rejects_successor_receipt_contact_head_hash(
+        self,
+    ):
+        self._assert_successor_receipt_afterimage_hash_rejected(
+            receipt_field="resultingContactHeadHash",
+            builder_field="resulting_contact_head_hash",
+            forged_hash="f" * 64,
+        )
+
+    def test_older_same_canonical_origin_rejects_successor_receipt_fanout_head_hash(
+        self,
+    ):
+        self._assert_successor_receipt_afterimage_hash_rejected(
+            receipt_field="resultingFanoutHeadHash",
+            builder_field="resulting_fanout_head_hash",
+            forged_hash="e" * 64,
+        )
+
+    def test_current_origin_rejects_successor_receipt_fanout_head_hash(
+        self,
+    ):
+        context = self._seed_current_release_origin()
+        _settlement_id, _successor, receipt = (
+            self._immediate_release_successor(context)
+        )
+        forged_hash = "e" * 64
+        self.assertNotEqual(
+            forged_hash,
+            receipt["resultingFanoutHeadHash"],
+        )
+        rebuilt = self._rebuild_successor_receipt(
+            receipt,
+            resulting_fanout_head_hash=forged_hash,
+        )
+        self.release._replace(
+            context,
+            "contactOptOutTransitionRequests",
+            rebuilt["contactTransitionId"],
+            rebuilt,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+
     def test_release_rejects_apply_origin_timestamp_drift(self):
         cases = (
             ("applied", self._seed_current_release_origin),
@@ -1486,6 +1905,778 @@ class ContactFanoutReleaseOriginTests(unittest.TestCase):
             head["effectiveSettlementHash"],
         )
         self.assertEqual(3, len(self.release._writes(context["store"])))
+
+    def _seed_third_same_canonical_release_origin(self):
+        context = self.release._seed_release(prior_owner="human_decision")
+        effective_apply = deepcopy(context["applyResult"])
+        effective_head = deepcopy(self.release._row_head(context))
+        predecessor = context["prior"]
+        release_a = {
+            "settlement": deepcopy(context["settlement"]),
+            "fanout": deepcopy(context["fanout"]),
+        }
+
+        def create_dominated_optout(
+            source_id,
+            *,
+            requested_at,
+            leased_at,
+            discovered_at,
+            processed_at,
+        ):
+            bundle, _link = context["transition"]._seed_bundle(
+                context["store"],
+                source_id,
+                exact_hash=context["activeSettlement"][
+                    "exactIdentityHash"
+                ],
+            )
+            transition = context["transition"]._record(
+                context["store"],
+                bundle,
+                requested_at=requested_at,
+            )
+            self.assertEqual("created", transition["disposition"])
+            self.release._lease_and_discover(
+                context,
+                transition,
+                leased_at=leased_at,
+                discovered_at=discovered_at,
+            )
+            applied = self.release.apply._process(
+                context,
+                processed_at=processed_at,
+            )
+            self.assertEqual("dominated", applied["disposition"])
+            self.assertEqual("claim_dominated", applied["result"]["reasonCode"])
+            self.assertIsNone(applied["result"]["rowGeneration"])
+            self.assertEqual(effective_head, self.release._row_head(context))
+            context.update(
+                {
+                    "activeSettlement": transition["settlement"],
+                    "activeReceipt": transition["transitionRequest"],
+                    "activeFanout": applied["fanoutHead"],
+                    "fanout": applied["fanoutHead"],
+                }
+            )
+            return transition
+
+        epoch_b = create_dominated_optout(
+            "source-release-origin-epoch-b-three-chain",
+            requested_at="2026-08-04T12:06:40.000000Z",
+            leased_at="2026-08-04T12:06:50.000000Z",
+            discovered_at="2026-08-04T12:07:00.000000Z",
+            processed_at="2026-08-04T12:07:10.000000Z",
+        )
+        release_b_transition = self.release._release_transition(
+            context,
+            requested_at="2026-08-04T12:07:20.000000Z",
+        )
+        self.release._lease_and_discover(
+            context,
+            release_b_transition,
+            leased_at="2026-08-04T12:07:30.000000Z",
+            discovered_at="2026-08-04T12:07:40.000000Z",
+        )
+        release_b = {
+            "settlement": deepcopy(context["settlement"]),
+            "fanout": deepcopy(context["fanout"]),
+        }
+
+        epoch_c = create_dominated_optout(
+            "source-release-origin-epoch-c-three-chain",
+            requested_at="2026-08-04T12:08:00.000000Z",
+            leased_at="2026-08-04T12:08:10.000000Z",
+            discovered_at="2026-08-04T12:08:20.000000Z",
+            processed_at="2026-08-04T12:08:30.000000Z",
+        )
+        release_c_transition = self.release._release_transition(
+            context,
+            requested_at="2026-08-04T12:08:40.000000Z",
+        )
+        self.release._lease_and_discover(
+            context,
+            release_c_transition,
+            leased_at="2026-08-04T12:08:50.000000Z",
+            discovered_at="2026-08-04T12:09:00.000000Z",
+        )
+        context.update(
+            {
+                "beforeReleaseHead": deepcopy(
+                    self.release._row_head(context)
+                ),
+                "beforeFanout": deepcopy(context["fanout"]),
+                "releaseProcessedAt": "2026-08-04T12:09:10.000000Z",
+            }
+        )
+
+        self.assertEqual(
+            [1, 2, 3, 4, 5, 6],
+            sorted(
+                settlement["generation"]
+                for settlement in self.release._documents(
+                    context,
+                    "contactOptOutSettlements",
+                ).values()
+            ),
+        )
+        self.assertEqual(3, epoch_b["settlement"]["generation"])
+        self.assertEqual(5, epoch_c["settlement"]["generation"])
+        result_documents = self.release._documents(
+            context,
+            "contactOptOutFanoutResults",
+        )
+        stored_fanouts = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )
+        for unfinished in (release_a, release_b):
+            fanout_id = unfinished["fanout"]["fanoutId"]
+            self.assertEqual("superseding", stored_fanouts[fanout_id]["state"])
+            self.assertNotIn(
+                f"{fanout_id}--{context['rowId']}",
+                result_documents,
+            )
+        current_fanout_id = context["fanout"]["fanoutId"]
+        self.assertEqual("applying", stored_fanouts[current_fanout_id]["state"])
+        self.assertNotIn(
+            f"{current_fanout_id}--{context['rowId']}",
+            result_documents,
+        )
+        self.assertEqual(effective_head, context["beforeReleaseHead"])
+        context["store"].events.clear()
+
+        return {
+            "context": context,
+            "effectiveApply": effective_apply,
+            "effectiveHead": effective_head,
+            "predecessor": predecessor,
+            "releaseA": release_a,
+            "releaseB": release_b,
+            "epochB": epoch_b,
+            "epochC": epoch_c,
+        }
+
+    def test_third_same_canonical_release_restores_effective_apply_predecessor(
+        self,
+    ):
+        fixture = self._seed_third_same_canonical_release_origin()
+        context = fixture["context"]
+        effective_apply = fixture["effectiveApply"]
+        predecessor = fixture["predecessor"]
+
+        processed = self.release._process(
+            context,
+            processed_at=context["releaseProcessedAt"],
+        )
+
+        result = self.release._result(context)
+        head = self.release._row_head(context)
+        prior_generation = predecessor["generation"]
+        prior_settlement = predecessor["settlement"]
+        self.assertEqual("restore", processed["disposition"])
+        self.assertEqual("restore", result["disposition"])
+        self.assertEqual("exact_predecessor", result["reasonCode"])
+        self.assertEqual(
+            effective_apply["rowGeneration"],
+            result["releasedRowGeneration"],
+        )
+        self.assertEqual(
+            effective_apply["rowSettlementHash"],
+            result["releasedRowSettlementHash"],
+        )
+        self.assertEqual(
+            prior_generation["generation"],
+            result["restoredEffectiveGeneration"],
+        )
+        self.assertEqual(
+            prior_settlement["settlementHash"],
+            result["restoredEffectiveSettlementHash"],
+        )
+        self.assertEqual("settled", head["state"])
+        self.assertEqual("human_decision", head["effectiveOwnerKind"])
+        self.assertEqual(
+            prior_generation["generation"],
+            head["effectiveOwnerGeneration"],
+        )
+        self.assertEqual(
+            prior_generation["generationHash"],
+            head["effectiveOwnerGenerationHash"],
+        )
+        self.assertEqual(
+            prior_settlement["settlementHash"],
+            head["effectiveSettlementHash"],
+        )
+        self.assertEqual(
+            result["contactFanoutResultHash"],
+            head["latestOptOutReleaseResultHash"],
+        )
+        writes = self.release._writes(context["store"])
+        self.assertEqual(
+            [
+                ("set", "rowAuthorityHeads"),
+                ("create", "contactOptOutFanoutResults"),
+                ("set", "contactOptOutFanoutHeads"),
+            ],
+            [
+                (operation, path.split("/")[-2])
+                for operation, path, *_rest in writes
+            ],
+        )
+        self.assertEqual(head, writes[0][2])
+        self.assertEqual(result, writes[1][2])
+        self.assertEqual(processed["fanoutHead"], writes[2][2])
+
+    def test_multi_epoch_contact_chain_rejects_missing_intermediate_evidence(
+        self,
+    ):
+        for evidence_kind in ("settlement", "receipt"):
+            with self.subTest(evidence_kind=evidence_kind):
+                fixture = self._seed_third_same_canonical_release_origin()
+                context = fixture["context"]
+                intermediate = fixture["releaseB"]["settlement"]
+                if evidence_kind == "settlement":
+                    collection = "contactOptOutSettlements"
+                    document_id = (
+                        f"{context['canonicalHash']}--"
+                        f"{intermediate['generation']}"
+                    )
+                else:
+                    collection = "contactOptOutTransitionRequests"
+                    document_id = intermediate["contactTransitionId"]
+                self.release._delete(
+                    context,
+                    collection,
+                    document_id,
+                )
+                self.assertNotIn(
+                    document_id,
+                    self.release._documents(context, collection),
+                )
+
+                self._assert_origin_validation_rejected_without_writes(
+                    context
+                )
+                self.assertEqual(
+                    fixture["effectiveHead"],
+                    self.release._row_head(context),
+                )
+
+    def test_multi_epoch_contact_chain_rejects_schema_valid_intermediate_chronology(
+        self,
+    ):
+        fixture = self._seed_third_same_canonical_release_origin()
+        context = fixture["context"]
+        original = fixture["releaseB"]["settlement"]
+        receipt = self.release._documents(
+            context,
+            "contactOptOutTransitionRequests",
+        )[original["contactTransitionId"]]
+        forged_at = "2026-08-04T12:08:10.000000Z"
+        self.assertGreater(
+            forged_at,
+            fixture["epochC"]["settlement"]["settledAt"],
+        )
+        self.assertLess(forged_at, context["settlement"]["settledAt"])
+        rebuilt = self.module.build_contact_settlement_document(
+            user_scope_hash=original["userScopeHash"],
+            canonical_mailbox_identity_hash=original[
+                "canonicalMailboxIdentityHash"
+            ],
+            generation=original["generation"],
+            predecessor_settlement_hash=original[
+                "predecessorSettlementHash"
+            ],
+            transition_kind=original["transitionKind"],
+            contact_transition_id=original["contactTransitionId"],
+            exact_identity_hash=original["exactIdentityHash"],
+            authority_link=original["authorityLink"],
+            actor_scope_hash=original["actorScopeHash"],
+            reason_code=original["reasonCode"],
+            settled_at=forged_at,
+        )
+        self.assertEqual(
+            rebuilt,
+            self.module.validate_contact_settlement_document(
+                document=rebuilt
+            ),
+        )
+        rebuilt_fanout_id = self.module._derive_contact_fanout_id(
+            user_scope_hash=context["scope"],
+            settlement_hash=rebuilt["contactSettlementHash"],
+            outcome="release",
+        )
+        canonical_alias = self.release._documents(
+            context,
+            "contactOptOutAliases",
+        )[context["canonicalHash"]]
+        contact_afterimage = self.module.build_contact_head_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            state_revision=rebuilt["generation"],
+            latest_generation=rebuilt["generation"],
+            latest_settlement_hash=rebuilt["contactSettlementHash"],
+            active_optout_settlement_hash=None,
+            state="released",
+            active_fanout_id=rebuilt_fanout_id,
+            created_at=canonical_alias["createdAt"],
+            updated_at=forged_at,
+        )
+        stored_fanout = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[receipt["resultingFanoutId"]]
+        fanout_afterimage = self.module.build_contact_fanout_head_document(
+            user_scope_hash=context["scope"],
+            fanout_id=rebuilt_fanout_id,
+            outcome="release",
+            expected_contact_settlement_hash=rebuilt[
+                "contactSettlementHash"
+            ],
+            state_revision=1,
+            state="discovering",
+            binding_revision=stored_fanout["bindingRevision"],
+            binding_head_hash=stored_fanout["bindingHeadHash"],
+            binding_association_count=stored_fanout[
+                "bindingAssociationCount"
+            ],
+            discovery_cursor_row_id=None,
+            obligation_count=0,
+            result_count=0,
+            cursor_processed_count=0,
+            lease_owner_hash=None,
+            lease_until=None,
+            fencing_token=1,
+            superseding_contact_settlement_hash=None,
+            completion_binding_revision=None,
+            completion_binding_head_hash=None,
+            completion_binding_association_count=None,
+            completion_obligation_count=None,
+            completion_result_count=None,
+            completed_at=None,
+            created_at=forged_at,
+            updated_at=forged_at,
+        )
+        rebuilt_receipt = self._rebuild_successor_receipt(
+            receipt,
+            resulting_contact_settlement_hash=rebuilt[
+                "contactSettlementHash"
+            ],
+            resulting_fanout_id=rebuilt_fanout_id,
+            resulting_contact_head_hash=contact_afterimage[
+                "contactHeadHash"
+            ],
+            resulting_fanout_head_hash=fanout_afterimage[
+                "contactFanoutHeadHash"
+            ],
+            requested_at=forged_at,
+        )
+        self.assertEqual(
+            original["contactTransitionId"],
+            rebuilt_receipt["contactTransitionId"],
+        )
+        self.release._replace(
+            context,
+            "contactOptOutSettlements",
+            f"{context['canonicalHash']}--{rebuilt['generation']}",
+            rebuilt,
+        )
+        self.release._replace(
+            context,
+            "contactOptOutTransitionRequests",
+            rebuilt_receipt["contactTransitionId"],
+            rebuilt_receipt,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+        self.assertEqual(
+            fixture["effectiveHead"],
+            self.release._row_head(context),
+        )
+
+    def test_multi_epoch_contact_chain_rejects_intermediate_receipt_fanout_head_hash(
+        self,
+    ):
+        fixture = self._seed_third_same_canonical_release_origin()
+        context = fixture["context"]
+        intermediate = fixture["releaseB"]["settlement"]
+        receipt = self.release._documents(
+            context,
+            "contactOptOutTransitionRequests",
+        )[intermediate["contactTransitionId"]]
+        forged_hash = "e" * 64
+        self.assertNotEqual(
+            forged_hash,
+            receipt["resultingFanoutHeadHash"],
+        )
+        rebuilt = self._rebuild_successor_receipt(
+            receipt,
+            resulting_fanout_head_hash=forged_hash,
+        )
+        self.assertEqual(
+            intermediate["contactTransitionId"],
+            rebuilt["contactTransitionId"],
+        )
+        self.release._replace(
+            context,
+            "contactOptOutTransitionRequests",
+            rebuilt["contactTransitionId"],
+            rebuilt,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+        self.assertEqual(
+            fixture["effectiveHead"],
+            self.release._row_head(context),
+        )
+
+    def test_multi_epoch_contact_chain_rejects_unreachable_intermediate_fanout_binding(
+        self,
+    ):
+        fixture = self._seed_third_same_canonical_release_origin()
+        context = fixture["context"]
+        intermediate = fixture["releaseB"]["settlement"]
+        fanout_id = self.module._derive_contact_fanout_id(
+            user_scope_hash=context["scope"],
+            settlement_hash=intermediate["contactSettlementHash"],
+            outcome="release",
+        )
+        original = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[fanout_id]
+        forged = self.module.build_contact_fanout_head_document(
+            user_scope_hash=original["userScopeHash"],
+            fanout_id=original["fanoutId"],
+            outcome=original["outcome"],
+            expected_contact_settlement_hash=original[
+                "expectedContactSettlementHash"
+            ],
+            state_revision=original["stateRevision"],
+            state=original["state"],
+            binding_revision=2,
+            binding_head_hash="f" * 64,
+            binding_association_count=2,
+            discovery_cursor_row_id=original["discoveryCursorRowId"],
+            obligation_count=original["obligationCount"],
+            result_count=original["resultCount"],
+            cursor_processed_count=original["cursorProcessedCount"],
+            lease_owner_hash=original["leaseOwnerHash"],
+            lease_until=original["leaseUntil"],
+            fencing_token=original["fencingToken"],
+            superseding_contact_settlement_hash=original[
+                "supersedingContactSettlementHash"
+            ],
+            completion_binding_revision=original[
+                "completionBindingRevision"
+            ],
+            completion_binding_head_hash=original[
+                "completionBindingHeadHash"
+            ],
+            completion_binding_association_count=original[
+                "completionBindingAssociationCount"
+            ],
+            completion_obligation_count=original[
+                "completionObligationCount"
+            ],
+            completion_result_count=original["completionResultCount"],
+            completed_at=original["completedAt"],
+            created_at=original["createdAt"],
+            updated_at=original["updatedAt"],
+        )
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.assertNotEqual(
+            original["contactFanoutHeadHash"],
+            forged["contactFanoutHeadHash"],
+        )
+        self.release._replace(
+            context,
+            "contactOptOutFanoutHeads",
+            fanout_id,
+            forged,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+        self.assertEqual(
+            fixture["effectiveHead"],
+            self.release._row_head(context),
+        )
+
+    def test_multi_epoch_contact_chain_rejects_equal_time_binding_ambiguity(
+        self,
+    ):
+        fixture = self._seed_third_same_canonical_release_origin()
+        context = fixture["context"]
+        intermediate = fixture["releaseB"]["settlement"]
+        receipt = self.release._documents(
+            context,
+            "contactOptOutTransitionRequests",
+        )[intermediate["contactTransitionId"]]
+        binding_heads = self.release._documents(
+            context,
+            "contactRowBindingHeads",
+        )
+        original_head = binding_heads[context["canonicalHash"]]
+        late_edge = self.module.build_contact_row_binding_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            row_id="sr1_00000000000140018000000000000002",
+            created_at=receipt["requestedAt"],
+        )
+        advanced_head = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            state_revision=original_head["stateRevision"] + 1,
+            association_count=original_head["associationCount"] + 1,
+            last_association_hash=late_edge["contactRowEdgeHash"],
+            created_at=original_head["createdAt"],
+            updated_at=receipt["requestedAt"],
+        )
+        fanout_id = receipt["resultingFanoutId"]
+        original_fanout = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[fanout_id]
+        post_edge_creation = self.module.build_contact_fanout_head_document(
+            user_scope_hash=context["scope"],
+            fanout_id=fanout_id,
+            outcome="release",
+            expected_contact_settlement_hash=intermediate[
+                "contactSettlementHash"
+            ],
+            state_revision=1,
+            state="discovering",
+            binding_revision=advanced_head["stateRevision"],
+            binding_head_hash=advanced_head["contactRowBindingHeadHash"],
+            binding_association_count=advanced_head["associationCount"],
+            discovery_cursor_row_id=None,
+            obligation_count=0,
+            result_count=0,
+            cursor_processed_count=0,
+            lease_owner_hash=None,
+            lease_until=None,
+            fencing_token=1,
+            superseding_contact_settlement_hash=None,
+            completion_binding_revision=None,
+            completion_binding_head_hash=None,
+            completion_binding_association_count=None,
+            completion_obligation_count=None,
+            completion_result_count=None,
+            completed_at=None,
+            created_at=receipt["requestedAt"],
+            updated_at=receipt["requestedAt"],
+        )
+        forged_receipt = self._rebuild_successor_receipt(
+            receipt,
+            resulting_fanout_head_hash=post_edge_creation[
+                "contactFanoutHeadHash"
+            ],
+        )
+        advanced_fanout = self.module.build_contact_fanout_head_document(
+            user_scope_hash=original_fanout["userScopeHash"],
+            fanout_id=original_fanout["fanoutId"],
+            outcome=original_fanout["outcome"],
+            expected_contact_settlement_hash=original_fanout[
+                "expectedContactSettlementHash"
+            ],
+            state_revision=original_fanout["stateRevision"],
+            state=original_fanout["state"],
+            binding_revision=advanced_head["stateRevision"],
+            binding_head_hash=advanced_head["contactRowBindingHeadHash"],
+            binding_association_count=advanced_head["associationCount"],
+            discovery_cursor_row_id=original_fanout[
+                "discoveryCursorRowId"
+            ],
+            obligation_count=original_fanout["obligationCount"],
+            result_count=original_fanout["resultCount"],
+            cursor_processed_count=original_fanout[
+                "cursorProcessedCount"
+            ],
+            lease_owner_hash=original_fanout["leaseOwnerHash"],
+            lease_until=original_fanout["leaseUntil"],
+            fencing_token=original_fanout["fencingToken"],
+            superseding_contact_settlement_hash=original_fanout[
+                "supersedingContactSettlementHash"
+            ],
+            completion_binding_revision=original_fanout[
+                "completionBindingRevision"
+            ],
+            completion_binding_head_hash=original_fanout[
+                "completionBindingHeadHash"
+            ],
+            completion_binding_association_count=original_fanout[
+                "completionBindingAssociationCount"
+            ],
+            completion_obligation_count=original_fanout[
+                "completionObligationCount"
+            ],
+            completion_result_count=original_fanout[
+                "completionResultCount"
+            ],
+            completed_at=original_fanout["completedAt"],
+            created_at=original_fanout["createdAt"],
+            updated_at=original_fanout["updatedAt"],
+        )
+        self.assertEqual(late_edge["createdAt"], receipt["requestedAt"])
+        self.assertEqual(
+            advanced_head,
+            self.module.validate_contact_row_binding_head_document(
+                document=advanced_head
+            ),
+        )
+        self.assertNotEqual(
+            receipt["resultingFanoutHeadHash"],
+            forged_receipt["resultingFanoutHeadHash"],
+        )
+        self.release._replace(
+            context,
+            "contactRowBindings",
+            late_edge["edgeId"],
+            late_edge,
+        )
+        self.release._replace(
+            context,
+            "contactRowBindingHeads",
+            context["canonicalHash"],
+            advanced_head,
+        )
+        self.release._replace(
+            context,
+            "contactOptOutTransitionRequests",
+            forged_receipt["contactTransitionId"],
+            forged_receipt,
+        )
+        self.release._replace(
+            context,
+            "contactOptOutFanoutHeads",
+            fanout_id,
+            advanced_fanout,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+        self.assertEqual(
+            fixture["effectiveHead"],
+            self.release._row_head(context),
+        )
+
+    def test_multi_epoch_contact_chain_rejects_post_cutover_fanout_binding(
+        self,
+    ):
+        fixture = self._seed_third_same_canonical_release_origin()
+        context = fixture["context"]
+        intermediate = fixture["releaseB"]["settlement"]
+        successor = fixture["epochC"]["settlement"]
+        late_at = "2026-08-04T12:08:10.000000Z"
+        self.assertGreater(late_at, successor["settledAt"])
+        binding_heads = self.release._documents(
+            context,
+            "contactRowBindingHeads",
+        )
+        original_head = binding_heads[context["canonicalHash"]]
+        late_edge = self.module.build_contact_row_binding_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            row_id="sr1_00000000000140018000000000000002",
+            created_at=late_at,
+        )
+        advanced_head = self.module.build_contact_row_binding_head_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            state_revision=original_head["stateRevision"] + 1,
+            association_count=original_head["associationCount"] + 1,
+            last_association_hash=late_edge["contactRowEdgeHash"],
+            created_at=original_head["createdAt"],
+            updated_at=late_at,
+        )
+        fanout_id = self.module._derive_contact_fanout_id(
+            user_scope_hash=context["scope"],
+            settlement_hash=intermediate["contactSettlementHash"],
+            outcome="release",
+        )
+        original_fanout = self.release._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[fanout_id]
+        forged_fanout = self.module.build_contact_fanout_head_document(
+            user_scope_hash=original_fanout["userScopeHash"],
+            fanout_id=original_fanout["fanoutId"],
+            outcome=original_fanout["outcome"],
+            expected_contact_settlement_hash=original_fanout[
+                "expectedContactSettlementHash"
+            ],
+            state_revision=original_fanout["stateRevision"] + 1,
+            state=original_fanout["state"],
+            binding_revision=advanced_head["stateRevision"],
+            binding_head_hash=advanced_head["contactRowBindingHeadHash"],
+            binding_association_count=advanced_head["associationCount"],
+            discovery_cursor_row_id=original_fanout[
+                "discoveryCursorRowId"
+            ],
+            obligation_count=original_fanout["obligationCount"],
+            result_count=original_fanout["resultCount"],
+            cursor_processed_count=original_fanout[
+                "cursorProcessedCount"
+            ],
+            lease_owner_hash=original_fanout["leaseOwnerHash"],
+            lease_until=original_fanout["leaseUntil"],
+            fencing_token=original_fanout["fencingToken"],
+            superseding_contact_settlement_hash=original_fanout[
+                "supersedingContactSettlementHash"
+            ],
+            completion_binding_revision=original_fanout[
+                "completionBindingRevision"
+            ],
+            completion_binding_head_hash=original_fanout[
+                "completionBindingHeadHash"
+            ],
+            completion_binding_association_count=original_fanout[
+                "completionBindingAssociationCount"
+            ],
+            completion_obligation_count=original_fanout[
+                "completionObligationCount"
+            ],
+            completion_result_count=original_fanout[
+                "completionResultCount"
+            ],
+            completed_at=original_fanout["completedAt"],
+            created_at=original_fanout["createdAt"],
+            updated_at=late_at,
+        )
+        self.assertEqual(
+            forged_fanout,
+            self.module.validate_contact_fanout_head_document(
+                document=forged_fanout
+            ),
+        )
+        self.release._replace(
+            context,
+            "contactRowBindings",
+            late_edge["edgeId"],
+            late_edge,
+        )
+        self.release._replace(
+            context,
+            "contactRowBindingHeads",
+            context["canonicalHash"],
+            advanced_head,
+        )
+        self.release._replace(
+            context,
+            "contactOptOutFanoutHeads",
+            fanout_id,
+            forged_fanout,
+        )
+
+        self._assert_origin_validation_rejected_without_writes(context)
+        self.assertEqual(
+            fixture["effectiveHead"],
+            self.release._row_head(context),
+        )
 
     def test_stale_release_cannot_clear_later_same_canonical_epoch(self):
         context = self.release._seed_release(apply_outcome="not_applied")

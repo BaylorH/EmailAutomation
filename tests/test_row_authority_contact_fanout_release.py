@@ -2286,6 +2286,729 @@ class ContactFanoutReleaseTests(unittest.TestCase):
         self.assertEqual([], self._writes(context["store"]))
         self.assertIn(("commit_applied", 0), context["store"].events)
 
+    def test_release_cursor_retry_after_hidden_late_reset_is_exact(self):
+        context = self._seed_release_scan(34, result_count=32)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        sentinel_row = context["rows"][32]
+        unprocessed_row = context["rows"][33]
+
+        context["rowId"] = sentinel_row
+        cursor_advance = self._process(context)
+        self.assertEqual("cursor_advanced", cursor_advance["disposition"])
+        self.assertEqual(
+            32,
+            cursor_advance["fanoutHead"]["cursorProcessedCount"],
+        )
+        context["fanout"] = cursor_advance["fanoutHead"]
+        sentinel_result = self._process(
+            context,
+            processed_at="2026-08-04T12:06:40.000000Z",
+        )
+        self.assertEqual("noop", sentinel_result["disposition"])
+        context["fanout"] = sentinel_result["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(35)
+        thread_id = "thread-release-cursor-replay-hidden-late-reset"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        context["fanout"] = late._current_fanout(
+            context,
+            original_expected["fanoutId"],
+        )
+        self.assertIsNone(context["fanout"]["discoveryCursorRowId"])
+        self.assertEqual(35, context["fanout"]["obligationCount"])
+        self.assertEqual(34, context["fanout"]["resultCount"])
+        unprocessed_result_id = (
+            f"{context['fanout']['fanoutId']}--{unprocessed_row}"
+        )
+        self.assertNotIn(
+            unprocessed_result_id,
+            self._documents(context, "contactOptOutFanoutResults"),
+        )
+        context["rowId"] = sentinel_row
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        retry = self._process(
+            context,
+            expected_fanout_head=original_expected,
+            processed_at=self.processed_at,
+        )
+
+        self.assertEqual(cursor_advance, retry)
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+        self.assertIn(("commit_applied", 0), context["store"].events)
+
+    def test_release_cursor_retry_after_binding_change_rejects_missing_prefix(
+        self,
+    ):
+        context = self._seed_release_scan(34, result_count=32)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        sentinel_row = context["rows"][32]
+        missing_row = context["rows"][33]
+
+        context["rowId"] = sentinel_row
+        cursor_advance = self._process(context)
+        self.assertEqual("cursor_advanced", cursor_advance["disposition"])
+        self.assertEqual(
+            32,
+            cursor_advance["fanoutHead"]["cursorProcessedCount"],
+        )
+        context["fanout"] = cursor_advance["fanoutHead"]
+        sentinel_result = self._process(
+            context,
+            processed_at="2026-08-04T12:06:40.000000Z",
+        )
+        self.assertEqual("noop", sentinel_result["disposition"])
+        context["fanout"] = sentinel_result["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(35)
+        thread_id = "thread-release-cursor-replay-late-prefix"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        current = late._current_fanout(
+            context,
+            original_expected["fanoutId"],
+        )
+        missing_result_id = f"{current['fanoutId']}--{missing_row}"
+        self.assertNotIn(
+            missing_result_id,
+            self._documents(context, "contactOptOutFanoutResults"),
+        )
+        self.assertEqual(35, current["obligationCount"])
+        self.assertEqual(34, current["resultCount"])
+        self.assertIsNone(current["discoveryCursorRowId"])
+
+        forged = self.discovery._fanout(
+            current,
+            state_revision=current["stateRevision"] + 1,
+            discovery_cursor_row_id=missing_row,
+            cursor_processed_count=34,
+            updated_at="2026-08-04T12:07:05.000000Z",
+        )
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.discovery._store_fanout(context, forged)
+        context["fanout"] = forged
+        context["rowId"] = sentinel_row
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at=self.processed_at,
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
+    def test_release_cursor_retry_rejects_missing_prefix_without_binding_change(
+        self,
+    ):
+        context = self._seed_release_scan(34, result_count=32)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        sentinel_row = context["rows"][32]
+        missing_row = context["rows"][33]
+
+        context["rowId"] = sentinel_row
+        cursor_advance = self._process(context)
+        self.assertEqual("cursor_advanced", cursor_advance["disposition"])
+        context["fanout"] = cursor_advance["fanoutHead"]
+        sentinel_result = self._process(
+            context,
+            processed_at="2026-08-04T12:06:40.000000Z",
+        )
+        self.assertEqual("noop", sentinel_result["disposition"])
+        current = sentinel_result["fanoutHead"]
+        missing_result_id = f"{current['fanoutId']}--{missing_row}"
+        self.assertNotIn(
+            missing_result_id,
+            self._documents(context, "contactOptOutFanoutResults"),
+        )
+        self.assertEqual(34, current["obligationCount"])
+        self.assertEqual(33, current["resultCount"])
+
+        forged = self.discovery._fanout(
+            current,
+            state_revision=current["stateRevision"] + 1,
+            discovery_cursor_row_id=missing_row,
+            cursor_processed_count=34,
+            updated_at="2026-08-04T12:06:50.000000Z",
+        )
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.discovery._store_fanout(context, forged)
+        context["fanout"] = forged
+        context["rowId"] = sentinel_row
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at=self.processed_at,
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
+    def test_release_binding_changed_retry_rejects_cursor_covering_missing_row(
+        self,
+    ):
+        context = self._seed_release_scan(2, result_count=0)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        context["rowId"] = context["rows"][0]
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(3)
+        thread_id = "thread-release-replay-cursor-missing-row"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        current = late._current_fanout(
+            context,
+            first["fanoutHead"]["fanoutId"],
+        )
+        missing_result_id = f"{current['fanoutId']}--{context['rows'][1]}"
+        self.assertNotIn(
+            missing_result_id,
+            self._documents(context, "contactOptOutFanoutResults"),
+        )
+        forged = self.discovery._fanout(
+            current,
+            state_revision=current["stateRevision"] + 1,
+            discovery_cursor_row_id=context["rows"][1],
+            cursor_processed_count=2,
+            updated_at="2026-08-04T12:07:05.000000Z",
+        )
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.discovery._store_fanout(context, forged)
+        context["fanout"] = forged
+        context["rowId"] = context["rows"][0]
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at="2026-08-04T12:07:10.000000Z",
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
+    def test_release_binding_changed_retry_rejects_null_cursor_hiding_progress(
+        self,
+    ):
+        context = self._seed_release_scan(3, result_count=0)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        context["rowId"] = context["rows"][0]
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(4)
+        thread_id = "thread-release-replay-null-cursor-hidden-progress"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        context["fanout"] = late._current_fanout(
+            context,
+            original_expected["fanoutId"],
+        )
+        self.assertEqual(4, context["fanout"]["obligationCount"])
+        self.assertEqual(2, context["fanout"]["resultCount"])
+        self.assertIsNone(context["fanout"]["discoveryCursorRowId"])
+        self.assertEqual(0, context["fanout"]["cursorProcessedCount"])
+
+        context["rowId"] = context["rows"][1]
+        second = self._process(
+            context,
+            processed_at="2026-08-04T12:07:10.000000Z",
+        )
+        current = second["fanoutHead"]
+        self.assertEqual(context["rows"][1], current["discoveryCursorRowId"])
+        self.assertEqual(2, current["cursorProcessedCount"])
+        self.assertEqual(4, current["obligationCount"])
+        self.assertEqual(3, current["resultCount"])
+
+        forged = self.discovery._fanout(
+            current,
+            state_revision=current["stateRevision"] + 1,
+            discovery_cursor_row_id=None,
+            cursor_processed_count=0,
+            updated_at="2026-08-04T12:07:20.000000Z",
+        )
+        self.assertEqual("applying", forged["state"])
+        self.assertLess(forged["resultCount"], forged["obligationCount"])
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.discovery._store_fanout(context, forged)
+        context["fanout"] = forged
+        context["rowId"] = context["rows"][0]
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at="2026-08-04T12:07:30.000000Z",
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
+    def test_release_row1_retry_after_off_page_late_row_is_exact(self):
+        context = self._seed_release_scan(33, result_count=0)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        context["rowId"] = context["rows"][0]
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(34)
+        self.assertGreater(late_row, context["rows"][-1])
+        thread_id = "thread-release-replay-off-page-late-row"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        context["fanout"] = late._current_fanout(
+            context,
+            first["fanoutHead"]["fanoutId"],
+        )
+        self.assertEqual(34, context["fanout"]["obligationCount"])
+        self.assertEqual(2, context["fanout"]["resultCount"])
+        context["rowId"] = context["rows"][0]
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        retry = self._process(
+            context,
+            expected_fanout_head=original_expected,
+            processed_at="2026-08-04T12:07:10.000000Z",
+        )
+
+        self.assertEqual(first, retry)
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+        self.assertIn(("commit_applied", 0), context["store"].events)
+
+    def test_release_binding_changed_retry_rejects_unwitnessed_off_page_result(
+        self,
+    ):
+        context = self._seed_release_scan(33, result_count=0)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        context["rowId"] = context["rows"][0]
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(34)
+        thread_id = "thread-release-replay-unwitnessed-off-page-result"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        current = late._current_fanout(
+            context,
+            original_expected["fanoutId"],
+        )
+        self.assertEqual(34, current["obligationCount"])
+        self.assertEqual(2, current["resultCount"])
+        off_page_result_id = (
+            f"{current['fanoutId']}--{context['rows'][-1]}"
+        )
+        self.assertNotIn(
+            off_page_result_id,
+            self._documents(context, "contactOptOutFanoutResults"),
+        )
+
+        forged = self.discovery._fanout(
+            current,
+            state_revision=current["stateRevision"] + 1,
+            result_count=3,
+            updated_at="2026-08-04T12:07:05.000000Z",
+        )
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.discovery._store_fanout(context, forged)
+        context["fanout"] = forged
+        context["rowId"] = context["rows"][0]
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at="2026-08-04T12:07:10.000000Z",
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
+    def test_release_retry_rejects_missing_off_page_late_work_artifact(self):
+        cases = (
+            ("obligation", "contactOptOutFanoutObligations"),
+            ("result", "contactOptOutFanoutResults"),
+        )
+        for label, collection in cases:
+            with self.subTest(artifact=label):
+                context = self._seed_release_scan(33, result_count=0)
+                self._materialize_scan_rows(context)
+                original_expected = deepcopy(context["fanout"])
+                context["rowId"] = context["rows"][0]
+                first = self._process(context)
+                context["fanout"] = first["fanoutHead"]
+
+                late_type = importlib.import_module(
+                    "tests.test_row_authority_contact_late_release"
+                ).ContactLateReleaseAssociationTests
+                late_type.setUpClass()
+                late = late_type(methodName="runTest")
+                late.setUp()
+                late_row = _row_id(34)
+                thread_id = (
+                    f"thread-release-replay-missing-off-page-{label}"
+                )
+                late._seed_prerequisites(
+                    context,
+                    row_id=late_row,
+                    thread_id=thread_id,
+                )
+                associated = late._associate(
+                    context,
+                    row_id=late_row,
+                    thread_id=thread_id,
+                )
+                self.assertEqual("created", associated["disposition"])
+                context["fanout"] = late._current_fanout(
+                    context,
+                    original_expected["fanoutId"],
+                )
+                artifact_id = (
+                    f"{context['fanout']['fanoutId']}--{late_row}"
+                )
+                self._delete(context, collection, artifact_id)
+                self.assertNotIn(
+                    artifact_id,
+                    self._documents(context, collection),
+                )
+                context["rowId"] = context["rows"][0]
+                committed = deepcopy(context["store"].data)
+                context["store"].events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityError):
+                    self._process(
+                        context,
+                        expected_fanout_head=original_expected,
+                        processed_at="2026-08-04T12:07:10.000000Z",
+                    )
+
+                self.assertEqual(committed, context["store"].data)
+                self.assertEqual([], self._writes(context["store"]))
+
+    def test_release_retry_rejects_visible_late_artifact_timestamp_drift(
+        self,
+    ):
+        context = self._seed_release_scan(2, result_count=0)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        context["rowId"] = context["rows"][0]
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(3)
+        thread_id = "thread-release-replay-visible-late-time-drift"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        current = late._current_fanout(
+            context,
+            original_expected["fanoutId"],
+        )
+        artifact_id = f"{current['fanoutId']}--{late_row}"
+        obligation = self._documents(
+            context,
+            "contactOptOutFanoutObligations",
+        )[artifact_id]
+        result = self._documents(
+            context,
+            "contactOptOutFanoutResults",
+        )[artifact_id]
+        drifted_at = "2026-08-04T12:07:02.000000Z"
+        drifted_obligation = (
+            self.module.build_contact_fanout_obligation_document(
+                user_scope_hash=obligation["userScopeHash"],
+                fanout_id=obligation["fanoutId"],
+                row_id=obligation["rowId"],
+                contact_row_edge_hash=obligation["contactRowEdgeHash"],
+                expected_contact_settlement_hash=obligation[
+                    "expectedContactSettlementHash"
+                ],
+                outcome=obligation["outcome"],
+                created_at=drifted_at,
+            )
+        )
+        drifted_result = self.module.build_contact_fanout_result_document(
+            user_scope_hash=result["userScopeHash"],
+            fanout_id=result["fanoutId"],
+            row_id=result["rowId"],
+            obligation_hash=drifted_obligation[
+                "contactFanoutObligationHash"
+            ],
+            outcome=result["outcome"],
+            disposition=result["disposition"],
+            reason_code=result["reasonCode"],
+            observed_row_head_hash=result["observedRowHeadHash"],
+            claim_request_id=result["claimRequestId"],
+            claim_set_hash=result["claimSetHash"],
+            row_generation=result["rowGeneration"],
+            row_settlement_hash=result["rowSettlementHash"],
+            released_row_generation=result["releasedRowGeneration"],
+            released_row_settlement_hash=result[
+                "releasedRowSettlementHash"
+            ],
+            restored_effective_generation=result[
+                "restoredEffectiveGeneration"
+            ],
+            restored_effective_settlement_hash=result[
+                "restoredEffectiveSettlementHash"
+            ],
+            created_at=drifted_at,
+        )
+        self._replace(
+            context,
+            "contactOptOutFanoutObligations",
+            artifact_id,
+            drifted_obligation,
+        )
+        self._replace(
+            context,
+            "contactOptOutFanoutResults",
+            artifact_id,
+            drifted_result,
+        )
+        forged = self.discovery._fanout(
+            current,
+            state_revision=current["stateRevision"] + 1,
+            updated_at=drifted_at,
+        )
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.assertLess(
+            associated["association"]["createdAt"],
+            drifted_obligation["createdAt"],
+        )
+        self.discovery._store_fanout(context, forged)
+        context["fanout"] = forged
+        context["rowId"] = context["rows"][0]
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at="2026-08-04T12:07:10.000000Z",
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
+    def test_release_old_head_retry_rejects_target_processed_after_binding_reset(
+        self,
+    ):
+        context = self._seed_release_scan(2, result_count=0)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(3)
+        thread_id = "thread-release-replay-late-before-target"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        context["fanout"] = late._current_fanout(
+            context,
+            original_expected["fanoutId"],
+        )
+
+        context["rowId"] = context["rows"][0]
+        processed_after_reset = self._process(
+            context,
+            processed_at="2026-08-04T12:07:10.000000Z",
+        )
+        context["fanout"] = processed_after_reset["fanoutHead"]
+        self.assertGreater(
+            processed_after_reset["fanoutHead"]["bindingAssociationCount"],
+            original_expected["bindingAssociationCount"],
+        )
+        self.assertGreater(
+            processed_after_reset["result"]["createdAt"],
+            associated["bindingHead"]["updatedAt"],
+        )
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at="2026-08-04T12:07:20.000000Z",
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
     def test_release_same_obligation_two_worker_cas_converges_exactly_once(self):
         context = self._seed_release(prior_owner="human_decision")
         context["store"].before_commit_barrier = Barrier(2)
@@ -2592,6 +3315,345 @@ class ContactFanoutReleaseTests(unittest.TestCase):
         self.assertEqual([], self._writes(context["store"]))
         self.assertIn(("commit_applied", 0), context["store"].events)
 
+    def test_release_result_retry_after_two_complete_late_recertifications_is_exact(
+        self,
+    ):
+        context = self._seed_release(prior_owner="human_decision")
+        original_expected = deepcopy(context["fanout"])
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+        certified = self.completion._certify(
+            context,
+            certified_at="2026-08-04T12:06:40.000000Z",
+        )
+        self.assertEqual("certification_complete", certified["disposition"])
+        context["fanout"] = certified["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        for ordinal, associated_at in enumerate(
+            (
+                "2026-08-04T12:07:00.000000Z",
+                "2026-08-04T12:07:10.000000Z",
+            ),
+            start=2,
+        ):
+            late_row = _row_id(ordinal)
+            thread_id = f"thread-release-replay-complete-late-{ordinal}"
+            late._seed_prerequisites(
+                context,
+                row_id=late_row,
+                thread_id=thread_id,
+            )
+            late.associated_at = associated_at
+            associated = late._associate(
+                context,
+                row_id=late_row,
+                thread_id=thread_id,
+            )
+            self.assertEqual("created", associated["disposition"])
+            context["fanout"] = late._current_fanout(
+                context,
+                first["fanoutHead"]["fanoutId"],
+            )
+        self.assertEqual("complete", context["fanout"]["state"])
+        self.assertEqual(
+            original_expected["bindingAssociationCount"] + 2,
+            context["fanout"]["bindingAssociationCount"],
+        )
+        self.assertEqual(
+            original_expected["bindingAssociationCount"],
+            context["fanout"]["completionBindingAssociationCount"],
+        )
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        retry = self._process(
+            context,
+            expected_fanout_head=original_expected,
+            processed_at="2026-08-04T12:07:20.000000Z",
+        )
+
+        self.assertEqual(first, retry)
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+        self.assertIn(("commit_applied", 0), context["store"].events)
+
+    def test_release_result_retry_after_renewal_and_two_complete_late_recertifications_is_exact(
+        self,
+    ):
+        context = self._seed_release(prior_owner="human_decision")
+        original_expected = deepcopy(context["fanout"])
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+
+        renewed = context["transition"]._authority(
+            context["store"]
+        ).acquire_contact_fanout_lease(
+            verified_user_id=context["transition"].fixture.user_id,
+            fanout_id=context["fanout"]["fanoutId"],
+            expected_fanout_head=context["fanout"],
+            lease_owner_hash=self.discovery.lease_owner,
+            lease_until="2026-08-04T12:11:00.000000Z",
+            acquired_at="2026-08-04T12:06:35.000000Z",
+        )
+        self.assertEqual("renewed", renewed["disposition"])
+        self.assertEqual(
+            first["fanoutHead"]["stateRevision"] + 1,
+            renewed["fanoutHead"]["stateRevision"],
+        )
+        self.assertEqual(
+            first["fanoutHead"]["fencingToken"] + 1,
+            renewed["fanoutHead"]["fencingToken"],
+        )
+        context["fanout"] = renewed["fanoutHead"]
+
+        certified = self.completion._certify(
+            context,
+            certified_at="2026-08-04T12:06:40.000000Z",
+        )
+        self.assertEqual("certification_complete", certified["disposition"])
+        context["fanout"] = certified["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        for ordinal, associated_at in enumerate(
+            (
+                "2026-08-04T12:07:00.000000Z",
+                "2026-08-04T12:07:10.000000Z",
+            ),
+            start=2,
+        ):
+            late_row = _row_id(ordinal)
+            thread_id = (
+                f"thread-release-replay-renew-complete-late-{ordinal}"
+            )
+            late._seed_prerequisites(
+                context,
+                row_id=late_row,
+                thread_id=thread_id,
+            )
+            late.associated_at = associated_at
+            associated = late._associate(
+                context,
+                row_id=late_row,
+                thread_id=thread_id,
+            )
+            self.assertEqual("created", associated["disposition"])
+            context["fanout"] = late._current_fanout(
+                context,
+                first["fanoutHead"]["fanoutId"],
+            )
+        self.assertEqual("complete", context["fanout"]["state"])
+        self.assertEqual(
+            original_expected["bindingAssociationCount"] + 2,
+            context["fanout"]["bindingAssociationCount"],
+        )
+        self.assertEqual(
+            original_expected["bindingAssociationCount"],
+            context["fanout"]["completionBindingAssociationCount"],
+        )
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        retry = self._process(
+            context,
+            expected_fanout_head=original_expected,
+            processed_at="2026-08-04T12:07:20.000000Z",
+        )
+
+        self.assertEqual(first, retry)
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+        self.assertIn(("commit_applied", 0), context["store"].events)
+
+        current = context["fanout"]
+        for label, overrides in (
+            (
+                "revision-only",
+                {"state_revision": current["stateRevision"] + 1},
+            ),
+            (
+                "fence-only",
+                {"fencing_token": current["fencingToken"] + 1},
+            ),
+        ):
+            with self.subTest(corruption=label):
+                forged = self.discovery._fanout(current, **overrides)
+                self.discovery._store_fanout(context, forged)
+                forged_state = deepcopy(context["store"].data)
+                context["store"].events.clear()
+
+                with self.assertRaises(self.module.RowAuthorityError):
+                    self._process(
+                        context,
+                        expected_fanout_head=original_expected,
+                        processed_at="2026-08-04T12:07:20.000000Z",
+                    )
+
+                self.assertEqual(forged_state, context["store"].data)
+                self.assertEqual([], self._writes(context["store"]))
+                self.discovery._store_fanout(context, current)
+                context["store"].events.clear()
+
+    def test_release_result_retry_after_two_certification_pages_and_late_recertifications_is_exact(
+        self,
+    ):
+        context = self._seed_release_scan(33, result_count=0)
+        self._materialize_scan_rows(context)
+        for row_id in context["rows"][:32]:
+            context["rowId"] = row_id
+            processed = self._process(
+                context,
+                processed_at="2026-08-04T12:06:30.000000Z",
+            )
+            context["fanout"] = processed["fanoutHead"]
+
+        original_expected = deepcopy(context["fanout"])
+        context["rowId"] = context["rows"][32]
+        first = self._process(
+            context,
+            processed_at="2026-08-04T12:06:31.000000Z",
+        )
+        context["fanout"] = first["fanoutHead"]
+
+        first_page = self.completion._certify(
+            context,
+            certified_at="2026-08-04T12:06:40.000000Z",
+        )
+        self.assertEqual("page_certified", first_page["disposition"])
+        self.assertEqual(32, len(first_page["obligations"]))
+        context["fanout"] = first_page["fanoutHead"]
+        second_page = self.completion._certify(
+            context,
+            certified_at="2026-08-04T12:06:41.000000Z",
+        )
+        self.assertEqual(
+            "certification_complete",
+            second_page["disposition"],
+        )
+        self.assertEqual(1, len(second_page["obligations"]))
+        context["fanout"] = second_page["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        for ordinal, associated_at in (
+            (34, "2026-08-04T12:07:00.000000Z"),
+            (35, "2026-08-04T12:07:10.000000Z"),
+        ):
+            late_row = _row_id(ordinal)
+            thread_id = (
+                f"thread-release-replay-paged-complete-late-{ordinal}"
+            )
+            late._seed_prerequisites(
+                context,
+                row_id=late_row,
+                thread_id=thread_id,
+            )
+            late.associated_at = associated_at
+            associated = late._associate(
+                context,
+                row_id=late_row,
+                thread_id=thread_id,
+            )
+            self.assertEqual("created", associated["disposition"])
+            context["fanout"] = late._current_fanout(
+                context,
+                first["fanoutHead"]["fanoutId"],
+            )
+
+        self.assertEqual("complete", context["fanout"]["state"])
+        self.assertEqual(40, context["fanout"]["stateRevision"])
+        self.assertEqual(2, context["fanout"]["fencingToken"])
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        retry = self._process(
+            context,
+            expected_fanout_head=original_expected,
+            processed_at="2026-08-04T12:07:20.000000Z",
+        )
+
+        self.assertEqual(first, retry)
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+        self.assertIn(("commit_applied", 0), context["store"].events)
+
+    def test_release_complete_late_retry_rejects_missing_binding_edge(self):
+        context = self._seed_release(prior_owner="human_decision")
+        original_expected = deepcopy(context["fanout"])
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+        certified = self.completion._certify(
+            context,
+            certified_at="2026-08-04T12:06:40.000000Z",
+        )
+        self.assertEqual("certification_complete", certified["disposition"])
+        context["fanout"] = certified["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(2)
+        thread_id = "thread-release-complete-late-missing-edge"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        context["fanout"] = late._current_fanout(
+            context,
+            first["fanoutHead"]["fanoutId"],
+        )
+        self.assertEqual("complete", context["fanout"]["state"])
+        self.assertEqual(
+            original_expected["bindingAssociationCount"],
+            context["fanout"]["completionBindingAssociationCount"],
+        )
+        self.assertEqual(
+            original_expected["bindingAssociationCount"] + 1,
+            context["fanout"]["bindingAssociationCount"],
+        )
+        edge_id = associated["association"]["edgeId"]
+        self._delete(context, "contactRowBindings", edge_id)
+        self.assertNotIn(
+            edge_id,
+            self._documents(context, "contactRowBindings"),
+        )
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at="2026-08-04T12:07:10.000000Z",
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+
     def test_release_result_retry_after_later_valid_reoptout_is_exact(self):
         context = self._seed_release(prior_owner="human_decision")
         original_expected = deepcopy(context["fanout"])
@@ -2670,6 +3732,95 @@ class ContactFanoutReleaseTests(unittest.TestCase):
         self.assertEqual(committed, context["store"].data)
         self.assertEqual([], self._writes(context["store"]))
         self.assertIn(("commit_applied", 0), context["store"].events)
+
+    def test_release_retry_rejects_superseding_cursor_covering_missing_row(
+        self,
+    ):
+        context = self._seed_release_scan(2, result_count=0)
+        self._materialize_scan_rows(context)
+        original_expected = deepcopy(context["fanout"])
+        context["rowId"] = context["rows"][0]
+        first = self._process(context)
+        context["fanout"] = first["fanoutHead"]
+
+        late_type = importlib.import_module(
+            "tests.test_row_authority_contact_late_release"
+        ).ContactLateReleaseAssociationTests
+        late_type.setUpClass()
+        late = late_type(methodName="runTest")
+        late.setUp()
+        late_row = _row_id(3)
+        thread_id = "thread-release-replay-superseding-cursor-prefix"
+        late._seed_prerequisites(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        associated = late._associate(
+            context,
+            row_id=late_row,
+            thread_id=thread_id,
+        )
+        self.assertEqual("created", associated["disposition"])
+        context["fanout"] = late._current_fanout(
+            context,
+            original_expected["fanoutId"],
+        )
+
+        bundle, _link = context["transition"]._seed_bundle(
+            context["store"],
+            "source-release-replay-superseding-cursor-prefix",
+            exact_hash=context["settlement"]["exactIdentityHash"],
+        )
+        reoptout = context["transition"]._record(
+            context["store"],
+            bundle,
+            requested_at="2026-08-04T12:07:10.000000Z",
+        )
+        self.assertEqual("created", reoptout["disposition"])
+        current = self._documents(
+            context,
+            "contactOptOutFanoutHeads",
+        )[original_expected["fanoutId"]]
+        self.assertEqual("superseding", current["state"])
+        self.assertIsNone(current["discoveryCursorRowId"])
+        self.assertEqual(3, current["obligationCount"])
+        self.assertEqual(2, current["resultCount"])
+        missing_row = context["rows"][1]
+        missing_result_id = f"{current['fanoutId']}--{missing_row}"
+        self.assertNotIn(
+            missing_result_id,
+            self._documents(context, "contactOptOutFanoutResults"),
+        )
+
+        forged = self.discovery._fanout(
+            current,
+            state_revision=current["stateRevision"] + 1,
+            discovery_cursor_row_id=missing_row,
+            cursor_processed_count=2,
+            updated_at="2026-08-04T12:07:20.000000Z",
+        )
+        self.assertEqual(
+            forged,
+            self.module.validate_contact_fanout_head_document(
+                document=forged
+            ),
+        )
+        self.discovery._store_fanout(context, forged)
+        context["fanout"] = forged
+        context["rowId"] = context["rows"][0]
+        committed = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                expected_fanout_head=original_expected,
+                processed_at="2026-08-04T12:07:30.000000Z",
+            )
+
+        self.assertEqual(committed, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
 
     def test_release_result_retry_after_completed_supersession_is_exact(self):
         context = self._seed_release_scan(2, result_count=0)
