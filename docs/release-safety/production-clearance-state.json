@@ -30,19 +30,27 @@
     "dedicatedBrowserControl": {
       "status": "PASS",
       "evidence": [
-        "Read the production login DOM.",
-        "Resolved one unique Pricing control.",
-        "Clicked Pricing and verified https://sitesiftai.com/pricing.",
-        "Returned to https://sitesiftai.com/login and left the tab ready for sign-in."
+        "Connected to the existing isolated Chrome testing session.",
+        "Claimed and released the production dashboard and three authorized self-owned mailbox tabs independently.",
+        "Returned SiteSift to the dashboard before releasing control.",
+        "No tab, profile, or account crossover was observed."
       ]
     },
     "authenticatedDashboard": {
-      "status": "BLOCKED_SIGNED_OUT",
-      "evidence": "The dedicated browser currently shows Continue with Microsoft rather than an authenticated dashboard."
+      "status": "PASS",
+      "evidence": [
+        "Production opened at /dashboard without a login prompt.",
+        "The browser navigated to Settings and verified the explicitly authorized self-owned sender.",
+        "The browser returned to /dashboard without changing any setting."
+      ]
     },
     "parallelChromeControl": {
-      "status": "BLOCKED_TIMEOUT",
-      "evidence": "Two read-only connection attempts timed out before a dashboard tab could be controlled."
+      "status": "PASS",
+      "evidence": [
+        "The SiteSift dashboard, one authorized Outlook mailbox, and two authorized Google mailboxes were all independently controllable.",
+        "Visible account identity matched each role explicitly authorized in the current turn.",
+        "Navigating SiteSift from Dashboard to Settings and back did not disrupt mailbox control."
+      ]
     }
   },
   "sourceState": {
