@@ -1,6 +1,9 @@
 # SiteSift production-clearance delivery train
 
-**Status:** Active control plan, 2026-08-04
+**Status:** Superseded as the active execution plan on 2026-08-06 by
+[`2026-08-06-browser-first-production-clearance.md`](2026-08-06-browser-first-production-clearance.md).
+The architecture work and exact-SHA evidence recorded here remain valid inputs;
+the old milestone order is no longer authoritative.
 **Deliverable:** both (code and production-readiness findings)
 **Outcome:** safely run a frontend-launched, fully observed campaign whose every
 source, row, effect, retry, and user-visible state is durably attributable and

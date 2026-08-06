@@ -1,0 +1,171 @@
+{
+  "schemaVersion": 1,
+  "programId": "sitesift-browser-first-production-clearance-2026-08-06",
+  "updatedAt": "2026-08-06",
+  "deliverable": "both",
+  "status": "BLOCKED",
+  "decision": "Production and user return remain NO-GO until every required core feature is PROD-CLEARED.",
+  "authoritativePlan": "docs/superpowers/plans/2026-08-06-browser-first-production-clearance.md",
+  "designSpec": "docs/superpowers/specs/2026-08-06-browser-first-production-clearance-design.md",
+  "canonicalRubric": "docs/release-safety/feature-gradebook.json",
+  "checkpointLedger": "docs/release-safety/production-clearance-checkpoints.jsonl",
+  "supersededPlan": "docs/superpowers/plans/2026-08-04-sitesift-production-clearance-train.md",
+  "executionPolicy": {
+    "productActions": "browser_only",
+    "readbackExceptions": [
+      "Firestore",
+      "Microsoft Graph",
+      "Google Sheets",
+      "deployment artifact and configuration",
+      "GitHub and CI"
+    ],
+    "directProductionWritesOutsideProduct": "prohibited",
+    "externalContact": "Only an exact self-owned recipient explicitly authorized in the current turn; never a customer recipient.",
+    "messageReuse": "Do not reuse an exact broker-response body in a later production run.",
+    "promotionRule": "No averaging. Any open P0 blocks traffic and user return."
+  },
+  "browserPreflight": {
+    "checkedAt": "2026-08-06",
+    "sideEffects": "none",
+    "dedicatedBrowserControl": {
+      "status": "PASS",
+      "evidence": [
+        "Read the production login DOM.",
+        "Resolved one unique Pricing control.",
+        "Clicked Pricing and verified https://sitesiftai.com/pricing.",
+        "Returned to https://sitesiftai.com/login and left the tab ready for sign-in."
+      ]
+    },
+    "authenticatedDashboard": {
+      "status": "BLOCKED_SIGNED_OUT",
+      "evidence": "The dedicated browser currently shows Continue with Microsoft rather than an authenticated dashboard."
+    },
+    "parallelChromeControl": {
+      "status": "BLOCKED_TIMEOUT",
+      "evidence": "Two read-only connection attempts timed out before a dashboard tab could be controlled."
+    }
+  },
+  "sourceState": {
+    "backend": {
+      "mainSha": "9e63704d3584966944814a93594d2be1e4b2fcb0",
+      "productionSha": "92de8ab5bf841f5faa453de34cc3846bd65611af",
+      "productionRevision": "process-user-jill-one-202608020520",
+      "productionTrafficPercent": 100,
+      "candidateSha": "ed64554b5e65fbbdd471364bc76b59209e4801af",
+      "candidateRevision": "process-user-00058-biz",
+      "candidateTrafficPercent": 0,
+      "candidateBranch": "codex/sitesift-production-clearance-20260804",
+      "candidateDeltaFromProduction": "90 commits and 96 files",
+      "candidateCiStatus": "QUEUED_WITHOUT_JOBS_AT_AUDIT",
+      "candidateCiRun": "https://github.com/BaylorH/EmailAutomation/actions/runs/31124867694",
+      "lastSuccessfulCandidateAncestorSha": "8510917ebc3ae04f6ab5106fde957dd4fc9ef5ed",
+      "candidateDisposition": "freeze_dark_and_reuse_only_through_reviewed_vertical_slices"
+    },
+    "frontend": {
+      "productionSha": "52aa66299751893bbf9ec596d7fa84c5a767933d",
+      "candidateSha": "45b182d244753769620ab78b4b9dd542a9cb055b",
+      "candidateBranch": "codex/sitesift-canonical-formula-20260802",
+      "candidateDeltaFromProduction": "21 commits",
+      "productionFunctionRevision": "api-00110-cib",
+      "productionFunctionCommitMapping": "BLOCKED_PROVENANCE",
+      "candidateDisposition": "do_not_deploy_without_versioned_functions_compatibility"
+    }
+  },
+  "statusModel": [
+    "BLOCKED",
+    "CODE_GREEN",
+    "DEPLOYED_DARK",
+    "BROWSER_PASS",
+    "PROD_CLEARED",
+    "OFF_SAFE"
+  ],
+  "allowedTransitions": {
+    "BLOCKED": ["CODE_GREEN", "OFF_SAFE"],
+    "CODE_GREEN": ["DEPLOYED_DARK", "BLOCKED"],
+    "DEPLOYED_DARK": ["BROWSER_PASS", "BLOCKED"],
+    "BROWSER_PASS": ["PROD_CLEARED", "BLOCKED"],
+    "PROD_CLEARED": ["BLOCKED"],
+    "OFF_SAFE": ["BLOCKED"]
+  },
+  "milestones": [
+    {
+      "id": "R0",
+      "name": "Source authority and release manifest",
+      "status": "BLOCKED",
+      "exitGate": "GitHub, production revisions, artifact digests, configuration, traffic, and rollback targets map to exact immutable commits."
+    },
+    {
+      "id": "R1",
+      "name": "Release rails and browser preflight",
+      "status": "BLOCKED",
+      "exitGate": "Exact-SHA CI, versioned coordinated deploy workflows, artifact readback, authenticated dedicated-browser control, and rollback rehearsal pass."
+    },
+    {
+      "id": "R2",
+      "name": "Notification and operator-action controls",
+      "status": "BLOCKED",
+      "exitGate": "Authenticated resolve/dismiss/clear semantics deploy dark first; PROD_CLEARED is deferred until R3-R4 create a browser-launched self-owned action set for Firestore/outbox/audit readback."
+    },
+    {
+      "id": "R3",
+      "name": "Campaign start and mailbox readiness",
+      "status": "BLOCKED",
+      "exitGate": "Versioned launch, mailbox preflight, capability separation, quota reservation, Sheet compensation, and truthful lifecycle pass production browser proof."
+    },
+    {
+      "id": "R4",
+      "name": "Core event, escalation, and projection lifecycle",
+      "status": "BLOCKED",
+      "exitGate": "Source-bound event receipts, visible call/tour/question actions, projection recovery, dedupe, and completion gates pass production proof."
+    },
+    {
+      "id": "R5",
+      "name": "Firestore integrity and operational truth",
+      "status": "BLOCKED",
+      "exitGate": "Indexes, parent/child integrity, stopped-campaign roots, notifications, outbox/audit reconciliation, health, and completion are clean or explicitly quarantined."
+    },
+    {
+      "id": "R6",
+      "name": "Varied historical conversation corpus",
+      "status": "BLOCKED",
+      "exitGate": "Every core feature passes fresh, non-repeating production-style browser variants seeded from sanitized historical failures."
+    },
+    {
+      "id": "R7",
+      "name": "Production self-canary and staged return",
+      "status": "BLOCKED",
+      "exitGate": "Exact deployed SHA, browser, mailbox, Firestore, Graph, Sheet, audit, notification, scheduler, and rollback evidence are clean with zero unresolved P0/P1 work."
+    }
+  ],
+  "featureStamps": [
+    {"featureId":"campaign.start","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.identity_context","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.mailbox_preflight","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.delivery_exact_once","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.extraction","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.attachments","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.partial_completion","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.unavailable","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.nonviable","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.alternate_property","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.questions","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.call_action","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.tour_action","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.contact_ooo","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.wrong_contact","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.optout","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.property_issue","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.followups","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.operator_actions","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.stop","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.health_recovery","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.firestore_integrity","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.sheet_formulas","lane":"core","status":"BLOCKED"},
+    {"featureId":"campaign.completion","lane":"core","status":"BLOCKED"},
+    {"featureId":"tour.scheduler","lane":"advanced","status":"BLOCKED"},
+    {"featureId":"tour.invite","lane":"advanced","status":"BLOCKED"},
+    {"featureId":"results.workspace","lane":"advanced","status":"BLOCKED"},
+    {"featureId":"results.artifacts","lane":"advanced","status":"BLOCKED"}
+  ],
+  "checkpointRule": "Every milestone writes a new immutable evidence entry containing code SHA, CI run, artifact digest, revision, configuration hash, traffic percentage, browser scenario IDs, exact message hashes, Firestore/Graph/Sheet readbacks, defects, rollback result, and evidence commit SHA. Prior entries are never overwritten."
+}
