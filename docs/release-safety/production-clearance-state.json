@@ -69,6 +69,14 @@
       "candidateRevision": "process-user-00058-biz",
       "candidateTrafficPercent": 0,
       "candidateBranch": "codex/sitesift-production-clearance-20260804",
+      "clearanceContractRemoteSha": "c3f452b31a34797b629c27e0397c77bf9beecdea",
+      "clearanceContractStatus": "CODE_GREEN",
+      "clearanceContractVerification": {
+        "testCount": 73,
+        "specReview": "APPROVED",
+        "qualityReview": "APPROVED",
+        "exactShaCi": "NOT_CREATED"
+      },
       "candidateDeltaFromProduction": "90 commits and 96 files",
       "candidateCiStatus": "QUEUED_WITHOUT_JOBS_AT_AUDIT",
       "candidateCiRun": "https://github.com/BaylorH/EmailAutomation/actions/runs/31124867694",
