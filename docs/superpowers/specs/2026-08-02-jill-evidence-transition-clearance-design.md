@@ -183,4 +183,3 @@ Any mismatch is a `NO-GO` for certification. Broader users, a second target-user
 - broad refactors unrelated to a reproduced transition failure;
 - enabling users or campaign automation as part of analysis;
 - treating repository state as proof of the live deployment.
-

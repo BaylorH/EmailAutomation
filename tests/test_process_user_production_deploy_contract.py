@@ -46,7 +46,9 @@ RELEASE_REVISION = "process-user-release-a-abc123"
 ENV_VARS = (
     "^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:"
     "ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:"
-    "SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2"
+    "SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:"
+    "SITESIFT_OUTBOUND_MODE=paused:"
+    "SITESIFT_SOURCE_COORDINATOR_MODE=disabled"
 )
 SECRETS = (
     "AZURE_API_APP_ID=AZURE_API_APP_ID:latest,"
@@ -453,6 +455,14 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertIn("--update-secrets", deploy)
         self.assertNotIn("--set-env-vars", deploy)
         self.assertNotIn("--set-secrets", deploy)
+
+    def test_deploy_explicitly_locks_outbound_and_coordinator_safe(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deploy = self._gcloud_calls()[-1]
+        env_vars = deploy[deploy.index("--update-env-vars") + 1]
+        self.assertIn(":SITESIFT_OUTBOUND_MODE=paused:", env_vars)
+        self.assertTrue(env_vars.endswith(":SITESIFT_SOURCE_COORDINATOR_MODE=disabled"))
 
     def test_every_gcloud_call_binds_explicit_account_and_project(self):
         result = self._run("--apply")

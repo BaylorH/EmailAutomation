@@ -119,10 +119,13 @@ jobs:
 
       - name: Compile changed Python and check the release diff
         shell: bash
+        env:
+          # Immutable commit currently deployed by the process-user revision.
+          PRODUCTION_BASELINE_SHA: 92de8ab5bf841f5faa453de34cc3846bd65611af
         run: |
           set -euo pipefail
           {
-            git diff --name-only --diff-filter=ACMR 2b5e785 -- '*.py'
+            git diff --name-only --diff-filter=ACMR "$PRODUCTION_BASELINE_SHA" -- '*.py'
             git ls-files --others --exclude-standard -- '*.py'
           } | LC_ALL=C sort -u | xargs python -m py_compile
-          git diff --check 2b5e785
+          git diff --check "$PRODUCTION_BASELINE_SHA"
