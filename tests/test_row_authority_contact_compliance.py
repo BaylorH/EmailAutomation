@@ -3252,7 +3252,9 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
                 }
             ],
             created_at=created_at,
-            canonical_mailbox_identity_hash="c" * 64,
+            canonical_mailbox_identity_hash=link[
+                "canonicalMailboxIdentityHash"
+            ],
             contact_settlement_hash=contact_settlement_hash,
         )
         generation = self.module.build_owner_generation_document(
@@ -5265,9 +5267,12 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
             user_scope_hash=self.fixture.scope,
             authority_link=authority_link,
             fanout_id="e" * 64,
-            canonical_mailbox_identity_hash="c" * 64,
+            canonical_mailbox_identity_hash=authority_link[
+                "canonicalMailboxIdentityHash"
+            ],
             contact_settlement_hash="f" * 64,
-            thread_binding_document=state["binding"],
+            thread_binding_document=None,
+            canonical_row_id=self.fixture.first,
             row_states=[row_state],
             stored_claim_set_document=None,
             created_at="2026-08-04T12:07:00.000000Z",
@@ -5303,15 +5308,19 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
             lease_until="2026-08-04T12:12:00.000000Z",
         )
         self.assertEqual(3, terminal["generations"][0]["generation"])
+        authority_link = self._contact_link(
+            source_id="combined-bridge-contact"
+        )
         contact_plan = self.module._plan_contact_fanout_row_claim(
             user_scope_hash=self.fixture.scope,
-            authority_link=self._contact_link(
-                source_id="combined-bridge-contact"
-            ),
+            authority_link=authority_link,
             fanout_id="e" * 64,
-            canonical_mailbox_identity_hash="c" * 64,
+            canonical_mailbox_identity_hash=authority_link[
+                "canonicalMailboxIdentityHash"
+            ],
             contact_settlement_hash="f" * 64,
-            thread_binding_document=binding,
+            thread_binding_document=None,
+            canonical_row_id=self.fixture.first,
             row_states=[self._bounded_state_from_store(store)],
             stored_claim_set_document=None,
             created_at="2026-08-04T12:08:00.000000Z",
@@ -5365,15 +5374,19 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
             created_at="2026-08-04T12:07:00.000000Z",
             lease_until="2026-08-04T12:12:00.000000Z",
         )
+        authority_link = self._contact_link(
+            source_id="late-combined-bridge-contact"
+        )
         contact_plan = self.module._plan_contact_fanout_row_claim(
             user_scope_hash=self.fixture.scope,
-            authority_link=self._contact_link(
-                source_id="late-combined-bridge-contact"
-            ),
+            authority_link=authority_link,
             fanout_id="e" * 64,
-            canonical_mailbox_identity_hash="c" * 64,
+            canonical_mailbox_identity_hash=authority_link[
+                "canonicalMailboxIdentityHash"
+            ],
             contact_settlement_hash="f" * 64,
-            thread_binding_document=binding,
+            thread_binding_document=None,
+            canonical_row_id=self.fixture.first,
             row_states=[self._bounded_state_from_store(store)],
             stored_claim_set_document=None,
             created_at="2026-08-04T12:08:00.000000Z",
@@ -5966,7 +5979,8 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
             fanout_id=claim["fanoutId"],
             canonical_mailbox_identity_hash=claim["ownerKey"],
             contact_settlement_hash=claim["payloadHash"],
-            thread_binding_document=release_state["binding"],
+            thread_binding_document=None,
+            canonical_row_id=claim["primaryRowId"],
             row_states=[
                 self._bounded_replay_state_from_store(
                     release_state["store"],
@@ -7197,7 +7211,9 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
                 }
             ],
             created_at=successor_at,
-            canonical_mailbox_identity_hash="c" * 64,
+            canonical_mailbox_identity_hash=successor_link[
+                "canonicalMailboxIdentityHash"
+            ],
             contact_settlement_hash=f"{456:064x}",
         )
         successor_generation = self.module.build_owner_generation_document(
@@ -7962,7 +7978,7 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
             predecessor_settlement=restored_settlement,
             created_at="2026-08-04T12:05:00.000000Z",
             settled_at="2026-08-04T12:05:00.000000Z",
-            cycle=2,
+            cycle=9,
         )
         second_release, _released_head = self._release_to(
             store,
@@ -7973,7 +7989,7 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
             restored_generation=restored_generation,
             restored_settlement=restored_settlement,
             released_at="2026-08-04T12:05:00.000000Z",
-            cycle=2,
+            cycle=9,
         )
         self.assertGreater(
             restored_head["latestOptOutReleaseResultHash"],
@@ -8188,15 +8204,19 @@ class ReleaseAwareRowHistoryTests(unittest.TestCase):
             created_at="2026-08-04T12:00:07.000000Z",
             lease_until="2026-08-04T12:05:07.000000Z",
         )
+        authority_link = self._contact_link(
+            source_id="deep-release-contact"
+        )
         contact = self.module._plan_contact_fanout_row_claim(
             user_scope_hash=self.fixture.scope,
-            authority_link=self._contact_link(
-                source_id="deep-release-contact"
-            ),
+            authority_link=authority_link,
             fanout_id="e" * 64,
-            canonical_mailbox_identity_hash="c" * 64,
+            canonical_mailbox_identity_hash=authority_link[
+                "canonicalMailboxIdentityHash"
+            ],
             contact_settlement_hash="f" * 64,
-            thread_binding_document=state["binding"],
+            thread_binding_document=None,
+            canonical_row_id=self.fixture.first,
             row_states=[self._bounded_state_from_store(store)],
             stored_claim_set_document=None,
             created_at="2026-08-04T12:00:08.000000Z",

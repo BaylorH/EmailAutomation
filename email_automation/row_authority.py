@@ -5022,6 +5022,273 @@ def _contact_fanout_discovery_result(
     }
 
 
+def _build_contact_fanout_processing_head(
+    *,
+    expected_document,
+    result_count,
+    discovery_cursor_row_id,
+    cursor_processed_count,
+    processed_at,
+):
+    expected = validate_contact_fanout_head_document(
+        document=expected_document
+    )
+    if expected["state"] != "applying":
+        raise RowAuthorityConfigError(
+            "contact fan-out processing requires applying state"
+        )
+    results = _require_uint(result_count, field_name="result_count")
+    if (
+        results < expected["resultCount"]
+        or results > expected["resultCount"] + 1
+        or results > expected["obligationCount"]
+    ):
+        raise RowAuthorityConfigError(
+            "contact fan-out processing result count is unreachable"
+        )
+    event_time = _require_timestamp(
+        processed_at,
+        field_name="processed_at",
+    )
+    if event_time < expected["updatedAt"]:
+        raise RowAuthorityConfigError(
+            "contact fan-out processing cannot predate its expected head"
+        )
+    if (
+        expected["leaseOwnerHash"] is None
+        or expected["leaseUntil"] is None
+        or event_time >= expected["leaseUntil"]
+    ):
+        raise RowAuthorityConfigError(
+            "contact fan-out processing requires an unexpired lease"
+        )
+    if results == expected["obligationCount"]:
+        cursor = None
+        processed = 0
+    else:
+        if discovery_cursor_row_id is None:
+            raise RowAuthorityConfigError(
+                "unfinished contact fan-out processing requires a cursor"
+            )
+        cursor = validate_row_id(discovery_cursor_row_id)
+        processed = _require_pos(
+            cursor_processed_count,
+            field_name="cursor_processed_count",
+        )
+        if (
+            processed <= expected["cursorProcessedCount"]
+            or processed > expected["obligationCount"]
+        ):
+            raise RowAuthorityConfigError(
+                "contact fan-out processing cursor count is unreachable"
+            )
+    return build_contact_fanout_head_document(
+        user_scope_hash=expected["userScopeHash"],
+        fanout_id=expected["fanoutId"],
+        outcome=expected["outcome"],
+        expected_contact_settlement_hash=expected[
+            "expectedContactSettlementHash"
+        ],
+        state_revision=expected["stateRevision"] + 1,
+        state="applying",
+        binding_revision=expected["bindingRevision"],
+        binding_head_hash=expected["bindingHeadHash"],
+        binding_association_count=expected["bindingAssociationCount"],
+        discovery_cursor_row_id=cursor,
+        obligation_count=expected["obligationCount"],
+        result_count=results,
+        cursor_processed_count=processed,
+        lease_owner_hash=expected["leaseOwnerHash"],
+        lease_until=expected["leaseUntil"],
+        fencing_token=expected["fencingToken"],
+        superseding_contact_settlement_hash=None,
+        completion_binding_revision=None,
+        completion_binding_head_hash=None,
+        completion_binding_association_count=None,
+        completion_obligation_count=None,
+        completion_result_count=None,
+        completed_at=None,
+        created_at=expected["createdAt"],
+        updated_at=event_time,
+    )
+
+
+def _build_contact_fanout_late_association_head(
+    *,
+    expected_document,
+    prior_binding_head_document,
+    binding_head_document,
+    obligation_count,
+    result_count,
+    associated_at,
+):
+    """Advance an active fan-out for one atomically-created stable edge."""
+    expected = validate_contact_fanout_head_document(
+        document=expected_document
+    )
+    if expected["outcome"] != "apply" or expected["state"] not in {
+        "discovering",
+        "applying",
+        "complete",
+    }:
+        raise RowAuthorityConfigError(
+            "active late association requires a current apply fan-out"
+        )
+    associated = _require_timestamp(
+        associated_at,
+        field_name="associated_at",
+    )
+    if associated < expected["updatedAt"]:
+        raise RowAuthorityConfigError(
+            "late association cannot predate its current fan-out"
+        )
+    if prior_binding_head_document is None:
+        prior_revision = 0
+        prior_hash = None
+        prior_count = 0
+    else:
+        prior = validate_contact_row_binding_head_document(
+            document=prior_binding_head_document
+        )
+        prior_revision = prior["stateRevision"]
+        prior_hash = prior["contactRowBindingHeadHash"]
+        prior_count = prior["associationCount"]
+    binding = validate_contact_row_binding_head_document(
+        document=binding_head_document
+    )
+    if (
+        binding["userScopeHash"] != expected["userScopeHash"]
+        or expected["bindingRevision"] != prior_revision
+        or expected["bindingHeadHash"] != prior_hash
+        or expected["bindingAssociationCount"] != prior_count
+        or binding["stateRevision"] != prior_revision + 1
+        or binding["associationCount"] != prior_count + 1
+        or binding["updatedAt"] != associated
+    ):
+        raise RowAuthorityConflict(
+            "late association binding snapshot is crossed"
+        )
+    obligations = _require_uint(
+        obligation_count,
+        field_name="obligation_count",
+    )
+    results = _require_uint(result_count, field_name="result_count")
+    if obligations != expected["obligationCount"] + 1:
+        raise RowAuthorityConfigError(
+            "late association must add exactly one obligation"
+        )
+    if expected["state"] == "complete":
+        if results != expected["resultCount"] + 1:
+            raise RowAuthorityConfigError(
+                "complete late association must resolve exactly one result"
+            )
+    elif results != expected["resultCount"]:
+        raise RowAuthorityConfigError(
+            "nonterminal late association cannot add a result"
+        )
+    lease_owner = expected["leaseOwnerHash"]
+    lease_until = expected["leaseUntil"]
+    if lease_until is not None and lease_until <= associated:
+        lease_owner = None
+        lease_until = None
+    return build_contact_fanout_head_document(
+        user_scope_hash=expected["userScopeHash"],
+        fanout_id=expected["fanoutId"],
+        outcome=expected["outcome"],
+        expected_contact_settlement_hash=expected[
+            "expectedContactSettlementHash"
+        ],
+        state_revision=expected["stateRevision"] + 1,
+        state=expected["state"],
+        binding_revision=binding["stateRevision"],
+        binding_head_hash=binding["contactRowBindingHeadHash"],
+        binding_association_count=binding["associationCount"],
+        discovery_cursor_row_id=None,
+        obligation_count=obligations,
+        result_count=results,
+        cursor_processed_count=0,
+        lease_owner_hash=lease_owner,
+        lease_until=lease_until,
+        fencing_token=expected["fencingToken"],
+        superseding_contact_settlement_hash=None,
+        completion_binding_revision=expected[
+            "completionBindingRevision"
+        ],
+        completion_binding_head_hash=expected[
+            "completionBindingHeadHash"
+        ],
+        completion_binding_association_count=expected[
+            "completionBindingAssociationCount"
+        ],
+        completion_obligation_count=expected[
+            "completionObligationCount"
+        ],
+        completion_result_count=expected["completionResultCount"],
+        completed_at=expected["completedAt"],
+        created_at=expected["createdAt"],
+        updated_at=associated,
+    )
+
+
+def _contact_fanout_processing_result(
+    *, disposition, fanout_head, obligation, result
+):
+    if disposition not in {
+        "applied",
+        "dominated",
+        "noop",
+        "superseded",
+        "cursor_advanced",
+    }:
+        raise RowAuthorityConfigError(
+            "contact fan-out processing disposition is unsupported"
+        )
+    head = validate_contact_fanout_head_document(document=fanout_head)
+    if head["state"] != "applying":
+        raise RowAuthorityConfigError(
+            "contact fan-out processing result requires applying state"
+        )
+    if disposition == "cursor_advanced":
+        if (
+            obligation is not None
+            or result is not None
+            or head["discoveryCursorRowId"] is None
+        ):
+            raise RowAuthorityConfigError(
+                "contact fan-out cursor result is inconsistent"
+            )
+        checked_obligation = None
+        checked_result = None
+    else:
+        checked_obligation = validate_contact_fanout_obligation_document(
+            document=obligation
+        )
+        checked_result = validate_contact_fanout_result_document(
+            document=result
+        )
+        if (
+            checked_obligation["userScopeHash"] != head["userScopeHash"]
+            or checked_obligation["fanoutId"] != head["fanoutId"]
+            or checked_obligation["outcome"] != head["outcome"]
+            or checked_result["userScopeHash"] != head["userScopeHash"]
+            or checked_result["fanoutId"] != head["fanoutId"]
+            or checked_result["outcome"] != head["outcome"]
+            or checked_result["disposition"] != disposition
+            or checked_result["rowId"] != checked_obligation["rowId"]
+            or checked_result["obligationHash"]
+            != checked_obligation["contactFanoutObligationHash"]
+        ):
+            raise RowAuthorityConfigError(
+                "contact fan-out processing artifact does not correlate"
+            )
+    return {
+        "disposition": disposition,
+        "fanoutHead": head,
+        "obligation": checked_obligation,
+        "result": checked_result,
+    }
+
+
 def _build_contact_fanout_certification_head(
     *,
     expected_document,
@@ -8932,13 +9199,43 @@ def _derive_claim_request_context(
     thread_binding_document,
     canonical_mailbox_identity_hash=None,
     contact_settlement_hash=None,
+    canonical_row_id=None,
 ):
     scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
-    binding = validate_thread_row_binding_document(
-        document=thread_binding_document
-    )
-    if binding["userScopeHash"] != scope:
-        raise RowAuthorityConfigError("claim thread binding scope conflicts")
+    if thread_binding_document is None:
+        if authority_origin != "contact_fanout" or canonical_row_id is None:
+            raise RowAuthorityConfigError(
+                "claim requires exact thread or private contact-row bindings"
+            )
+        checked_row_id = validate_row_id(canonical_row_id)
+        bindings, primary, count, bindings_hash = (
+            _canonical_claim_bindings(
+                user_scope_hash=scope,
+                row_ids=[checked_row_id],
+                primary_row_id=checked_row_id,
+            )
+        )
+        binding = {
+            "userScopeHash": scope,
+            "rowBindings": bindings,
+            "primaryRowId": primary,
+            "bindingCount": count,
+            "rowBindingsHash": bindings_hash,
+            "clientId": None,
+            "createdAt": None,
+        }
+    else:
+        if canonical_row_id is not None:
+            raise RowAuthorityConfigError(
+                "claim cannot mix thread and private contact-row bindings"
+            )
+        binding = validate_thread_row_binding_document(
+            document=thread_binding_document
+        )
+        if binding["userScopeHash"] != scope:
+            raise RowAuthorityConfigError(
+                "claim thread binding scope conflicts"
+            )
     origin = _claim_origin_from_inputs(
         user_scope_hash=scope,
         authority_origin=authority_origin,
@@ -10836,6 +11133,7 @@ def _plan_row_claim_set(
     lease_owner_hash,
     lease_until,
     combined_operator_decline=False,
+    canonical_row_id=None,
 ):
     scope = _require_sha256(user_scope_hash, field_name="user_scope_hash")
     created = _require_timestamp(created_at, field_name="created_at")
@@ -10855,6 +11153,7 @@ def _plan_row_claim_set(
         thread_binding_document=thread_binding_document,
         canonical_mailbox_identity_hash=canonical_mailbox_identity_hash,
         contact_settlement_hash=contact_settlement_hash,
+        canonical_row_id=canonical_row_id,
     )
     binding = context["binding"]
     if type(row_states) not in {list, tuple} or len(row_states) != binding[
@@ -10894,7 +11193,10 @@ def _plan_row_claim_set(
         if (
             identity["userScopeHash"] != scope
             or identity["rowId"] != row_id
-            or identity["clientId"] != binding["clientId"]
+            or (
+                binding["clientId"] is not None
+                and identity["clientId"] != binding["clientId"]
+            )
             or head["userScopeHash"] != scope
             or head["rowId"] != row_id
             or head["createdAt"] != identity["createdAt"]
@@ -10903,8 +11205,14 @@ def _plan_row_claim_set(
                 "claim row identity, binding, and head do not correlate"
             )
         if (
-            binding["createdAt"] < identity["createdAt"]
-            or created < binding["createdAt"]
+            (
+                binding["createdAt"] is not None
+                and binding["createdAt"] < identity["createdAt"]
+            )
+            or (
+                binding["createdAt"] is not None
+                and created < binding["createdAt"]
+            )
             or created < identity["createdAt"]
             or (
                 stored_claim_set_document is None
@@ -11544,6 +11852,14 @@ def _plan_operator_row_claim(**arguments):
 
 
 def _plan_contact_fanout_row_claim(**arguments):
+    if arguments.get("thread_binding_document") is not None:
+        raise RowAuthorityConfigError(
+            "contact fan-out claim cannot accept caller-selected thread bindings"
+        )
+    if arguments.get("canonical_row_id") is None:
+        raise RowAuthorityConfigError(
+            "contact fan-out claim requires its canonical obligation row"
+        )
     link = validate_b1_authority_link(
         authority_link=arguments.get("authority_link"),
         user_scope_hash=arguments.get("user_scope_hash"),
@@ -11552,11 +11868,658 @@ def _plan_contact_fanout_row_claim(**arguments):
         raise RowAuthorityConfigError(
             "contact fan-out requires a v2 verified-contact authority link"
         )
+    canonical_hash = _require_sha256(
+        arguments.get("canonical_mailbox_identity_hash"),
+        field_name="canonical_mailbox_identity_hash",
+    )
+    if link["canonicalMailboxIdentityHash"] != canonical_hash:
+        raise RowAuthorityConfigError(
+            "contact fan-out link and canonical mailbox identity conflict"
+        )
     return _plan_row_claim_set(
         authority_origin="contact_fanout",
         operator_action_document=None,
         **arguments,
     )
+
+
+def _read_contact_apply_row_state(
+    *,
+    user_ref,
+    user_scope_hash,
+    row_id,
+    identity_document,
+    head_document,
+    read,
+    read_query,
+):
+    """Read and validate the bounded authority needed for one contact apply."""
+    scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    checked_row_id = validate_row_id(row_id)
+    identity = validate_row_identity_document(document=identity_document)
+    head = validate_row_authority_head(document=head_document)
+    if (
+        identity["userScopeHash"] != scope
+        or identity["rowId"] != checked_row_id
+        or head["userScopeHash"] != scope
+        or head["rowId"] != checked_row_id
+        or head["createdAt"] != identity["createdAt"]
+    ):
+        raise RowAuthorityConflict(
+            "contact apply bounded row authority is crossed"
+        )
+    claims = user_ref.collection("rowClaimSets")
+    generations = user_ref.collection("rowOwnerGenerations")
+    settlements = user_ref.collection("rowOwnerSettlements")
+    fanout_results = user_ref.collection("contactOptOutFanoutResults")
+    try:
+        history_query = (
+            settlements.where("rowId", "==", checked_row_id)
+            .order_by("generation", direction="DESCENDING")
+            .limit(2)
+        )
+    except Exception as exc:
+        raise RowAuthorityConfigError(
+            "contact apply cannot form bounded history query"
+        ) from exc
+    history_matches = read_query(
+        history_query,
+        description="bounded settlement history",
+        kind="settlement_history",
+        history_row_id=checked_row_id,
+    )
+    latest_settlements = []
+    latest_authorities = []
+    for settlement_ref, settlement_payload in history_matches:
+        latest_settlements.append(
+            {
+                "path": settlement_ref.path,
+                "document": settlement_payload,
+            }
+        )
+        try:
+            checked_settlement = validate_owner_settlement_document(
+                document=settlement_payload
+            )
+            authority_id = _generation_document_id(
+                row_id=checked_row_id,
+                generation=checked_settlement["generation"],
+            )
+            authority_generation_ref = generations.document(authority_id)
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "contact apply bounded settlement is malformed"
+            ) from exc
+        generation_exists, generation_payload = read(
+            authority_generation_ref
+        )
+        authority_claim_payload = None
+        if generation_exists:
+            try:
+                checked_generation = validate_owner_generation_document(
+                    document=generation_payload
+                )
+                authority_claim_ref = claims.document(
+                    checked_generation["requestId"]
+                )
+            except Exception as exc:
+                raise RowAuthorityAmbiguous(
+                    "contact apply bounded generation is malformed"
+                ) from exc
+            authority_claim_exists, observed_claim = read(
+                authority_claim_ref
+            )
+            if authority_claim_exists:
+                authority_claim_payload = observed_claim
+        latest_authorities.append(
+            {
+                "generation": (
+                    generation_payload if generation_exists else None
+                ),
+                "claimSet": authority_claim_payload,
+            }
+        )
+
+    predecessor_release_matches = []
+    predecessor_restored_authority = None
+    predecessor_release_hash = _bounded_predecessor_release_lookup_hash(
+        latest_settlements=latest_settlements,
+        latest_authorities=latest_authorities,
+    )
+    if predecessor_release_hash is not None:
+        predecessor_release_query = (
+            fanout_results.where("rowId", "==", checked_row_id)
+            .where(
+                "releasedRowSettlementHash",
+                "==",
+                predecessor_release_hash,
+            )
+            .order_by("__name__")
+            .limit(2)
+        )
+        for release_ref, release_payload in read_query(
+            predecessor_release_query,
+            description="predecessor release",
+        ):
+            predecessor_release_matches.append(
+                {
+                    "path": release_ref.path,
+                    "document": release_payload,
+                }
+            )
+        if len(predecessor_release_matches) == 1:
+            predecessor_restored_authority = (
+                _read_bounded_release_restored_authority(
+                    user_ref=user_ref,
+                    row_id=checked_row_id,
+                    release_document=predecessor_release_matches[0][
+                        "document"
+                    ],
+                    read=read,
+                )
+            )
+
+    current_generation = None
+    current_claim = None
+    current_settlement = None
+    current_settlement_ref = None
+    current_number = head["effectiveOwnerGeneration"]
+    if current_number is not None:
+        current_id = _generation_document_id(
+            row_id=checked_row_id,
+            generation=current_number,
+        )
+        current_generation_ref = generations.document(current_id)
+        current_generation_exists, current_generation_payload = read(
+            current_generation_ref
+        )
+        if current_generation_exists:
+            current_generation = current_generation_payload
+            try:
+                checked_current_generation = (
+                    validate_owner_generation_document(
+                        document=current_generation_payload
+                    )
+                )
+                current_claim_ref = claims.document(
+                    checked_current_generation["requestId"]
+                )
+            except Exception as exc:
+                raise RowAuthorityAmbiguous(
+                    "contact apply current generation is malformed"
+                ) from exc
+            current_claim_exists, current_claim_payload = read(
+                current_claim_ref
+            )
+            if current_claim_exists:
+                current_claim = current_claim_payload
+        current_settlement_ref = settlements.document(current_id)
+        current_settlement_exists, current_settlement_payload = read(
+            current_settlement_ref
+        )
+        if current_settlement_exists:
+            current_settlement = current_settlement_payload
+
+    release_result = None
+    release_result_path = None
+    released_authority = None
+    restored_authority = None
+    if (
+        head["latestSettlementHash"] != head["effectiveSettlementHash"]
+        and head["latestOptOutReleaseResultHash"] is not None
+    ):
+        release_query = (
+            fanout_results.where("rowId", "==", checked_row_id)
+            .where(
+                "contactFanoutResultHash",
+                "==",
+                head["latestOptOutReleaseResultHash"],
+            )
+            .order_by("__name__")
+            .limit(2)
+        )
+        release_matches = read_query(
+            release_query,
+            description="release result bridge",
+        )
+        if len(release_matches) != 1:
+            raise RowAuthorityAmbiguous(
+                "contact apply release bridge is missing or duplicated"
+            )
+        release_ref, release_payload = release_matches[0]
+        release_result = release_payload
+        release_result_path = release_ref.path
+        try:
+            checked_release = validate_contact_fanout_result_document(
+                document=release_payload
+            )
+            released_id = _generation_document_id(
+                row_id=checked_row_id,
+                generation=checked_release["releasedRowGeneration"],
+            )
+            released_generation_ref = generations.document(released_id)
+            released_settlement_ref = settlements.document(released_id)
+            (
+                released_generation_exists,
+                released_generation_payload,
+            ) = read(released_generation_ref)
+            released_claim_payload = None
+            if released_generation_exists:
+                checked_released_generation = (
+                    validate_owner_generation_document(
+                        document=released_generation_payload
+                    )
+                )
+                released_claim_ref = claims.document(
+                    checked_released_generation["requestId"]
+                )
+                released_claim_exists, observed_claim = read(
+                    released_claim_ref
+                )
+                if released_claim_exists:
+                    released_claim_payload = observed_claim
+            released_settlement_exists, released_settlement_payload = read(
+                released_settlement_ref
+            )
+            released_authority = {
+                "path": released_settlement_ref.path,
+                "generation": (
+                    released_generation_payload
+                    if released_generation_exists
+                    else None
+                ),
+                "claimSet": released_claim_payload,
+                "settlement": (
+                    released_settlement_payload
+                    if released_settlement_exists
+                    else None
+                ),
+            }
+            restored_number = checked_release["restoredEffectiveGeneration"]
+            if restored_number is not None:
+                restored_id = _generation_document_id(
+                    row_id=checked_row_id,
+                    generation=restored_number,
+                )
+                restored_generation_ref = generations.document(restored_id)
+                restored_settlement_ref = settlements.document(restored_id)
+                (
+                    restored_generation_exists,
+                    restored_generation_payload,
+                ) = read(restored_generation_ref)
+                restored_claim_payload = None
+                if restored_generation_exists:
+                    checked_restored_generation = (
+                        validate_owner_generation_document(
+                            document=restored_generation_payload
+                        )
+                    )
+                    restored_claim_ref = claims.document(
+                        checked_restored_generation["requestId"]
+                    )
+                    restored_claim_exists, observed_restored_claim = read(
+                        restored_claim_ref
+                    )
+                    if restored_claim_exists:
+                        restored_claim_payload = observed_restored_claim
+                (
+                    restored_settlement_exists,
+                    restored_settlement_payload,
+                ) = read(restored_settlement_ref)
+                restored_authority = {
+                    "generation": (
+                        restored_generation_payload
+                        if restored_generation_exists
+                        else None
+                    ),
+                    "claimSet": restored_claim_payload,
+                    "settlement": (
+                        restored_settlement_payload
+                        if restored_settlement_exists
+                        else None
+                    ),
+                }
+        except RowAuthorityError:
+            raise
+        except Exception:
+            released_authority = {"malformed": True}
+            restored_authority = {"malformed": True}
+
+    row_state = {
+        "rowId": checked_row_id,
+        "identity": identity,
+        "head": head,
+        "currentGeneration": current_generation,
+        "currentClaimSet": current_claim,
+        "currentSettlement": current_settlement,
+        "latestSettlements": latest_settlements,
+        "latestSettlementAuthorities": latest_authorities,
+        "latestPredecessorReleaseMatches": predecessor_release_matches,
+        "latestPredecessorRestoredAuthority": (
+            predecessor_restored_authority
+        ),
+        "releaseResult": release_result,
+        "releaseResultPath": release_result_path,
+        "releasedAuthority": released_authority,
+        "restoredAuthority": restored_authority,
+    }
+    bounded_history = _validate_bounded_row_history(
+        scope=scope,
+        row_id=checked_row_id,
+        head=head,
+        row_state=row_state,
+    )
+    candidate_id = _generation_document_id(
+        row_id=checked_row_id,
+        generation=bounded_history["nextGeneration"],
+    )
+    candidate_generation_ref = generations.document(candidate_id)
+    candidate_settlement_ref = settlements.document(candidate_id)
+    candidate_generation_exists, candidate_generation_payload = read(
+        candidate_generation_ref
+    )
+    candidate_settlement_exists, candidate_settlement_payload = read(
+        candidate_settlement_ref
+    )
+    row_state.update(
+        {
+            "candidateGeneration": (
+                candidate_generation_payload
+                if candidate_generation_exists
+                else None
+            ),
+            "candidateSettlement": (
+                candidate_settlement_payload
+                if candidate_settlement_exists
+                else None
+            ),
+        }
+    )
+
+    prior_effective_settlement = None
+    effective_hash = head["effectiveSettlementHash"]
+    if effective_hash is not None:
+        effective_query = (
+            settlements.where("settlementHash", "==", effective_hash)
+            .order_by("__name__")
+            .limit(2)
+        )
+        effective_matches = read_query(
+            effective_query,
+            description="effective predecessor settlement",
+        )
+        if len(effective_matches) != 1:
+            raise RowAuthorityAmbiguous(
+                "contact apply effective predecessor is missing or duplicated"
+            )
+        effective_ref, effective_payload = effective_matches[0]
+        try:
+            prior_effective_settlement = validate_owner_settlement_document(
+                document=effective_payload
+            )
+        except Exception as exc:
+            raise RowAuthorityAmbiguous(
+                "contact apply effective predecessor is malformed"
+            ) from exc
+        if (
+            effective_ref.path
+            != settlements.document(
+                _generation_document_id(
+                    row_id=checked_row_id,
+                    generation=prior_effective_settlement["generation"],
+                )
+            ).path
+            or prior_effective_settlement["userScopeHash"] != scope
+            or prior_effective_settlement["rowId"] != checked_row_id
+            or prior_effective_settlement["settlementHash"] != effective_hash
+        ):
+            raise RowAuthorityConflict(
+                "contact apply effective predecessor is crossed"
+            )
+    return {
+        "rowState": row_state,
+        "boundedHistory": bounded_history,
+        "candidateGenerationReference": candidate_generation_ref,
+        "candidateSettlementReference": candidate_settlement_ref,
+        "currentSettlementReference": current_settlement_ref,
+        "priorEffectiveSettlement": prior_effective_settlement,
+    }
+
+
+def _plan_contact_fanout_apply_row(
+    *,
+    user_scope_hash,
+    fanout_document,
+    contact_settlement_document,
+    obligation_document,
+    edge_document,
+    identity_document,
+    row_head_document,
+    row_state,
+    stored_claim_set_document,
+    prior_effective_settlement_document,
+    applied_at,
+    transient_lease_owner_hash,
+    transient_lease_until,
+):
+    """Plan one atomic apply result without selecting or reading authority."""
+    scope = _require_sha256(
+        user_scope_hash,
+        field_name="user_scope_hash",
+    )
+    fanout = validate_contact_fanout_head_document(
+        document=fanout_document
+    )
+    contact_settlement = validate_contact_settlement_document(
+        document=contact_settlement_document
+    )
+    obligation = validate_contact_fanout_obligation_document(
+        document=obligation_document
+    )
+    edge = validate_contact_row_binding_document(document=edge_document)
+    identity = validate_row_identity_document(document=identity_document)
+    before_head = validate_row_authority_head(document=row_head_document)
+    created = _require_timestamp(applied_at, field_name="applied_at")
+    row_id = obligation["rowId"]
+    canonical_hash = contact_settlement["canonicalMailboxIdentityHash"]
+    if (
+        fanout["userScopeHash"] != scope
+        or fanout["outcome"] != "apply"
+        or fanout["expectedContactSettlementHash"]
+        != contact_settlement["contactSettlementHash"]
+        or contact_settlement["userScopeHash"] != scope
+        or contact_settlement["transitionKind"] != "verified_optout"
+        or obligation["userScopeHash"] != scope
+        or obligation["fanoutId"] != fanout["fanoutId"]
+        or obligation["expectedContactSettlementHash"]
+        != contact_settlement["contactSettlementHash"]
+        or obligation["outcome"] != "apply"
+        or edge["userScopeHash"] != scope
+        or edge["canonicalMailboxIdentityHash"] != canonical_hash
+        or edge["rowId"] != row_id
+        or edge["contactRowEdgeHash"] != obligation["contactRowEdgeHash"]
+        or identity["userScopeHash"] != scope
+        or identity["rowId"] != row_id
+        or before_head["userScopeHash"] != scope
+        or before_head["rowId"] != row_id
+        or before_head["createdAt"] != identity["createdAt"]
+        or contact_settlement["settledAt"] > created
+        or obligation["createdAt"] > created
+        or edge["createdAt"] > created
+        or before_head["updatedAt"] > created
+    ):
+        raise RowAuthorityConflict(
+            "contact fan-out apply-row authority is crossed or unready"
+        )
+
+    if before_head["currentLocationLifecycle"] == "deleted":
+        if (
+            row_state is not None
+            or stored_claim_set_document is not None
+            or prior_effective_settlement_document is not None
+        ):
+            raise RowAuthorityConfigError(
+                "deleted contact apply cannot carry ownership planning state"
+            )
+        result = build_contact_fanout_result_document(
+            user_scope_hash=scope,
+            fanout_id=fanout["fanoutId"],
+            row_id=row_id,
+            obligation_hash=obligation["contactFanoutObligationHash"],
+            outcome="apply",
+            disposition="noop",
+            reason_code="row_deleted",
+            observed_row_head_hash=before_head["headHash"],
+            claim_request_id=None,
+            claim_set_hash=None,
+            row_generation=None,
+            row_settlement_hash=None,
+            released_row_generation=None,
+            released_row_settlement_hash=None,
+            restored_effective_generation=None,
+            restored_effective_settlement_hash=None,
+            created_at=created,
+        )
+        return {
+            "disposition": "noop",
+            "result": result,
+            "claimSet": None,
+            "generation": None,
+            "settlement": None,
+            "head": before_head,
+            "mutations": (),
+        }
+
+    if stored_claim_set_document is not None:
+        raise RowAuthorityAmbiguous(
+            "contact fan-out apply found a claim without its atomic result"
+        )
+    if type(row_state) is not dict or row_state.get("rowId") != row_id:
+        raise RowAuthorityConfigError(
+            "contact fan-out apply requires one exact bounded row state"
+        )
+    claim_plan = _plan_contact_fanout_row_claim(
+        user_scope_hash=scope,
+        authority_link=contact_settlement["authorityLink"],
+        fanout_id=fanout["fanoutId"],
+        canonical_mailbox_identity_hash=canonical_hash,
+        contact_settlement_hash=contact_settlement[
+            "contactSettlementHash"
+        ],
+        thread_binding_document=None,
+        canonical_row_id=row_id,
+        row_states=[row_state],
+        stored_claim_set_document=None,
+        created_at=created,
+        lease_owner_hash=transient_lease_owner_hash,
+        lease_until=transient_lease_until,
+    )
+    if claim_plan["disposition"] == "dominated":
+        claim = claim_plan["claimSet"]
+        result = build_contact_fanout_result_document(
+            user_scope_hash=scope,
+            fanout_id=fanout["fanoutId"],
+            row_id=row_id,
+            obligation_hash=obligation["contactFanoutObligationHash"],
+            outcome="apply",
+            disposition="dominated",
+            reason_code="claim_dominated",
+            observed_row_head_hash=before_head["headHash"],
+            claim_request_id=claim["requestId"],
+            claim_set_hash=claim["claimSetHash"],
+            row_generation=None,
+            row_settlement_hash=None,
+            released_row_generation=None,
+            released_row_settlement_hash=None,
+            restored_effective_generation=None,
+            restored_effective_settlement_hash=None,
+            created_at=created,
+        )
+        return {
+            "disposition": "dominated",
+            "result": result,
+            "claimSet": claim,
+            "generation": None,
+            "settlement": None,
+            "head": before_head,
+            "mutations": claim_plan["mutations"],
+        }
+    if claim_plan["disposition"] != "created":
+        raise RowAuthorityAmbiguous(
+            "contact fan-out claim replay lacks its atomic result"
+        )
+    if len(claim_plan["generations"]) != 1 or len(claim_plan["heads"]) != 1:
+        raise RowAuthorityConfigError(
+            "contact fan-out accepted claim is not one-row"
+        )
+    generation = claim_plan["generations"][0]
+    intermediate_head = claim_plan["heads"][0]
+    settlement_plan = _plan_owner_generation_settlement(
+        user_scope_hash=scope,
+        row_id=row_id,
+        expected_head=intermediate_head,
+        actual_head_document=intermediate_head,
+        identity_document=identity,
+        generation_document=generation,
+        claim_set_document=claim_plan["claimSet"],
+        stored_settlement_document=None,
+        prior_effective_settlement_document=(
+            prior_effective_settlement_document
+        ),
+        settled_at=created,
+        operator_action_document=None,
+        actual_bounded_history=None,
+    )
+    mutations = [
+        mutation
+        for mutation in claim_plan["mutations"]
+        if mutation["target"] != f"head:{row_id}"
+    ]
+    mutations.extend(
+        {
+            "target": (
+                f"settlement:{row_id}"
+                if mutation["target"] == "settlement"
+                else f"head:{row_id}"
+            ),
+            "operation": mutation["operation"],
+            "document": mutation["document"],
+        }
+        for mutation in settlement_plan["mutations"]
+    )
+    result = build_contact_fanout_result_document(
+        user_scope_hash=scope,
+        fanout_id=fanout["fanoutId"],
+        row_id=row_id,
+        obligation_hash=obligation["contactFanoutObligationHash"],
+        outcome="apply",
+        disposition="applied",
+        reason_code="claim_accepted",
+        observed_row_head_hash=before_head["headHash"],
+        claim_request_id=claim_plan["claimSet"]["requestId"],
+        claim_set_hash=claim_plan["claimSet"]["claimSetHash"],
+        row_generation=generation["generation"],
+        row_settlement_hash=settlement_plan["settlement"][
+            "settlementHash"
+        ],
+        released_row_generation=None,
+        released_row_settlement_hash=None,
+        restored_effective_generation=None,
+        restored_effective_settlement_hash=None,
+        created_at=created,
+    )
+    return {
+        "disposition": "applied",
+        "result": result,
+        "claimSet": claim_plan["claimSet"],
+        "generation": generation,
+        "settlement": settlement_plan["settlement"],
+        "head": settlement_plan["head"],
+        "mutations": tuple(mutations),
+    }
 
 
 def _plan_owner_generation_settlement(
@@ -14140,6 +15103,1695 @@ class RowAuthorityStore:
             disposition=disposition,
             fanout_head=callback_state["fanout_head"],
             obligations=callback_state["obligations"],
+        )
+
+    def process_contact_fanout_obligation(
+        self,
+        *,
+        verified_user_id,
+        fanout_id,
+        row_id,
+        expected_fanout_head,
+        lease_owner_hash,
+        processed_at,
+    ):
+        _require_row_authority_planned_writes(7)
+        expected = validate_contact_fanout_head_document(
+            document=expected_fanout_head
+        )
+        checked_user_id = _require_firestore_document_id(
+            verified_user_id,
+            field_name="verified_user_id",
+        )
+        checked_scope = user_scope_hash(checked_user_id)
+        checked_fanout_id = _require_sha256(
+            fanout_id,
+            field_name="fanout_id",
+        )
+        checked_row_id = validate_row_id(row_id)
+        checked_owner = _require_sha256(
+            lease_owner_hash,
+            field_name="lease_owner_hash",
+        )
+        event_time = _require_timestamp(
+            processed_at,
+            field_name="processed_at",
+        )
+        if (
+            expected["userScopeHash"] != checked_scope
+            or expected["fanoutId"] != checked_fanout_id
+        ):
+            raise RowAuthorityConfigError(
+                "expected contact processing fan-out does not belong to the request"
+            )
+        if expected["outcome"] != "apply" or expected["state"] != "applying":
+            raise RowAuthorityConfigError(
+                "contact fan-out apply processing requires applying apply state"
+            )
+        if expected["resultCount"] >= expected["obligationCount"]:
+            raise RowAuthorityConfigError(
+                "contact fan-out apply processing requires unfinished work"
+            )
+        if (
+            expected["leaseOwnerHash"] != checked_owner
+            or expected["leaseUntil"] is None
+        ):
+            raise RowAuthorityConfigError(
+                "contact fan-out apply processing requires its exact lease owner"
+            )
+        if event_time < expected["updatedAt"]:
+            raise RowAuthorityConfigError(
+                "contact fan-out apply processing cannot predate its expected head"
+            )
+        if event_time >= expected["leaseUntil"]:
+            raise RowAuthorityConfigError(
+                "contact fan-out apply processing requires an unexpired lease"
+            )
+
+        try:
+            user_ref = self._firestore.collection("users").document(
+                checked_user_id
+            )
+            fanout_ref = user_ref.collection(
+                "contactOptOutFanoutHeads"
+            ).document(checked_fanout_id)
+            contact_settlements = user_ref.collection(
+                "contactOptOutSettlements"
+            )
+            contact_receipts = user_ref.collection(
+                "contactOptOutTransitionRequests"
+            )
+            contact_heads = user_ref.collection("contactOptOutHeads")
+            obligations = user_ref.collection(
+                "contactOptOutFanoutObligations"
+            )
+            results = user_ref.collection("contactOptOutFanoutResults")
+            contact_edges = user_ref.collection("contactRowBindings")
+            row_identities = user_ref.collection("rowIdentities")
+            row_heads = user_ref.collection("rowAuthorityHeads")
+            claims = user_ref.collection("rowClaimSets")
+            generations = user_ref.collection("rowOwnerGenerations")
+            row_settlements = user_ref.collection("rowOwnerSettlements")
+        except Exception as exc:
+            raise RowAuthorityConfigError(
+                "contact fan-out apply processing cannot form exact paths"
+            ) from exc
+
+        callback_state = {
+            "entered": False,
+            "prepared": False,
+            "replayed": False,
+            "rejected": False,
+            "read_failed": False,
+            "before": {},
+            "references": {},
+            "queries": [],
+            "mutations": [],
+            "disposition": None,
+            "fanout_head": None,
+            "obligation": None,
+            "result": None,
+        }
+
+        def reject(error):
+            callback_state["rejected"] = True
+            raise error
+
+        def prepare(transaction):
+            callback_state.update(
+                {
+                    "entered": True,
+                    "prepared": False,
+                    "replayed": False,
+                    "rejected": False,
+                    "read_failed": False,
+                    "before": {},
+                    "references": {},
+                    "queries": [],
+                    "mutations": [],
+                    "disposition": None,
+                    "fanout_head": None,
+                    "obligation": None,
+                    "result": None,
+                }
+            )
+
+            def read(reference):
+                path = reference.path
+                if path in callback_state["before"]:
+                    return callback_state["before"][path]
+                try:
+                    snapshot = reference.get(transaction=transaction)
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "contact fan-out apply read failed before writes"
+                    ) from exc
+                observed = (
+                    bool(snapshot.exists),
+                    snapshot.to_dict() if snapshot.exists else None,
+                )
+                callback_state["before"][path] = observed
+                callback_state["references"][path] = reference
+                return observed
+
+            def read_query(
+                query,
+                *,
+                description,
+                kind="stable",
+                history_row_id=None,
+            ):
+                try:
+                    snapshots = tuple(transaction.get(query))
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "contact fan-out apply "
+                        f"{description} query failed before writes"
+                    ) from exc
+                matches = []
+                observed = []
+                for snapshot in snapshots:
+                    exists, payload = read(snapshot.reference)
+                    if not exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out apply "
+                                f"{description} query returned a missing document"
+                            )
+                        )
+                    matches.append((snapshot.reference, payload))
+                    observed.append(
+                        (
+                            snapshot.reference.path,
+                            _defensive_copy(payload),
+                        )
+                    )
+                callback_state["queries"].append(
+                    {
+                        "query": query,
+                        "matches": tuple(observed),
+                        "description": description,
+                        "kind": kind,
+                        "rowId": history_row_id,
+                    }
+                )
+                return tuple(matches)
+
+            def validate_existing_result(*, obligation, payload):
+                try:
+                    result = validate_contact_fanout_result_document(
+                        document=payload
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out apply existing result is malformed"
+                        )
+                    )
+                if (
+                    result["userScopeHash"] != checked_scope
+                    or result["fanoutId"] != checked_fanout_id
+                    or result["rowId"] != obligation["rowId"]
+                    or result["obligationHash"]
+                    != obligation["contactFanoutObligationHash"]
+                    or result["outcome"] != "apply"
+                    or result["createdAt"] < obligation["createdAt"]
+                    or result["createdAt"] > event_time
+                    or result["disposition"] == "superseded"
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out apply existing result is crossed"
+                        )
+                    )
+                return result
+
+            def validate_existing_result_evidence(
+                *, obligation, result, canonical_hash, contact_settlement
+            ):
+                if result["disposition"] == "noop":
+                    if result["reasonCode"] != "row_deleted":
+                        reject(
+                            RowAuthorityConflict(
+                                "contact fan-out apply noop result is unsupported"
+                            )
+                        )
+                    return
+                claim_ref = claims.document(result["claimRequestId"])
+                claim_exists, claim_payload = read(claim_ref)
+                if not claim_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out apply result claim is missing"
+                        )
+                    )
+                try:
+                    claim = validate_claim_set_document(
+                        document=claim_payload
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out apply result claim is malformed"
+                        )
+                    )
+                decisions = [
+                    decision
+                    for decision in claim["rowDecisions"]
+                    if decision["rowId"] == obligation["rowId"]
+                ]
+                if (
+                    claim_ref.path
+                    != claims.document(claim["requestId"]).path
+                    or claim["userScopeHash"] != checked_scope
+                    or claim["requestId"] != result["claimRequestId"]
+                    or claim["claimSetHash"] != result["claimSetHash"]
+                    or claim["authorityOrigin"] != "contact_fanout"
+                    or claim["authorityLink"]
+                    != contact_settlement["authorityLink"]
+                    or claim["fanoutId"] != checked_fanout_id
+                    or claim["ownerKind"] != "contact_optout"
+                    or claim["ownerKey"] != canonical_hash
+                    or claim["payloadHash"]
+                    != expected["expectedContactSettlementHash"]
+                    or claim["bindingCount"] != 1
+                    or claim["primaryRowId"] != obligation["rowId"]
+                    or claim["rowBindings"]
+                    != [
+                        {
+                            "rowId": obligation["rowId"],
+                            "role": "primary",
+                        }
+                    ]
+                    or len(decisions) != 1
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out apply result claim is crossed"
+                        )
+                    )
+                if result["disposition"] == "dominated":
+                    if (
+                        result["reasonCode"] != "claim_dominated"
+                        or claim["outcome"] != "dominated"
+                        or decisions[0]["decision"] != "dominated"
+                        or result["rowGeneration"] is not None
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "contact fan-out dominated result evidence is crossed"
+                            )
+                        )
+                    return
+                if (
+                    result["disposition"] != "applied"
+                    or result["reasonCode"] != "claim_accepted"
+                    or claim["outcome"] != "accepted"
+                    or decisions[0]["decision"] != "accepted"
+                    or decisions[0]["plannedGeneration"]
+                    != result["rowGeneration"]
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out applied result claim is crossed"
+                        )
+                    )
+                generation_id = _generation_document_id(
+                    row_id=obligation["rowId"],
+                    generation=result["rowGeneration"],
+                )
+                generation_ref = generations.document(generation_id)
+                settlement_ref = row_settlements.document(generation_id)
+                generation_exists, generation_payload = read(generation_ref)
+                settlement_exists, settlement_payload = read(settlement_ref)
+                if not generation_exists or not settlement_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out applied result authority is incomplete"
+                        )
+                    )
+                try:
+                    generation = validate_owner_generation_document(
+                        document=generation_payload
+                    )
+                    settlement = _validate_correlated_owner_settlement(
+                        scope=checked_scope,
+                        row_id=obligation["rowId"],
+                        generation=generation,
+                        claim=claim,
+                        settlement_document=settlement_payload,
+                    )
+                except RowAuthorityError as exc:
+                    reject(exc)
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out applied result authority is malformed"
+                        )
+                    )
+                if (
+                    generation["requestId"] != claim["requestId"]
+                    or generation["claimSetHash"] != claim["claimSetHash"]
+                    or generation["ownerKind"] != "contact_optout"
+                    or generation["ownerKey"] != canonical_hash
+                    or generation["generation"] != result["rowGeneration"]
+                    or generation["predecessorHeadHash"]
+                    != result["observedRowHeadHash"]
+                    or settlement["settlementHash"]
+                    != result["rowSettlementHash"]
+                    or settlement["outcome"] != "contact_optout"
+                    or settlement["settledAt"] > result["createdAt"]
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out applied result lineage is crossed"
+                        )
+                    )
+
+            fanout_exists, fanout_payload = read(fanout_ref)
+            if not fanout_exists:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply head is missing"
+                    )
+                )
+            try:
+                current = validate_contact_fanout_head_document(
+                    document=fanout_payload
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply head is malformed"
+                    )
+                )
+            if (
+                current["userScopeHash"] != checked_scope
+                or current["fanoutId"] != checked_fanout_id
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply head authority is crossed"
+                    )
+                )
+
+            try:
+                contact_settlement_query = (
+                    contact_settlements.where(
+                        "contactSettlementHash",
+                        "==",
+                        expected["expectedContactSettlementHash"],
+                    )
+                    .order_by("__name__")
+                    .limit(2)
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConfigError(
+                        "contact fan-out apply cannot form its settlement query"
+                    )
+                )
+            contact_settlement_matches = read_query(
+                contact_settlement_query,
+                description="contact settlement",
+            )
+            if len(contact_settlement_matches) != 1:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply requires one exact contact settlement"
+                    )
+                )
+            contact_settlement_ref, contact_settlement_payload = (
+                contact_settlement_matches[0]
+            )
+            try:
+                contact_settlement = validate_contact_settlement_document(
+                    document=contact_settlement_payload
+                )
+                canonical_hash = contact_settlement[
+                    "canonicalMailboxIdentityHash"
+                ]
+                expected_contact_settlement_path = (
+                    contact_settlements.document(
+                        f"{canonical_hash}--{contact_settlement['generation']}"
+                    ).path
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply settlement is malformed"
+                    )
+                )
+            if (
+                contact_settlement_ref.path
+                != expected_contact_settlement_path
+                or contact_settlement["userScopeHash"] != checked_scope
+                or contact_settlement["contactSettlementHash"]
+                != expected["expectedContactSettlementHash"]
+                or contact_settlement["transitionKind"] != "verified_optout"
+                or contact_settlement["settledAt"] > event_time
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply settlement occupies a wrong "
+                        "authority path"
+                    )
+                )
+            contact_head_ref = contact_heads.document(canonical_hash)
+            receipt_ref = contact_receipts.document(
+                contact_settlement["contactTransitionId"]
+            )
+            contact_head_exists, contact_head_payload = read(contact_head_ref)
+            receipt_exists, receipt_payload = read(receipt_ref)
+            if not contact_head_exists or not receipt_exists:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply current contact authority is incomplete"
+                    )
+                )
+            try:
+                _validate_current_contact_fanout_worker_authority(
+                    fanout_document=current,
+                    settlement_document=contact_settlement,
+                    receipt_document=receipt_payload,
+                    contact_head_document=contact_head_payload,
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply current contact authority is "
+                        "stale or crossed"
+                    )
+                )
+
+            try:
+                obligation_query = obligations.where(
+                    "fanoutId",
+                    "==",
+                    checked_fanout_id,
+                ).order_by("rowId", direction="ASCENDING")
+                if expected["discoveryCursorRowId"] is not None:
+                    obligation_query = obligation_query.start_after(
+                        {"rowId": expected["discoveryCursorRowId"]}
+                    )
+                obligation_query = obligation_query.limit(33)
+            except Exception as exc:
+                reject(
+                    RowAuthorityConfigError(
+                        "contact fan-out apply cannot form its obligation query"
+                    )
+                )
+            obligation_matches = read_query(
+                obligation_query,
+                description="obligation",
+            )
+            checked_obligations = []
+            previous_row = expected["discoveryCursorRowId"]
+            for obligation_ref, obligation_payload in obligation_matches:
+                try:
+                    obligation = validate_contact_fanout_obligation_document(
+                        document=obligation_payload
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out apply obligation is malformed"
+                        )
+                    )
+                if (
+                    obligation_ref.path
+                    != obligations.document(
+                        f"{checked_fanout_id}--{obligation['rowId']}"
+                    ).path
+                    or obligation["userScopeHash"] != checked_scope
+                    or obligation["fanoutId"] != checked_fanout_id
+                    or obligation["expectedContactSettlementHash"]
+                    != expected["expectedContactSettlementHash"]
+                    or obligation["outcome"] != "apply"
+                    or obligation["createdAt"] > event_time
+                    or (
+                        previous_row is not None
+                        and obligation["rowId"] <= previous_row
+                    )
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out apply obligation is crossed or unordered"
+                        )
+                    )
+                previous_row = obligation["rowId"]
+                checked_obligations.append(obligation)
+
+            inspected_obligations = checked_obligations[:32]
+            inspected_results = []
+            first_missing_index = None
+            for index, obligation in enumerate(inspected_obligations):
+                result_ref = results.document(
+                    f"{checked_fanout_id}--{obligation['rowId']}"
+                )
+                result_exists, result_payload = read(result_ref)
+                if result_exists:
+                    inspected_results.append(
+                        validate_existing_result(
+                            obligation=obligation,
+                            payload=result_payload,
+                        )
+                    )
+                else:
+                    inspected_results.append(None)
+                    if first_missing_index is None:
+                        first_missing_index = index
+
+            nominated_index = next(
+                (
+                    index
+                    for index, obligation in enumerate(
+                        inspected_obligations
+                    )
+                    if obligation["rowId"] == checked_row_id
+                ),
+                None,
+            )
+            nominated_result = (
+                None
+                if nominated_index is None
+                else inspected_results[nominated_index]
+            )
+            if nominated_result is not None and all(
+                result is not None
+                for result in inspected_results[:nominated_index]
+            ):
+                nominated_obligation = inspected_obligations[nominated_index]
+                processed_ordinal = (
+                    expected["cursorProcessedCount"] + nominated_index + 1
+                )
+                try:
+                    replay_head = _build_contact_fanout_processing_head(
+                        expected_document=expected,
+                        result_count=expected["resultCount"] + 1,
+                        discovery_cursor_row_id=nominated_obligation["rowId"],
+                        cursor_processed_count=processed_ordinal,
+                        processed_at=nominated_result["createdAt"],
+                    )
+                except Exception:
+                    replay_head = None
+                if current == replay_head:
+                    edge_id = domain_hash(
+                        CONTACT_ROW_EDGE_ID_DOMAIN,
+                        {
+                            "canonicalMailboxIdentityHash": canonical_hash,
+                            "rowId": checked_row_id,
+                        },
+                        user_scope_hash=checked_scope,
+                    )
+                    edge_ref = contact_edges.document(edge_id)
+                    edge_exists, edge_payload = read(edge_ref)
+                    if not edge_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out apply target edge is missing"
+                            )
+                        )
+                    try:
+                        edge = validate_contact_row_binding_document(
+                            document=edge_payload
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out apply target edge is malformed"
+                            )
+                        )
+                    if (
+                        edge_ref.path
+                        != contact_edges.document(edge["edgeId"]).path
+                        or edge["userScopeHash"] != checked_scope
+                        or edge["canonicalMailboxIdentityHash"]
+                        != canonical_hash
+                        or edge["rowId"] != checked_row_id
+                        or edge["contactRowEdgeHash"]
+                        != nominated_obligation["contactRowEdgeHash"]
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "contact fan-out apply target edge is crossed"
+                            )
+                        )
+                    validate_existing_result_evidence(
+                        obligation=nominated_obligation,
+                        result=nominated_result,
+                        canonical_hash=canonical_hash,
+                        contact_settlement=contact_settlement,
+                    )
+                    callback_state.update(
+                        {
+                            "replayed": True,
+                            "disposition": nominated_result[
+                                "disposition"
+                            ],
+                            "fanout_head": current,
+                            "obligation": nominated_obligation,
+                            "result": nominated_result,
+                        }
+                    )
+                    return nominated_result["disposition"]
+
+            if first_missing_index is None:
+                if len(checked_obligations) <= 32:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out apply exhausted exact results "
+                            "while counts differ"
+                        )
+                    )
+                sentinel = checked_obligations[32]
+                if checked_row_id != sentinel["rowId"]:
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out apply caller row is not the "
+                            "bounded sentinel"
+                        )
+                    )
+                if current != expected:
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out apply expected head is stale or drifted"
+                        )
+                    )
+                cursor_head = _build_contact_fanout_processing_head(
+                    expected_document=expected,
+                    result_count=expected["resultCount"],
+                    discovery_cursor_row_id=inspected_obligations[-1][
+                        "rowId"
+                    ],
+                    cursor_processed_count=(
+                        expected["cursorProcessedCount"] + 32
+                    ),
+                    processed_at=event_time,
+                )
+                callback_state.update(
+                    {
+                        "mutations": [("set", fanout_ref, cursor_head)],
+                        "disposition": "cursor_advanced",
+                        "fanout_head": cursor_head,
+                        "obligation": None,
+                        "result": None,
+                    }
+                )
+                transaction.set(fanout_ref, cursor_head, merge=False)
+                callback_state["prepared"] = True
+                return "cursor_advanced"
+
+            target_obligation = inspected_obligations[first_missing_index]
+            if checked_row_id != target_obligation["rowId"]:
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply caller row is not the first "
+                        "missing result"
+                    )
+                )
+            if current != expected:
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply expected head is stale or drifted"
+                    )
+                )
+
+            edge_id = domain_hash(
+                CONTACT_ROW_EDGE_ID_DOMAIN,
+                {
+                    "canonicalMailboxIdentityHash": canonical_hash,
+                    "rowId": checked_row_id,
+                },
+                user_scope_hash=checked_scope,
+            )
+            edge_ref = contact_edges.document(edge_id)
+            edge_exists, edge_payload = read(edge_ref)
+            if not edge_exists:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply target edge is missing"
+                    )
+                )
+            try:
+                edge = validate_contact_row_binding_document(
+                    document=edge_payload
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply target edge is malformed"
+                    )
+                )
+            if (
+                edge_ref.path != contact_edges.document(edge["edgeId"]).path
+                or edge["userScopeHash"] != checked_scope
+                or edge["canonicalMailboxIdentityHash"] != canonical_hash
+                or edge["rowId"] != checked_row_id
+                or edge["contactRowEdgeHash"]
+                != target_obligation["contactRowEdgeHash"]
+                or edge["createdAt"] > event_time
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply target edge is crossed"
+                    )
+                )
+
+            identity_ref = row_identities.document(checked_row_id)
+            row_head_ref = row_heads.document(checked_row_id)
+            identity_exists, identity_payload = read(identity_ref)
+            row_head_exists, row_head_payload = read(row_head_ref)
+            if not identity_exists or not row_head_exists:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply target row authority is incomplete"
+                    )
+                )
+            try:
+                identity = validate_row_identity_document(
+                    document=identity_payload
+                )
+                before_head = validate_row_authority_head(
+                    document=row_head_payload
+                )
+            except Exception as exc:
+                reject(
+                    RowAuthorityAmbiguous(
+                        "contact fan-out apply target row authority is malformed"
+                    )
+                )
+            if (
+                identity["userScopeHash"] != checked_scope
+                or identity["rowId"] != checked_row_id
+                or before_head["userScopeHash"] != checked_scope
+                or before_head["rowId"] != checked_row_id
+                or before_head["createdAt"] != identity["createdAt"]
+                or before_head["updatedAt"] > event_time
+            ):
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply target row authority is crossed"
+                    )
+                )
+
+            target_result_ref = results.document(
+                f"{checked_fanout_id}--{checked_row_id}"
+            )
+            target_result_exists, _target_result_payload = read(
+                target_result_ref
+            )
+            if target_result_exists:
+                reject(
+                    RowAuthorityConflict(
+                        "contact fan-out apply target result appeared outside "
+                        "its ordered scan"
+                    )
+                )
+
+            planned_mutations = []
+            if before_head["currentLocationLifecycle"] == "deleted":
+                disposition = "noop"
+                result = build_contact_fanout_result_document(
+                    user_scope_hash=checked_scope,
+                    fanout_id=checked_fanout_id,
+                    row_id=checked_row_id,
+                    obligation_hash=target_obligation[
+                        "contactFanoutObligationHash"
+                    ],
+                    outcome="apply",
+                    disposition="noop",
+                    reason_code="row_deleted",
+                    observed_row_head_hash=before_head["headHash"],
+                    claim_request_id=None,
+                    claim_set_hash=None,
+                    row_generation=None,
+                    row_settlement_hash=None,
+                    released_row_generation=None,
+                    released_row_settlement_hash=None,
+                    restored_effective_generation=None,
+                    restored_effective_settlement_hash=None,
+                    created_at=event_time,
+                )
+            else:
+                try:
+                    request_context = _derive_claim_request_context(
+                        user_scope_hash=checked_scope,
+                        authority_origin="contact_fanout",
+                        authority_link=contact_settlement["authorityLink"],
+                        operator_action_document=None,
+                        fanout_id=checked_fanout_id,
+                        thread_binding_document=None,
+                        canonical_mailbox_identity_hash=canonical_hash,
+                        contact_settlement_hash=contact_settlement[
+                            "contactSettlementHash"
+                        ],
+                        canonical_row_id=checked_row_id,
+                    )
+                    claim_ref = claims.document(
+                        request_context["requestId"]
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "contact fan-out apply claim identity cannot form"
+                        )
+                    )
+                claim_exists, _claim_payload = read(claim_ref)
+                if claim_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out apply found a claim without its "
+                            "atomic result"
+                        )
+                    )
+
+                try:
+                    history_query = (
+                        row_settlements.where(
+                            "rowId",
+                            "==",
+                            checked_row_id,
+                        )
+                        .order_by("generation", direction="DESCENDING")
+                        .limit(2)
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConfigError(
+                            "contact fan-out apply cannot form bounded history query"
+                        )
+                    )
+                history_matches = read_query(
+                    history_query,
+                    description="bounded settlement history",
+                    kind="settlement_history",
+                    history_row_id=checked_row_id,
+                )
+                latest_settlements = []
+                latest_authorities = []
+                for settlement_ref, settlement_payload in history_matches:
+                    latest_settlements.append(
+                        {
+                            "path": settlement_ref.path,
+                            "document": settlement_payload,
+                        }
+                    )
+                    try:
+                        checked_settlement = (
+                            validate_owner_settlement_document(
+                                document=settlement_payload
+                            )
+                        )
+                        authority_id = _generation_document_id(
+                            row_id=checked_row_id,
+                            generation=checked_settlement["generation"],
+                        )
+                        authority_generation_ref = generations.document(
+                            authority_id
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out apply bounded settlement is malformed"
+                            )
+                        )
+                    generation_exists, generation_payload = read(
+                        authority_generation_ref
+                    )
+                    authority_claim_payload = None
+                    if generation_exists:
+                        try:
+                            checked_generation = (
+                                validate_owner_generation_document(
+                                    document=generation_payload
+                                )
+                            )
+                            authority_claim_ref = claims.document(
+                                checked_generation["requestId"]
+                            )
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "contact fan-out apply bounded generation "
+                                    "is malformed"
+                                )
+                            )
+                        authority_claim_exists, observed_claim = read(
+                            authority_claim_ref
+                        )
+                        if authority_claim_exists:
+                            authority_claim_payload = observed_claim
+                    latest_authorities.append(
+                        {
+                            "generation": (
+                                generation_payload
+                                if generation_exists
+                                else None
+                            ),
+                            "claimSet": authority_claim_payload,
+                        }
+                    )
+
+                predecessor_release_matches = []
+                predecessor_restored_authority = None
+                predecessor_release_hash = (
+                    _bounded_predecessor_release_lookup_hash(
+                        latest_settlements=latest_settlements,
+                        latest_authorities=latest_authorities,
+                    )
+                )
+                if predecessor_release_hash is not None:
+                    predecessor_release_query = (
+                        results.where("rowId", "==", checked_row_id)
+                        .where(
+                            "releasedRowSettlementHash",
+                            "==",
+                            predecessor_release_hash,
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    for release_ref, release_payload in read_query(
+                        predecessor_release_query,
+                        description="predecessor release",
+                    ):
+                        predecessor_release_matches.append(
+                            {
+                                "path": release_ref.path,
+                                "document": release_payload,
+                            }
+                        )
+                    if len(predecessor_release_matches) == 1:
+                        predecessor_restored_authority = (
+                            _read_bounded_release_restored_authority(
+                                user_ref=user_ref,
+                                row_id=checked_row_id,
+                                release_document=(
+                                    predecessor_release_matches[0][
+                                        "document"
+                                    ]
+                                ),
+                                read=read,
+                            )
+                        )
+
+                current_generation = None
+                current_claim = None
+                current_settlement = None
+                current_settlement_ref = None
+                current_number = before_head["effectiveOwnerGeneration"]
+                if current_number is not None:
+                    current_id = _generation_document_id(
+                        row_id=checked_row_id,
+                        generation=current_number,
+                    )
+                    current_generation_ref = generations.document(current_id)
+                    current_generation_exists, current_generation_payload = read(
+                        current_generation_ref
+                    )
+                    if current_generation_exists:
+                        current_generation = current_generation_payload
+                        try:
+                            checked_current_generation = (
+                                validate_owner_generation_document(
+                                    document=current_generation_payload
+                                )
+                            )
+                            current_claim_ref = claims.document(
+                                checked_current_generation["requestId"]
+                            )
+                        except Exception as exc:
+                            reject(
+                                RowAuthorityAmbiguous(
+                                    "contact fan-out apply current generation "
+                                    "is malformed"
+                                )
+                            )
+                        current_claim_exists, current_claim_payload = read(
+                            current_claim_ref
+                        )
+                        if current_claim_exists:
+                            current_claim = current_claim_payload
+                    current_settlement_ref = row_settlements.document(
+                        current_id
+                    )
+                    (
+                        current_settlement_exists,
+                        current_settlement_payload,
+                    ) = read(current_settlement_ref)
+                    if current_settlement_exists:
+                        current_settlement = current_settlement_payload
+
+                release_result = None
+                release_result_path = None
+                released_authority = None
+                restored_authority = None
+                if (
+                    before_head["latestSettlementHash"]
+                    != before_head["effectiveSettlementHash"]
+                    and before_head["latestOptOutReleaseResultHash"]
+                    is not None
+                ):
+                    release_query = (
+                        results.where("rowId", "==", checked_row_id)
+                        .where(
+                            "contactFanoutResultHash",
+                            "==",
+                            before_head["latestOptOutReleaseResultHash"],
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    release_matches = read_query(
+                        release_query,
+                        description="release result bridge",
+                    )
+                    if len(release_matches) != 1:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out apply release bridge is "
+                                "missing or duplicated"
+                            )
+                        )
+                    release_ref, release_payload = release_matches[0]
+                    release_result = release_payload
+                    release_result_path = release_ref.path
+                    try:
+                        checked_release = (
+                            validate_contact_fanout_result_document(
+                                document=release_payload
+                            )
+                        )
+                        released_id = _generation_document_id(
+                            row_id=checked_row_id,
+                            generation=checked_release[
+                                "releasedRowGeneration"
+                            ],
+                        )
+                        released_generation_ref = generations.document(
+                            released_id
+                        )
+                        released_settlement_ref = row_settlements.document(
+                            released_id
+                        )
+                        (
+                            released_generation_exists,
+                            released_generation_payload,
+                        ) = read(released_generation_ref)
+                        released_claim_payload = None
+                        if released_generation_exists:
+                            checked_released_generation = (
+                                validate_owner_generation_document(
+                                    document=released_generation_payload
+                                )
+                            )
+                            released_claim_ref = claims.document(
+                                checked_released_generation["requestId"]
+                            )
+                            released_claim_exists, observed_claim = read(
+                                released_claim_ref
+                            )
+                            if released_claim_exists:
+                                released_claim_payload = observed_claim
+                        (
+                            released_settlement_exists,
+                            released_settlement_payload,
+                        ) = read(released_settlement_ref)
+                        released_authority = {
+                            "path": released_settlement_ref.path,
+                            "generation": (
+                                released_generation_payload
+                                if released_generation_exists
+                                else None
+                            ),
+                            "claimSet": released_claim_payload,
+                            "settlement": (
+                                released_settlement_payload
+                                if released_settlement_exists
+                                else None
+                            ),
+                        }
+                        restored_number = checked_release[
+                            "restoredEffectiveGeneration"
+                        ]
+                        if restored_number is not None:
+                            restored_id = _generation_document_id(
+                                row_id=checked_row_id,
+                                generation=restored_number,
+                            )
+                            restored_generation_ref = generations.document(
+                                restored_id
+                            )
+                            restored_settlement_ref = (
+                                row_settlements.document(restored_id)
+                            )
+                            (
+                                restored_generation_exists,
+                                restored_generation_payload,
+                            ) = read(restored_generation_ref)
+                            restored_claim_payload = None
+                            if restored_generation_exists:
+                                checked_restored_generation = (
+                                    validate_owner_generation_document(
+                                        document=restored_generation_payload
+                                    )
+                                )
+                                restored_claim_ref = claims.document(
+                                    checked_restored_generation[
+                                        "requestId"
+                                    ]
+                                )
+                                (
+                                    restored_claim_exists,
+                                    observed_restored_claim,
+                                ) = read(restored_claim_ref)
+                                if restored_claim_exists:
+                                    restored_claim_payload = (
+                                        observed_restored_claim
+                                    )
+                            (
+                                restored_settlement_exists,
+                                restored_settlement_payload,
+                            ) = read(restored_settlement_ref)
+                            restored_authority = {
+                                "generation": (
+                                    restored_generation_payload
+                                    if restored_generation_exists
+                                    else None
+                                ),
+                                "claimSet": restored_claim_payload,
+                                "settlement": (
+                                    restored_settlement_payload
+                                    if restored_settlement_exists
+                                    else None
+                                ),
+                            }
+                    except RowAuthorityRetryable:
+                        raise
+                    except Exception:
+                        released_authority = {"malformed": True}
+                        restored_authority = {"malformed": True}
+
+                row_state = {
+                    "rowId": checked_row_id,
+                    "identity": identity,
+                    "head": before_head,
+                    "currentGeneration": current_generation,
+                    "currentClaimSet": current_claim,
+                    "currentSettlement": current_settlement,
+                    "latestSettlements": latest_settlements,
+                    "latestSettlementAuthorities": latest_authorities,
+                    "latestPredecessorReleaseMatches": (
+                        predecessor_release_matches
+                    ),
+                    "latestPredecessorRestoredAuthority": (
+                        predecessor_restored_authority
+                    ),
+                    "releaseResult": release_result,
+                    "releaseResultPath": release_result_path,
+                    "releasedAuthority": released_authority,
+                    "restoredAuthority": restored_authority,
+                }
+                try:
+                    bounded_history = _validate_bounded_row_history(
+                        scope=checked_scope,
+                        row_id=checked_row_id,
+                        head=before_head,
+                        row_state=row_state,
+                    )
+                except RowAuthorityError as exc:
+                    reject(exc)
+
+                candidate_id = _generation_document_id(
+                    row_id=checked_row_id,
+                    generation=bounded_history["nextGeneration"],
+                )
+                candidate_generation_ref = generations.document(candidate_id)
+                candidate_settlement_ref = row_settlements.document(
+                    candidate_id
+                )
+                candidate_generation_exists, candidate_generation_payload = read(
+                    candidate_generation_ref
+                )
+                (
+                    candidate_settlement_exists,
+                    candidate_settlement_payload,
+                ) = read(candidate_settlement_ref)
+                row_state.update(
+                    {
+                        "candidateGeneration": (
+                            candidate_generation_payload
+                            if candidate_generation_exists
+                            else None
+                        ),
+                        "candidateSettlement": (
+                            candidate_settlement_payload
+                            if candidate_settlement_exists
+                            else None
+                        ),
+                    }
+                )
+
+                prior_effective_settlement = None
+                effective_hash = before_head["effectiveSettlementHash"]
+                if effective_hash is not None:
+                    effective_query = (
+                        row_settlements.where(
+                            "settlementHash",
+                            "==",
+                            effective_hash,
+                        )
+                        .order_by("__name__")
+                        .limit(2)
+                    )
+                    effective_matches = read_query(
+                        effective_query,
+                        description="effective predecessor settlement",
+                    )
+                    if len(effective_matches) != 1:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out apply effective predecessor "
+                                "is missing or duplicated"
+                            )
+                        )
+                    effective_ref, effective_payload = effective_matches[0]
+                    try:
+                        prior_effective_settlement = (
+                            validate_owner_settlement_document(
+                                document=effective_payload
+                            )
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact fan-out apply effective predecessor "
+                                "is malformed"
+                            )
+                        )
+                    if (
+                        effective_ref.path
+                        != row_settlements.document(
+                            _generation_document_id(
+                                row_id=checked_row_id,
+                                generation=prior_effective_settlement[
+                                    "generation"
+                                ],
+                            )
+                        ).path
+                        or prior_effective_settlement["userScopeHash"]
+                        != checked_scope
+                        or prior_effective_settlement["rowId"]
+                        != checked_row_id
+                        or prior_effective_settlement["settlementHash"]
+                        != effective_hash
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "contact fan-out apply effective predecessor is crossed"
+                            )
+                        )
+
+                try:
+                    claim_plan = _plan_contact_fanout_row_claim(
+                        user_scope_hash=checked_scope,
+                        authority_link=contact_settlement["authorityLink"],
+                        fanout_id=checked_fanout_id,
+                        canonical_mailbox_identity_hash=canonical_hash,
+                        contact_settlement_hash=contact_settlement[
+                            "contactSettlementHash"
+                        ],
+                        thread_binding_document=None,
+                        canonical_row_id=checked_row_id,
+                        row_states=[row_state],
+                        stored_claim_set_document=None,
+                        created_at=event_time,
+                        lease_owner_hash=checked_owner,
+                        lease_until=expected["leaseUntil"],
+                    )
+                except RowAuthorityError as exc:
+                    reject(exc)
+
+                claim_mutation_references = {
+                    "claim_set": claim_ref,
+                    f"generation:{checked_row_id}": (
+                        candidate_generation_ref
+                    ),
+                    f"predecessor_settlement:{checked_row_id}": (
+                        current_settlement_ref
+                    ),
+                    f"head:{checked_row_id}": row_head_ref,
+                }
+                if claim_plan["disposition"] == "dominated":
+                    disposition = "dominated"
+                    for mutation in claim_plan["mutations"]:
+                        reference = claim_mutation_references.get(
+                            mutation["target"]
+                        )
+                        if reference is None:
+                            reject(
+                                RowAuthorityConfigError(
+                                    "contact fan-out dominated claim lacks an "
+                                    "exact mutation reference"
+                                )
+                            )
+                        planned_mutations.append(
+                            (
+                                mutation["operation"],
+                                reference,
+                                mutation["document"],
+                            )
+                        )
+                    claim = claim_plan["claimSet"]
+                    result = build_contact_fanout_result_document(
+                        user_scope_hash=checked_scope,
+                        fanout_id=checked_fanout_id,
+                        row_id=checked_row_id,
+                        obligation_hash=target_obligation[
+                            "contactFanoutObligationHash"
+                        ],
+                        outcome="apply",
+                        disposition="dominated",
+                        reason_code="claim_dominated",
+                        observed_row_head_hash=before_head["headHash"],
+                        claim_request_id=claim["requestId"],
+                        claim_set_hash=claim["claimSetHash"],
+                        row_generation=None,
+                        row_settlement_hash=None,
+                        released_row_generation=None,
+                        released_row_settlement_hash=None,
+                        restored_effective_generation=None,
+                        restored_effective_settlement_hash=None,
+                        created_at=event_time,
+                    )
+                elif claim_plan["disposition"] == "created":
+                    disposition = "applied"
+                    if (
+                        len(claim_plan["generations"]) != 1
+                        or len(claim_plan["heads"]) != 1
+                    ):
+                        reject(
+                            RowAuthorityConfigError(
+                                "contact fan-out accepted claim is not one-row"
+                            )
+                        )
+                    generation = claim_plan["generations"][0]
+                    intermediate_head = claim_plan["heads"][0]
+                    try:
+                        settlement_plan = _plan_owner_generation_settlement(
+                            user_scope_hash=checked_scope,
+                            row_id=checked_row_id,
+                            expected_head=intermediate_head,
+                            actual_head_document=intermediate_head,
+                            identity_document=identity,
+                            generation_document=generation,
+                            claim_set_document=claim_plan["claimSet"],
+                            stored_settlement_document=None,
+                            prior_effective_settlement_document=(
+                                prior_effective_settlement
+                            ),
+                            settled_at=event_time,
+                            operator_action_document=None,
+                            actual_bounded_history=None,
+                        )
+                    except RowAuthorityError as exc:
+                        reject(exc)
+                    for mutation in claim_plan["mutations"]:
+                        if mutation["target"] == f"head:{checked_row_id}":
+                            continue
+                        reference = claim_mutation_references.get(
+                            mutation["target"]
+                        )
+                        if reference is None:
+                            reject(
+                                RowAuthorityConfigError(
+                                    "contact fan-out accepted claim lacks an "
+                                    "exact mutation reference"
+                                )
+                            )
+                        planned_mutations.append(
+                            (
+                                mutation["operation"],
+                                reference,
+                                mutation["document"],
+                            )
+                        )
+                    settlement_references = {
+                        "settlement": candidate_settlement_ref,
+                        "head": row_head_ref,
+                    }
+                    for mutation in settlement_plan["mutations"]:
+                        reference = settlement_references.get(
+                            mutation["target"]
+                        )
+                        if reference is None:
+                            reject(
+                                RowAuthorityConfigError(
+                                    "contact fan-out settlement lacks an exact "
+                                    "mutation reference"
+                                )
+                            )
+                        planned_mutations.append(
+                            (
+                                mutation["operation"],
+                                reference,
+                                mutation["document"],
+                            )
+                        )
+                    result = build_contact_fanout_result_document(
+                        user_scope_hash=checked_scope,
+                        fanout_id=checked_fanout_id,
+                        row_id=checked_row_id,
+                        obligation_hash=target_obligation[
+                            "contactFanoutObligationHash"
+                        ],
+                        outcome="apply",
+                        disposition="applied",
+                        reason_code="claim_accepted",
+                        observed_row_head_hash=before_head["headHash"],
+                        claim_request_id=claim_plan["claimSet"]["requestId"],
+                        claim_set_hash=claim_plan["claimSet"]["claimSetHash"],
+                        row_generation=generation["generation"],
+                        row_settlement_hash=settlement_plan["settlement"][
+                            "settlementHash"
+                        ],
+                        released_row_generation=None,
+                        released_row_settlement_hash=None,
+                        restored_effective_generation=None,
+                        restored_effective_settlement_hash=None,
+                        created_at=event_time,
+                    )
+                else:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact fan-out claim planner returned a replay "
+                            "without its atomic result"
+                        )
+                    )
+
+            next_result_count = expected["resultCount"] + 1
+            inspected_count = first_missing_index + 1
+            next_head = _build_contact_fanout_processing_head(
+                expected_document=expected,
+                result_count=next_result_count,
+                discovery_cursor_row_id=checked_row_id,
+                cursor_processed_count=(
+                    expected["cursorProcessedCount"] + inspected_count
+                ),
+                processed_at=event_time,
+            )
+            planned_mutations.extend(
+                [
+                    ("create", target_result_ref, result),
+                    ("set", fanout_ref, next_head),
+                ]
+            )
+            _require_row_authority_planned_writes(len(planned_mutations))
+            expected_writes = {
+                "applied": 6,
+                "dominated": 3,
+                "noop": 2,
+            }[disposition]
+            if len(planned_mutations) not in (
+                {6, 7} if disposition == "applied" else {expected_writes}
+            ):
+                reject(
+                    RowAuthorityConfigError(
+                        "contact fan-out apply mutation count drifted"
+                    )
+                )
+            callback_state.update(
+                {
+                    "mutations": planned_mutations,
+                    "disposition": disposition,
+                    "fanout_head": next_head,
+                    "obligation": target_obligation,
+                    "result": result,
+                }
+            )
+            for operation, reference, document in planned_mutations:
+                if operation == "create":
+                    transaction.create(reference, document)
+                elif operation == "set":
+                    transaction.set(reference, document, merge=False)
+                else:
+                    reject(
+                        RowAuthorityConfigError(
+                            "contact fan-out apply mutation operation is unsupported"
+                        )
+                    )
+            callback_state["prepared"] = True
+            return disposition
+
+        try:
+            transaction = self._firestore.transaction()
+        except Exception as exc:
+            raise RowAuthorityRetryable(
+                "contact fan-out apply transaction could not be created"
+            ) from exc
+        try:
+            disposition = self._transaction_executor(transaction, prepare)
+        except Exception as exc:
+            if callback_state["read_failed"]:
+                raise
+            if callback_state["rejected"]:
+                raise
+            if not callback_state["entered"]:
+                raise RowAuthorityRetryable(
+                    "contact fan-out apply transaction could not start"
+                ) from exc
+            if (
+                callback_state["fanout_head"] is None
+                or callback_state["disposition"] is None
+            ):
+                raise RowAuthorityAmbiguous(
+                    "contact fan-out apply commit has no complete plan"
+                ) from exc
+            try:
+                readback = {}
+                for path, reference in callback_state["references"].items():
+                    snapshot = reference.get()
+                    readback[path] = (
+                        bool(snapshot.exists),
+                        snapshot.to_dict() if snapshot.exists else None,
+                    )
+                query_observed = []
+                for query_state in callback_state["queries"]:
+                    query = query_state["query"]
+                    stream = getattr(query, "stream", None)
+                    if callable(stream):
+                        snapshots = tuple(stream())
+                    else:
+                        get = getattr(query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "contact fan-out apply query cannot be read back"
+                            )
+                        snapshots = tuple(get())
+                    query_observed.append(
+                        tuple(
+                            (
+                                snapshot.reference.path,
+                                snapshot.to_dict(),
+                            )
+                            for snapshot in snapshots
+                            if snapshot.exists
+                        )
+                    )
+            except Exception as readback_exc:
+                raise RowAuthorityAmbiguous(
+                    "contact fan-out apply commit outcome cannot be read back"
+                ) from readback_exc
+
+            expected_after = _defensive_copy(callback_state["before"])
+            for _operation, reference, document in callback_state[
+                "mutations"
+            ]:
+                expected_after[reference.path] = (True, document)
+            exact_before = readback == callback_state["before"]
+            exact_after = readback == expected_after
+            query_before_ok = all(
+                observed == query_state["matches"]
+                for observed, query_state in zip(
+                    query_observed,
+                    callback_state["queries"],
+                    strict=True,
+                )
+            )
+            query_after_expectations = []
+            for query_state in callback_state["queries"]:
+                expected_matches = query_state["matches"]
+                if query_state["kind"] == "settlement_history":
+                    by_path = {
+                        path: _defensive_copy(document)
+                        for path, document in expected_matches
+                    }
+                    for _operation, reference, document in callback_state[
+                        "mutations"
+                    ]:
+                        if (
+                            "/rowOwnerSettlements/" not in reference.path
+                            or document.get("rowId")
+                            != query_state["rowId"]
+                        ):
+                            continue
+                        by_path[reference.path] = _defensive_copy(document)
+                    expected_matches = tuple(
+                        sorted(
+                            by_path.items(),
+                            key=lambda item: (
+                                item[1]["generation"],
+                                item[0],
+                            ),
+                            reverse=True,
+                        )[:2]
+                    )
+                query_after_expectations.append(expected_matches)
+            query_after_ok = all(
+                observed == expected_matches
+                for observed, expected_matches in zip(
+                    query_observed,
+                    query_after_expectations,
+                    strict=True,
+                )
+            )
+            if exact_after and query_after_ok:
+                disposition = callback_state["disposition"]
+            elif (
+                exact_before
+                and query_before_ok
+                and not callback_state["mutations"]
+            ):
+                disposition = callback_state["disposition"]
+            elif exact_before and query_before_ok:
+                raise RowAuthorityRetryable(
+                    "contact fan-out apply commit failed before any apply"
+                ) from exc
+            else:
+                raise RowAuthorityAmbiguous(
+                    "contact fan-out apply commit readback is partial or drifted"
+                ) from exc
+
+        if disposition != callback_state["disposition"]:
+            raise RowAuthorityRetryable(
+                "contact fan-out apply returned a mismatched disposition"
+            )
+        if callback_state["mutations"] and not callback_state["prepared"]:
+            raise RowAuthorityRetryable(
+                "contact fan-out apply reported unprepared mutations"
+            )
+        if not callback_state["mutations"] and not callback_state["replayed"]:
+            raise RowAuthorityRetryable(
+                "contact fan-out apply returned no exact replay or mutation"
+            )
+        return _contact_fanout_processing_result(
+            disposition=disposition,
+            fanout_head=callback_state["fanout_head"],
+            obligation=callback_state["obligation"],
+            result=callback_state["result"],
         )
 
     def certify_contact_fanout_page(
@@ -25968,7 +28620,7 @@ class RowAuthorityStore:
         thread_id,
         created_at,
     ):
-        maximum_planned_writes = 3
+        maximum_planned_writes = 11
         if maximum_planned_writes > MAX_ROW_AUTHORITY_PLANNED_WRITES:
             raise RowAuthorityConfigError(
                 "contact association exceeds the planned-write ceiling"
@@ -26036,6 +28688,8 @@ class RowAuthorityStore:
             "disposition": None,
             "references": None,
             "observed": None,
+            "queries": [],
+            "mutation_references": {},
             "plan": None,
         }
 
@@ -26053,6 +28707,8 @@ class RowAuthorityStore:
                     "disposition": None,
                     "references": None,
                     "observed": None,
+                    "queries": [],
+                    "mutation_references": {},
                     "plan": None,
                 }
             )
@@ -26070,12 +28726,28 @@ class RowAuthorityStore:
                     ) from exc
 
             optout_observed = read_one(optout_head_ref)
+            contact_head = None
             if optout_observed[0]:
-                reject(
-                    RowAuthorityConflict(
-                        "an existing contact opt-out head blocks association"
+                try:
+                    contact_head = validate_contact_head_document(
+                        document=optout_observed[1]
                     )
-                )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConflict(
+                            "contact association current contact head is malformed"
+                        )
+                    )
+                if (
+                    contact_head["userScopeHash"] != checked_scope
+                    or contact_head["canonicalMailboxIdentityHash"]
+                    != checked_canonical_hash
+                ):
+                    reject(
+                        RowAuthorityConflict(
+                            "contact association current contact head is crossed"
+                        )
+                    )
 
             binding_observed = read_one(thread_binding_ref)
             if not binding_observed[0]:
@@ -26232,29 +28904,445 @@ class RowAuthorityStore:
             except RowAuthorityError as exc:
                 reject(exc)
 
-            mutations = plan["mutations"]
-            if len(mutations) not in {0, 1, 3}:
-                reject(
-                    RowAuthorityConfigError(
-                        "contact association produced an invalid write count"
+            all_references = list(references)
+            all_observed = list(observed)
+            reference_indexes = {
+                reference.path: index
+                for index, reference in enumerate(all_references)
+            }
+            query_readbacks = []
+
+            def read_tracked(reference):
+                existing_index = reference_indexes.get(reference.path)
+                if existing_index is not None:
+                    return all_observed[existing_index]
+                item = read_one(reference)
+                reference_indexes[reference.path] = len(all_references)
+                all_references.append(reference)
+                all_observed.append(item)
+                return item
+
+            def read_query(
+                query,
+                *,
+                description,
+                kind="stable",
+                history_row_id=None,
+            ):
+                try:
+                    snapshots = tuple(transaction.get(query))
+                except Exception as exc:
+                    callback_state["read_failed"] = True
+                    raise RowAuthorityRetryable(
+                        "contact association "
+                        f"{description} query failed before writes"
+                    ) from exc
+                matches = []
+                query_observed = []
+                for snapshot in snapshots:
+                    exists, payload = read_tracked(snapshot.reference)
+                    if not exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact association "
+                                f"{description} query returned a missing document"
+                            )
+                        )
+                    matches.append((snapshot.reference, payload))
+                    query_observed.append(
+                        (
+                            snapshot.reference.path,
+                            _defensive_copy(payload),
+                        )
                     )
+                query_readbacks.append(
+                    {
+                        "query": query,
+                        "matches": tuple(query_observed),
+                        "kind": kind,
+                        "rowId": history_row_id,
+                    }
                 )
-            if len(mutations) > MAX_ROW_AUTHORITY_PLANNED_WRITES:
-                reject(
-                    RowAuthorityConfigError(
-                        "contact association exceeds the planned-write ceiling"
-                    )
-                )
+                return tuple(matches)
+
+            mutations = list(plan["mutations"])
             target_references = {
                 "association": association_ref,
                 "evidence": evidence_ref,
                 "binding_head": contact_binding_head_ref,
             }
-            callback_state["plan"] = plan
+            late_obligation = None
+            late_result = None
+            late_fanout = None
+            if optout_observed[0]:
+                if (
+                    contact_head["state"] != "active"
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact association current contact authority is crossed"
+                        )
+                    )
+                try:
+                    contact_settlement_ref = user_ref.collection(
+                        "contactOptOutSettlements"
+                    ).document(
+                        f"{checked_canonical_hash}--"
+                        f"{contact_head['latestGeneration']}"
+                    )
+                    current_fanout_ref = user_ref.collection(
+                        "contactOptOutFanoutHeads"
+                    ).document(contact_head["activeFanoutId"])
+                except Exception as exc:
+                    reject(
+                        RowAuthorityConfigError(
+                            "contact association cannot form current contact paths"
+                        )
+                    )
+                settlement_exists, settlement_payload = read_tracked(
+                    contact_settlement_ref
+                )
+                if not settlement_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact association current settlement is missing"
+                        )
+                    )
+                try:
+                    contact_settlement = validate_contact_settlement_document(
+                        document=settlement_payload
+                    )
+                    receipt_ref = user_ref.collection(
+                        "contactOptOutTransitionRequests"
+                    ).document(contact_settlement["contactTransitionId"])
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact association current settlement is malformed"
+                        )
+                    )
+                receipt_exists, receipt_payload = read_tracked(receipt_ref)
+                fanout_exists, fanout_payload = read_tracked(
+                    current_fanout_ref
+                )
+                if not receipt_exists or not fanout_exists:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact association current fan-out authority is incomplete"
+                        )
+                    )
+                try:
+                    authority = _validate_current_contact_fanout_worker_authority(
+                        fanout_document=fanout_payload,
+                        settlement_document=contact_settlement,
+                        receipt_document=receipt_payload,
+                        contact_head_document=contact_head,
+                    )
+                except Exception as exc:
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact association current fan-out authority is malformed"
+                        )
+                    )
+                current_fanout = authority["fanoutHead"]
+                if (
+                    current_fanout["outcome"] != "apply"
+                    or current_fanout["state"]
+                    not in {"discovering", "applying", "complete"}
+                    or contact_settlement["transitionKind"]
+                    != "verified_optout"
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact association fan-out is not active and convergent"
+                        )
+                    )
+                prior_binding_head = (
+                    binding_head_observed[1]
+                    if binding_head_observed[0]
+                    else None
+                )
+                if prior_binding_head is None:
+                    prior_binding_revision = 0
+                    prior_binding_hash = None
+                    prior_binding_count = 0
+                else:
+                    try:
+                        checked_prior_binding = (
+                            validate_contact_row_binding_head_document(
+                                document=prior_binding_head
+                            )
+                        )
+                    except Exception as exc:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact association prior binding head is malformed"
+                            )
+                        )
+                    prior_binding_revision = checked_prior_binding[
+                        "stateRevision"
+                    ]
+                    prior_binding_hash = checked_prior_binding[
+                        "contactRowBindingHeadHash"
+                    ]
+                    prior_binding_count = checked_prior_binding[
+                        "associationCount"
+                    ]
+                if (
+                    current_fanout["bindingRevision"]
+                    != prior_binding_revision
+                    or current_fanout["bindingHeadHash"]
+                    != prior_binding_hash
+                    or current_fanout["bindingAssociationCount"]
+                    != prior_binding_count
+                ):
+                    reject(
+                        RowAuthorityAmbiguous(
+                            "contact association fan-out binding snapshot drifted"
+                        )
+                    )
+
+                if plan["disposition"] == "created":
+                    if (
+                        contact_head["updatedAt"] > checked_created_at
+                        or contact_settlement["settledAt"] > checked_created_at
+                        or current_fanout["updatedAt"] > checked_created_at
+                    ):
+                        reject(
+                            RowAuthorityConflict(
+                                "late association predates its current contact fan-out"
+                            )
+                        )
+                    late_obligation = build_contact_fanout_obligation_document(
+                        user_scope_hash=checked_scope,
+                        fanout_id=current_fanout["fanoutId"],
+                        row_id=checked_row_id,
+                        contact_row_edge_hash=plan["association"][
+                            "contactRowEdgeHash"
+                        ],
+                        expected_contact_settlement_hash=contact_settlement[
+                            "contactSettlementHash"
+                        ],
+                        outcome="apply",
+                        created_at=checked_created_at,
+                    )
+                    obligation_ref = user_ref.collection(
+                        "contactOptOutFanoutObligations"
+                    ).document(
+                        f"{current_fanout['fanoutId']}--{checked_row_id}"
+                    )
+                    result_ref = user_ref.collection(
+                        "contactOptOutFanoutResults"
+                    ).document(
+                        f"{current_fanout['fanoutId']}--{checked_row_id}"
+                    )
+                    obligation_exists, _obligation_payload = read_tracked(
+                        obligation_ref
+                    )
+                    result_exists, _result_payload = read_tracked(result_ref)
+                    if obligation_exists or result_exists:
+                        reject(
+                            RowAuthorityAmbiguous(
+                                "contact association late work already exists"
+                            )
+                        )
+                    target_references["fanout_obligation"] = obligation_ref
+                    target_references["fanout_head"] = current_fanout_ref
+                    mutations.append(
+                        {
+                            "target": "fanout_obligation",
+                            "operation": "create",
+                            "document": late_obligation,
+                        }
+                    )
+
+                    if current_fanout["state"] == "complete":
+                        row_apply_state = None
+                        prior_effective_settlement = None
+                        stored_claim = None
+                        if row_head["currentLocationLifecycle"] != "deleted":
+                            try:
+                                request_context = _derive_claim_request_context(
+                                    user_scope_hash=checked_scope,
+                                    authority_origin="contact_fanout",
+                                    authority_link=contact_settlement[
+                                        "authorityLink"
+                                    ],
+                                    operator_action_document=None,
+                                    fanout_id=current_fanout["fanoutId"],
+                                    thread_binding_document=None,
+                                    canonical_mailbox_identity_hash=(
+                                        checked_canonical_hash
+                                    ),
+                                    contact_settlement_hash=contact_settlement[
+                                        "contactSettlementHash"
+                                    ],
+                                    canonical_row_id=checked_row_id,
+                                )
+                                claim_ref = user_ref.collection(
+                                    "rowClaimSets"
+                                ).document(request_context["requestId"])
+                            except Exception as exc:
+                                reject(
+                                    RowAuthorityConflict(
+                                        "contact association claim identity cannot form"
+                                    )
+                                )
+                            claim_exists, claim_payload = read_tracked(
+                                claim_ref
+                            )
+                            stored_claim = (
+                                claim_payload if claim_exists else None
+                            )
+                            try:
+                                loaded = _read_contact_apply_row_state(
+                                    user_ref=user_ref,
+                                    user_scope_hash=checked_scope,
+                                    row_id=checked_row_id,
+                                    identity_document=row_identity,
+                                    head_document=row_head,
+                                    read=read_tracked,
+                                    read_query=read_query,
+                                )
+                            except RowAuthorityError as exc:
+                                reject(exc)
+                            row_apply_state = loaded["rowState"]
+                            prior_effective_settlement = loaded[
+                                "priorEffectiveSettlement"
+                            ]
+                            target_references.update(
+                                {
+                                    "claim_set": claim_ref,
+                                    f"generation:{checked_row_id}": loaded[
+                                        "candidateGenerationReference"
+                                    ],
+                                    f"predecessor_settlement:{checked_row_id}": (
+                                        loaded["currentSettlementReference"]
+                                    ),
+                                    f"settlement:{checked_row_id}": loaded[
+                                        "candidateSettlementReference"
+                                    ],
+                                    f"head:{checked_row_id}": row_head_ref,
+                                }
+                            )
+                        try:
+                            transient_deadline = (
+                                _timestamp_as_datetime(
+                                    checked_created_at,
+                                    field_name="created_at",
+                                )
+                                + timedelta(microseconds=1)
+                            ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                            apply_plan = _plan_contact_fanout_apply_row(
+                                user_scope_hash=checked_scope,
+                                fanout_document=current_fanout,
+                                contact_settlement_document=contact_settlement,
+                                obligation_document=late_obligation,
+                                edge_document=plan["association"],
+                                identity_document=row_identity,
+                                row_head_document=row_head,
+                                row_state=row_apply_state,
+                                stored_claim_set_document=stored_claim,
+                                prior_effective_settlement_document=(
+                                    prior_effective_settlement
+                                ),
+                                applied_at=checked_created_at,
+                                transient_lease_owner_hash=current_fanout[
+                                    "fanoutId"
+                                ],
+                                transient_lease_until=transient_deadline,
+                            )
+                        except (OverflowError, ValueError) as exc:
+                            reject(
+                                RowAuthorityConfigError(
+                                    "contact association cannot form transient claim lease"
+                                )
+                            )
+                        except RowAuthorityError as exc:
+                            reject(exc)
+                        for mutation in apply_plan["mutations"]:
+                            reference = target_references.get(
+                                mutation["target"]
+                            )
+                            if reference is None:
+                                reject(
+                                    RowAuthorityConfigError(
+                                        "contact association row apply lacks an exact mutation reference"
+                                    )
+                                )
+                            mutations.append(mutation)
+                        late_result = apply_plan["result"]
+                        target_references["fanout_result"] = result_ref
+                        mutations.append(
+                            {
+                                "target": "fanout_result",
+                                "operation": "create",
+                                "document": late_result,
+                            }
+                        )
+                        next_result_count = current_fanout["resultCount"] + 1
+                    else:
+                        next_result_count = current_fanout["resultCount"]
+
+                    try:
+                        late_fanout = (
+                            _build_contact_fanout_late_association_head(
+                                expected_document=current_fanout,
+                                prior_binding_head_document=(
+                                    prior_binding_head
+                                ),
+                                binding_head_document=plan["bindingHead"],
+                                obligation_count=(
+                                    current_fanout["obligationCount"] + 1
+                                ),
+                                result_count=next_result_count,
+                                associated_at=checked_created_at,
+                            )
+                        )
+                    except RowAuthorityError as exc:
+                        reject(exc)
+                    mutations.append(
+                        {
+                            "target": "fanout_head",
+                            "operation": "set",
+                            "document": late_fanout,
+                        }
+                    )
+
+            allowed_counts = (
+                {0, 1, 3}
+                if not optout_observed[0]
+                else {0, 1, 5, 6, 7, 10, 11}
+            )
+            if len(mutations) not in allowed_counts:
+                reject(
+                    RowAuthorityConfigError(
+                        "contact association produced an invalid write count"
+                    )
+                )
+            _require_row_authority_planned_writes(len(mutations))
+            combined_plan = {
+                **plan,
+                "mutations": tuple(mutations),
+                "obligation": late_obligation,
+                "fanoutResult": late_result,
+                "fanoutHead": late_fanout,
+            }
+            callback_state["references"] = tuple(all_references)
+            callback_state["observed"] = tuple(all_observed)
+            callback_state["queries"] = query_readbacks
+            callback_state["mutation_references"] = target_references
+            callback_state["plan"] = combined_plan
             callback_state["disposition"] = plan["disposition"]
             callback_state["prepared"] = bool(mutations)
             for mutation in mutations:
-                reference = target_references[mutation["target"]]
+                reference = target_references.get(mutation["target"])
+                if reference is None:
+                    reject(
+                        RowAuthorityConfigError(
+                            "contact association produced an unbound mutation"
+                        )
+                    )
                 if mutation["operation"] == "create":
                     transaction.create(reference, mutation["document"])
                 elif mutation["operation"] == "set":
@@ -26297,27 +29385,99 @@ class RowAuthorityStore:
                 ) from exc
             try:
                 readback = self._read_reference_payloads(references)
+                query_observed = []
+                for query_readback in callback_state["queries"]:
+                    query = query_readback["query"]
+                    stream = getattr(query, "stream", None)
+                    if callable(stream):
+                        snapshots = tuple(stream())
+                    else:
+                        get = getattr(query, "get", None)
+                        if not callable(get):
+                            raise RuntimeError(
+                                "contact association query cannot be read back"
+                            )
+                        snapshots = tuple(get())
+                    query_observed.append(
+                        tuple(
+                            (
+                                snapshot.reference.path,
+                                snapshot.to_dict(),
+                            )
+                            for snapshot in snapshots
+                            if snapshot.exists
+                        )
+                    )
             except Exception as readback_exc:
                 raise RowAuthorityAmbiguous(
                     "contact association commit outcome cannot be read back"
                 ) from readback_exc
 
             expected_after = list(observed)
-            target_indexes = {
-                "association": 5,
-                "evidence": 6,
-                "binding_head": 7,
+            reference_indexes = {
+                reference.path: index
+                for index, reference in enumerate(references)
             }
             for mutation in plan["mutations"]:
-                expected_after[target_indexes[mutation["target"]]] = (
+                reference = callback_state["mutation_references"][
+                    mutation["target"]
+                ]
+                expected_after[reference_indexes[reference.path]] = (
                     True,
                     mutation["document"],
                 )
             exact_before = readback == observed
             exact_after = readback == tuple(expected_after)
-            if exact_after:
+            query_before_ok = all(
+                observed_query == query_readback["matches"]
+                for observed_query, query_readback in zip(
+                    query_observed,
+                    callback_state["queries"],
+                    strict=True,
+                )
+            )
+            query_after_expectations = []
+            for query_readback in callback_state["queries"]:
+                expected_matches = query_readback["matches"]
+                if query_readback["kind"] == "settlement_history":
+                    by_path = {
+                        path: _defensive_copy(document)
+                        for path, document in expected_matches
+                    }
+                    for mutation in plan["mutations"]:
+                        reference = callback_state["mutation_references"][
+                            mutation["target"]
+                        ]
+                        if "/rowOwnerSettlements/" not in reference.path:
+                            continue
+                        document = mutation["document"]
+                        if document["rowId"] != query_readback["rowId"]:
+                            continue
+                        by_path[reference.path] = _defensive_copy(document)
+                    expected_matches = tuple(
+                        sorted(
+                            by_path.items(),
+                            key=lambda item: (
+                                item[1]["generation"],
+                                item[0],
+                            ),
+                            reverse=True,
+                        )[:2]
+                    )
+                query_after_expectations.append(expected_matches)
+            query_after_ok = all(
+                observed_query == expected_matches
+                for observed_query, expected_matches in zip(
+                    query_observed,
+                    query_after_expectations,
+                    strict=True,
+                )
+            )
+            if exact_after and query_after_ok:
                 disposition = plan["disposition"]
-            elif exact_before and plan["mutations"]:
+            elif exact_before and query_before_ok and not plan["mutations"]:
+                disposition = plan["disposition"]
+            elif exact_before and query_before_ok:
                 raise RowAuthorityRetryable(
                     "contact association commit failed before any apply"
                 ) from exc

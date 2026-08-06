@@ -1971,6 +1971,8 @@ class RowOwnershipContractTests(unittest.TestCase):
                 self.module._plan_contact_fanout_row_claim(
                     user_scope_hash=self.scope,
                     authority_link=legacy,
+                    thread_binding_document=None,
+                    canonical_row_id=self.first,
                 )
         generic_planner.assert_not_called()
 
@@ -1989,6 +1991,11 @@ class RowOwnershipContractTests(unittest.TestCase):
                 user_scope_hash=self.scope,
                 authority_link=link,
                 fanout_id="8" * 64,
+                canonical_mailbox_identity_hash=link[
+                    "canonicalMailboxIdentityHash"
+                ],
+                thread_binding_document=None,
+                canonical_row_id=self.first,
             )
         self.assertIs(sentinel, result)
         generic_planner.assert_called_once_with(
@@ -1997,7 +2004,43 @@ class RowOwnershipContractTests(unittest.TestCase):
             user_scope_hash=self.scope,
             authority_link=link,
             fanout_id="8" * 64,
+            canonical_mailbox_identity_hash=link[
+                "canonicalMailboxIdentityHash"
+            ],
+            thread_binding_document=None,
+            canonical_row_id=self.first,
         )
+
+    def test_contact_fanout_origin_rejects_caller_selected_thread_binding(self):
+        link, _bundle = self._link(
+            "contact_optout",
+            contact_evidence_version=2,
+        )
+        binding = self.module.build_thread_row_binding_document(
+            user_scope_hash=self.scope,
+            thread_id="thread-1",
+            client_id="client-1",
+            row_ids=[self.first],
+            primary_row_id=self.first,
+            created_at=self.created_at,
+        )
+        with patch.object(
+            self.module,
+            "_plan_row_claim_set",
+            side_effect=AssertionError("generic row planning was reached"),
+        ) as generic_planner:
+            with self.assertRaises(self.module.RowAuthorityConfigError):
+                self.module._plan_contact_fanout_row_claim(
+                    user_scope_hash=self.scope,
+                    authority_link=link,
+                    fanout_id="8" * 64,
+                    canonical_mailbox_identity_hash=link[
+                        "canonicalMailboxIdentityHash"
+                    ],
+                    thread_binding_document=binding,
+                    canonical_row_id=self.first,
+                )
+        generic_planner.assert_not_called()
 
     def test_b1_link_exact_schema_owner_correlations_and_hard_optout_requirement(self):
         terminal, _bundle = self._link("terminal")
@@ -4564,7 +4607,7 @@ class ContactRowAssociationStoreTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, accessed)
 
-    def test_existing_contact_optout_head_blocks_association_with_zero_writes(self):
+    def test_malformed_contact_optout_head_blocks_association_with_zero_writes(self):
         store = self._store()
         _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
             self._seed_prerequisites(store)
@@ -4589,7 +4632,7 @@ class ContactRowAssociationStoreTests(unittest.TestCase):
             [event[1] for event in store.events if event[0] == "get"],
         )
 
-    def test_contact_optout_head_blocks_exact_association_replay_first(self):
+    def test_malformed_contact_optout_head_blocks_exact_association_replay_first(self):
         store = self._store()
         _rows, (binding, _reverse, _binding_ref, _reverse_refs) = (
             self._seed_prerequisites(store)
@@ -4613,7 +4656,7 @@ class ContactRowAssociationStoreTests(unittest.TestCase):
             [event[1] for event in store.events if event[0] == "get"],
         )
 
-    def test_association_never_accesses_alias_settlement_fanout_or_release_collections(self):
+    def test_association_without_contact_head_skips_contact_fanout_lineage(self):
         store = self._store()
         self._seed_prerequisites(store)
         store.events.clear()
@@ -4633,12 +4676,8 @@ class ContactRowAssociationStoreTests(unittest.TestCase):
             for event in store.events
             if event[0] in {"get", "create", "set", "update", "delete"}
         )
-        source = inspect.getsource(
-            self.module.RowAuthorityStore.record_contact_row_association
-        )
         for collection in forbidden:
             self.assertNotIn(collection, accessed)
-            self.assertNotIn(collection, source)
 
     def test_identical_first_association_workers_create_one_edge_and_evidence(self):
         store = self._store()
@@ -5917,7 +5956,6 @@ class RowClaimStoreTests(unittest.TestCase):
     def _contact_plan(
         self,
         store,
-        binding,
         *,
         created_at="2026-08-04T12:00:03.000000Z",
         lease_until="2026-08-04T12:06:00.000000Z",
@@ -5940,9 +5978,12 @@ class RowClaimStoreTests(unittest.TestCase):
             user_scope_hash=self.scope,
             authority_link=link,
             fanout_id="8" * 64,
-            canonical_mailbox_identity_hash="9" * 64,
+            canonical_mailbox_identity_hash=link[
+                "canonicalMailboxIdentityHash"
+            ],
             contact_settlement_hash="7" * 64,
-            thread_binding_document=binding,
+            thread_binding_document=None,
+            canonical_row_id=self.first,
             row_states=[self._current_row_state(store, self.first)],
             stored_claim_set_document=None,
             created_at=created_at,
@@ -6334,7 +6375,7 @@ class RowClaimStoreTests(unittest.TestCase):
         self._seed_row(store, self.first)
         binding = self._seed_thread_binding(store, [self.first])
         store.events.clear()
-        plan = self._contact_plan(store, binding)
+        plan = self._contact_plan(store)
         self.assertEqual("created", plan["disposition"])
         self.assertEqual("contact_fanout", plan["claimSet"]["authorityOrigin"])
         self.assertEqual([], store.events)
@@ -6520,7 +6561,7 @@ class RowClaimStoreTests(unittest.TestCase):
                     self.first,
                     owner_kind=owner_kind,
                 )
-                plan = self._contact_plan(store, binding)
+                plan = self._contact_plan(store)
                 self.assertEqual("created", plan["disposition"])
                 self.assertEqual(3, plan["claimSet"]["derivedPriority"])
                 self.assertEqual(2, plan["generations"][0]["generation"])
@@ -6678,14 +6719,6 @@ class RowClaimStoreTests(unittest.TestCase):
         )
         contact = self._contact_plan(
             store,
-            self.module.validate_thread_row_binding_document(
-                document=store.data[
-                    self._user_reference(store)
-                    .collection("threadRowBindings")
-                    .document("thread-1")
-                    .path
-                ]
-            ),
             created_at="2026-08-04T12:00:05.000000Z",
             lease_until="2026-08-04T12:08:00.000000Z",
         )
@@ -6754,7 +6787,6 @@ class RowClaimStoreTests(unittest.TestCase):
         )
         plan = self._contact_plan(
             store,
-            binding,
             created_at="2026-08-04T12:00:04.000000Z",
         )
         self.assertEqual((), plan["predecessorSettlements"])
@@ -7330,7 +7362,6 @@ class RowClaimStoreTests(unittest.TestCase):
                 with self.assertRaises(self.module.RowAuthorityConflict):
                     self._contact_plan(
                         store,
-                        binding,
                         created_at="2026-08-04T12:00:04.000000Z",
                     )
 
@@ -7759,7 +7790,6 @@ class RowClaimStoreTests(unittest.TestCase):
         )
         contact = self._contact_plan(
             store,
-            binding,
             created_at="2026-08-04T12:00:04.000000Z",
             lease_until="2026-08-04T12:07:00.000000Z",
         )
@@ -8145,7 +8175,6 @@ class RowClaimStoreTests(unittest.TestCase):
         with self.assertRaises(self.module.RowAuthorityConflict):
             self._contact_plan(
                 store,
-                binding,
                 created_at="2026-08-04T12:00:04.000000Z",
             )
         with self.assertRaises(self.module.RowAuthorityAmbiguous):
@@ -8892,7 +8921,6 @@ class RowSettlementStoreTests(unittest.TestCase):
         ) = self.fixture._install_settled_human_owner(store, self.row_id)
         contact_plan = self.fixture._contact_plan(
             store,
-            binding,
             created_at="2026-08-04T12:00:04.000000Z",
             lease_until="2026-08-04T12:06:00.000000Z",
         )
@@ -9233,7 +9261,6 @@ class RowSettlementStoreTests(unittest.TestCase):
         self._settle(higher_store, old_head)
         contact_plan = self.fixture._contact_plan(
             higher_store,
-            binding,
             created_at="2026-08-04T12:00:05.000000Z",
             lease_until="2026-08-04T12:06:00.000000Z",
         )
