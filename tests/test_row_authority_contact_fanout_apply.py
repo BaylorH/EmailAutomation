@@ -737,6 +737,53 @@ class ContactFanoutApplyTests(unittest.TestCase):
         self.assertEqual(2, len(self._writes(context["store"])))
         self.assertIn(("commit_applied", 2), context["store"].events)
 
+    def test_stale_apply_cannot_reassert_after_later_release(self):
+        context = self._seed_apply(prior_owner="human_decision")
+        active_head = deepcopy(context["contactHead"])
+        active_fanout = deepcopy(context["fanout"])
+        before_row = deepcopy(context["rowHead"])
+        releases = importlib.import_module(
+            "tests.test_row_authority_contact_releases"
+        ).ContactReleaseTransitionTests
+        releases.setUpClass()
+        release = releases(methodName="runTest")
+        release.setUp()
+        released = release._release(
+            {
+                "store": context["store"],
+                "settlement": context["settlement"],
+            },
+            requested_at="2026-08-04T12:05:50.000000Z",
+        )
+        self.assertEqual("created", released["disposition"])
+        self.assertEqual(
+            "authenticated_release",
+            released["settlement"]["transitionKind"],
+        )
+
+        user = context["transition"]._user(context["store"])
+        user.collection("contactOptOutHeads").document(
+            context["canonicalHash"]
+        ).set(active_head, merge=False)
+        user.collection("contactOptOutFanoutHeads").document(
+            active_fanout["fanoutId"]
+        ).set(active_fanout, merge=False)
+        context["fanout"] = active_fanout
+        before = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self._process(
+                context,
+                processed_at="2026-08-04T12:06:10.000000Z",
+            )
+
+        self.assertEqual(before, context["store"].data)
+        self.assertEqual(before_row, self._documents(context, "rowAuthorityHeads")[
+            context["rowId"]
+        ])
+        self.assertEqual([], self._writes(context["store"]))
+
     def test_apply_uses_v2_contact_settlement_link_not_thread_authority(self):
         self._method()
         context = self._seed_apply()

@@ -826,10 +826,15 @@ selected tests. The Task 5 plus B2-B gate passed 356 tests, and the complete
 **Files:**
 
 - Modify: `email_automation/row_authority.py`
-- Modify: `tests/test_row_authority_contact_compliance.py`
-- Modify: `tests/test_row_authority_ownership.py`
+- Modify:
+  `docs/superpowers/specs/2026-08-04-stable-row-authority-b2-c-contact-compliance-amendment.md`
+- Create: `tests/test_row_authority_contact_fanout_release.py`
+- Create: `tests/test_row_authority_contact_fanout_release_origin.py`
+- Create: `tests/test_row_authority_contact_late_release.py`
+- Retained gates: `tests/test_row_authority_contact_compliance.py`,
+  `tests/test_row_authority_ownership.py`
 
-- [ ] **Step 1: Write failing release result-matrix tests**
+- [x] **Step 1: Write failing release result-matrix tests**
 
 Selected RED names:
 
@@ -837,14 +842,14 @@ Selected RED names:
 ContactFanoutReleaseTests.test_release_restores_exact_terminal_or_human_predecessor
 ContactFanoutReleaseTests.test_release_restores_clear_without_reusing_generation
 ContactFanoutReleaseTests.test_release_noops_when_row_optout_was_dominated_or_not_applied
-ContactFanoutReleaseTests.test_release_noops_when_different_effective_owner_controls_exact_target
+ContactFanoutReleaseTests.test_release_rejects_impossible_equal_priority_different_owner_lineage
 ContactFanoutReleaseTests.test_partial_release_a_then_optout_and_release_b_restores_still_a_controlled_row
 ContactFanoutReleaseTests.test_release_never_restores_another_canonical_contacts_optout
 ContactFanoutReleaseTests.test_release_loses_safely_to_newer_contact_transition
 ContactFanoutReleaseTests.test_release_result_uses_before_image_and_exact_nullable_matrix
 ```
 
-- [ ] **Step 2: Write failing restore-lineage corruption tests**
+- [x] **Step 2: Write failing restore-lineage corruption tests**
 
 Cover missing/duplicate predecessor hash lookup, wrong row, non-lower
 generation, wrong generation hash/claim, dominated/contact-optout/nonsettled or
@@ -854,7 +859,14 @@ same-canonical older epoch versus different canonical owner, stale row head,
 and partial readback. Prove `already_restored` cannot be a first-write result.
 Every failure must preserve the complete before-image.
 
-- [ ] **Step 3: Implement exact release planner and obligation processing**
+The frozen priority lattice has no valid first-write
+`noop/different_effective_owner` path: an applied contact opt-out is already at
+the maximum priority, and a release bridge has its own deterministic row
+result. Keep the tuple reserved in the result schema, prove the valid
+different-canonical-first path is `row_optout_not_applied`, and reject a
+synthetic direct equal-priority successor without writes.
+
+- [x] **Step 3: Implement exact release planner and obligation processing**
 
 Resolve the current effective contact claim, the selected settlement's
 mandatory originating apply obligation and result evidence from its own epoch,
@@ -864,20 +876,21 @@ different canonical owner. Restore only effective fields, preserve latest
 historical/source fields, create result plus row/fan-out heads atomically, and
 allocate no row generation.
 
-- [ ] **Step 4: Write failing released-complete late-association tests**
+- [x] **Step 4: Write failing released-complete late-association tests**
 
 Selected RED names:
 
 ```text
-ContactLateAssociationTests.test_released_nonterminal_late_row_adds_immediate_noop_and_resets_cursor
-ContactLateAssociationTests.test_released_complete_late_row_recertifies_binding_without_obligation
-ContactLateAssociationTests.test_released_complete_recertification_keeps_counts_state_fence_and_null_lease
-ContactLateAssociationTests.test_released_complete_count_exception_survives_later_contact_epoch
-ContactLateAssociationTests.test_released_complete_next_epoch_discovers_late_row
-ContactLateAssociationTests.test_released_complete_race_or_malformed_fanout_writes_nothing
+ContactLateReleaseAssociationTests.test_released_nonterminal_late_row_adds_immediate_noop_and_resets_cursor
+ContactLateReleaseAssociationTests.test_released_complete_late_row_recertifies_without_obligation_or_result
+ContactLateReleaseAssociationTests.test_released_complete_recertification_preserves_terminal_certificate
+ContactLateReleaseAssociationTests.test_released_complete_count_exception_survives_later_contact_epoch
+ContactLateReleaseAssociationTests.test_released_complete_next_active_epoch_discovers_late_row
+ContactLateReleaseAssociationTests.test_released_malformed_or_terminal_fanout_writes_nothing
+ContactLateReleaseAssociationTests.test_released_contact_fanout_race_creates_no_late_artifacts
 ```
 
-- [ ] **Step 5: Implement exact released-state late-association behavior**
+- [x] **Step 5: Implement exact released-state late-association behavior**
 
 During `discovering|applying`, atomically create association/evidence/binding
 head, release obligation, and immediate `noop/row_optout_not_applied` result;
@@ -889,22 +902,73 @@ exception against the immutable first-completion certificate, prove it remains
 healthy after a later contact epoch, and prove the next active epoch discovers
 the new association.
 
-- [ ] **Step 6: Prove delayed B1 settlement-link compatibility end to end**
+- [x] **Step 6: Prove delayed B1 settlement-link compatibility end to end**
 
 Test both orders: B1 source settlement before row fan-out settlement/link, and
 after row fan-out settlement including after contact release. Prove exact v2
 link preservation, no B1 writes from B2, no link for an already-active receipt
 that never owned the row, and no effective-owner reactivation.
 
-- [ ] **Step 7: Run the complete B2-C and B2 suites**
+- [x] **Step 7: Run the complete B2-C and B2 suites**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
   tests.test_row_authority_contact_compliance \
+  tests.test_row_authority_contact_fanout_release \
+  tests.test_row_authority_contact_fanout_release_origin \
+  tests.test_row_authority_contact_late_release \
   tests.test_row_authority_contracts \
   tests.test_row_authority_identity_location \
   tests.test_row_authority_ownership -q
+
+../codex-release-a-medium-recovery-20260714/.venv/bin/python - <<'PY'
+import unittest
+
+modules = (
+    "tests.test_row_authority_contact_compliance",
+    "tests.test_row_authority_contact_fanout_release",
+    "tests.test_row_authority_contact_fanout_release_origin",
+    "tests.test_row_authority_contact_late_release",
+    "tests.test_row_authority_contracts",
+    "tests.test_row_authority_identity_location",
+    "tests.test_row_authority_ownership",
+)
+
+def flatten(suite):
+    tests = []
+    for item in suite:
+        tests.extend(flatten(item) if isinstance(item, unittest.TestSuite) else [item])
+    return tests
+
+loaded = flatten(unittest.TestLoader().loadTestsFromNames(modules))
+test_ids = [test.id() for test in loaded]
+new_ids = [
+    test_id
+    for test_id in test_ids
+    if any(
+        module in test_id
+        for module in (
+            "test_row_authority_contact_fanout_release.",
+            "test_row_authority_contact_fanout_release_origin.",
+            "test_row_authority_contact_late_release.",
+        )
+    )
+]
+assert len(test_ids) == len(set(test_ids)) == 480, (len(test_ids), len(set(test_ids)))
+assert len(new_ids) == len(set(new_ids)) == 79, (len(new_ids), len(set(new_ids)))
+PY
+
+../codex-release-a-medium-recovery-20260714/.venv/bin/python -m pytest -q \
+  tests/test_row_authority\*.py
 ```
+
+Fresh corrected-candidate evidence: the authoritative seven-module gate passed
+480/480 tests, loader inspection found 480/480 unique total IDs with 79/79
+unique Task 6 IDs, and the complete row-authority discovery passed 642 tests
+plus 1,351 subtests. The worker gates include immutable latest-contact proofs,
+mutable-head rollback rejection, exact replay through later fan-out/contact/
+location successors, frozen obligation chronology, and zero-write corruption
+failures.
 
 - [ ] **Step 8: Review, commit, push, and prove `B2-C final` code**
 

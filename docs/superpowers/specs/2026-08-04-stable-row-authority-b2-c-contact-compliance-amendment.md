@@ -615,14 +615,38 @@ The restored row-head after-image:
 - increments row state revision exactly once.
 
 If no same-canonical opt-out controls the row and the current release epoch has
-no exact applied target, release records `noop/row_optout_not_applied`. If the
-current epoch's exact applied target exists but another effective owner now
-controls the row, it records `noop/different_effective_owner` with that target's
-generation/hash. Exact retry returns the existing result rather than creating
-an `already_restored` result. A contact-head advance observed before commit
-creates only the superseded result; it cannot restore a row. Consequently a
-stale release A cannot clear epoch B, while current release B can clear a
+no exact applied target, release records `noop/row_optout_not_applied`. Under
+the frozen v1 priority lattice, an exact applied `contact_optout` target is
+already priority 3, so no valid different owner can directly succeed it:
+equal-priority first commit wins and no higher-priority owner kind exists.
+Moving off that owner requires an exact release bridge, whose deterministic row
+result then replays. A direct equal-priority successor is crossed bounded
+history and fails closed without writes. The structurally valid
+`noop/different_effective_owner` tuple remains reserved in the v1 result schema
+to avoid a schema/hash ripple, but B2-C has no first-write producer for it.
+Exact retry returns the existing result rather than creating an
+`already_restored` result. A contact-head advance observed before commit creates
+only the superseded result; it cannot restore a row. Consequently a stale
+release A cannot clear epoch B, while current release B can clear a
 still-effective same-canonical settlement from A.
+
+Every send-affecting contact read proves the mutable contact head against the
+bounded immutable latest settlement pair. APPLY, RELEASE, late association,
+and suppression therefore fail closed when a current head/fan-out is rolled
+back behind a later contact epoch. A committed RELEASE result remains exactly
+replayable with zero writes through monotone later row processing,
+certification, binding recertification, contact transitions, fan-out
+supersession, source-settlement links, lease expiry, and row-location
+observations. Replay must reproduce the original deterministic response while
+proving the current successor from exact immutable result/obligation/edge,
+binding, settlement, receipt, and bounded page evidence; it cannot infer a
+write from a stale mutable head.
+
+Every inspected RELEASE obligation is correlated to its exact stable edge and
+release settlement. Frozen obligations must lie between their edge/contact
+creation and the expected fan-out update. A later obligation is admissible only
+as exact bounded late-association successor evidence during an existing-result
+replay; it can never authorize a fresh row mutation.
 
 ## Late contact-row association
 

@@ -603,6 +603,79 @@ class ContactLateAssociationTests(unittest.TestCase):
         self.assertEqual(6, len(self._writes(context["store"])))
         self.assertIn(("commit_applied", 6), context["store"].events)
 
+    def test_rolled_back_active_complete_cannot_associate_after_later_release(self):
+        row_id = _row_id(1)
+        context = self._seed_complete()
+        self._seed_association_prerequisites(context, row_id=row_id)
+        contact_head_ref = self._reference(
+            context,
+            "contactOptOutHeads",
+            context["canonicalHash"],
+        )
+        active_head = deepcopy(
+            self._documents(context, "contactOptOutHeads")[
+                context["canonicalHash"]
+            ]
+        )
+        active_fanout = deepcopy(self._current_fanout(context))
+        active_fanout_ref = self._reference(
+            context,
+            "contactOptOutFanoutHeads",
+            active_fanout["fanoutId"],
+        )
+        released = context["transition"]._authority(
+            context["store"]
+        ).record_authenticated_contact_release(
+            verified_user_id=context["transition"].fixture.user_id,
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            expected_active_optout_settlement_hash=context["settlement"][
+                "contactSettlementHash"
+            ],
+            actor_scope_hash="d" * 64,
+            client_request_id="late-association-rollback-release",
+            requested_at="2026-08-04T12:06:30.000000Z",
+        )
+        self.assertEqual("created", released["disposition"])
+        self.assertEqual(
+            "released",
+            self._documents(context, "contactOptOutHeads")[
+                context["canonicalHash"]
+            ]["state"],
+        )
+
+        contact_head_ref.set(active_head, merge=False)
+        active_fanout_ref.set(active_fanout, merge=False)
+        before = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        with self.assertRaises(self.module.RowAuthorityError):
+            self.association._associate(
+                context["store"],
+                canonical_mailbox_identity_hash=context[
+                    "canonicalHash"
+                ],
+                exact_identity_hash=context["receipt"][
+                    "exactIdentityHash"
+                ],
+                row_id=row_id,
+                thread_id="thread-1",
+                created_at=self.associated_at,
+            )
+
+        self.assertEqual(before, context["store"].data)
+        self.assertEqual([], self._writes(context["store"]))
+        for collection in (
+            "contactRowBindings",
+            "contactRowBindingEvidence",
+            "contactRowBindingHeads",
+            "contactOptOutFanoutObligations",
+            "contactOptOutFanoutResults",
+            "rowClaimSets",
+            "rowOwnerGenerations",
+            "rowOwnerSettlements",
+        ):
+            self.assertEqual({}, self._documents(context, collection))
+
     def test_late_association_ambiguity_creates_no_edge_or_evidence(self):
         row_id = _row_id(1)
         context = self._seed_complete()

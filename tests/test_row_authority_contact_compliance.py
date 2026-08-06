@@ -2008,9 +2008,15 @@ class ContactSuppressionTests(unittest.TestCase):
             created_at=self.created_at,
         )
 
-    def _v2_link(self, context, *, exact_hash=None):
+    def _v2_link(
+        self,
+        context,
+        *,
+        exact_hash=None,
+        canonical_source_id="source-contact-suppression",
+    ):
         material = {
-            "canonicalSourceId": "source-contact-suppression",
+            "canonicalSourceId": canonical_source_id,
             "snapshotImmutableHash": "1" * 64,
             "selectionHash": "2" * 64,
             "ownerDecisionHash": "3" * 64,
@@ -2032,6 +2038,89 @@ class ContactSuppressionTests(unittest.TestCase):
                 material,
                 user_scope_hash=context["scope"],
             ),
+        }
+
+    def _reactivated_graph(self, context, *, predecessor):
+        reactivated_at = "2026-08-04T12:00:02.000000Z"
+        link = self._v2_link(
+            context,
+            canonical_source_id="source-contact-suppression-reactivated",
+        )
+        transition_material = {
+            "transitionKind": "verified_optout",
+            "exactIdentityHash": context["exactHash"],
+            "canonicalMailboxIdentityHash": context["canonicalHash"],
+            "authorityLinkHash": link["authorityLinkHash"],
+            "hardOptOutEvidenceHash": link["hardOptOutEvidenceHash"],
+            "actorScopeHash": None,
+            "clientRequestHash": None,
+            "expectedActiveOptOutSettlementHash": None,
+            "reasonCode": None,
+        }
+        transition_id = self.module.domain_hash(
+            self.module.CONTACT_TRANSITION_ID_DOMAIN,
+            transition_material,
+            user_scope_hash=context["scope"],
+        )
+        settlement = self.module.build_contact_settlement_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            generation=3,
+            predecessor_settlement_hash=predecessor[
+                "contactSettlementHash"
+            ],
+            transition_kind="verified_optout",
+            contact_transition_id=transition_id,
+            exact_identity_hash=context["exactHash"],
+            authority_link=link,
+            actor_scope_hash=None,
+            reason_code=None,
+            settled_at=reactivated_at,
+        )
+        fanout_id = self._fanout_id(
+            context,
+            settlement["contactSettlementHash"],
+            "apply",
+        )
+        head = self.module.build_contact_head_document(
+            user_scope_hash=context["scope"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            state_revision=3,
+            latest_generation=3,
+            latest_settlement_hash=settlement["contactSettlementHash"],
+            active_optout_settlement_hash=settlement[
+                "contactSettlementHash"
+            ],
+            state="active",
+            active_fanout_id=fanout_id,
+            created_at=self.created_at,
+            updated_at=reactivated_at,
+        )
+        receipt = self.module.build_contact_transition_request_document(
+            user_scope_hash=context["scope"],
+            transition_kind="verified_optout",
+            exact_identity_hash=context["exactHash"],
+            canonical_mailbox_identity_hash=context["canonicalHash"],
+            authority_link_hash=link["authorityLinkHash"],
+            hard_optout_evidence_hash=link["hardOptOutEvidenceHash"],
+            actor_scope_hash=None,
+            client_request_hash=None,
+            expected_active_optout_settlement_hash=None,
+            reason_code=None,
+            outcome="created",
+            resulting_contact_generation=3,
+            resulting_contact_settlement_hash=settlement[
+                "contactSettlementHash"
+            ],
+            resulting_fanout_id=fanout_id,
+            resulting_contact_head_hash=head["contactHeadHash"],
+            resulting_fanout_head_hash="b" * 64,
+            requested_at=reactivated_at,
+        )
+        return {
+            "settlement": settlement,
+            "head": head,
+            "receipt": receipt,
         }
 
     def _fanout_id(self, context, settlement_hash, outcome):
@@ -2127,7 +2216,10 @@ class ContactSuppressionTests(unittest.TestCase):
         }
 
     def _release_graph(self, context, *, client_request_hash="e" * 64):
-        predecessor_hash = "9" * 64
+        predecessor = self._active_graph(context)
+        predecessor_hash = predecessor["settlement"][
+            "contactSettlementHash"
+        ]
         actor_hash = "d" * 64
         transition_material = {
             "transitionKind": "authenticated_release",
@@ -2202,6 +2294,8 @@ class ContactSuppressionTests(unittest.TestCase):
                 context,
                 exact_hash=context["canonicalHash"],
             ),
+            "predecessorSettlement": predecessor["settlement"],
+            "predecessorReceipt": predecessor["receipt"],
             "settlement": settlement,
             "head": head,
             "receipt": receipt,
@@ -2234,6 +2328,25 @@ class ContactSuppressionTests(unittest.TestCase):
                     "contactOptOutAliases",
                     context["canonicalHash"],
                     graph["selfAlias"],
+                )
+            )
+        predecessor_settlement = graph.get("predecessorSettlement")
+        if predecessor_settlement is not None:
+            documents.append(
+                (
+                    "contactOptOutSettlements",
+                    f"{context['canonicalHash']}--"
+                    f"{predecessor_settlement['generation']}",
+                    predecessor_settlement,
+                )
+            )
+        predecessor_receipt = graph.get("predecessorReceipt")
+        if predecessor_receipt is not None:
+            documents.append(
+                (
+                    "contactOptOutTransitionRequests",
+                    predecessor_settlement["contactTransitionId"],
+                    predecessor_receipt,
                 )
             )
         documents.extend(
@@ -2392,6 +2505,51 @@ class ContactSuppressionTests(unittest.TestCase):
                 absent,
                 raw_mailbox="Broker+Unseen@Example.test",
             ),
+        )
+
+    def test_rolled_back_released_head_cannot_allow_later_active_epoch(self):
+        context = self._context()
+        released = self._release_graph(context)
+        self._seed_graph(context, released)
+        reactivated = self._reactivated_graph(
+            context,
+            predecessor=released["settlement"],
+        )
+        head_ref = self._reference(
+            context,
+            "contactOptOutHeads",
+            context["canonicalHash"],
+        )
+        self._reference(
+            context,
+            "contactOptOutSettlements",
+            f"{context['canonicalHash']}--3",
+        ).create(reactivated["settlement"])
+        self._reference(
+            context,
+            "contactOptOutTransitionRequests",
+            reactivated["settlement"]["contactTransitionId"],
+        ).create(reactivated["receipt"])
+        head_ref.set(reactivated["head"], merge=False)
+        self.assertEqual(
+            {"decision": "suppress", "reason": "active"},
+            self._read(context),
+        )
+
+        head_ref.set(released["head"], merge=False)
+        before = deepcopy(context["store"].data)
+        context["store"].events.clear()
+
+        self.assertEqual(
+            {"decision": "suppress", "reason": "ambiguous"},
+            self._read(context),
+        )
+        self.assertEqual(before, context["store"].data)
+        self.assertFalse(
+            any(
+                event[0] in {"create", "set", "update", "delete"}
+                for event in context["store"].events
+            )
         )
 
     def test_every_alias_head_and_settlement_failure_is_fail_closed(self):
@@ -2597,7 +2755,27 @@ class ContactSuppressionTests(unittest.TestCase):
             with self.subTest(label=label):
                 before = deepcopy(context["store"].data)
                 context["store"].events.clear()
-                self.assertEqual(expected_result, self._read(context))
+                query_type = type(
+                    context["store"]
+                    .collection("probe")
+                    .where("field", "==", "value")
+                )
+                observed_limits = []
+                original_limit = query_type.limit
+
+                def observing_limit(query, count):
+                    if query._collection.path.endswith(
+                        "/contactOptOutSettlements"
+                    ):
+                        observed_limits.append(count)
+                    return original_limit(query, count)
+
+                with patch.object(
+                    query_type,
+                    "limit",
+                    observing_limit,
+                ):
+                    self.assertEqual(expected_result, self._read(context))
                 self.assertEqual(before, context["store"].data)
                 self.assertEqual(
                     expected_reads,
@@ -2609,9 +2787,37 @@ class ContactSuppressionTests(unittest.TestCase):
                 self.assertFalse(
                     any(
                         event[0]
-                        in {"create", "set", "update", "delete", "query"}
+                        in {"create", "set", "update", "delete"}
                         for event in context["store"].events
                     )
+                )
+                self.assertEqual([2], observed_limits)
+                settlement_queries = [
+                    event
+                    for event in context["store"].events
+                    if event[0] == "query"
+                    and event[1].endswith(
+                        "/contactOptOutSettlements"
+                    )
+                ]
+                self.assertEqual(1, len(settlement_queries))
+                self.assertEqual(
+                    (
+                        (
+                            "canonicalMailboxIdentityHash",
+                            "==",
+                            context["canonicalHash"],
+                        ),
+                    ),
+                    settlement_queries[0][2],
+                )
+                self.assertEqual(
+                    ("generation",),
+                    settlement_queries[0][3],
+                )
+                self.assertEqual(
+                    ("DESCENDING",),
+                    settlement_queries[0][4],
                 )
 
     def test_suppression_is_zero_write_and_persists_no_raw_identity(self):
@@ -2653,9 +2859,13 @@ class ContactSuppressionTests(unittest.TestCase):
             if event[0] == "get"
         ]
         self.assertEqual(5, len(get_events))
-        self.assertFalse(
-            any(event[0] == "query" for event in context["store"].events)
-        )
+        settlement_queries = [
+            event
+            for event in context["store"].events
+            if event[0] == "query"
+            and event[1].endswith("/contactOptOutSettlements")
+        ]
+        self.assertEqual(1, len(settlement_queries))
         persisted = json.dumps(
             {
                 "data": context["store"].data,
