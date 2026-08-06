@@ -51,6 +51,7 @@ RAW_MESSAGE_CONTEXT_MARKERS = {
     "html",
     "inbound",
     "message",
+    "original",
     "outbound",
     "raw",
     "reply",
@@ -106,9 +107,14 @@ def _is_raw_message_body_key(key: str) -> bool:
         return False
     if normalized in RAW_MESSAGE_KEYS:
         return True
-    return normalized.endswith("body") and any(
-        marker in normalized[:-4] for marker in RAW_MESSAGE_CONTEXT_MARKERS
-    )
+    for suffix in ("body", "bodytext", "message"):
+        if not normalized.endswith(suffix):
+            continue
+        prefix = normalized[: -len(suffix)]
+        if suffix == "bodytext" and not prefix:
+            return True
+        return any(marker in prefix for marker in RAW_MESSAGE_CONTEXT_MARKERS)
+    return False
 
 
 def _normalize_address(value: str) -> str:
@@ -192,6 +198,12 @@ def _markdown_has_raw_body_label(line: str) -> bool:
         match = pattern.match(line)
         if match and _is_raw_message_body_key(match.group("label")):
             return True
+    stripped = line.strip()
+    if stripped.startswith("|") and stripped.endswith("|"):
+        return any(
+            _is_raw_message_body_key(cell.strip())
+            for cell in stripped.strip("|").split("|")
+        )
     return False
 
 

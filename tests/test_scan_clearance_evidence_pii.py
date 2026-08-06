@@ -141,6 +141,25 @@ class ClearanceEvidencePiiScannerTests(unittest.TestCase):
                     {finding.kind for finding in findings},
                 )
 
+    def test_public_raw_body_text_message_and_table_shapes_are_rejected(self):
+        for key in ("bodyText", "originalMessage"):
+            with self.subTest(format="json", key=key):
+                findings = self._scan_payload(
+                    {key: "runtime-only sensitive prose"}
+                )
+                self.assertIn(
+                    "raw_message_body",
+                    {finding.kind for finding in findings},
+                )
+
+        findings = self._scan_markdown(
+            "| Raw Message Body |\n| --- |\n| runtime-only sensitive prose |\n"
+        )
+        self.assertIn(
+            "raw_message_body",
+            {finding.kind for finding in findings},
+        )
+
     def test_structural_raw_body_classifier_exempts_hash_and_digest_fields(self):
         body_hash = hashlib.sha256(b"sanitized synthetic body").hexdigest()
         safe_payload = {
@@ -148,6 +167,10 @@ class ClearanceEvidencePiiScannerTests(unittest.TestCase):
             "body_hash": body_hash,
             "rawOutboundBodyDigest": body_hash,
             "messageBodyChecksum": body_hash,
+            "bodyTextHash": body_hash,
+            "originalMessageDigest": body_hash,
+            "bodyFormat": "plain_text",
+            "messageId": "opaque_message_id",
         }
         safe_markdown = "\n".join(
             (
@@ -165,6 +188,20 @@ class ClearanceEvidencePiiScannerTests(unittest.TestCase):
         self.assertNotIn(
             "raw_message_body",
             {finding.kind for finding in self._scan_markdown(safe_markdown)},
+        )
+
+        safe_table = "\n".join(
+            (
+                "| Field | Value |",
+                "| --- | --- |",
+                f"| Body SHA256 | {body_hash} |",
+                f"| Original Message Digest | {body_hash} |",
+                "| Message ID | opaque_message_id |",
+            )
+        )
+        self.assertNotIn(
+            "raw_message_body",
+            {finding.kind for finding in self._scan_markdown(safe_table)},
         )
 
     def test_non_utf8_markdown_is_a_fail_closed_finding(self):

@@ -1,3 +1,4 @@
+import copy
 import json
 import unittest
 from pathlib import Path
@@ -65,6 +66,16 @@ class ProductionClearanceStateTests(unittest.TestCase):
     def setUp(self):
         self.state = _load_json(STATE_PATH)
 
+    def _assert_statuses_are_declared(self, state):
+        declared_statuses = set(state["statusModel"])
+        self.assertIn(state["status"], declared_statuses)
+        for milestone in state["milestones"]:
+            self.assertIn(
+                milestone["status"],
+                declared_statuses,
+                f"milestone {milestone['id']} uses an undeclared status",
+            )
+
     def test_has_one_authoritative_control_path(self):
         self.assertEqual(
             "docs/superpowers/plans/2026-08-06-browser-first-production-clearance.md",
@@ -89,12 +100,27 @@ class ProductionClearanceStateTests(unittest.TestCase):
     def test_status_transitions_are_exact_and_fail_closed(self):
         self.assertEqual(list(EXPECTED_TRANSITIONS), self.state["statusModel"])
         self.assertEqual(EXPECTED_TRANSITIONS, self.state["allowedTransitions"])
+        self._assert_statuses_are_declared(self.state)
 
         for status, destinations in self.state["allowedTransitions"].items():
             with self.subTest(status=status):
                 if status != "BLOCKED":
                     self.assertIn("BLOCKED", destinations)
                 self.assertEqual(len(destinations), len(set(destinations)))
+
+    def test_invalid_status_mutations_fail_the_status_contract(self):
+        invalid_top_level = copy.deepcopy(self.state)
+        invalid_top_level["status"] = "NOT_A_REAL_STATUS"
+        invalid_milestone = copy.deepcopy(self.state)
+        invalid_milestone["milestones"][0]["status"] = "NOT_A_REAL_STATUS"
+
+        for name, mutated_state in (
+            ("top_level", invalid_top_level),
+            ("milestone", invalid_milestone),
+        ):
+            with self.subTest(case=name):
+                with self.assertRaises(AssertionError):
+                    self._assert_statuses_are_declared(mutated_state)
 
     def test_feature_stamps_cover_each_required_lane_exactly_once(self):
         stamps = self.state["featureStamps"]
