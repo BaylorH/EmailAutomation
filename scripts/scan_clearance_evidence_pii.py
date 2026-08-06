@@ -46,6 +46,24 @@ RAW_MESSAGE_KEYS = {
     "rawmessagebody",
     "textbody",
 }
+RAW_MESSAGE_CONTEXT_MARKERS = {
+    "email",
+    "html",
+    "inbound",
+    "message",
+    "outbound",
+    "raw",
+    "reply",
+    "text",
+}
+BODY_METADATA_SUFFIXES = (
+    "checksum",
+    "digest",
+    "hash",
+    "sha1",
+    "sha256",
+    "sha512",
+)
 MARKDOWN_HEADING_RE = re.compile(
     r"^\s{0,3}#{1,6}\s+(?P<label>.+?)\s*#*\s*$"
 )
@@ -80,6 +98,17 @@ def _reject_nonstandard_constant(value: str) -> None:
 
 def _normalize_key(key: str) -> str:
     return re.sub(r"[^a-z0-9]", "", key.casefold())
+
+
+def _is_raw_message_body_key(key: str) -> bool:
+    normalized = _normalize_key(key)
+    if normalized.endswith(BODY_METADATA_SUFFIXES):
+        return False
+    if normalized in RAW_MESSAGE_KEYS:
+        return True
+    return normalized.endswith("body") and any(
+        marker in normalized[:-4] for marker in RAW_MESSAGE_CONTEXT_MARKERS
+    )
 
 
 def _normalize_address(value: str) -> str:
@@ -161,7 +190,7 @@ def _safe_source_label(
 def _markdown_has_raw_body_label(line: str) -> bool:
     for pattern in (MARKDOWN_HEADING_RE, MARKDOWN_LABEL_RE):
         match = pattern.match(line)
-        if match and _normalize_key(match.group("label")) in RAW_MESSAGE_KEYS:
+        if match and _is_raw_message_body_key(match.group("label")):
             return True
     return False
 
@@ -210,7 +239,7 @@ def _scan_node(
             )
             for kind in key_kinds:
                 findings.add(ScanFinding(source, child_path, kind))
-            if _normalize_key(key_text) in RAW_MESSAGE_KEYS:
+            if _is_raw_message_body_key(key_text):
                 findings.add(ScanFinding(source, child_path, "raw_message_body"))
             _scan_node(
                 node[key],
@@ -291,6 +320,13 @@ def scan_evidence_paths(
             denied_names=normalized_names,
             approved_addresses=normalized_addresses,
         )
+        filename_kinds = _string_pii_kinds(
+            path.name,
+            denied_names=normalized_names,
+            approved_addresses=normalized_addresses,
+        )
+        for kind in filename_kinds:
+            findings.add(ScanFinding(source, "$<source>", kind))
         try:
             if suffix == ".jsonl":
                 with path.open(encoding="utf-8") as handle:

@@ -110,6 +110,63 @@ class ClearanceEvidencePiiScannerTests(unittest.TestCase):
                     {finding.kind for finding in findings},
                 )
 
+    def test_structural_raw_body_aliases_are_rejected_in_json_and_markdown(self):
+        json_aliases = (
+            "rawOutboundBody",
+            "archivedInboundBody",
+            "latestBrokerReplyBody",
+        )
+        for alias in json_aliases:
+            with self.subTest(format="json", alias=alias):
+                findings = self._scan_payload(
+                    {alias: "runtime-only sensitive prose"}
+                )
+                self.assertIn(
+                    "raw_message_body",
+                    {finding.kind for finding in findings},
+                )
+
+        markdown_aliases = (
+            "Raw outbound body",
+            "Archived inbound body",
+            "Latest broker reply body",
+        )
+        for alias in markdown_aliases:
+            with self.subTest(format="markdown", alias=alias):
+                findings = self._scan_markdown(
+                    f"## {alias}\n\nruntime-only sensitive prose\n"
+                )
+                self.assertIn(
+                    "raw_message_body",
+                    {finding.kind for finding in findings},
+                )
+
+    def test_structural_raw_body_classifier_exempts_hash_and_digest_fields(self):
+        body_hash = hashlib.sha256(b"sanitized synthetic body").hexdigest()
+        safe_payload = {
+            "bodySha256": body_hash,
+            "body_hash": body_hash,
+            "rawOutboundBodyDigest": body_hash,
+            "messageBodyChecksum": body_hash,
+        }
+        safe_markdown = "\n".join(
+            (
+                f"- Body SHA256: {body_hash}",
+                f"- Body hash: {body_hash}",
+                f"- Raw outbound body digest: {body_hash}",
+                f"- Message body checksum: {body_hash}",
+            )
+        )
+
+        self.assertNotIn(
+            "raw_message_body",
+            {finding.kind for finding in self._scan_payload(safe_payload)},
+        )
+        self.assertNotIn(
+            "raw_message_body",
+            {finding.kind for finding in self._scan_markdown(safe_markdown)},
+        )
+
     def test_non_utf8_markdown_is_a_fail_closed_finding(self):
         from scripts.scan_clearance_evidence_pii import scan_evidence_paths
 
@@ -368,6 +425,26 @@ class ClearanceEvidencePiiScannerTests(unittest.TestCase):
 
         self.assertTrue(findings)
         rendered = "\n".join(finding.render() for finding in findings)
+        self.assertNotIn(sensitive_filename, rendered)
+        self.assertNotIn("runtime-file", rendered)
+
+    def test_filename_only_pii_is_a_finding_with_a_redacted_source(self):
+        from scripts.scan_clearance_evidence_pii import scan_evidence_paths
+
+        sensitive_filename = (
+            "@".join(("runtime-file", "private.invalid")) + ".json"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / sensitive_filename
+            path.write_text(
+                json.dumps({"status": "BLOCKED"}),
+                encoding="utf-8",
+            )
+            findings = scan_evidence_paths([path])
+
+        self.assertEqual(["email_address"], [finding.kind for finding in findings])
+        self.assertRegex(findings[0].source, r"^source-[0-9a-f]{12}\.json$")
+        rendered = findings[0].render()
         self.assertNotIn(sensitive_filename, rendered)
         self.assertNotIn("runtime-file", rendered)
 
