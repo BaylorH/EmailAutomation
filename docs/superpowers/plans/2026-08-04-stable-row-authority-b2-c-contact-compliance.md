@@ -752,7 +752,7 @@ original disposition and artifacts with zero writes.
 - Modify: `tests/test_row_authority_contact_compliance.py`
 - Modify: `tests/test_row_authority_ownership.py`
 
-- [ ] **Step 1: Write failing one-row apply tests**
+- [x] **Step 1: Write failing one-row apply tests**
 
 Use the real contact transition, obligation, private contact claim, and
 settlement chain. Cover clear/terminal/human rows, different equal-priority
@@ -773,7 +773,7 @@ ContactFanoutApplyTests.test_apply_loses_safely_to_contact_head_or_fence_advance
 ContactFanoutApplyTests.test_apply_retry_preapply_and_apply_then_raise_are_exact
 ```
 
-- [ ] **Step 2: Refactor generic claim input to canonical one-row bindings**
+- [x] **Step 2: Refactor generic claim input to canonical one-row bindings**
 
 Permit the private contact planner to derive a deterministic single-row
 binding without a persisted thread binding. Existing direct B1 callers must
@@ -781,13 +781,13 @@ still validate and derive from their exact stored thread binding. Keep public
 direct contact claims blocked. Permuting or adding supporting thread evidence
 must not change the contact claim request ID.
 
-- [ ] **Step 3: Implement atomic apply obligation processing**
+- [x] **Step 3: Implement atomic apply obligation processing**
 
 Compose claim and settlement planners inside the fan-out transaction. The
 accepted path has no externally visible intermediate claimed state. Advance
 result count/cursor exactly once.
 
-- [ ] **Step 4: Write failing nonterminal and active-complete association tests**
+- [x] **Step 4: Write failing nonterminal and active-complete association tests**
 
 Selected RED names:
 
@@ -800,7 +800,7 @@ ContactLateAssociationTests.test_active_complete_deleted_row_is_noop_and_recerti
 ContactLateAssociationTests.test_late_association_ambiguity_creates_no_edge_or_evidence
 ```
 
-- [ ] **Step 5: Extend the B2-B association executor by composition**
+- [x] **Step 5: Extend the B2-B association executor by composition**
 
 Remove only the blanket contact-head sentinel. Read and validate the current
 contact/fan-out state before any write; invoke the existing association planner
@@ -808,7 +808,7 @@ and the appropriate deterministic obligation/result planner in one
 transaction. Preserve the original 3/1/0-write behavior when no contact head
 exists.
 
-- [ ] **Step 6: Run Task 5 plus complete B2-B compatibility tests**
+- [x] **Step 6: Run Task 5 plus complete B2-B compatibility tests**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -816,6 +816,10 @@ exists.
   tests.test_row_authority_contact_compliance.ContactLateAssociationTests \
   tests.test_row_authority_ownership -q
 ```
+
+Local verification used the split apply/late-association modules that hold the
+selected tests. The Task 5 plus B2-B gate passed 356 tests, and the complete
+`test_row_authority*.py` regression discovery passed 560 tests before publication.
 
 ## Task 6: Restore same-canonical rows and converge late released associations
 
@@ -1113,6 +1117,24 @@ or merge `main`, deploy, launch a campaign, or contact a user under this plan.
   [job 92469544623](https://github.com/BaylorH/EmailAutomation/actions/runs/31054694964/job/92469544623)
   completed successfully. This milestone remains provider-free and
   runtime-unwired; it did not deploy or contact a user.
+- Task 5 RED/GREEN implemented ordered one-row apply with an atomic final
+  settlement and active late-association convergence for nonterminal and
+  completed apply fan-outs. Permanent regressions cover exact 6/7/10/11-write
+  paths, bounded-history query after-images, unknown commit recovery, expired
+  lease reset, deleted/dominated rows, evidence-only stability, and current
+  contact/fan-out races.
+- The reviewed Task 5 candidate passes the 356-test apply/late/B2-B gate and
+  all 560 automatically discovered `test_row_authority*.py` tests under
+  provider and Firestore blackholes. Compilation and diff checks are clean.
+  Independent review returned CLEAN with no Critical or Important findings;
+  the exact code/test diff SHA-256 is
+  `93278685c13f785b01ea079cd999eca99209dbb4ada20f995c29443b4fe6e771`.
+- Task 5 code publication: local HEAD, owned remote branch, and workflow head
+  SHA were `800d065db5af2304c924e730fd7d87c84910282f`;
+  [run 31059647024](https://github.com/BaylorH/EmailAutomation/actions/runs/31059647024),
+  [job 92484567669](https://github.com/BaylorH/EmailAutomation/actions/runs/31059647024/job/92484567669)
+  completed successfully. This milestone remains provider-free and
+  runtime-unwired; it did not deploy, launch a campaign, or contact a user.
 - Plan reviews, publication SHA/run, selected RED outputs, code milestone
   SHAs/runs, final diff digest, final review outcomes, and evidence SHA/run are
   appended here only after they exist and are independently verified.
