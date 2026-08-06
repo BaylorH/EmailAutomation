@@ -9,6 +9,12 @@
   "designSpec": "docs/superpowers/specs/2026-08-06-browser-first-production-clearance-design.md",
   "canonicalRubric": "docs/release-safety/feature-gradebook.json",
   "checkpointLedger": "docs/release-safety/production-clearance-checkpoints.jsonl",
+  "contractExecutables": {
+    "stateTest": "tests/test_production_clearance_state.py",
+    "browserVariantFixture": "tests/fixtures/production_browser_conversation_variants.json",
+    "browserVariantSelector": "scripts/select_production_browser_variant.py",
+    "evidencePiiScanner": "scripts/scan_clearance_evidence_pii.py"
+  },
   "supersededPlan": "docs/superpowers/plans/2026-08-04-sitesift-production-clearance-train.md",
   "executionPolicy": {
     "productActions": "browser_only",

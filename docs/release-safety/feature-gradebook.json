@@ -1,6 +1,140 @@
 {
   "schemaVersion": 1,
   "purpose": "Combinatorial SiteSift feature gradebook. Use this to generate fresh adversarial tests across event types, trigger variations, state permutations, actor/account scopes, and cross-feature collisions before any production widening.",
+  "browserExecutionPolicy": {
+    "productActions": "browser_only",
+    "allowedReadbackSurfaces": [
+      "firestore",
+      "microsoft_graph",
+      "google_sheets",
+      "deployment_artifact_and_configuration",
+      "github_and_ci"
+    ],
+    "forbiddenProductBypasses": [
+      "direct_firestore_seed",
+      "direct_product_api_mutation",
+      "synthetic_queue_insertion",
+      "local_browser_simulation_as_production_proof"
+    ],
+    "advancedTourFeatureIds": [
+      "tour.planner_preview",
+      "tour.route_timing",
+      "tour.invite_queue"
+    ],
+    "advancedTourCapabilities": {
+      "route_planning": [
+        "tour.planner_preview",
+        "tour.route_timing"
+      ],
+      "itinerary_generation": [
+        "tour.planner_preview"
+      ],
+      "tour_invite_sending": [
+        "tour.invite_queue"
+      ]
+    },
+    "deploymentOperations": "cli_or_ci_with_postdeploy_readback"
+  },
+  "historicalSeedPolicy": {
+    "fixture": "tests/fixtures/production_browser_conversation_variants.json",
+    "sourceUse": "sanitized_semantic_facts_only",
+    "sourceClasses": [
+      "production_report",
+      "production_history",
+      "production_model_misread",
+      "synthetic_near_miss"
+    ],
+    "exactBodyReuse": "prohibited",
+    "checkpointHashField": "exactBodyHashes",
+    "selectionRule": "lexicographically_smallest_unused_variant_id",
+    "requiredProofPerFeature": [
+      "historic_semantic_seed",
+      "fresh_generated_variant",
+      "negative_control",
+      "cross_feature_collision"
+    ]
+  },
+  "clearanceStatusModel": {
+    "statuses": [
+      "BLOCKED",
+      "CODE_GREEN",
+      "DEPLOYED_DARK",
+      "BROWSER_PASS",
+      "PROD_CLEARED",
+      "OFF_SAFE"
+    ],
+    "allowedTransitions": {
+      "BLOCKED": [
+        "CODE_GREEN",
+        "OFF_SAFE"
+      ],
+      "CODE_GREEN": [
+        "DEPLOYED_DARK",
+        "BLOCKED"
+      ],
+      "DEPLOYED_DARK": [
+        "BROWSER_PASS",
+        "BLOCKED"
+      ],
+      "BROWSER_PASS": [
+        "PROD_CLEARED",
+        "BLOCKED"
+      ],
+      "PROD_CLEARED": [
+        "BLOCKED"
+      ],
+      "OFF_SAFE": [
+        "BLOCKED"
+      ]
+    },
+    "invalidationTarget": "BLOCKED",
+    "promotionRule": "no_averaging_and_any_open_p0_blocks_traffic_or_user_return"
+  },
+  "checkpointPolicy": {
+    "ledger": "docs/release-safety/production-clearance-checkpoints.jsonl",
+    "appendOnly": true,
+    "codeCheckpointRequired": true,
+    "evidenceCheckpointRequired": true,
+    "requiredFields": [
+      "checkpointId",
+      "milestoneId",
+      "featureId",
+      "recordedAt",
+      "productionBaseSha",
+      "candidateSha",
+      "ciRun",
+      "artifactDigest",
+      "revision",
+      "configHash",
+      "trafficPercent",
+      "browserScenarioIds",
+      "messageVariantIds",
+      "exactBodyHashes",
+      "firestoreReadback",
+      "graphReceipt",
+      "sheetReadback",
+      "auditReadback",
+      "defects",
+      "rollbackTarget",
+      "rollbackResult",
+      "status",
+      "evidenceSha"
+    ],
+    "piiScanner": "scripts/scan_clearance_evidence_pii.py",
+    "committedEvidenceAllows": [
+      "sha256",
+      "opaque_ids",
+      "role_aliases",
+      "counts",
+      "sanitized_scenario_ids"
+    ],
+    "committedEvidenceRejects": [
+      "email_addresses",
+      "raw_message_bodies",
+      "runtime_denylisted_personal_names",
+      "unapproved_property_addresses"
+    ]
+  },
   "eventTaxonomy": {
     "launch_with_variable_mapping": "Campaign setup creates outreach from uploaded rows, mapped variables, selected custom fields, and launch preview copy.",
     "broker_available_full_specs": "Broker says the property is available and gives all requested economics/specs in one reply.",
@@ -2521,6 +2655,39 @@
   "releaseSuites": {
     "production_v1_base_campaign": {
       "purpose": "Prove the base product that normal users are allowed to use: upload, variable mapping, launch, reply processing, sheet updates, dashboard actions, follow-ups, stop/cancel/dismiss, signature identity, health, scheduler scope, and reply-all safety.",
+      "coreActionEntries": [
+        {
+          "id": "core.call_action",
+          "featureStampId": "campaign.call_action",
+          "lane": "core",
+          "semanticCases": [
+            "call_request_with_number",
+            "call_request_without_number"
+          ],
+          "registryCoverageFeatureIds": [
+            "core.event_classifier",
+            "core.sheet_update",
+            "core.stop_cancel_dismiss"
+          ],
+          "requiredBehavior": "Create a visible source-bound operator call action without creating a route, itinerary, or tour invite."
+        },
+        {
+          "id": "core.broker_tour_action",
+          "featureStampId": "campaign.tour_action",
+          "lane": "core",
+          "semanticCases": [
+            "core_tour_offer",
+            "alternate_tour_time",
+            "temporary_tour_restriction"
+          ],
+          "registryCoverageFeatureIds": [
+            "core.event_classifier",
+            "core.sheet_update",
+            "core.stop_cancel_dismiss"
+          ],
+          "requiredBehavior": "Create a visible source-bound broker-tour action while route planning, itinerary generation, and tour-invite sending remain advanced."
+        }
+      ],
       "featureIds": [
         "core.upload_mapping",
         "core.name_resolution",

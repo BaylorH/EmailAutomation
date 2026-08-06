@@ -1,0 +1,741 @@
+{
+  "schemaVersion": 1,
+  "historicalSources": [
+    {
+      "sourceId": "e2e_reply_semantics",
+      "sourceClass": "production_history",
+      "path": "tests/E2E_REPLY_CHEATSHEET.md",
+      "sanitizationPolicy": "semantic_facts_only"
+    },
+    {
+      "sourceId": "real_world_semantic_catalog",
+      "sourceClass": "production_report",
+      "path": "tests/REAL_WORLD_TEST_DATA.md",
+      "sanitizationPolicy": "semantic_facts_only"
+    },
+    {
+      "sourceId": "model_misread_findings",
+      "sourceClass": "production_model_misread",
+      "path": "docs/release-safety/surface-aprime-real-ai-findings.md",
+      "sanitizationPolicy": "semantic_facts_only"
+    },
+    {
+      "sourceId": "language_near_miss_sweep",
+      "sourceClass": "synthetic_near_miss",
+      "path": "docs/release-safety/surface-a-broker-language-bugs.md",
+      "sanitizationPolicy": "semantic_facts_only"
+    }
+  ],
+  "scenarioFamilies": [
+    {
+      "variantId": "flyer_not_tour.001",
+      "scenarioFamily": "flyer_not_tour",
+      "sourceClass": "production_model_misread",
+      "semanticFacts": {
+        "semanticCase": "flyer_wording_not_tour",
+        "flyerMention": true,
+        "tourOffered": false
+      },
+      "expectedEvents": [
+        "attachment_reference_recorded"
+      ],
+      "forbiddenEvents": [
+        "tour_action_created"
+      ],
+      "expectedReplyPolicy": "continue",
+      "axes": {
+        "tone": "helpful",
+        "register": "formal",
+        "informationOrder": "artifact_then_boundary",
+        "quoteStyle": "none",
+        "attachmentBundle": "one_pdf",
+        "turnTiming": "immediate"
+      },
+      "body": "The brochure is attached for review. This message shares marketing material and does not offer a walkthrough.",
+      "bodySha256": "31dd8324791e8f86801aeed2a71ce5267d0530dbb39be80058878fa1429aa1ef",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "economics_completion.001",
+      "scenarioFamily": "economics_completion",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "complete_rent_opex_ti",
+        "availability": "available",
+        "rent": "$14.25",
+        "operatingExpenses": "$3.10",
+        "tenantImprovement": "$1.50"
+      },
+      "expectedEvents": [
+        "economics_extracted",
+        "completion_evaluated"
+      ],
+      "forbiddenEvents": [
+        "unsourced_economics"
+      ],
+      "expectedReplyPolicy": "continue",
+      "axes": {
+        "tone": "helpful",
+        "register": "formal",
+        "informationOrder": "availability_then_economics",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "The space is available at $14.25 base rent with $3.10 in operating expenses and a $1.50 tenant-improvement allowance.",
+      "bodySha256": "ef180b1163eac929d495c91111df6f35c21f68c8a2200c2dcbfa55056f3025d3",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "economics_completion.002",
+      "scenarioFamily": "economics_completion",
+      "sourceClass": "synthetic_near_miss",
+      "semanticFacts": {
+        "semanticCase": "partial_rent_opex_ti",
+        "rent": "$12.80",
+        "operatingExpenses": "missing",
+        "tenantImprovement": "missing"
+      },
+      "expectedEvents": [
+        "economics_partial_extracted",
+        "missing_facts_followup"
+      ],
+      "forbiddenEvents": [
+        "premature_completion"
+      ],
+      "expectedReplyPolicy": "follow_up_missing_facts",
+      "axes": {
+        "tone": "terse",
+        "register": "informal",
+        "informationOrder": "known_fact_then_unknowns",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "delayed"
+      },
+      "body": "The asking rent is $12.80. Operating expenses and the improvement allowance are still being confirmed.",
+      "bodySha256": "311ed5f5a6784c01391de7d2005a6900d65bf64979d918ea9953442e56beaf7e",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "availability_taxonomy.001",
+      "scenarioFamily": "availability_taxonomy",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "property_unavailable",
+        "propertyAvailable": false,
+        "alternateOffered": false
+      },
+      "expectedEvents": [
+        "property_unavailable"
+      ],
+      "forbiddenEvents": [
+        "property_non_fit"
+      ],
+      "expectedReplyPolicy": "stop_property_outreach",
+      "axes": {
+        "tone": "terse",
+        "register": "formal",
+        "informationOrder": "terminal_state_first",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "The requested space is no longer available, and this reply does not include a replacement.",
+      "bodySha256": "9dd294c758fad161ef7ae836cfe7589802462c2b353ff81ec3519ffa16a1e189",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "availability_taxonomy.002",
+      "scenarioFamily": "availability_taxonomy",
+      "sourceClass": "production_report",
+      "semanticFacts": {
+        "semanticCase": "property_non_fit",
+        "propertyAvailable": true,
+        "fit": false
+      },
+      "expectedEvents": [
+        "property_non_fit"
+      ],
+      "forbiddenEvents": [
+        "property_unavailable"
+      ],
+      "expectedReplyPolicy": "stop_property_outreach",
+      "axes": {
+        "tone": "direct",
+        "register": "formal",
+        "informationOrder": "availability_then_fit",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "The space remains available, but its office-heavy layout does not fit the stated industrial requirement.",
+      "bodySha256": "921f62d483440983fc3b53cb71871f6debbccf581a185c2cca1f851112b4f5f4",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "availability_taxonomy.003",
+      "scenarioFamily": "availability_taxonomy",
+      "sourceClass": "production_model_misread",
+      "semanticFacts": {
+        "semanticCase": "tour_unavailable_property_viable",
+        "propertyAvailable": true,
+        "tourAvailable": false
+      },
+      "expectedEvents": [
+        "tour_restriction_recorded"
+      ],
+      "forbiddenEvents": [
+        "property_unavailable"
+      ],
+      "expectedReplyPolicy": "continue_property_research",
+      "axes": {
+        "tone": "helpful",
+        "register": "informal",
+        "informationOrder": "positive_then_restriction",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "delayed"
+      },
+      "body": "The space is available, but walkthroughs are paused until the current work inside is complete.",
+      "bodySha256": "82e2cee17ef9a4226be4e82f448a73061942820dc01463f6e601d938ac218e10",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "quoted_history.001",
+      "scenarioFamily": "quoted_history",
+      "sourceClass": "production_model_misread",
+      "semanticFacts": {
+        "semanticCase": "quoted_stale_terminal_fresh_positive",
+        "quotedAvailability": "unavailable",
+        "freshAvailability": "available"
+      },
+      "expectedEvents": [
+        "fresh_availability_correction"
+      ],
+      "forbiddenEvents": [
+        "stale_terminal_state"
+      ],
+      "expectedReplyPolicy": "continue",
+      "axes": {
+        "tone": "corrective",
+        "register": "formal",
+        "informationOrder": "quoted_stale_then_fresh_correction",
+        "quoteStyle": "inline_quote",
+        "attachmentBundle": "none",
+        "turnTiming": "second_reply_before_processing"
+      },
+      "body": "Quoted earlier note: 'The space is no longer available.' Current correction: the space is available; please use this new update.",
+      "bodySha256": "cfcab757e273dbebe1effef85b4f0696cc1b37ca32f2b71d28280397ce2bea5f",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "confidential_question.001",
+      "scenarioFamily": "confidential_question",
+      "sourceClass": "production_report",
+      "semanticFacts": {
+        "semanticCase": "confidential_question_with_useful_facts",
+        "squareFeet": 28000,
+        "dockDoors": 2,
+        "identityQuestion": true
+      },
+      "expectedEvents": [
+        "facts_extracted",
+        "confidential_question_action"
+      ],
+      "forbiddenEvents": [
+        "confidential_disclosure"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "formal",
+        "register": "formal",
+        "informationOrder": "facts_then_question",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "We can confirm 28,000 square feet and two dock doors. Before discussing pricing, can you identify the represented organization?",
+      "bodySha256": "82b983605846f07fe4a7dcc806a024218d7accde88ecb3fca4616fb71eee6e9c",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "call_action.001",
+      "scenarioFamily": "call_action",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "call_request_with_number",
+        "callRequested": true,
+        "numberPresent": true
+      },
+      "expectedEvents": [
+        "call_action_created"
+      ],
+      "forbiddenEvents": [
+        "tour_invite_created"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "direct",
+        "register": "informal",
+        "informationOrder": "call_request_then_context",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "Please call the campaign desk at 555-0107 to discuss the available space.",
+      "bodySha256": "473e60c709e5c488f9bb25f81bf4211733062b0c236e62230d2934400537b302",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "call_action.002",
+      "scenarioFamily": "call_action",
+      "sourceClass": "synthetic_near_miss",
+      "semanticFacts": {
+        "semanticCase": "call_request_without_number",
+        "callRequested": true,
+        "numberPresent": false
+      },
+      "expectedEvents": [
+        "call_action_created"
+      ],
+      "forbiddenEvents": [
+        "tour_invite_created"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "helpful",
+        "register": "informal",
+        "informationOrder": "call_request_then_coordination",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "delayed"
+      },
+      "body": "A call would be easier; please reply with a suitable time and we can coordinate.",
+      "bodySha256": "32aab49a7dbc62b250534fd45f3bdfc4533124e3f56c27d3aec970e8eeaf8c9d",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "tour_action.001",
+      "scenarioFamily": "tour_action",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "core_tour_offer",
+        "propertyAvailable": true,
+        "tourOffered": true
+      },
+      "expectedEvents": [
+        "tour_action_created"
+      ],
+      "forbiddenEvents": [
+        "tour_invite_created"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "helpful",
+        "register": "formal",
+        "informationOrder": "availability_then_offer",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "The property remains available, and we can offer a walkthrough next Tuesday afternoon.",
+      "bodySha256": "873b5f970a1ce11d2fb7e2c2ec7b1e59627af0863d8e9d40a072115d874eef2a",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "tour_action.002",
+      "scenarioFamily": "tour_action",
+      "sourceClass": "production_report",
+      "semanticFacts": {
+        "semanticCase": "alternate_tour_time",
+        "proposedTimeRejected": true,
+        "alternateTimeOffered": true
+      },
+      "expectedEvents": [
+        "tour_alternate_time_action"
+      ],
+      "forbiddenEvents": [
+        "route_plan_created"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "terse",
+        "register": "informal",
+        "informationOrder": "rejection_then_alternate",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "second_reply_before_processing"
+      },
+      "body": "The proposed morning slot will not work; Thursday at 3:00 p.m. is available instead.",
+      "bodySha256": "a04a2754a280364a7a9fa40c0c20180d66ea16dc33bb8bd28a1a13c5cddaff58",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "tour_action.003",
+      "scenarioFamily": "tour_action",
+      "sourceClass": "synthetic_near_miss",
+      "semanticFacts": {
+        "semanticCase": "temporary_tour_restriction",
+        "propertyAvailable": true,
+        "restrictionTemporary": true
+      },
+      "expectedEvents": [
+        "tour_restriction_recorded"
+      ],
+      "forbiddenEvents": [
+        "property_unavailable"
+      ],
+      "expectedReplyPolicy": "continue_property_research",
+      "axes": {
+        "tone": "formal",
+        "register": "formal",
+        "informationOrder": "availability_then_temporary_restriction",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "delayed"
+      },
+      "body": "The property is available, but walkthroughs cannot occur this week while maintenance is underway.",
+      "bodySha256": "a28403fd517566719465345c1790133fa937762b2326c06e221614e58bd3fbc6",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "alternate_property.001",
+      "scenarioFamily": "alternate_property",
+      "sourceClass": "production_model_misread",
+      "semanticFacts": {
+        "semanticCase": "alternate_property_before_rejection",
+        "alternateOffered": true,
+        "originalFit": false
+      },
+      "expectedEvents": [
+        "alternate_property_referred",
+        "original_property_non_fit"
+      ],
+      "forbiddenEvents": [
+        "alternate_facts_crossed"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "helpful",
+        "register": "formal",
+        "informationOrder": "alternate_then_original_rejection",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "Another portfolio space may fit the requirement. The originally requested space is not a fit because its clear height is too low.",
+      "bodySha256": "86cdb0f0a71d97e0822ce3d01b4f076e0f0ef1b1dc65b50c7e86febc73beb2cb",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "alternate_property.002",
+      "scenarioFamily": "alternate_property",
+      "sourceClass": "production_report",
+      "semanticFacts": {
+        "semanticCase": "alternate_property_after_rejection",
+        "alternateOffered": true,
+        "originalFit": false
+      },
+      "expectedEvents": [
+        "original_property_non_fit",
+        "alternate_property_referred"
+      ],
+      "forbiddenEvents": [
+        "alternate_facts_crossed"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "direct",
+        "register": "formal",
+        "informationOrder": "original_rejection_then_alternate",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "delayed"
+      },
+      "body": "The requested space is not a fit because its clear height is too low. Another portfolio space may meet the requirement.",
+      "bodySha256": "38898a86497e11ca8668e8ebf016790e89526d09f04b94575a53c4c2f6aab8a0",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "contact_lifecycle.001",
+      "scenarioFamily": "contact_lifecycle",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "out_of_office",
+        "automaticReply": true,
+        "wrongContact": false
+      },
+      "expectedEvents": [
+        "out_of_office_recorded"
+      ],
+      "forbiddenEvents": [
+        "wrong_contact_transition"
+      ],
+      "expectedReplyPolicy": "defer_until_return",
+      "axes": {
+        "tone": "formal",
+        "register": "operational",
+        "informationOrder": "automatic_notice_then_return",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "This is an automatic absence notice. The leasing role will review messages after the stated return window.",
+      "bodySha256": "1319de5ecd49cb95dcf607679266175ad1455619952b02f6c9de263760567ef9",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "contact_lifecycle.002",
+      "scenarioFamily": "contact_lifecycle",
+      "sourceClass": "production_report",
+      "semanticFacts": {
+        "semanticCase": "wrong_contact",
+        "wrongContact": true,
+        "replacementKnown": false
+      },
+      "expectedEvents": [
+        "wrong_contact_action"
+      ],
+      "forbiddenEvents": [
+        "redirected_contact_send"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "terse",
+        "register": "formal",
+        "informationOrder": "wrong_contact_then_pause",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "This mailbox does not handle leasing for the requested property. Please pause while the correct role is identified.",
+      "bodySha256": "254f744a191411b8c317445bc57dcebeff5d6cdc6b43449e753fbebd665d19ee",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "contact_lifecycle.003",
+      "scenarioFamily": "contact_lifecycle",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "forwarded_contact",
+        "forwarded": true,
+        "replacementRoleKnown": true
+      },
+      "expectedEvents": [
+        "forwarded_contact_action"
+      ],
+      "forbiddenEvents": [
+        "redirected_contact_send"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "helpful",
+        "register": "formal",
+        "informationOrder": "forward_marker_then_role",
+        "quoteStyle": "forwarded_header",
+        "attachmentBundle": "none",
+        "turnTiming": "delayed"
+      },
+      "body": "Forwarded for handling: the regional leasing desk is the correct role for this request.",
+      "bodySha256": "a7e5f11f86c4ee4f48f7b980d6a89813d49831cebaa557ea8c3ef9e5468960df",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "contact_lifecycle.004",
+      "scenarioFamily": "contact_lifecycle",
+      "sourceClass": "production_report",
+      "semanticFacts": {
+        "semanticCase": "opt_out",
+        "optOut": true,
+        "scope": "contact"
+      },
+      "expectedEvents": [
+        "opt_out_applied"
+      ],
+      "forbiddenEvents": [
+        "future_followup"
+      ],
+      "expectedReplyPolicy": "no_reply",
+      "axes": {
+        "tone": "frustrated",
+        "register": "informal",
+        "informationOrder": "stop_request_only",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "Please stop this outreach and do not send any further messages to this contact.",
+      "bodySha256": "bc9907d969ae0679cab1ab00e0220f6a4cac6531a80122ae01b1304f9ddfdff8",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "attachment_handling.001",
+      "scenarioFamily": "attachment_handling",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "attachment_only",
+        "bodyFacts": false,
+        "attachmentPresent": true
+      },
+      "expectedEvents": [
+        "attachment_reference_recorded"
+      ],
+      "forbiddenEvents": [
+        "processed_without_extraction"
+      ],
+      "expectedReplyPolicy": "extract_attachment",
+      "axes": {
+        "tone": "terse",
+        "register": "informal",
+        "informationOrder": "artifact_only",
+        "quoteStyle": "none",
+        "attachmentBundle": "one_pdf",
+        "turnTiming": "immediate"
+      },
+      "body": "Please review the attached fact sheet.",
+      "bodySha256": "abb86bc9e1fab52f50f4fd49fefb649d42a8cbafebbe078d52a5fd12547444ae",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "attachment_handling.002",
+      "scenarioFamily": "attachment_handling",
+      "sourceClass": "synthetic_near_miss",
+      "semanticFacts": {
+        "semanticCase": "protected_link",
+        "linkPresent": true,
+        "authorizationRequired": true
+      },
+      "expectedEvents": [
+        "protected_link_issue"
+      ],
+      "forbiddenEvents": [
+        "premature_completion"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "formal",
+        "register": "formal",
+        "informationOrder": "link_then_restriction",
+        "quoteStyle": "none",
+        "attachmentBundle": "protected_link",
+        "turnTiming": "delayed"
+      },
+      "body": "The details are in the shared link, but access requires authorization.",
+      "bodySha256": "4c6541bfc7cb19b5a8c223128e65d4ad372686b5c86425cde00b868ab820fae3",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "attachment_handling.003",
+      "scenarioFamily": "attachment_handling",
+      "sourceClass": "production_model_misread",
+      "semanticFacts": {
+        "semanticCase": "wrong_property_attachment",
+        "attachmentProperty": "portfolio_item_b",
+        "requestedProperty": "portfolio_item_a"
+      },
+      "expectedEvents": [
+        "attachment_property_mismatch"
+      ],
+      "forbiddenEvents": [
+        "cross_property_extraction"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "corrective",
+        "register": "formal",
+        "informationOrder": "artifact_then_mismatch",
+        "quoteStyle": "none",
+        "attachmentBundle": "wrong_property_pdf",
+        "turnTiming": "second_reply_before_processing"
+      },
+      "body": "The attached brochure describes portfolio item B, not the requested portfolio item A.",
+      "bodySha256": "9ac063cabae2c839baad58ff57b3fbb6b0b9f09c2c6d2af7d7f481a6301d8264",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "manual_continuation.001",
+      "scenarioFamily": "manual_continuation",
+      "sourceClass": "production_report",
+      "semanticFacts": {
+        "semanticCase": "manual_mailbox_continuation_before_retry",
+        "manualContinuation": true,
+        "retryQueued": true
+      },
+      "expectedEvents": [
+        "manual_continuation_detected"
+      ],
+      "forbiddenEvents": [
+        "autonomous_retry_send"
+      ],
+      "expectedReplyPolicy": "suppress_autonomous_retry",
+      "axes": {
+        "tone": "operational",
+        "register": "operational",
+        "informationOrder": "manual_action_then_retry_state",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "manual_before_retry"
+      },
+      "body": "The campaign owner already continued this conversation from the mailbox before the queued retry ran.",
+      "bodySha256": "e958e2f9d0de410bb3276448f7a56752c2e536763fe3c47f7298751ec0209bde",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "property_issue.001",
+      "scenarioFamily": "property_issue",
+      "sourceClass": "production_history",
+      "semanticFacts": {
+        "semanticCase": "property_issue_severity",
+        "issue": "localized_water_leak",
+        "propertyOperating": true
+      },
+      "expectedEvents": [
+        "property_issue_action_with_severity"
+      ],
+      "forbiddenEvents": [
+        "property_terminalized"
+      ],
+      "expectedReplyPolicy": "pause_for_operator",
+      "axes": {
+        "tone": "concerned",
+        "register": "formal",
+        "informationOrder": "issue_then_remaining_operation",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "immediate"
+      },
+      "body": "A water leak affects one loading area, but the remainder of the space is operating; please flag the issue for review.",
+      "bodySha256": "90d9f05b3dfd1d398bd5a663ee73623bd7199e0434e65bb858b78a99582eb852",
+      "lastProductionUse": null
+    },
+    {
+      "variantId": "property_issue.002",
+      "scenarioFamily": "property_issue",
+      "sourceClass": "synthetic_near_miss",
+      "semanticFacts": {
+        "semanticCase": "projection_failure",
+        "sourceProcessed": true,
+        "dashboardProjectionVisible": false
+      },
+      "expectedEvents": [
+        "projection_recovery_required"
+      ],
+      "forbiddenEvents": [
+        "event_settled_without_projection"
+      ],
+      "expectedReplyPolicy": "record_operator_visible_failure",
+      "axes": {
+        "tone": "operational",
+        "register": "operational",
+        "informationOrder": "source_state_then_projection_gap",
+        "quoteStyle": "none",
+        "attachmentBundle": "none",
+        "turnTiming": "followup_due_transition"
+      },
+      "body": "The source reply was processed, but the dashboard action did not appear; keep the event open for projection recovery.",
+      "bodySha256": "8647db33774ecf1da3bd9d517001eed35cb83ea107969140bcfd2c5ce495db5b",
+      "lastProductionUse": null
+    }
+  ],
+  "productionUse": []
+}
