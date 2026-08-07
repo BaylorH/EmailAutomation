@@ -18,7 +18,9 @@ The failure is deterministic: `_OPS_EX_RE` finds only the earlier figure-first `
 
 ## Design
 
-Add a narrow explicit keyword-first candidate extractor that accepts ordinary prose between an unambiguous OpEx label and a nearby dollar figure, including commas and phrases such as `taxes, and insurance are running roughly`. It must stop at sentence boundaries and must not treat bare `NNN` as an explicit keyword-first label.
+Add a narrow explicit keyword-first candidate extractor that accepts ordinary prose between an unambiguous OpEx label and a nearby dollar figure, including commas and phrases such as `taxes, and insurance are running roughly`. It must stop at sentence, newline, semicolon, or intervening-dollar boundaries and must not treat bare `NNN` as an explicit keyword-first label.
+
+The rent-reference guard must reject only a rent phrase that assigns the captured dollar figure, such as `asking rent is $14.10`. It must not reject relational language in a genuine OpEx clause, such as `CAM, on top of the base rent, is $3.90`.
 
 `_extract_ops_ex_sf_from_text` will preserve the existing combined base-plus-OpEx matcher as the highest-specificity path, then evaluate this explicit candidate before general `_OPS_EX_RE` candidates. Existing monthly-basis normalization and hypothetical-language rejection remain in force. The existing general matcher remains the fallback for compact forms such as `$8/SF opex` and `NNN charges are $7.25/SF/yr`.
 
@@ -30,6 +32,8 @@ No notification, recipient, outbox, access-control, replacement, or deployment b
 - The proposal augmentation replaces a conflicting model OpEx value of `14.10` with `3.90` before the Sheet write.
 - Explicit OpEx figures continue to win over earlier rent-basis `NNN` figures.
 - NNN-only rent statements do not fabricate OpEx.
+- `CAM pending; quoted rate $14.10 NNN` does not cross the semicolon and fabricate OpEx.
+- `CAM, on top of base rent, is $3.90` retains the explicit OpEx value.
 - Hypothetical and monthly-basis safeguards remain green.
 - Focused extraction tests, Jill live-regression tests, the backend safety suite, deploy contracts, syntax checks, and diff checks pass before release.
 

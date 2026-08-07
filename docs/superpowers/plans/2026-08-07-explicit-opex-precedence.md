@@ -75,21 +75,79 @@ Add this method to the same class:
         text = "CAM is still pending; the asking rent is $14.10 per square foot NNN."
 
         self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_pending_cam_does_not_cross_semicolon_into_quoted_rent(self):
+        text = "CAM is still pending; the quoted rate is $14.10 per square foot NNN."
+        proposal = {"updates": [], "events": []}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {
+            "mappings": {
+                "rent_sf_yr": "Rent/SF/Yr",
+                "ops_ex_sf": "Ops Ex / SF",
+            }
+        }
+
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["4800 Space Center Blvd", "", ""],
+            header,
+            config,
+            _conversation(text),
+        )
+        self.assertIsNone(
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+        )
+
+    def test_relational_base_rent_phrase_keeps_explicit_cam_figure(self):
+        text = (
+            "For Space Center, we can offer 18,750 SF at $14.10 NNN. "
+            "CAM, on top of the base rent, is $3.90 per square foot."
+        )
+        proposal = {
+            "updates": [{"column": "Ops Ex / SF", "value": "14.10"}],
+            "events": [],
+        }
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {
+            "mappings": {
+                "rent_sf_yr": "Rent/SF/Yr",
+                "ops_ex_sf": "Ops Ex / SF",
+            }
+        }
+
+        self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["4800 Space Center Blvd", "", ""],
+            header,
+            config,
+            _conversation(text),
+        )
+        self.assertEqual(
+            "3.90",
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
+        )
 ```
 
-- [ ] **Step 3: Run the two tests and verify RED**
+- [ ] **Step 3: Run the five tests and verify RED**
 
 Run:
 
 ```bash
-E2E_TEST_MODE=true python3 -m pytest \
+E2E_TEST_MODE=true \
+FIRESTORE_EMULATOR_HOST=127.0.0.1:1 \
+GOOGLE_APPLICATION_CREDENTIALS=/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json \
+/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/.venv/bin/python -m pytest \
   tests/test_jill_live_campaign_regressions.py::JillLiveCampaignRegressionTests::test_explicit_cam_figure_wins_over_earlier_nnn_rent_basis \
   tests/test_jill_live_campaign_regressions.py::JillLiveCampaignRegressionTests::test_explicit_cam_replaces_conflicting_model_opex_before_sheet_write \
   tests/test_jill_live_campaign_regressions.py::JillLiveCampaignRegressionTests::test_pending_cam_clause_does_not_capture_later_asking_rent \
+  tests/test_jill_live_campaign_regressions.py::JillLiveCampaignRegressionTests::test_pending_cam_does_not_cross_semicolon_into_quoted_rent \
+  tests/test_jill_live_campaign_regressions.py::JillLiveCampaignRegressionTests::test_relational_base_rent_phrase_keeps_explicit_cam_figure \
   -q
 ```
 
-Expected: the first two tests fail because the actual OpEx value is `14.10`; the negative guard may already pass.
+Expected before the final boundary fix: the two original positive cases and the two new quality-review cases fail with actual `14.10`; the original pending-CAM guard passes.
 
 - [ ] **Step 4: Commit the RED tests**
 
@@ -111,16 +169,23 @@ Immediately after `_OPS_EX_RE`, add:
 ```python
 _EXPLICIT_OPS_EX_RE = re.compile(
     r"\b(?:opex|op\s*ex|cam|tmi|operating\s+expenses?)\b"
-    r"([^.!?\n$]{0,96}?)"
+    r"([^.!?;\n$]{0,96}?)"
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
     r"(?:(?:/\s*|\bper\s+)(?:sf|psf|sq\.?\s*ft|square\s+foot))?"
     r"(?:\s*/?\s*(?:yr|year|annum|mo|month|monthly))?",
     re.IGNORECASE,
 )
 
-_RENT_REFERENCE_IN_OPS_EX_GAP_RE = re.compile(
-    r"\b(?:asking\s+(?:rental\s+)?rate|base\s+rent|lease\s+rate|"
-    r"rental\s+rate|asking\s+rent|rent\s+(?:is|at))\b",
+_RENT_ASSIGNMENT_IN_OPS_EX_GAP_RE = re.compile(
+    r"\b(?:asking\s+(?:rental\s+)?rate|quoted\s+(?:rental\s+)?rate|"
+    r"base\s+rent|lease\s+rate|rental\s+rate|asking\s+rent|rent)\b"
+    r"[^,;:]{0,24}?(?:\b(?:is|at|of|runs?|equals?)\b|[:=])\s*$",
+    re.IGNORECASE,
+)
+
+_OPS_EX_RELATION_TO_RENT_RE = re.compile(
+    r"\b(?:on\s+top\s+of|in\s+addition\s+to|plus)\s+"
+    r"(?:the\s+)?(?:base\s+)?rent\b",
     re.IGNORECASE,
 )
 ```
@@ -133,7 +198,11 @@ In `_extract_ops_ex_sf_from_text`, retain the existing `_COMBINED_RENT_OPEX_RE` 
 
 ```python
     for explicit in _EXPLICIT_OPS_EX_RE.finditer(text):
-        if _RENT_REFERENCE_IN_OPS_EX_GAP_RE.search(explicit.group(1)):
+        gap = explicit.group(1)
+        if (
+            _RENT_ASSIGNMENT_IN_OPS_EX_GAP_RE.search(gap)
+            and not _OPS_EX_RELATION_TO_RENT_RE.search(gap)
+        ):
             continue
         if not _HYPOTHETICAL_RENT_RE.search(
             text[max(0, explicit.start() - 40): explicit.end()]
@@ -147,18 +216,21 @@ In `_extract_ops_ex_sf_from_text`, retain the existing `_COMBINED_RENT_OPEX_RE` 
                 return f"{annual:.2f}"
 ```
 
-- [ ] **Step 3: Run the three production regressions and verify GREEN**
+- [ ] **Step 3: Run the five production regressions and verify GREEN**
 
 Run the Task 1 command again.
 
-Expected: `3 passed`.
+Expected: `5 passed`.
 
 - [ ] **Step 4: Run focused extraction regressions**
 
 Run:
 
 ```bash
-E2E_TEST_MODE=true python3 -m pytest \
+E2E_TEST_MODE=true \
+FIRESTORE_EMULATOR_HOST=127.0.0.1:1 \
+GOOGLE_APPLICATION_CREDENTIALS=/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json \
+/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/.venv/bin/python -m pytest \
   tests/test_jill_live_campaign_regressions.py \
   tests/test_battery_ai_processing.py \
   tests/test_processing_completion_guards.py \
@@ -189,13 +261,19 @@ git commit -m "fix: prefer explicit opex figures"
 Run the complete collected backend test surface:
 
 ```bash
-E2E_TEST_MODE=true python3 -m pytest tests -q
+E2E_TEST_MODE=true \
+FIRESTORE_EMULATOR_HOST=127.0.0.1:1 \
+GOOGLE_APPLICATION_CREDENTIALS=/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json \
+/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/.venv/bin/python -m pytest tests -q
 ```
 
 Then rerun the release-critical contract files as an independently visible gate:
 
 ```bash
-E2E_TEST_MODE=true python3 -m pytest -q \
+E2E_TEST_MODE=true \
+FIRESTORE_EMULATOR_HOST=127.0.0.1:1 \
+GOOGLE_APPLICATION_CREDENTIALS=/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json \
+/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/.venv/bin/python -m pytest -q \
   tests/test_process_user_production_deploy_contract.py \
   tests/test_runtime_dependency_contract.py \
   tests/test_ws_b_cloudrun_job_spec.py \
