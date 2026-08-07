@@ -1736,7 +1736,15 @@ _RATE_BASIS_SUFFIX = (
     r"(?:(?:on\s+(?:a|the)\s+)?monthly(?:\s+basis)?)\b)?"
 )
 _RATE_NNN_SUFFIX = r"\s*\bnnn\b"
-_RATE_TRAILING_SUFFIX = rf"{_RATE_BASIS_SUFFIX}(?:{_RATE_NNN_SUFFIX})?"
+_RATE_NNN_FIRST_SUFFIX = rf"{_RATE_NNN_SUFFIX}{_RATE_BASIS_SUFFIX}"
+_RATE_TRAILING_SUFFIX = (
+    rf"(?:{_RATE_NNN_FIRST_SUFFIX}|"
+    rf"{_RATE_BASIS_SUFFIX}(?:{_RATE_NNN_SUFFIX})?)"
+)
+_RATE_REQUIRED_NNN_TRAILING_SUFFIX = (
+    rf"(?:{_RATE_NNN_FIRST_SUFFIX}|"
+    rf"{_RATE_BASIS_SUFFIX}{_RATE_NNN_SUFFIX})"
+)
 _PRIOR_RATE_FIGURE = (
     rf"\$\s*(?P<prior_value>{_RATE_NUMBER})\s*{_RATE_UNIT_SUFFIX}"
     rf"{_RATE_TRAILING_SUFFIX}"
@@ -1748,7 +1756,7 @@ _CURRENT_RATE_FIGURE = (
 _OPS_EX_OWNER_NNN_RATE_RE = re.compile(
     rf"\b{_OPS_EX_NNN_OWNER}\b[^\d$\n]{{0,18}}?"
     rf"(?P<current_evidence>\$\s*(?P<value>{_RATE_NUMBER})\s*"
-    rf"{_RATE_UNIT_SUFFIX}{_RATE_BASIS_SUFFIX}{_RATE_NNN_SUFFIX})",
+    rf"{_RATE_UNIT_SUFFIX}{_RATE_REQUIRED_NNN_TRAILING_SUFFIX})",
     re.IGNORECASE,
 )
 _OPS_EX_ELLIPTICAL_CORRECTION_RE = re.compile(
