@@ -299,6 +299,60 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_long_form_expense_nnn_rates_keep_explicit_basis(self):
+        examples = (
+            ("Expenses are $0.34 per SF/month NNN.", "4.08", "0.34"),
+            ("Expenses are $0.34 per SF per month NNN.", "4.08", "0.34"),
+            ("Expenses are $3.65 per SF/year NNN.", "3.65", "3.65"),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, expected_opex, preseeded_opex in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": expected_opex},
+                        {"column": "Ops Ex / SF", "value": preseeded_opex},
+                    ],
+                    "events": [],
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            normalized = ai_processing._augment_proposal_opex_basis(
+                augmented,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                normalized,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                normalized,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [
+                (None, expected_opex, None, expected_opex)
+                for _, expected_opex, _ in examples
+            ],
+            results,
+        )
+
     def test_expense_rate_compounds_are_owned_only_by_opex(self):
         examples = (
             "Operating expense rate is $3.65 NNN.",
@@ -1018,6 +1072,72 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_elliptical_opex_corrections_keep_prior_rate_suffixes(self):
+        examples = (
+            (
+                "CAM is $4.25/SF NNN, corrected to $3.90/SF NNN.",
+                "3.90",
+                "4.25",
+            ),
+            (
+                "CAM is $0.34/SF/month, corrected to $0.36/SF/month.",
+                "4.32",
+                "4.08",
+            ),
+            (
+                "CAM is $4.25/SF/year, corrected to $3.90/SF/year.",
+                "3.90",
+                "4.25",
+            ),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, expected_opex, stale_opex in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": expected_opex},
+                        {"column": "Ops Ex / SF", "value": stale_opex},
+                    ],
+                    "events": [],
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            normalized = ai_processing._augment_proposal_opex_basis(
+                augmented,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                normalized,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                normalized,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [
+                (None, expected_opex, None, expected_opex)
+                for _, expected_opex, _ in examples
+            ],
+            results,
+        )
+
     def test_negated_opex_figures_and_pronominal_corrections(self):
         examples = (
             (
@@ -1063,6 +1183,72 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
 
         self.assertEqual(
             [(None, "3.90", None, "3.90")] * len(examples),
+            results,
+        )
+
+    def test_pronominal_opex_corrections_keep_negated_rate_suffixes(self):
+        examples = (
+            (
+                "CAM is not $4.25/SF NNN; it is $3.90/SF NNN.",
+                "3.90",
+                "4.25",
+            ),
+            (
+                "CAM is not $0.34/SF/month; it is $0.36/SF/month.",
+                "4.32",
+                "4.08",
+            ),
+            (
+                "CAM is not $4.25/SF/year; it is $3.90/SF/year.",
+                "3.90",
+                "4.25",
+            ),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, expected_opex, stale_opex in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": expected_opex},
+                        {"column": "Ops Ex / SF", "value": stale_opex},
+                    ],
+                    "events": [],
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            normalized = ai_processing._augment_proposal_opex_basis(
+                augmented,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                normalized,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                normalized,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [
+                (None, expected_opex, None, expected_opex)
+                for _, expected_opex, _ in examples
+            ],
             results,
         )
 
