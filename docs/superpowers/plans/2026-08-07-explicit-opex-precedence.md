@@ -4,7 +4,7 @@
 
 **Goal:** Prevent an earlier `$X NNN` rent-basis phrase from overriding a later explicit OpEx/CAM dollar figure in a broker reply.
 
-**Architecture:** Add one sentence-bounded, keyword-first OpEx candidate matcher and evaluate it before the existing ambiguous/general matcher. Preserve the current combined-rate, monthly normalization, hypothetical-language, NNN rent-line, and proposal-reconciliation behavior; the deterministic value will continue to replace an unsupported model value through the existing `_fill` path.
+**Architecture:** Add one sentence-bounded, keyword-first OpEx candidate matcher. Preserve the existing combined base-plus-OpEx matcher as the highest-specificity path, evaluate the explicit candidate second, and retain the ambiguous/general matcher as the final fallback. Preserve monthly normalization, hypothetical-language, NNN rent-line, and proposal-reconciliation behavior; the deterministic value will continue to replace an unsupported model value through the existing `_fill` path.
 
 **Tech Stack:** Python 3, `re`, `unittest`, pytest, existing `email_automation.ai_processing` extraction pipeline.
 
@@ -127,9 +127,9 @@ _RENT_REFERENCE_IN_OPS_EX_GAP_RE = re.compile(
 
 The matcher deliberately excludes bare `NNN`: `NNN` is ambiguous between a lease basis and operating expenses, while the listed labels explicitly name OpEx.
 
-- [ ] **Step 2: Evaluate explicit candidates before the ambiguous matcher**
+- [ ] **Step 2: Evaluate explicit candidates after combined expressions and before the ambiguous matcher**
 
-In `_extract_ops_ex_sf_from_text`, after the initial empty/nonviable guards and before `_COMBINED_RENT_OPEX_RE`, add:
+In `_extract_ops_ex_sf_from_text`, retain the existing `_COMBINED_RENT_OPEX_RE` block immediately after the initial empty/nonviable guards. After that combined block and before `matches = list(_OPS_EX_RE.finditer(text))`, add:
 
 ```python
     for explicit in _EXPLICIT_OPS_EX_RE.finditer(text):

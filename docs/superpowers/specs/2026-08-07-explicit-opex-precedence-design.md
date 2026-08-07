@@ -20,7 +20,7 @@ The failure is deterministic: `_OPS_EX_RE` finds only the earlier figure-first `
 
 Add a narrow explicit keyword-first candidate extractor that accepts ordinary prose between an unambiguous OpEx label and a nearby dollar figure, including commas and phrases such as `taxes, and insurance are running roughly`. It must stop at sentence boundaries and must not treat bare `NNN` as an explicit keyword-first label.
 
-`_extract_ops_ex_sf_from_text` will evaluate this explicit candidate before combined and general `_OPS_EX_RE` candidates. Existing monthly-basis normalization and hypothetical-language rejection remain in force. The existing general matcher remains the fallback for compact forms such as `$8/SF opex` and `NNN charges are $7.25/SF/yr`.
+`_extract_ops_ex_sf_from_text` will preserve the existing combined base-plus-OpEx matcher as the highest-specificity path, then evaluate this explicit candidate before general `_OPS_EX_RE` candidates. Existing monthly-basis normalization and hypothetical-language rejection remain in force. The existing general matcher remains the fallback for compact forms such as `$8/SF opex` and `NNN charges are $7.25/SF/yr`.
 
 No notification, recipient, outbox, access-control, replacement, or deployment behavior changes in this hotfix.
 
