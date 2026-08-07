@@ -1671,9 +1671,14 @@ _OPS_EX_NNN_OWNER_RE = re.compile(
     rf"\b{_OPS_EX_NNN_OWNER}\b",
     re.IGNORECASE,
 )
+_OPS_EX_RATE_COMPOUND_RE = re.compile(
+    rf"\b{_OPS_EX_NNN_OWNER}\s+(?P<rate>rate)\b",
+    re.IGNORECASE,
+)
 _NNN_RELATIONAL_OBJECT_RE = re.compile(
     rf"\b(?:before|excluding|exclusive\s+of|net[\s-]+of|"
-    rf"(?:does|do|did)\s+not\s+include|not\s+including|separate\s+from)\s+"
+    rf"(?:does|do|did)\s+not\s+include|not\s+including|separate\s+from|"
+    rf"on\s+top\s+of|in\s+addition\s+to)\s+"
     rf"(?:the\s+)?(?P<object>{_RENT_NNN_EXPLICIT_OWNER}|"
     rf"{_OPS_EX_NNN_OWNER})\b",
     re.IGNORECASE,
@@ -1713,6 +1718,81 @@ _CONTEXTUAL_RENT_NNN_OWNER_RES = (
         re.IGNORECASE,
     ),
 )
+_PENDING_OPS_EX_CONTEXT_RE = re.compile(
+    r"\b(?:pending|tbd|unknown|not\s+(?:yet\s+)?finalized)\b",
+    re.IGNORECASE,
+)
+_STRUCTURAL_FIELD_SEPARATOR_RE = re.compile(r"[|:–—-]")
+
+_RATE_NUMBER = r"[0-9]{1,3}(?:\.[0-9]{1,2})?"
+_RATE_UNIT_SUFFIX = rf"(?:(?:/\s*|\bper\s+)?{_OPS_EX_RATE_UNIT})"
+_PRIOR_RATE_FIGURE = (
+    rf"\$\s*(?P<prior_value>{_RATE_NUMBER})\s*{_RATE_UNIT_SUFFIX}"
+)
+_CURRENT_RATE_FIGURE = (
+    rf"\$\s*(?P<value>{_RATE_NUMBER})\s*{_RATE_UNIT_SUFFIX}"
+)
+_OPS_EX_OWNER_NNN_RATE_RE = re.compile(
+    rf"\b{_OPS_EX_NNN_OWNER}\b[^\d$\n]{{0,18}}?{_CURRENT_RATE_FIGURE}"
+    r"\s*\bnnn\b",
+    re.IGNORECASE,
+)
+_OPS_EX_ELLIPTICAL_CORRECTION_RE = re.compile(
+    rf"\b{_OPS_EX_NNN_OWNER}\b[^\n;!?]{{0,40}}?{_PRIOR_RATE_FIGURE}"
+    r"\s*(?:,\s*(?:corrected\s+to|now)|"
+    r";\s*(?:correction\s*:|actually))\s*"
+    rf"{_CURRENT_RATE_FIGURE}",
+    re.IGNORECASE,
+)
+_PRONOMINAL_RATE_CORRECTION_RE = re.compile(
+    rf"(?:(?P<opex_owner>\b{_OPS_EX_NNN_OWNER}\b)|"
+    rf"(?P<rent_owner>\b{_RENT_NNN_EXPLICIT_OWNER}\b))"
+    rf"[^\d$\n;!?]{{0,24}}?\bnot\s+{_PRIOR_RATE_FIGURE}"
+    rf"\s*;\s*it\s+is\s+{_CURRENT_RATE_FIGURE}",
+    re.IGNORECASE,
+)
+_NEGATED_RATE_RE = re.compile(
+    rf"\bnot\s+\$\s*(?P<value>{_RATE_NUMBER})\s*{_RATE_UNIT_SUFFIX}"
+    r"(?:\s*/?\s*(?:monthly|annually|annual|yearly|month|annum|year|"
+    r"mos|mo|yr)\b)?(?:\s*\bnnn\b)?",
+    re.IGNORECASE,
+)
+
+
+def _correction_figure_owner(
+    text: str,
+    start: int,
+    end: Optional[int],
+) -> Optional[str]:
+    """Return the field inherited by a tightly bound correction figure."""
+    figure_end = end if end is not None else start
+    for match in _OPS_EX_ELLIPTICAL_CORRECTION_RE.finditer(text):
+        numeric_start, numeric_end = match.span("value")
+        if start <= numeric_start and numeric_end <= figure_end:
+            prior_start, prior_end = match.span("prior_value")
+            prior_owner = _figure_field_owner(
+                text,
+                _currency_figure_start(text, prior_start),
+                prior_end,
+            )
+            return "opex" if prior_owner == "opex" else None
+    for match in _PRONOMINAL_RATE_CORRECTION_RE.finditer(text):
+        numeric_start, numeric_end = match.span("value")
+        if start <= numeric_start and numeric_end <= figure_end:
+            prior_start, prior_end = match.span("prior_value")
+            prior_owner = _figure_field_owner(
+                text,
+                _currency_figure_start(text, prior_start),
+                prior_end,
+            )
+            return prior_owner if prior_owner in {"opex", "rent"} else None
+    return None
+
+
+def _figure_is_negated(text: str, numeric_start: int) -> bool:
+    """Return whether ``numeric_start`` is immediately governed by ``not``."""
+    prefix = text[max(0, numeric_start - 24):numeric_start]
+    return bool(re.search(r"\bnot\s+\$?\s*$", prefix, re.IGNORECASE))
 
 
 def _nnn_clause_start(text: str, start: int) -> int:
@@ -1738,11 +1818,19 @@ def _nnn_clause_start(text: str, start: int) -> int:
 
 def _figure_field_owner(text: str, start: int, end: Optional[int] = None) -> str:
     """Resolve the explicit field subject governing a nearby rate figure."""
+    correction_owner = _correction_figure_owner(text, start, end)
+    if correction_owner is not None:
+        return correction_owner
+
     clause_start = _nnn_clause_start(text, start)
     prefix = text[clause_start + 1:start]
     relational_objects = [
         match.span("object")
         for match in _NNN_RELATIONAL_OBJECT_RE.finditer(prefix)
+    ]
+    expense_rate_spans = [
+        match.span("rate")
+        for match in _OPS_EX_RATE_COMPOUND_RE.finditer(prefix)
     ]
 
     def _is_relational_object(match: "re.Match") -> bool:
@@ -1760,12 +1848,47 @@ def _figure_field_owner(text: str, start: int, end: Optional[int] = None) -> str
         (match.start(), "rent")
         for match in _RENT_NNN_EXPLICIT_OWNER_RE.finditer(prefix)
         if not _is_relational_object(match)
+        and not (
+            match.group(0).lower() == "rate"
+            and any(
+                rate_start <= match.start() and match.end() <= rate_end
+                for rate_start, rate_end in expense_rate_spans
+            )
+        )
     )
     prefix_owner = max(explicit_owners)[1] if explicit_owners else "neutral"
-    contextual_rent = any(
-        pattern.search(prefix)
+    contextual_rent_matches = [
+        match
         for pattern in _CONTEXTUAL_RENT_NNN_OWNER_RES
-    )
+        if (match := pattern.search(prefix)) is not None
+    ]
+    contextual_rent = bool(contextual_rent_matches)
+    if prefix_owner == "opex" and contextual_rent_matches:
+        latest_expense_owner = max(
+            (
+                match
+                for match in _OPS_EX_NNN_OWNER_RE.finditer(prefix)
+                if not _is_relational_object(match)
+            ),
+            key=lambda match: match.start(),
+            default=None,
+        )
+        latest_contextual_rent = max(
+            contextual_rent_matches,
+            key=lambda match: match.start(),
+        )
+        if (
+            latest_expense_owner is not None
+            and latest_contextual_rent.start() > latest_expense_owner.end()
+        ):
+            intervening = prefix[
+                latest_expense_owner.end():latest_contextual_rent.start()
+            ]
+            if (
+                _PENDING_OPS_EX_CONTEXT_RE.search(intervening)
+                and _STRUCTURAL_FIELD_SEPARATOR_RE.search(intervening)
+            ):
+                prefix_owner = "rent"
     remainder = text[end:] if end is not None else ""
     postpositive_expense = bool(
         end is not None
@@ -2005,6 +2128,16 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     # supersedes a stale prior quote on the same line (#19).
     current = None
     for cm in _CURRENT_ASKING_RE.finditer(text):
+        numeric_start, _ = cm.span(1)
+        if _figure_is_negated(text, numeric_start):
+            continue
+        figure_owner = _figure_field_owner(
+            text,
+            _currency_figure_start(text, numeric_start),
+            cm.end(),
+        )
+        if figure_owner in {"opex", "conflict"}:
+            continue
         value = float(cm.group(1))
         window = text[max(0, cm.start() - 20): min(len(text), cm.end() + 30)]
         annual_value = value * 12 if _is_monthly_context(window) else value
@@ -2071,6 +2204,8 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     for pattern in (dollar_per_sf, rent_context, dollar_rate_basis, dollar_less_basis, cents_basis):
         for match in pattern.finditer(text):
             numeric_start, numeric_end = match.span(1)
+            if _figure_is_negated(text, numeric_start):
+                continue
             figure_start = _currency_figure_start(text, numeric_start)
             nnn_end = (
                 match.end()
@@ -2445,6 +2580,31 @@ def _combined_base_rent_evidence(text: str) -> List[tuple]:
     return evidence
 
 
+def _negated_rate_evidence(text: str) -> List[tuple]:
+    """Return rate figures explicitly rejected by ``not``."""
+    evidence = []
+    for match in _NEGATED_RATE_RE.finditer(text or ""):
+        start, end = match.span("value")
+        try:
+            raw_value = Decimal(match.group("value"))
+        except InvalidOperation:
+            continue
+        if raw_value < Decimal("0.01"):
+            continue
+        basis_values = _ops_ex_basis_values(
+            text,
+            match.start(),
+            match.end(),
+            match.group("value"),
+            numeric_span=(start, end),
+            context_before=10,
+            context_after=20,
+        )
+        annualized_value = basis_values[1] if basis_values is not None else raw_value
+        evidence.append((start, end, raw_value, annualized_value))
+    return evidence
+
+
 def _rejected_nnn_evidence(text: str) -> List[tuple]:
     """Return non-expense NNN values separately from accepted OpEx evidence."""
     evidence = []
@@ -2549,10 +2709,19 @@ def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
         ):
             return
         numeric_start, numeric_end = match.span(group)
+        if _figure_is_negated(text, numeric_start):
+            return
         if any(
             numeric_start < rejected_end and rejected_start < numeric_end
             for rejected_start, rejected_end, _, _ in rejected
         ):
+            return
+
+        if source == "narrow" and _figure_field_owner(
+            text,
+            _currency_figure_start(text, numeric_start),
+            match.end(),
+        ) != "opex":
             return
 
         legacy_owner = None
@@ -2622,8 +2791,17 @@ def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
     narrow_matches = sorted(
         [
             match
-            for pattern in (_OPS_EX_COMPONENT_LIST_RE, _OPS_EX_RENT_MODIFIER_RE)
+            for pattern in (
+                _OPS_EX_COMPONENT_LIST_RE,
+                _OPS_EX_RENT_MODIFIER_RE,
+                _OPS_EX_OWNER_NNN_RATE_RE,
+                _OPS_EX_ELLIPTICAL_CORRECTION_RE,
+            )
             for match in pattern.finditer(text)
+        ]
+        + [
+            match
+            for match in _PRONOMINAL_RATE_CORRECTION_RE.finditer(text)
         ],
         key=lambda match: match.start(),
     )
@@ -4050,6 +4228,7 @@ def _strip_unsupported_opex_update(
         for _, _, raw_value, annualized_value in (
             _combined_total_opex_evidence(text)
             + _combined_base_rent_evidence(text)
+            + _negated_rate_evidence(text)
             + _rejected_nnn_evidence(text)
         )
         for value in (raw_value, annualized_value)
@@ -4139,6 +4318,13 @@ def _augment_proposal_with_deterministic_extractions(
             )
             if normalized is not None
         }
+        negated_rate_values = {
+            value
+            for _, _, raw_value, annualized_value in _negated_rate_evidence(
+                fresh_text
+            )
+            for value in (raw_value, annualized_value)
+        }
         if (
             (trusted_rents and proposed_rent not in trusted_rents)
             or (
@@ -4155,6 +4341,10 @@ def _augment_proposal_with_deterministic_extractions(
                         candidate.annualized_value,
                     )
                 }
+                and proposed_rent not in trusted_rents
+            )
+            or (
+                proposed_rent in negated_rate_values
                 and proposed_rent not in trusted_rents
             )
         ):
