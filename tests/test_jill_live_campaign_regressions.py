@@ -372,6 +372,18 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     ai_processing._proposal_update_for_column(twice, "Ops Ex / SF")["value"],
                 )
 
+    def test_monthly_report_after_cam_is_not_a_basis_marker(self):
+        text = "CAM is $4.00/SF, monthly report attached."
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_unrelated_annual_rent_does_not_override_monthly_cam_basis(self):
+        text = "Rent: $1.25/SF/year, CAM: $0.34/SF/month"
+        self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_conflicting_owned_cam_basis_abstains(self):
+        text = "CAM is $0.34/SF/month/year"
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
