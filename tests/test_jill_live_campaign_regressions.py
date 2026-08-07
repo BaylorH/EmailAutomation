@@ -402,6 +402,15 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM is $4.00/SF, monthly report attached."
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_monthly_report_inside_cam_clause_is_not_a_basis_marker(self):
+        examples = (
+            "CAM monthly report is $4.00/SF.",
+            "CAM report monthly is $4.00/SF.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_unrelated_annual_rent_does_not_override_monthly_cam_basis(self):
         text = "Rent: $1.25/SF/year, CAM: $0.34/SF/month"
         self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
