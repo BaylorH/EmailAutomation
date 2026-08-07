@@ -147,7 +147,7 @@ GOOGLE_APPLICATION_CREDENTIALS=/Users/baylorharrison/Documents/GitHub.nosync/Ema
   -q
 ```
 
-Expected before the final boundary fix: the two original positive cases and the two new quality-review cases fail with actual `14.10`; the original pending-CAM guard passes.
+Expected at the quality-review fix loop: the three previously approved cases pass; the semicolon and relational-base-rent cases fail with actual `14.10`.
 
 - [ ] **Step 4: Commit the RED tests**
 
