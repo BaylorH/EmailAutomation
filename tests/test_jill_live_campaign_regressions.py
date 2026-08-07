@@ -1252,6 +1252,86 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_opex_correction_basis_changes_use_current_figure_only(self):
+        examples = (
+            (
+                "CAM is $0.34/SF/month, corrected to $3.90/SF/year.",
+                "3.90",
+                "4.08",
+            ),
+            (
+                "CAM is $4.25/SF/year, corrected to $0.36/SF/month.",
+                "4.32",
+                "4.25",
+            ),
+            (
+                "CAM is not $0.34/SF/month; it is $3.90/SF/year.",
+                "3.90",
+                "4.08",
+            ),
+            (
+                "CAM is not $4.25/SF/year; it is $0.36/SF/month.",
+                "4.32",
+                "4.25",
+            ),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, expected_opex, stale_opex in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": expected_opex},
+                        {"column": "Ops Ex / SF", "value": stale_opex},
+                    ],
+                    "events": [],
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            once = ai_processing._augment_proposal_opex_basis(
+                augmented,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            once_updates = [dict(update) for update in (once.get("updates") or [])]
+            twice = ai_processing._augment_proposal_opex_basis(
+                once,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            self.assertEqual(once_updates, twice.get("updates") or [])
+            rent_update = ai_processing._proposal_update_for_column(
+                twice,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                twice,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [
+                (None, expected_opex, None, expected_opex)
+                for _, expected_opex, _ in examples
+            ],
+            results,
+        )
+
     def test_negated_rent_figures_and_pronominal_corrections(self):
         examples = (
             "Rent is not $14.10/SF; it is $15.25/SF.",
