@@ -320,6 +320,10 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "$14 NNN + $4 OPEX, rent billed monthly"
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_combined_opex_sq_ft_billed_monthly_is_annualized(self):
+        text = "$14 NNN + $0.34 OPEX per sq. ft., billed monthly."
+        self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_pending_cam_does_not_annualize_monthly_rent_proposal_opex(self):
         text = "CAM pending; rent is $1.25/SF/month"
         proposal = {"updates": [{"column": "Ops Ex / SF", "value": "1.25"}]}
@@ -336,6 +340,37 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "1.25",
             ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
         )
+
+    def test_proposal_opex_basis_uses_shared_combined_winner_idempotently(self):
+        text = "$1.25 NNN + $0.34 OPEX = $1.59 PSF/month."
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+
+        for preseed, expected in (
+            ("0.34", "4.08"),
+            ("4.08", "4.08"),
+            ("2.00", "2.00"),
+        ):
+            with self.subTest(preseed=preseed):
+                proposal = {"updates": [{"column": "Ops Ex / SF", "value": preseed}]}
+                once = ai_processing._augment_proposal_opex_basis(
+                    proposal,
+                    ["4800 Space Center Blvd", "", ""],
+                    header,
+                    config,
+                    _conversation(text),
+                )
+                twice = ai_processing._augment_proposal_opex_basis(
+                    once,
+                    ["4800 Space Center Blvd", "", ""],
+                    header,
+                    config,
+                    _conversation(text),
+                )
+                self.assertEqual(
+                    expected,
+                    ai_processing._proposal_update_for_column(twice, "Ops Ex / SF")["value"],
+                )
 
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
