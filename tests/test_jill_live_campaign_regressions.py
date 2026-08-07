@@ -316,6 +316,14 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM: $4.00/SF, rent billed monthly"
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_following_per_month_rent_does_not_annualize_cam(self):
+        text = "CAM is $4.00/SF, per month rent is $1.20/SF."
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_following_per_year_rent_does_not_conflict_with_monthly_cam(self):
+        text = "CAM is $0.34/SF/month, per year rent is $14/SF."
+        self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_following_rent_billing_does_not_annualize_combined_opex(self):
         text = "$14 NNN + $4 OPEX, rent billed monthly"
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
