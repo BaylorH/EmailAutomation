@@ -299,6 +299,44 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM is $4.00/SF, monthly rent is $1.20/SF."
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_cam_sq_ft_monthly_suffixes_are_annualized(self):
+        examples = (
+            "CAM is $0.34 per sq. ft./month",
+            "CAM is $0.34 per sq. ft., billed monthly.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_prior_monthly_rent_does_not_annualize_later_cam(self):
+        text = "Rent: $1.25/SF/month, CAM: $4.00/SF"
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_following_rent_billing_does_not_annualize_cam(self):
+        text = "CAM: $4.00/SF, rent billed monthly"
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_following_rent_billing_does_not_annualize_combined_opex(self):
+        text = "$14 NNN + $4 OPEX, rent billed monthly"
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_pending_cam_does_not_annualize_monthly_rent_proposal_opex(self):
+        text = "CAM pending; rent is $1.25/SF/month"
+        proposal = {"updates": [{"column": "Ops Ex / SF", "value": "1.25"}]}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        result = ai_processing._augment_proposal_opex_basis(
+            proposal,
+            ["4800 Space Center Blvd", "", ""],
+            header,
+            config,
+            _conversation(text),
+        )
+        self.assertEqual(
+            "1.25",
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
+        )
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
