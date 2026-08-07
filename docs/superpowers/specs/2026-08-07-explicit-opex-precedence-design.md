@@ -2,105 +2,115 @@
 
 Date: 2026-08-07
 
-Status: approved within the active SiteSift production-readiness build
+Status: implemented locally within the active SiteSift production-readiness build
 
-## Production finding and audit correction
+## Production finding and design correction
 
-The Wave B-M1 broker reply stated an asking rent of `$14.10 NNN` and later stated
+The Wave B-M1 broker reply stated rent as `$14.10 NNN` and later stated that
 `CAM, taxes, and insurance are running roughly $3.90 per square foot`. The
-deployed deterministic fallback returned `14.10`, duplicating rent into
-`Ops Ex / SF`.
+deployed deterministic fallback duplicated the rent figure into `Ops Ex / SF`.
 
-The first hotfix added an arbitrary 96-character keyword-first matcher. Audit
-rejected that architecture: it repaired the production sentence but admitted
-nine plausible non-OpEx figures that the deployed extractor had correctly left
-alone. A negative extractor result was also insufficient because proposal
-augmentation retained a model-proposed OpEx update unless deterministic evidence
-provided a replacement.
+The first correction bounded the broad matcher, but later review exposed a
+second split-brain path: extraction and proposal normalization inferred basis
+independently. Nearby rent, parking, report, or annual language could therefore
+change an OpEx value even when it did not belong to that value. The final design
+uses one accepted-candidate model and keeps negative evidence separate.
 
-## Considered approaches
+## Architecture
 
-1. **Evidence-bounded positive and negative grammars — selected.** Add only the
-   two explicit positive structures required by production evidence, detect
-   combined rent-and-OpEx totals separately, and use the negative evidence both
-   while extracting and while validating an existing model proposal.
-2. **Keep the broad matcher and enumerate exclusions — rejected.** Each new
-   exclusion leaves another plausible prose path through the arbitrary gap and
-   repeats the audit failure mode.
-3. **Remove deterministic proposal reconciliation — rejected.** This would make
-   the production result model-dependent and would discard established compact
-   OpEx, monthly, and combined-component safeguards.
+### Accepted candidate and winner
 
-## Design
+Every accepted OpEx candidate is represented by `_OpsExCandidate` with:
 
-### Evidence precedence
+- the raw `Decimal` value;
+- the annualized `Decimal` value;
+- its owned monthly or annual basis;
+- numeric and owned-evidence spans;
+- source (`combined`, `narrow`, or `legacy`); and
+- explicit precedence.
 
-`_COMBINED_RENT_OPEX_RE` remains highest specificity for component expressions
-such as `$14 + $4 OpEx` and `$1.25 NNN + $0.34 OPEX`. Its OpEx component is
-returned before any total rejection or standalone matching.
+`_ops_ex_candidates` applies recency, hypothetical, combined-total, field-owner,
+and overlap guards before ranking candidates. `_ops_ex_winner` selects once.
+Both `_extract_ops_ex_sf_from_text` and `_augment_proposal_opex_basis` consume
+that same winner from the same fresh, quote-stripped inbound text. Proposal
+normalization changes only a value equal to the winning monthly candidate's raw
+value; an already annualized or unrelated value is unchanged, making repeated
+normalization idempotent.
 
-All other extraction uses two kinds of evidence:
+### Basis ownership
 
-- **Rejected combined totals.** Two bounded, symmetric patterns require an
-  OpEx/CAM label, a rent label, an additive or inclusion relation (`plus`, `and`,
-  `on top of`, or `in addition to`), a totalizing predicate (`is`, `equals`,
-  `totals`, `comes to`, or `amounts to`, with optional `combined`, `all-in`, or
-  `gross` wording), and one dollar figure. The detector returns the exact numeric
-  span and its annualized `Decimal` value.
-- **Valid standalone candidates.** Two narrow positive patterns cover only the
-  audited production component-list form (`CAM, taxes, and insurance are running
-  roughly $3.90`) and a structurally parenthetical rent modifier (`CAM, on top of
-  base rent, is $3.90` or `CAM (in addition to base rent) is $3.90`). Ordinary
-  compact forms remain owned by `_OPS_EX_RE`.
+`_ops_ex_basis_values` owns basis syntax only when it is structurally attached
+to the candidate. Supported forms include `/mo`, `/month`, `per month`, bare
+`monthly`, `billed monthly`, and `billed on a|the monthly basis`, together with
+annual equivalents. Rate units include `PSF`, `/SF`, `per SF`, `per-SF`,
+`sq. ft.`, `sq.ft.`, `sq ft.`, and `square foot`.
 
-The arbitrary 96-character matcher and its rent-relation exceptions are removed.
-Bare `NNN` remains excluded from the narrow positive patterns because it commonly
-describes the rent basis rather than a separate operating-expense component.
+Combined equations remain the most specific source. Their matcher consumes the
+equation total and unit so a 30-character trailing ownership window still covers
+forms such as:
 
-### Extraction safety
+```text
+$1.25 NNN + $0.34 OPEX = $1.59/SF/month
+$1.25 NNN + $0.34 OPEX = $1.59 per square foot, billed monthly
+```
 
-The standalone-candidate collector evaluates narrow positives before legacy
-candidates so the exact production `3.90` outranks the earlier `$14.10 NNN`
-lease-basis match. It applies the existing hypothetical and monthly guards and
-rejects any candidate whose numeric span overlaps combined-total evidence.
-Legacy fallback uses the same rejected spans, so a rent-first total such as
-`Base rent plus CAM equals $18` cannot be re-admitted by `_OPS_EX_RE`.
+Decimal points and recognized square-foot abbreviation periods are not clause
+boundaries. Real sentence punctuation remains a boundary. A marker followed by
+a subject, including `monthly-report`, `monthly: rent`, `monthly - rent`,
+`monthly (rent ...)`, `per year parking`, or similar field language, is not
+owned by the OpEx candidate. Conflicting candidate-owned monthly and annual
+markers make an accepted candidate abstain.
 
-Multiple sentences remain independent: in
-`CAM plus base rent totals $18/SF. CAM alone is $3.90/SF.`, only the first numeric
-span is rejected and the later standalone `3.90` is returned.
+### Ambiguous NNN ownership
 
-### Proposal-write safety
+Figure-first `NNN` is ambiguous because it can describe rent basis or operating
+expenses. `_nnn_figure_owner` classifies it as `rent`, `opex`, `neutral`, or
+`conflict` from explicit field ownership; magnitude never decides the field.
 
-Before the event-specific early return and before `_fill`, proposal augmentation
-resolves the configured OpEx column and compares an existing model value with the
-normalized rejected combined-total values from the fresh inbound text. It removes
-only an exact matching model OpEx update, and only when the same normalized value
-is not also supported by a valid standalone OpEx candidate. No other model update
-or event is altered.
+- Asking/rent/rate, offer-at, available-at, and area-at syntax owns the figure as
+  rent.
+- An explicit expense noun, CAM, OpEx, TMI, or an immediate same-field
+  `/CAM`, `/OpEx`, or `/TMI` suffix owns it as OpEx.
+- A recognized second addend remains owned by the combined-expression source.
+- Bare `$3.65 NNN` is neutral.
+- Conflicting ownership such as `Asking $14.10 NNN/CAM` abstains.
 
-This ordering prevents terminal or new-property proposals from carrying a known
-combined total into the Sheet, while allowing `_fill` to add a later valid
-standalone value after a rejected model total is removed.
+This classification is shared by rent extraction, OpEx candidate admission, and
+proposal validation. Clear `$3.65 CAM`, `$3.65 OpEx`, `$3.65 TMI`, and
+expense-owned `$3.65 NNN` forms remain supported.
+
+### Negative evidence and proposal-write safety
+
+Rejected combined totals and non-expense NNN figures are not accepted
+`_OpsExCandidate` records. They remain separate negative evidence with their
+numeric spans plus raw and annualized values. Proposal validation removes only
+an exact rejected value that is not also supported by an accepted candidate.
+
+Combined-total rejection is intentionally stronger than candidate acceptance:
+negative evidence survives an ambiguous or conflicting basis. If the rejected
+total itself contains a monthly token, both raw and conservative x12 values are
+rejected. Thus `CAM plus rent is $1.50/SF/month/year` rejects both `1.50` and
+`18.00`, and unrelated `per year parking` cannot erase the rejection. This check
+runs before terminal-event early returns.
 
 ## Acceptance criteria
 
-- The exact Wave B-M1 sentence extracts `3.90` and overwrites model OpEx `14.10`.
-- Each audited rent-and-CAM total, including rent-first order, extracts no OpEx.
-- A preseeded model OpEx equal to a rejected total is removed before an event
-  early return.
-- A later standalone `3.90` wins over an earlier rejected combined total in both
-  direct extraction and proposal augmentation.
-- Pending, unknown, prior, and unresolved projected-range language does not
-  fabricate an OpEx value; a current standalone value remains eligible.
-- Parenthetical rent modifiers, distinct rent and CAM figures, combined component
-  expressions, and monthly annualization remain green.
-- The focused five-file regression suite, syntax compilation, diff checks, and
-  clean-worktree check pass.
+- Offer-at and available-at `$14.10 NNN` shorthand extracts rent `14.10`, never
+  OpEx, and removes a matching model-proposed OpEx value during full augmentation.
+- Explicit expense-owned NNN/CAM/OpEx/TMI forms remain eligible; bare NNN is
+  neutral and conflicting rent/expense ownership abstains.
+- All accepted combined-equation and standalone monthly forms annualize `0.34`
+  to `4.08` in both extraction and proposal normalization.
+- Punctuated following subjects and unrelated rent or parking fields do not
+  contaminate candidate basis.
+- Rejected combined totals remove both raw and annualized proposal values even
+  with terminal events, unrelated annual fields, or `/month/year` conflicts.
+- Jill, the focused five-file backend suite, the release-critical suite, syntax
+  compilation, diff checks, and the clean-worktree check pass.
 
 ## Scope and release boundary
 
-Only `email_automation/ai_processing.py`, its focused regression tests, and these
+Only `email_automation/ai_processing.py`, focused regression tests, and these
 planning artifacts change. Recipient, outbox, access, notification, scheduler,
-and deployment code are out of scope. This correction is committed and reviewed
-locally; it is not pushed or deployed in this task.
+and deployment behavior are out of scope. This is a local no-ship correction:
+no push, deploy, or external action is authorized.

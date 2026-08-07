@@ -1517,11 +1517,16 @@ _DOLLAR_PER_SF_RE = re.compile(
 )
 # Combined "base + opex" line: "$24 + $8/sf opex", "$1.25 NNN + $0.34 OPEX".
 # Group 1 is the base rent; group 2 is OpEx/NNN and must never be read as rent.
+_OPS_EX_RATE_UNIT = r"(?:psf|sf|sq\.?\s*ft\.?|square\s+foot)"
+_COMBINED_EQUATION_SUFFIX = (
+    rf"(?:\s*=\s*\$\s*\d+(?:\.\d+)?\s*"
+    rf"(?:(?:/|\bper(?:\s+|-))\s*)?{_OPS_EX_RATE_UNIT})?"
+)
 _COMBINED_RENT_OPEX_RE = re.compile(
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/?\s*(?:psf|sf|sq\.?\s*ft))?\s*(?:nnn|net|gross)?"
     r"\s*\+\s*"
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/?\s*(?:psf|sf|sq\.?\s*ft))?\s*(?:in\s+)?"
-    r"(?:opex|op\s*ex|nnn|cam|net|operating\s+expense)",
+    rf"(?:opex|op\s*ex|nnn|cam|net|operating\s+expense){_COMBINED_EQUATION_SUFFIX}",
     re.IGNORECASE,
 )
 # Range: "rates are between $20.00 - $22.00" → low end is a defensible asking rent.
@@ -1631,19 +1636,65 @@ _OPS_EX_CURRENT_EVIDENCE_LOCAL_RE = re.compile(
 # from mistaking such a rent line for OpEx (which would overwrite a valid LLM
 # OpEx and land rent+opex on mixed bases before #15 annualizes).
 _RENT_KW_BEFORE_FIGURE_RE = re.compile(
-    r"(?:asking\s+(?:rental\s+)?rate|base\s+rent|lease\s+rate|"
+    r"(?:asking(?:\s+(?:rental\s+)?rate)?|base\s+rent|lease\s+rate|"
     r"rental\s+rate|rent|rate)\b[^\d$]{0,32}$",
     re.IGNORECASE,
 )
+_OPS_EX_NNN_OWNER_RE = re.compile(
+    r"\b(?:operating\s+(?:expenses?|costs?)|expenses?|opex|op\s*ex|cam|tmi|"
+    r"pass[\s-]?throughs?)\b",
+    re.IGNORECASE,
+)
+_RENT_NNN_OWNER_RES = (
+    _RENT_KW_BEFORE_FIGURE_RE,
+    re.compile(r"\b(?:offer|avail(?:able)?)\b[^$]{0,80}(?:\bat\b|[,|:-])\s*$", re.IGNORECASE),
+    re.compile(
+        r"\b\d{1,3}(?:,\d{3})*\s*(?:sf|sq\.?\s*ft\.?|square\s+f(?:ee|oo)t)"
+        r"\s*(?:\bat\b|[,|:-])\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _nnn_figure_owner(text: str, start: int, end: Optional[int] = None) -> str:
+    """Classify ambiguous figure-first NNN evidence without using magnitude."""
+    clause_start = max(
+        text.rfind(delimiter, 0, start)
+        for delimiter in (".", "!", "?", ";", "\n")
+    )
+    prefix = text[clause_start + 1:start]
+    owners = [
+        (match.start(), "opex")
+        for match in _OPS_EX_NNN_OWNER_RE.finditer(prefix)
+    ]
+    owners.extend(
+        (match.start(), "rent")
+        for pattern in _RENT_NNN_OWNER_RES
+        for match in pattern.finditer(prefix)
+    )
+    prefix_owner = max(owners)[1] if owners else "neutral"
+    expense_suffix = bool(
+        end is not None
+        and re.match(
+            r"\s*/\s*(?:cam|opex|op\s*ex|tmi|operating\s+expenses?)\b",
+            text[end:],
+            re.IGNORECASE,
+        )
+    )
+    if expense_suffix and prefix_owner == "rent":
+        return "conflict"
+    if expense_suffix:
+        return "opex"
+    return prefix_owner
 
 
 def _opex_match_is_rent_basis_line(text: str, m: "re.Match") -> bool:
-    """True when a figure-first OpEx hit is really the rent line's NNN basis.
+    """True when an ambiguous NNN hit lacks explicit expense ownership.
 
     Only the bare "nnn" label is ambiguous (cam/tmi/opex/operating-expense are
-    unambiguous OpEx labels). When such a figure is immediately preceded by a
-    rent keyword, it is the asking rent stated on a triple-net basis, so it must
-    not be mined as OpEx.
+    unambiguous OpEx labels). A figure-first NNN value is accepted as OpEx only
+    when its clause carries a nearer explicit expense owner. Rent-owned and
+    neutral values remain separate negative evidence, never magnitude guesses.
     """
     matched_text = m.group(0).lower()
     if m.group(1) is None:
@@ -1655,8 +1706,7 @@ def _opex_match_is_rent_basis_line(text: str, m: "re.Match") -> bool:
         )
     if not m.group(0).rstrip().lower().endswith("nnn"):
         return False
-    before = text[max(0, m.start() - 72): m.start()]
-    return bool(_RENT_KW_BEFORE_FIGURE_RE.search(before))
+    return _nnn_figure_owner(text, m.start(), m.end()) != "opex"
 # Total SF as an area (thousands-grouped or 4+ digits), not a $/SF rate figure.
 _TOTAL_SF_RE = re.compile(
     r"(?<![\w$/.])((?:\d{1,3}(?:,\d{3})+)|\d{4,})\s*(?:sf|sq\.?\s*ft|square\s*f(?:ee|oo)t)\b",
@@ -1683,7 +1733,12 @@ _COMPONENT_SF_BEFORE_RE = re.compile(
     r"(?:about|approximately|approx\.?|roughly)?\s*$",
     re.IGNORECASE,
 )
-_MONTHLY_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:mo|mos|month)\b|\bmonthly\b|\bpsf\s*/?\s*mo(?:nth)?\b", re.IGNORECASE)
+_MONTHLY_UNIT_RE = re.compile(
+    r"\bbilled\s+(?:(?:on\s+(?:a|the)\s+)?monthly(?:\s+basis)?)\b"
+    r"|(?:/\s*|\bper\s+)(?:mo|mos|month)\b"
+    r"|\bmonthly\b|\bpsf\s*/?\s*mo(?:nth)?\b",
+    re.IGNORECASE,
+)
 _ANNUAL_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 _OPS_EX_ANNUAL_BASIS_RE = re.compile(
     r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually|yearly)\b"
@@ -1860,11 +1915,23 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     annual_unit = re.compile(r"(?:/|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 
     basis_patterns = (dollar_rate_basis, dollar_less_basis, cents_basis)
+    explicit_rate_unit = re.compile(
+        r"(?:p\.?s\.?f\.?|per\s+(?:sq\.?\s*)?f(?:oo)?t|"
+        r"a\s+(?:sq\.?\s*)?f(?:oo)?t|/\s*sf)",
+        re.IGNORECASE,
+    )
     # Classify figure-local $/SF matches before the wider keyword-first pattern.
     # Otherwise "...$12.75/SF asking rent, $3.95/SF operating expenses" lets
     # "asking rent" reach across the comma and incorrectly bind to the OpEx figure.
     for pattern in (dollar_per_sf, rent_context, dollar_rate_basis, dollar_less_basis, cents_basis):
         for match in pattern.finditer(text):
+            if (
+                pattern in (dollar_rate_basis, dollar_less_basis)
+                and re.search(r"\bnnn\b", match.group(0), re.IGNORECASE)
+                and not explicit_rate_unit.search(match.group(0))
+                and _nnn_figure_owner(text, match.start(), match.end()) != "rent"
+            ):
+                continue
             # rent_context already required an explicit rent keyword, so trust it.
             # The keyword-less patterns must screen out non-rent cost figures
             # (TI allowance/credit, taxes, parking, opex, buildout) in a $/SF shape.
@@ -1946,7 +2013,7 @@ def _ops_ex_basis_values(
 
     unit_abbreviation_periods = {
         position
-        for abbreviation in re.finditer(r"\bsq\.\s*ft\.?", text, re.IGNORECASE)
+        for abbreviation in re.finditer(r"\bsq\.?\s*ft\.?", text, re.IGNORECASE)
         for position in range(abbreviation.start(), abbreviation.end())
         if text[position] == "."
     }
@@ -1979,7 +2046,7 @@ def _ops_ex_basis_values(
     window = text[window_start:window_end]
     numeric_start, numeric_end = numeric_span or (start, end)
 
-    unit = r"(?:psf|sf|sq\.?\s*ft\.?|square\s+foot)"
+    unit = _OPS_EX_RATE_UNIT
 
     def _basis_gap_is_attached(gap: str) -> bool:
         billed = re.search(r"\bbilled\s*$", gap, re.IGNORECASE)
@@ -1988,11 +2055,12 @@ def _ops_ex_basis_values(
         gap = _MONTHLY_UNIT_RE.sub("", gap)
         gap = _OPS_EX_ANNUAL_BASIS_RE.sub("", gap)
         attached_unit = (
-            rf"\s*(?:(?:(?:/|\bper\s+)\s*)?{unit})?"
+            rf"\s*(?:(?:(?:/|\bper(?:\s+|-))\s*)?{unit})?"
             r"[\s,:()/\-]*"
         )
         combined_equation = (
-            rf"\s*=\s*\$\s*\d+(?:\.\d+)?(?:\s*{unit})?"
+            rf"\s*=\s*\$\s*\d+(?:\.\d+)?\s*"
+            rf"(?:(?:(?:/|\bper(?:\s+|-))\s*)?{unit})?"
             r"[\s,:()/\-]*"
         )
         return bool(
@@ -2076,8 +2144,8 @@ def _ops_ex_basis_values(
                     continue
                 if not _basis_gap_is_attached(gap):
                     continue
-                if marker in {"monthly", "annual", "annually", "yearly"} and re.match(
-                    r"\s+[a-z]",
+                if re.match(
+                    r"\s*(?:(?:[-:]\s*)|\(\s*)?[a-z]",
                     text[marker_end:window_end],
                     re.IGNORECASE,
                 ):
@@ -2111,6 +2179,12 @@ def _combined_total_opex_evidence(text: str) -> List[tuple]:
     for pattern in _COMBINED_TOTAL_OPEX_RES:
         for match in pattern.finditer(text or ""):
             start, end = match.span("value")
+            try:
+                raw_value = Decimal(match.group("value"))
+            except InvalidOperation:
+                continue
+            if raw_value < Decimal("0.01"):
+                continue
             basis_values = _ops_ex_basis_values(
                 text,
                 match.start(),
@@ -2119,8 +2193,45 @@ def _combined_total_opex_evidence(text: str) -> List[tuple]:
                 numeric_span=(start, end),
             )
             if basis_values is not None:
-                raw_value, annualized_value, _, _ = basis_values
-                evidence.append((start, end, raw_value, annualized_value))
+                _, annualized_value, _, _ = basis_values
+            else:
+                # Negative evidence must survive ambiguous/conflicting basis text.
+                # When the rejected total itself carries a monthly token, reject
+                # both the raw value and its conservative x12 counterpart.
+                annualized_value = (
+                    raw_value * Decimal("12")
+                    if _MONTHLY_UNIT_RE.search(match.group(0))
+                    else raw_value
+                )
+            evidence.append((start, end, raw_value, annualized_value))
+    return evidence
+
+
+def _rejected_nnn_evidence(text: str) -> List[tuple]:
+    """Return non-expense NNN values separately from accepted OpEx evidence."""
+    evidence = []
+    for match in _OPS_EX_RE.finditer(text or ""):
+        if (
+            match.group(1) is None
+            or not match.group(0).rstrip().lower().endswith("nnn")
+            or _nnn_figure_owner(text, match.start(), match.end()) == "opex"
+        ):
+            continue
+        start, end = match.span(1)
+        try:
+            raw_value = Decimal(match.group(1))
+        except InvalidOperation:
+            continue
+        basis_values = _ops_ex_basis_values(
+            text,
+            match.start(),
+            match.end(),
+            match.group(1),
+            numeric_span=(start, end),
+            context_after=30,
+        )
+        annualized_value = basis_values[1] if basis_values is not None else raw_value
+        evidence.append((start, end, raw_value, annualized_value))
     return evidence
 
 
@@ -2274,7 +2385,7 @@ def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
                 for combined_start, combined_end in combined_spans
             ):
                 continue
-            _append(match, group, "legacy", context_after=30)
+            _append(match, group, "legacy", context_after=50)
     return sorted(candidates, key=lambda candidate: candidate.precedence)
 
 
@@ -3633,7 +3744,9 @@ def _strip_rejected_combined_total_opex_update(
     proposed = _normalized_numeric_value(update.get("value"))
     rejected_values = {
         value
-        for _, _, raw_value, annualized_value in _combined_total_opex_evidence(text)
+        for _, _, raw_value, annualized_value in (
+            _combined_total_opex_evidence(text) + _rejected_nnn_evidence(text)
+        )
         for value in (raw_value, annualized_value)
     }
     supported_values = {
