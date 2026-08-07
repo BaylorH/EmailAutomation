@@ -1592,7 +1592,7 @@ _COMBINED_TOTAL_OPEX_RES = (
     ),
     re.compile(
         rf"\b{_COMBINED_TOTAL_RENT_LABEL}\b\s+{_COMBINED_TOTAL_RELATION}\s+"
-        rf"{_OPS_EX_EXPLICIT_LABEL}\b\s+{_COMBINED_TOTAL_PREDICATE}\s*"
+        rf"(?:the\s+)?{_OPS_EX_EXPLICIT_LABEL}\b\s+{_COMBINED_TOTAL_PREDICATE}\s*"
         rf"{_OPS_EX_DOLLAR_VALUE}",
         re.IGNORECASE,
     ),
@@ -1920,12 +1920,16 @@ def _annualized_ops_ex_decimal(
     start: int,
     end: int,
     raw: str,
+    context_before: int = 15,
+    context_after: int = 25,
 ) -> Optional[Decimal]:
     try:
         value = Decimal(raw)
     except InvalidOperation:
         return None
-    window = text[max(0, start - 15):min(len(text), end + 25)]
+    window = text[
+        max(0, start - context_before):min(len(text), end + context_after)
+    ]
     annual = value * Decimal("12") if _is_monthly_context(window) else value
     return annual if annual >= Decimal("0.01") else None
 
@@ -1935,14 +1939,18 @@ def _combined_total_opex_evidence(text: str) -> List[tuple]:
     for pattern in _COMBINED_TOTAL_OPEX_RES:
         for match in pattern.finditer(text or ""):
             start, end = match.span("value")
-            value = _annualized_ops_ex_decimal(
+            try:
+                raw_value = Decimal(match.group("value"))
+            except InvalidOperation:
+                continue
+            annualized_value = _annualized_ops_ex_decimal(
                 text,
                 match.start(),
                 match.end(),
                 match.group("value"),
             )
-            if value is not None:
-                evidence.append((start, end, value))
+            if annualized_value is not None:
+                evidence.append((start, end, raw_value, annualized_value))
     return evidence
 
 
@@ -1991,14 +1999,21 @@ def _ops_ex_candidate_recency(text: str, match: "re.Match") -> str:
     return "stale" if stale else "ordinary"
 
 
-def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
-    """Return non-rejected `(numeric_start, numeric_end, annual_value)` evidence."""
+def _ops_ex_candidates(text: str) -> List[tuple]:
+    """Return ranked `(numeric_start, numeric_end, annual_value)` evidence."""
     text = text or ""
     rejected = _combined_total_opex_evidence(text)
     current_candidates = []
+    ordinary_combined_candidates = []
     ordinary_candidates = []
 
-    def _append(match: "re.Match", group: Any) -> None:
+    def _append(
+        match: "re.Match",
+        group: Any,
+        ordinary_target: Optional[List[tuple]] = None,
+        context_before: int = 15,
+        context_after: int = 25,
+    ) -> None:
         recency = _ops_ex_candidate_recency(text, match)
         if recency == "stale":
             return
@@ -2009,7 +2024,7 @@ def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
         start, end = match.span(group)
         if any(
             start < rejected_end and rejected_start < end
-            for rejected_start, rejected_end, _ in rejected
+            for rejected_start, rejected_end, _, _ in rejected
         ):
             return
         value = _annualized_ops_ex_decimal(
@@ -2017,10 +2032,27 @@ def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
             match.start(),
             match.end(),
             match.group(group),
+            context_before=context_before,
+            context_after=context_after,
         )
         if value is not None:
-            target = current_candidates if recency == "current" else ordinary_candidates
+            target = (
+                current_candidates
+                if recency == "current"
+                else ordinary_target if ordinary_target is not None else ordinary_candidates
+            )
             target.append((start, end, value))
+
+    combined_matches = list(_COMBINED_RENT_OPEX_RE.finditer(text))
+    combined_spans = [match.span() for match in combined_matches]
+    for match in combined_matches:
+        _append(
+            match,
+            2,
+            ordinary_combined_candidates,
+            context_before=10,
+            context_after=30,
+        )
 
     narrow_matches = sorted(
         [
@@ -2040,8 +2072,14 @@ def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
             continue
         group = 1 if match.group(1) is not None else 2
         if match.group(group) is not None:
+            start, end = match.span(group)
+            if any(
+                start < combined_end and combined_start < end
+                for combined_start, combined_end in combined_spans
+            ):
+                continue
             _append(match, group)
-    return current_candidates + ordinary_candidates
+    return current_candidates + ordinary_combined_candidates + ordinary_candidates
 
 
 def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
@@ -2051,19 +2089,7 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
     if _looks_like_requirements_mismatch_nonviable(text):
         return None
 
-    # Past-tense hypothetical ("opex would have been $8/sf, but it's leased now")
-    # is not a current figure — mirror the rent extractor's match-local guard on
-    # every return path so a fabricated OpEx is never written to the sheet.
-    combined = _COMBINED_RENT_OPEX_RE.search(text)
-    if combined:
-        if not _HYPOTHETICAL_RENT_RE.search(text[max(0, combined.start() - 40): combined.end()]):
-            opex = float(combined.group(2))
-            window = text[max(0, combined.start() - 10): min(len(text), combined.end() + 30)]
-            annual = opex * 12 if _is_monthly_context(window) else opex
-            if annual >= 0.01:
-                return f"{annual:.2f}"
-
-    candidates = _ops_ex_standalone_candidates(text)
+    candidates = _ops_ex_candidates(text)
     if candidates:
         return f"{candidates[0][2]:.2f}"
     return None
@@ -3407,10 +3433,12 @@ def _strip_rejected_combined_total_opex_update(
         return
     proposed = _normalized_numeric_value(update.get("value"))
     rejected_values = {
-        value for _, _, value in _combined_total_opex_evidence(text)
+        value
+        for _, _, raw_value, annualized_value in _combined_total_opex_evidence(text)
+        for value in (raw_value, annualized_value)
     }
     supported_values = {
-        value for _, _, value in _ops_ex_standalone_candidates(text)
+        value for _, _, value in _ops_ex_candidates(text)
     }
     if proposed in rejected_values and proposed not in supported_values:
         _remove_proposal_update(proposal, opex_col)
