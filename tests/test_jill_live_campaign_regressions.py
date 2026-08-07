@@ -372,6 +372,24 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     ai_processing._proposal_update_for_column(twice, "Ops Ex / SF")["value"],
                 )
 
+    def test_proposal_opex_basis_ignores_entirely_quoted_monthly_candidate(self):
+        proposal = {"updates": [{"column": "Ops Ex / SF", "value": "0.34"}]}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+
+        result = ai_processing._augment_proposal_opex_basis(
+            proposal,
+            ["4800 Space Center Blvd", "", ""],
+            header,
+            config,
+            _conversation("> CAM is $0.34/SF/month"),
+        )
+
+        self.assertEqual(
+            "0.34",
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
+        )
+
     def test_monthly_report_after_cam_is_not_a_basis_marker(self):
         text = "CAM is $4.00/SF, monthly report attached."
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
