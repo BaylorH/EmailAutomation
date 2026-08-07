@@ -5015,6 +5015,93 @@ def _is_auto_reply_subject(
     return False
 
 
+def _inbound_authority_ineligibility_reason(
+    *,
+    subject: Optional[str],
+    from_addr: Optional[str],
+    sender_addr: Optional[str],
+    internet_message_headers: Optional[List[Dict[str, Any]]],
+    own_email: Optional[str],
+    fresh_text: str,
+    has_attachments: bool,
+) -> Optional[str]:
+    """Return why an inbound message cannot establish broker authority.
+
+    This is the shared, side-effect-free gate for both normal inbox processing
+    and the earlier-message batching shortcut. Keeping RFC auto-reply signals,
+    self-mail exclusion, and substantive-content rules together prevents the
+    shortcut from pausing a campaign for a message the normal path would skip.
+    """
+    is_auto_reply = False
+    for header in internet_message_headers or []:
+        name = str(header.get("name") or "").lower()
+        value = str(header.get("value") or "")
+        value_lower = value.lower()
+        if name == "auto-submitted" and value_lower != "no":
+            is_auto_reply = True
+        elif name == "x-auto-response-suppress":
+            is_auto_reply = True
+        elif name in {"x-autoreply", "x-autorespond"}:
+            is_auto_reply = True
+        elif name == "precedence" and value_lower in {"bulk", "junk", "auto_reply"}:
+            is_auto_reply = True
+
+    auto_reply_signal = is_auto_reply or _is_auto_reply_sender(
+        sender_addr or from_addr
+    )
+    if _is_auto_reply_subject(
+        subject,
+        has_auto_reply_signal=auto_reply_signal,
+    ):
+        is_auto_reply = True
+    if is_auto_reply:
+        return "auto_reply"
+
+    normalized_own_email = str(own_email or "").strip().lower()
+    normalized_from_addr = str(from_addr or "").strip().lower()
+    if normalized_own_email and normalized_from_addr == normalized_own_email:
+        return "self_email"
+
+    if _is_no_new_reply_text(fresh_text) and not has_attachments:
+        return "no_new_content"
+    return None
+
+
+def _resolve_current_mailbox_email(headers: Dict[str, str]) -> Optional[str]:
+    """Resolve the authenticated Graph mailbox using the existing fallbacks."""
+    my_email = None
+    my_email_resp = requests.get(
+        "https://graph.microsoft.com/v1.0/me",
+        headers=headers,
+        params={"$select": "mail,userPrincipalName"},
+        timeout=10,
+    )
+    if my_email_resp.status_code == 200:
+        my_data = my_email_resp.json()
+        my_email = (
+            my_data.get("mail") or my_data.get("userPrincipalName") or ""
+        ).lower()
+
+    if not my_email:
+        sent_resp = requests.get(
+            "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
+            headers=headers,
+            params={"$top": "1", "$select": "from"},
+            timeout=10,
+        )
+        if sent_resp.status_code == 200:
+            sent_data = sent_resp.json()
+            if sent_data.get("value"):
+                my_email = (
+                    sent_data["value"][0]
+                    .get("from", {})
+                    .get("emailAddress", {})
+                    .get("address")
+                    or ""
+                ).lower()
+    return my_email or None
+
+
 def _validate_operator_replay_claims(
     user_id: str,
     graph_message_id: str,
@@ -5127,10 +5214,10 @@ def process_inbox_message(
             print(f"⚠️ Could not fetch headers for {msg_id}: {e}")
             internet_message_headers = []
     
-    # Extract reply headers and check for auto-replies
+    # Extract reply headers. Automatic/self/substantive eligibility is decided
+    # by the same pure helper used by the batched-message shortcut below.
     in_reply_to = None
     references = []
-    is_auto_reply = False
 
     for header in internet_message_headers or []:
         name = header.get("name", "").lower()
@@ -5139,30 +5226,19 @@ def process_inbox_message(
             in_reply_to = normalize_message_id(value)
         elif name == "references":
             references = parse_references_header(value)
-        # Detect auto-reply headers (RFC 3834)
-        elif name == "auto-submitted" and value.lower() != "no":
-            is_auto_reply = True
-        elif name == "x-auto-response-suppress":
-            is_auto_reply = True
-        elif name == "x-autoreply" or name == "x-autorespond":
-            is_auto_reply = True
-        elif name == "precedence" and value.lower() in ["bulk", "junk", "auto_reply"]:
-            is_auto_reply = True
 
-    # Also check subject line for common auto-reply patterns.
-    # Ambiguous subject phrases ("on vacation", "fuori sede") only count when
-    # an independent auto-reply signal corroborates them: the RFC-3834 header
-    # match above, or a machine auto-responder sender address. This keeps the
-    # subject guard from dropping legitimate broker replies that merely contain
-    # those words while still catching real localized auto-responders.
-    auto_reply_signal = is_auto_reply or _is_auto_reply_sender(
-        sender_addr or from_addr
+    authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
+        subject=subject,
+        from_addr=from_addr,
+        sender_addr=sender_addr,
+        internet_message_headers=internet_message_headers,
+        own_email=None,
+        fresh_text=_text_for_ai,
+        has_attachments=has_attachments,
     )
-    if _is_auto_reply_subject(subject, has_auto_reply_signal=auto_reply_signal):
-        is_auto_reply = True
 
     # SAFETY: Skip auto-replies to prevent processing OOO messages as real data
-    if is_auto_reply:
+    if authority_ineligibility_reason == "auto_reply":
         print(f"⏭️ Skipping auto-reply from {from_addr}: {subject}")
         print(f"   Auto-reply emails are not processed to prevent data corruption")
         return
@@ -5170,33 +5246,17 @@ def process_inbox_message(
     # SAFETY: Skip emails from ourselves (e.g., forwarded back via auto-forward rules)
     # This prevents our own outbound emails from being processed as broker replies
     try:
-        my_email = None
-
-        # Try /me endpoint first
-        my_email_resp = requests.get(
-            "https://graph.microsoft.com/v1.0/me",
-            headers=headers,
-            params={"$select": "mail,userPrincipalName"},
-            timeout=10
+        my_email = _resolve_current_mailbox_email(headers)
+        authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
+            subject=subject,
+            from_addr=from_addr,
+            sender_addr=sender_addr,
+            internet_message_headers=internet_message_headers,
+            own_email=my_email,
+            fresh_text=_text_for_ai,
+            has_attachments=has_attachments,
         )
-        if my_email_resp.status_code == 200:
-            my_data = my_email_resp.json()
-            my_email = (my_data.get("mail") or my_data.get("userPrincipalName") or "").lower()
-
-        # Fallback: get our email from a sent message (works for personal accounts)
-        if not my_email:
-            sent_resp = requests.get(
-                "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
-                headers=headers,
-                params={"$top": "1", "$select": "from"},
-                timeout=10
-            )
-            if sent_resp.status_code == 200:
-                sent_data = sent_resp.json()
-                if sent_data.get("value"):
-                    my_email = (sent_data["value"][0].get("from", {}).get("emailAddress", {}).get("address") or "").lower()
-
-        if my_email and from_addr.lower() == my_email:
+        if authority_ineligibility_reason == "self_email":
             print(f"⏭️ Skipping self-email (forwarded back): {subject}")
             print(f"   Sender {from_addr} matches our own address - likely auto-forwarded")
             return
@@ -5427,7 +5487,7 @@ def process_inbox_message(
     except Exception as e:
         print(f"⚠️ Failed to update thread timestamp: {e}")
 
-    if _is_no_new_reply_text(_text_for_ai) and not has_attachments:
+    if authority_ineligibility_reason == "no_new_content":
         print(
             "⏭️ Inbound reply has no new broker-authored text and no attachments; "
             "saved for history without AI/sheet/follow-up side effects"
@@ -7486,13 +7546,19 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
     has_attachments = bool(msg.get("hasAttachments"))
 
     full_msg = {}
+    merged_msg = dict(msg)
     # Fetch full body
     try:
         full_msg = exponential_backoff_request(
             lambda: requests.get(
                 f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
                 headers=headers,
-                params={"$select": "body,hasAttachments,sender,replyTo,ccRecipients"},
+                params={
+                    "$select": (
+                        "body,hasAttachments,sender,replyTo,ccRecipients,"
+                        "internetMessageHeaders"
+                    )
+                },
                 timeout=30
             )
         ).json() or {}
@@ -7510,7 +7576,7 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
         _full_text = msg.get("bodyPreview", "")
 
     # Get headers for in_reply_to and references
-    internet_message_headers = msg.get("internetMessageHeaders", [])
+    internet_message_headers = merged_msg.get("internetMessageHeaders", [])
     in_reply_to = None
     references = []
 
@@ -7563,11 +7629,35 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
         pass
 
     # Earlier messages in a scanner batch are saved without full AI processing,
-    # but substantive inbound evidence must still become authoritative before the
-    # scanner marks that message processed. Quote-only messages intentionally keep
-    # their existing no-marker behavior; attachments remain substantive evidence.
+    # but only broker-eligible evidence may become authoritative before the
+    # scanner marks that message processed. This is the exact pure gate used by
+    # normal processing, including auto-reply, self-mail, and content checks.
     fresh_text = strip_email_quotes(_full_text)
-    if not (_is_no_new_reply_text(fresh_text) and not has_attachments):
+    authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
+        subject=subject,
+        from_addr=from_addr,
+        sender_addr=sender_addr,
+        internet_message_headers=internet_message_headers,
+        own_email=None,
+        fresh_text=fresh_text,
+        has_attachments=has_attachments,
+    )
+    if authority_ineligibility_reason not in {"auto_reply", "no_new_content"}:
+        try:
+            my_email = _resolve_current_mailbox_email(headers)
+            authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
+                subject=subject,
+                from_addr=from_addr,
+                sender_addr=sender_addr,
+                internet_message_headers=internet_message_headers,
+                own_email=my_email,
+                fresh_text=fresh_text,
+                has_attachments=has_attachments,
+            )
+        except Exception as e:
+            print(f"⚠️ Could not check batched message for self-email: {e}")
+
+    if authority_ineligibility_reason is None:
         from .followup import cancel_followup_on_response
         cancel_followup_on_response(user_id, thread_id)
 

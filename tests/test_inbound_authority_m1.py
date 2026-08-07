@@ -368,6 +368,10 @@ class BatchedInboundAuthorityTests(unittest.TestCase):
             return_value=True,
         ), patch.object(
             processing,
+            "_resolve_current_mailbox_email",
+            return_value="operator@example.test",
+        ), patch.object(
+            processing,
             "_skip_inbox_retry_after_manual_continuation",
             return_value=False,
         ), patch.object(processing, "_fs"), patch.object(

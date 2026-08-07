@@ -35,6 +35,33 @@ class FakeFirestore:
 
 
 class SourceMessageEnvelopeTests(unittest.TestCase):
+    def _record_batched_authority(self, msg, body):
+        with patch.object(
+            processing,
+            "exponential_backoff_request",
+            return_value=FakeResponse({
+                "body": {"contentType": "Text", "content": body},
+                "hasAttachments": bool(msg.get("hasAttachments")),
+            }),
+        ), patch.object(
+            processing,
+            "_resolve_current_mailbox_email",
+            return_value="operator@example.com",
+        ), patch.object(processing, "save_message", return_value=True), patch.object(
+            processing,
+            "index_message_id",
+            return_value=True,
+        ), patch.object(processing, "_fs", FakeFirestore()), patch(
+            "email_automation.followup.cancel_followup_on_response",
+        ) as record_inbound:
+            processing._save_message_to_thread(
+                "uid-1",
+                "thread-1",
+                msg,
+                {"Authorization": "Bearer token"},
+            )
+        return record_inbound
+
     def test_source_message_envelope_preserves_reply_all_recipients(self):
         msg = {
             "id": "graph-msg-1",
@@ -147,6 +174,7 @@ class SourceMessageEnvelopeTests(unittest.TestCase):
         })), \
                 patch.object(processing, "save_message", side_effect=lambda *args: saved_messages.append(args) or True), \
                 patch.object(processing, "index_message_id", return_value=True), \
+                patch.object(processing, "_resolve_current_mailbox_email", return_value="operator@example.com"), \
                 patch.object(processing, "_fs", FakeFirestore()), \
                 patch("email_automation.followup.cancel_followup_on_response") as record_inbound:
             processing._save_message_to_thread(
@@ -177,24 +205,84 @@ class SourceMessageEnvelopeTests(unittest.TestCase):
             "hasAttachments": False,
         }
 
-        with patch.object(processing, "exponential_backoff_request", return_value=FakeResponse({
-            "body": {"contentType": "Text", "content": quoted_only},
-            "hasAttachments": False,
-        })), patch.object(processing, "save_message", return_value=True), patch.object(
-            processing,
-            "index_message_id",
-            return_value=True,
-        ), patch.object(processing, "_fs", FakeFirestore()), patch(
-            "email_automation.followup.cancel_followup_on_response",
-        ) as record_inbound:
-            processing._save_message_to_thread(
-                "uid-1",
-                "thread-1",
-                msg,
-                {"Authorization": "Bearer token"},
-            )
-
+        record_inbound = self._record_batched_authority(msg, quoted_only)
         record_inbound.assert_not_called()
+
+    def test_batched_auto_reply_does_not_record_inbound_authority(self):
+        msg = {
+            "id": "graph-auto-reply",
+            "internetMessageId": "<auto-reply@example.com>",
+            "subject": "Automatic reply: RE: 410 Genesis Blvd",
+            "from": {"emailAddress": {"address": "broker@example.com"}},
+            "sender": {"emailAddress": {"address": "broker@example.com"}},
+            "receivedDateTime": "2026-08-07T04:02:00Z",
+            "bodyPreview": "I am out of the office until Monday.",
+            "hasAttachments": False,
+            "internetMessageHeaders": [
+                {"name": "Auto-Submitted", "value": "auto-replied"},
+            ],
+        }
+
+        record_inbound = self._record_batched_authority(
+            msg,
+            "I am out of the office until Monday.",
+        )
+        record_inbound.assert_not_called()
+
+    def test_batched_self_email_does_not_record_inbound_authority(self):
+        msg = {
+            "id": "graph-self-email",
+            "internetMessageId": "<self-email@example.com>",
+            "subject": "FW: 410 Genesis Blvd",
+            "from": {"emailAddress": {"address": "operator@example.com"}},
+            "sender": {"emailAddress": {"address": "operator@example.com"}},
+            "receivedDateTime": "2026-08-07T04:03:00Z",
+            "bodyPreview": "Forwarding this campaign message for my records.",
+            "hasAttachments": False,
+        }
+
+        record_inbound = self._record_batched_authority(
+            msg,
+            "Forwarding this campaign message for my records.",
+        )
+        record_inbound.assert_not_called()
+
+    def test_batched_substantive_broker_reply_records_inbound_authority(self):
+        msg = {
+            "id": "graph-broker-reply",
+            "internetMessageId": "<broker-reply@example.com>",
+            "subject": "RE: 410 Genesis Blvd",
+            "from": {"emailAddress": {"address": "broker@example.com"}},
+            "sender": {"emailAddress": {"address": "broker@example.com"}},
+            "receivedDateTime": "2026-08-07T04:04:00Z",
+            "bodyPreview": "The property has 600A power.",
+            "hasAttachments": False,
+        }
+
+        record_inbound = self._record_batched_authority(
+            msg,
+            "The property has 600A power.",
+        )
+        record_inbound.assert_called_once_with("uid-1", "thread-1")
+
+    def test_batched_attachment_without_new_text_records_inbound_authority(self):
+        quoted_only = (
+            "On Thu, Aug 6, 2026 at 9:00 PM Baylor wrote:\n"
+            "> Please attach the flyer."
+        )
+        msg = {
+            "id": "graph-attachment-reply",
+            "internetMessageId": "<attachment-reply@example.com>",
+            "subject": "RE: 410 Genesis Blvd",
+            "from": {"emailAddress": {"address": "broker@example.com"}},
+            "sender": {"emailAddress": {"address": "broker@example.com"}},
+            "receivedDateTime": "2026-08-07T04:05:00Z",
+            "bodyPreview": quoted_only,
+            "hasAttachments": True,
+        }
+
+        record_inbound = self._record_batched_authority(msg, quoted_only)
+        record_inbound.assert_called_once_with("uid-1", "thread-1")
 
 
 if __name__ == "__main__":
