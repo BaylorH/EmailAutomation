@@ -1562,7 +1562,7 @@ _RENT_ASSIGNMENT_IN_OPS_EX_GAP_RE = re.compile(
     re.IGNORECASE,
 )
 _OPS_EX_RELATION_TO_RENT_RE = re.compile(
-    r"\b(?:on\s+top\s+of|in\s+addition\s+to|plus)\s+"
+    r"\b(?:on\s+top\s+of|in\s+addition\s+to)\s+"
     r"(?:the\s+)?(?:base\s+)?rent\b",
     re.IGNORECASE,
 )
