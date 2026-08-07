@@ -252,6 +252,53 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_long_form_per_sf_nnn_is_admitted_for_expense_owners(self):
+        examples = (
+            "Expenses are $3.65 per SF NNN.",
+            "Expenses are $3.65 per square foot NNN.",
+            "Pass-throughs are $3.65 per SF NNN.",
+            "Operating costs are $3.65 per square foot NNN.",
+            "Expenses are $3.65/SF NNN.",
+            "Operating expenses are $3.65 per SF NNN.",
+            "CAM is $3.65 per square foot NNN.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": "3.65"},
+                        {"column": "Ops Ex / SF", "value": "3.65"},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [(None, "3.65", None, "3.65")] * len(examples),
+            results,
+        )
+
     def test_expense_rate_compounds_are_owned_only_by_opex(self):
         examples = (
             "Operating expense rate is $3.65 NNN.",
