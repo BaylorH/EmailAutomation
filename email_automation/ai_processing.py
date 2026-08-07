@@ -1580,6 +1580,10 @@ _OPS_EX_RENT_MODIFIER_RE = re.compile(
 _COMBINED_TOTAL_RENT_LABEL = (
     r"(?:(?:base|asking)\s+rent|rent|lease\s+rate|rental\s+rate)"
 )
+_OPS_EX_COMPETING_BASIS_SUBJECT = (
+    rf"(?:{_COMBINED_TOTAL_RENT_LABEL}|base\s+rate|parking|reports?|"
+    r"tax(?:es)?|insurance|utilities?|invoices?|statements?|summar(?:y|ies))"
+)
 _COMBINED_TOTAL_RELATION = (
     r"(?:plus|and|on\s+top\s+of|in\s+addition\s+to)"
 )
@@ -2077,7 +2081,8 @@ def _ops_ex_basis_values(
             bare_markers = {"monthly", "annual", "annually", "yearly"}
 
             if re.match(
-                rf"\s*{_COMBINED_TOTAL_RENT_LABEL}\b",
+                rf"\s*(?:(?:[-:/]\s*)|\(\s*)?"
+                rf"(?:for\s+)?{_OPS_EX_COMPETING_BASIS_SUBJECT}\b",
                 text[marker_end:window_end],
                 re.IGNORECASE,
             ):
@@ -2144,7 +2149,7 @@ def _ops_ex_basis_values(
                     continue
                 if not _basis_gap_is_attached(gap):
                     continue
-                if re.match(
+                if marker in bare_markers and re.match(
                     r"\s*(?:(?:[-:]\s*)|\(\s*)?[a-z]",
                     text[marker_end:window_end],
                     re.IGNORECASE,
