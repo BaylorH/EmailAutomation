@@ -274,6 +274,14 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM $0.50/month fee. $14.00 NNN + $4.00 OPEX."
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_combined_component_ignores_standalone_monthly_sentence(self):
+        text = "Monthly. $14.00 NNN + $4.00 OPEX."
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_combined_component_ignores_prior_monthly_sentence(self):
+        text = "Prior fee billed monthly. $14.00 NNN + $4.00 OPEX."
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
