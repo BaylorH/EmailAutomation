@@ -36,6 +36,11 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "18,750 SF for $14.10 NNN.",
             "18750 SF at $14.10 NNN.",
             "18,750 sq. ft. at $14.10 NNN.",
+            "The suite is available at approximately $14.10 NNN.",
+            "The suite is available for about $14.10 NNN.",
+            "18,750 SF at roughly $14.10 NNN.",
+            "We are offering the suite at around $14.10 NNN.",
+            "The suite is available at approx. $14.10 NNN.",
         )
 
         self.assertEqual(
@@ -87,6 +92,44 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         self.assertEqual(
             ["3.65", "3.65", "3.65", "3.65"],
             [ai_processing._extract_ops_ex_sf_from_text(text) for text in examples],
+        )
+
+    def test_explicit_expense_owner_overrides_contextual_area_syntax(self):
+        examples = (
+            "Operating expenses for 18,750 SF at $3.65 NNN.",
+            "CAM for 18,750 SF @ $3.65 NNN.",
+            "OpEx for 18750 sq.ft. — $3.65 NNN.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            proposal = {"updates": [{"column": "Ops Ex / SF", "value": "3.65"}]}
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                proposal,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                ai_processing._proposal_update_for_column(
+                    augmented,
+                    "Rent/SF/Yr",
+                ),
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [(None, "3.65", None, "3.65")] * len(examples),
+            results,
         )
 
     def test_bare_figure_first_nnn_is_neutral_without_field_ownership(self):
