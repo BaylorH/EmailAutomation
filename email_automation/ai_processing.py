@@ -1927,9 +1927,31 @@ def _annualized_ops_ex_decimal(
         value = Decimal(raw)
     except InvalidOperation:
         return None
-    window = text[
-        max(0, start - context_before):min(len(text), end + context_after)
-    ]
+
+    def _is_clause_boundary(position: int) -> bool:
+        character = text[position]
+        if character != ".":
+            return character in ";!?\n"
+        return not (
+            position > 0
+            and position + 1 < len(text)
+            and text[position - 1].isdigit()
+            and text[position + 1].isdigit()
+        )
+
+    window_start = max(0, start - context_before)
+    for position in range(start - 1, window_start - 1, -1):
+        if _is_clause_boundary(position):
+            window_start = position + 1
+            break
+
+    window_end = min(len(text), end + context_after)
+    for position in range(end, window_end):
+        if _is_clause_boundary(position):
+            window_end = position
+            break
+
+    window = text[window_start:window_end]
     annual = value * Decimal("12") if _is_monthly_context(window) else value
     return annual if annual >= Decimal("0.01") else None
 
