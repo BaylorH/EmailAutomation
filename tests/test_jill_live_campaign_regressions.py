@@ -384,6 +384,38 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM is $0.34/SF/month/year"
         self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_supported_raw_monthly_opex_survives_rejected_total_then_normalizes(self):
+        text = (
+            "CAM plus rent is $0.34/SF/month. "
+            "CAM alone is $0.34/SF/month."
+        )
+        proposal = {
+            "updates": [{"column": "Ops Ex / SF", "value": "0.34"}],
+            "events": [{"type": "property_unavailable", "reason": "leased"}],
+        }
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        stripped = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["4800 Space Center Blvd", "", ""],
+            header,
+            config,
+            _conversation(text),
+        )
+        result = ai_processing._augment_proposal_opex_basis(
+            stripped,
+            ["4800 Space Center Blvd", "", ""],
+            header,
+            config,
+            _conversation(text),
+        )
+        update = ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+        self.assertIsNotNone(update)
+        self.assertEqual(
+            "4.08",
+            update["value"],
+        )
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
