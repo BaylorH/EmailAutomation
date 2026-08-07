@@ -45,6 +45,42 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     ai_processing._extract_ops_ex_sf_from_text(text),
                 )
 
+    def test_explicit_cam_figure_wins_over_earlier_nnn_rent_basis(self):
+        text = (
+            "For Space Center, we can offer 18,750 SF at $14.10 NNN. "
+            "CAM, taxes, and insurance are running roughly $3.90 per square foot. "
+            "The suite has one drive-in and two dock-high doors, 26 feet clear, "
+            "277/480V three-phase 600-amp service, and was completed in 2008."
+        )
+        self.assertEqual("14.10", ai_processing._extract_rent_sf_yr_from_text(text))
+        self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_explicit_cam_replaces_conflicting_model_opex_before_sheet_write(self):
+        text = (
+            "For Space Center, we can offer 18,750 SF at $14.10 NNN. "
+            "CAM, taxes, and insurance are running roughly $3.90 per square foot."
+        )
+        proposal = {
+            "updates": [
+                {"column": "Rent/SF/Yr", "value": "14.10"},
+                {"column": "Ops Ex / SF", "value": "14.10"},
+            ],
+            "events": [],
+        }
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertEqual(
+            "3.90",
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
+        )
+
+    def test_pending_cam_clause_does_not_capture_later_asking_rent(self):
+        text = "CAM is still pending; the asking rent is $14.10 per square foot NNN."
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
