@@ -629,6 +629,10 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             ("CAM is $4.00/SF/month for property taxes: $0.50/SF.", "4.00", "4.00"),
             ("CAM is $4.00/SF per month for real estate taxes: $0.50/SF.", "4.00", "4.00"),
             ("CAM is $4.00/SF, billed monthly for property insurance: $0.50/SF.", "4.00", "4.00"),
+            ("CAM is $4.00/SF, per month asking rate is $1.20/SF.", "4.00", "4.00"),
+            ("CAM is $4.00/SF/month for quoted rate: $1.20/SF.", "4.00", "4.00"),
+            ("CAM is $4.00/SF, billed monthly for lease price: $1.20/SF.", "4.00", "4.00"),
+            ("CAM is $4.00/SF monthly for asking price: $1.20/SF.", "4.00", "4.00"),
         )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
