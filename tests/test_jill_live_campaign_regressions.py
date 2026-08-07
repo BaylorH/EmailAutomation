@@ -23,10 +23,14 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         examples = (
             "For Space Center, we can offer 18,750 SF at $14.10 NNN.",
             "The suite is available at $14.10 NNN.",
+            "18,750 SF @ $14.10 NNN.",
+            "The suite is available @ $14.10 NNN.",
+            "18,750 SF — $14.10 NNN.",
+            "The suite is available – $14.10 NNN.",
         )
 
         self.assertEqual(
-            [("14.10", None), ("14.10", None)],
+            [("14.10", None)] * len(examples),
             [
                 (
                     ai_processing._extract_rent_sf_yr_from_text(text),
@@ -462,6 +466,10 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         examples = (
             "OpEx is $0.34/SF/month for taxes and insurance.",
             "OpEx is $0.34/SF monthly for taxes and insurance.",
+            "OpEx is $0.34/SF monthly for property taxes and insurance.",
+            "OpEx is $0.34/SF monthly for real estate taxes and insurance.",
+            "OpEx is $0.34/SF/month for property taxes and insurance.",
+            "OpEx is $0.34/SF, billed monthly for real estate taxes and insurance.",
         )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
@@ -525,6 +533,9 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         examples = (
             ("CAM is $0.34/SF/month, per year parking is $12/SF.", "0.34", "4.08"),
             ("CAM is $4.00/SF, billed monthly for parking.", "4.00", "4.00"),
+            ("CAM is $4.00/SF/month for property taxes: $0.50/SF.", "4.00", "4.00"),
+            ("CAM is $4.00/SF per month for real estate taxes: $0.50/SF.", "4.00", "4.00"),
+            ("CAM is $4.00/SF, billed monthly for property insurance: $0.50/SF.", "4.00", "4.00"),
         )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
