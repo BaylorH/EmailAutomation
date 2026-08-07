@@ -642,6 +642,14 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "CAM is $4.25/SF; revised CAM is $3.90/SF.",
             "CAM is $4.25/SF; updated CAM is $3.90/SF.",
             "CAM is $4.25/SF; now CAM is $3.90/SF.",
+            (
+                "CAM is $4.25/SF; correction: CAM is $4.00/SF; "
+                "correction: CAM is $3.90/SF."
+            ),
+            (
+                "CAM is $4.25/SF; corrected CAM is $4.00/SF; "
+                "actually, CAM is $3.90/SF."
+            ),
         )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
