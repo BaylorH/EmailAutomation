@@ -248,6 +248,7 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 None,
             ),
             ("Rent net of expenses is $14.10 NNN.", "14.10", None),
+            ("Rent net-of expenses is $14.10 NNN.", "14.10", None),
             ("Rent excluding pass-throughs is $14.10 NNN.", "14.10", None),
             ("Expenses are separate; rent is $14.10 NNN.", "14.10", None),
             (
@@ -255,6 +256,7 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 None,
                 "3.65",
             ),
+            ("Operating expenses net-of rent are $3.65 NNN.", None, "3.65"),
             ("CAM does not include rent and is $3.65 NNN.", None, "3.65"),
         )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
