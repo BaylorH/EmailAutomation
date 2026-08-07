@@ -5,7 +5,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
 from .messaging import build_conversation_payload
@@ -1550,7 +1550,7 @@ _OPS_EX_EXPLICIT_LABEL = r"(?:opex|op\s*ex|cam|tmi|operating\s+expenses?)"
 _OPS_EX_DOLLAR_VALUE = (
     r"\$\s*(?P<value>[0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
     r"(?:(?:/\s*|\bper\s+)(?:sf|psf|sq\.?\s*ft|square\s+foot))?"
-    r"(?:\s*/?\s*(?:yr|year|annum|mo|month|monthly))?"
+    r"(?:\s*/?\s*(?:monthly|annually|annual|yearly|month|annum|year|mos|mo|yr)\b)?"
 )
 _OPS_EX_COMPONENT_LIST_RE = re.compile(
     rf"\b{_OPS_EX_EXPLICIT_LABEL}\b"
@@ -1685,6 +1685,11 @@ _COMPONENT_SF_BEFORE_RE = re.compile(
 )
 _MONTHLY_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:mo|mos|month)\b|\bmonthly\b|\bpsf\s*/?\s*mo(?:nth)?\b", re.IGNORECASE)
 _ANNUAL_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
+_OPS_EX_ANNUAL_BASIS_RE = re.compile(
+    r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually|yearly)\b"
+    r"|\b(?:annual|annually|yearly)\b",
+    re.IGNORECASE,
+)
 _HYPOTHETICAL_RENT_RE = re.compile(
     r"would(?:'ve| have)?\s+(?:have\s+)?been|would\s+be\b|could\s+have\s+been|might\s+have\s+been",
     re.IGNORECASE,
@@ -1915,23 +1920,43 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     return None
 
 
-def _annualized_ops_ex_decimal(
+class _OpsExCandidate(NamedTuple):
+    raw_value: Decimal
+    annualized_value: Decimal
+    basis: str
+    numeric_span: Tuple[int, int]
+    owned_span: Tuple[int, int]
+    precedence: int
+    source: str
+
+
+def _ops_ex_basis_values(
     text: str,
     start: int,
     end: int,
     raw: str,
+    numeric_span: Optional[Tuple[int, int]] = None,
     context_before: int = 15,
     context_after: int = 25,
-) -> Optional[Decimal]:
+) -> Optional[Tuple[Decimal, Decimal, str, Tuple[int, int]]]:
     try:
         value = Decimal(raw)
     except InvalidOperation:
         return None
 
+    unit_abbreviation_periods = {
+        position
+        for abbreviation in re.finditer(r"\bsq\.\s*ft\.?", text, re.IGNORECASE)
+        for position in range(abbreviation.start(), abbreviation.end())
+        if text[position] == "."
+    }
+
     def _is_clause_boundary(position: int) -> bool:
         character = text[position]
         if character != ".":
             return character in ";!?\n"
+        if position in unit_abbreviation_periods:
+            return False
         return not (
             position > 0
             and position + 1 < len(text)
@@ -1952,8 +1977,133 @@ def _annualized_ops_ex_decimal(
             break
 
     window = text[window_start:window_end]
-    annual = value * Decimal("12") if _is_monthly_context(window) else value
-    return annual if annual >= Decimal("0.01") else None
+    numeric_start, numeric_end = numeric_span or (start, end)
+
+    unit = r"(?:psf|sf|sq\.?\s*ft\.?|square\s+foot)"
+
+    def _basis_gap_is_attached(gap: str) -> bool:
+        billed = re.search(r"\bbilled\s*$", gap, re.IGNORECASE)
+        if billed:
+            gap = gap[:billed.start()]
+        gap = _MONTHLY_UNIT_RE.sub("", gap)
+        gap = _OPS_EX_ANNUAL_BASIS_RE.sub("", gap)
+        attached_unit = (
+            rf"\s*(?:(?:(?:/|\bper\s+)\s*)?{unit})?"
+            r"[\s,:()/\-]*"
+        )
+        combined_equation = (
+            rf"\s*=\s*\$\s*\d+(?:\.\d+)?(?:\s*{unit})?"
+            r"[\s,:()/\-]*"
+        )
+        return bool(
+            re.fullmatch(attached_unit, gap, re.IGNORECASE)
+            or re.fullmatch(combined_equation, gap, re.IGNORECASE)
+        )
+
+    def _owned_basis_spans(pattern: "re.Pattern", basis: str) -> List[Tuple[int, int]]:
+        spans = []
+        for marker_match in pattern.finditer(window):
+            marker_start = window_start + marker_match.start()
+            marker_end = window_start + marker_match.end()
+            marker = marker_match.group(0).strip().lower()
+            bare_markers = {"monthly", "annual", "annually", "yearly"}
+
+            if re.match(
+                rf"\s*{_COMBINED_TOTAL_RENT_LABEL}\b",
+                text[marker_end:window_end],
+                re.IGNORECASE,
+            ):
+                continue
+
+            if marker_end <= start:
+                leading_markers = (
+                    {"monthly"}
+                    if basis == "monthly"
+                    else {"annual", "annually", "yearly"}
+                )
+                if marker in leading_markers and not text[marker_end:start].strip():
+                    spans.append((marker_start, marker_end))
+                continue
+
+            if (
+                marker in bare_markers
+                and marker_start < numeric_start
+                and marker_end > start
+            ):
+                before_marker = text[start:marker_start]
+                parenthetical = (
+                    bool(re.search(r"\(\s*$", before_marker))
+                    and bool(re.match(r"\s*\)", text[marker_end:numeric_start]))
+                )
+                if not parenthetical:
+                    before_marker = re.sub(
+                        r"\bbilled\s*$",
+                        "",
+                        before_marker,
+                        flags=re.IGNORECASE,
+                    )
+                    directly_follows_label = re.search(
+                        rf"(?:{_OPS_EX_EXPLICIT_LABEL}|n\.?n\.?n\.?)"
+                        r"[\s.,:()/-]*$",
+                        before_marker,
+                        re.IGNORECASE,
+                    )
+                    linking_words = re.findall(
+                        r"[a-z]+",
+                        text[marker_end:numeric_start],
+                        re.IGNORECASE,
+                    )
+                    allowed_linking_words = {
+                        "is", "are", "of", "at", "run", "runs", "estimated",
+                        "approx", "approximately", "about", "around",
+                    }
+                    if (
+                        not directly_follows_label
+                        or any(
+                            word.lower() not in allowed_linking_words
+                            for word in linking_words
+                        )
+                    ):
+                        continue
+
+            if marker_start >= end:
+                gap = text[end:marker_start]
+                if re.search(
+                    rf"\b{_COMBINED_TOTAL_RENT_LABEL}\b",
+                    gap,
+                    re.IGNORECASE,
+                ):
+                    continue
+                if not _basis_gap_is_attached(gap):
+                    continue
+                if marker in {"monthly", "annual", "annually", "yearly"} and re.match(
+                    r"\s+[a-z]",
+                    text[marker_end:window_end],
+                    re.IGNORECASE,
+                ):
+                    continue
+
+            spans.append((marker_start, marker_end))
+        return spans
+
+    monthly_spans = _owned_basis_spans(_MONTHLY_UNIT_RE, "monthly")
+    annual_spans = _owned_basis_spans(_OPS_EX_ANNUAL_BASIS_RE, "annual")
+    if monthly_spans and annual_spans:
+        return None
+
+    basis = "monthly" if monthly_spans else "annual"
+    owned_basis_spans = monthly_spans or annual_spans
+    annualized = value * Decimal("12") if basis == "monthly" else value
+    if annualized < Decimal("0.01"):
+        return None
+    owned_start = min([start] + [span[0] for span in owned_basis_spans])
+    owned_end = max([end] + [span[1] for span in owned_basis_spans])
+    return (
+        value,
+        annualized,
+        basis,
+        (owned_start, owned_end),
+    )
 
 
 def _combined_total_opex_evidence(text: str) -> List[tuple]:
@@ -1961,17 +2111,15 @@ def _combined_total_opex_evidence(text: str) -> List[tuple]:
     for pattern in _COMBINED_TOTAL_OPEX_RES:
         for match in pattern.finditer(text or ""):
             start, end = match.span("value")
-            try:
-                raw_value = Decimal(match.group("value"))
-            except InvalidOperation:
-                continue
-            annualized_value = _annualized_ops_ex_decimal(
+            basis_values = _ops_ex_basis_values(
                 text,
                 match.start(),
                 match.end(),
                 match.group("value"),
+                numeric_span=(start, end),
             )
-            if annualized_value is not None:
+            if basis_values is not None:
+                raw_value, annualized_value, _, _ = basis_values
                 evidence.append((start, end, raw_value, annualized_value))
     return evidence
 
@@ -2021,18 +2169,17 @@ def _ops_ex_candidate_recency(text: str, match: "re.Match") -> str:
     return "stale" if stale else "ordinary"
 
 
-def _ops_ex_candidates(text: str) -> List[tuple]:
-    """Return ranked `(numeric_start, numeric_end, annual_value)` evidence."""
+def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
+    """Return accepted OpEx evidence ranked by recency and source specificity."""
     text = text or ""
     rejected = _combined_total_opex_evidence(text)
-    current_candidates = []
-    ordinary_combined_candidates = []
-    ordinary_candidates = []
+    candidates = []
+    source_rank = {"combined": 0, "narrow": 1, "legacy": 2}
 
     def _append(
         match: "re.Match",
         group: Any,
-        ordinary_target: Optional[List[tuple]] = None,
+        source: str,
         context_before: int = 15,
         context_after: int = 25,
     ) -> None:
@@ -2043,27 +2190,54 @@ def _ops_ex_candidates(text: str) -> List[tuple]:
             text[max(0, match.start() - 40):match.end()]
         ):
             return
-        start, end = match.span(group)
+        numeric_start, numeric_end = match.span(group)
         if any(
-            start < rejected_end and rejected_start < end
+            numeric_start < rejected_end and rejected_start < numeric_end
             for rejected_start, rejected_end, _, _ in rejected
         ):
             return
-        value = _annualized_ops_ex_decimal(
+
+        if source == "legacy" and group == 2:
+            label_text = text[match.start():numeric_start]
+            rent_labels = list(re.finditer(
+                rf"\b{_COMBINED_TOTAL_RENT_LABEL}\b",
+                label_text,
+                re.IGNORECASE,
+            ))
+            opex_labels = list(re.finditer(
+                rf"\b(?:{_OPS_EX_EXPLICIT_LABEL}|n\.?n\.?n\.?)\b",
+                label_text,
+                re.IGNORECASE,
+            ))
+            if rent_labels and (
+                not opex_labels
+                or rent_labels[-1].start() > opex_labels[-1].start()
+            ):
+                return
+
+        basis_values = _ops_ex_basis_values(
             text,
             match.start(),
             match.end(),
             match.group(group),
+            numeric_span=(numeric_start, numeric_end),
             context_before=context_before,
             context_after=context_after,
         )
-        if value is not None:
-            target = (
-                current_candidates
-                if recency == "current"
-                else ordinary_target if ordinary_target is not None else ordinary_candidates
+        if basis_values is not None:
+            raw_value, annualized_value, basis, owned_span = basis_values
+            candidates.append(
+                _OpsExCandidate(
+                    raw_value=raw_value,
+                    annualized_value=annualized_value,
+                    basis=basis,
+                    numeric_span=(numeric_start, numeric_end),
+                    owned_span=owned_span,
+                    precedence=(0 if recency == "current" else 10)
+                    + source_rank[source],
+                    source=source,
+                )
             )
-            target.append((start, end, value))
 
     combined_matches = list(_COMBINED_RENT_OPEX_RE.finditer(text))
     combined_spans = [match.span() for match in combined_matches]
@@ -2071,7 +2245,7 @@ def _ops_ex_candidates(text: str) -> List[tuple]:
         _append(
             match,
             2,
-            ordinary_combined_candidates,
+            "combined",
             context_before=10,
             context_after=30,
         )
@@ -2085,7 +2259,7 @@ def _ops_ex_candidates(text: str) -> List[tuple]:
         key=lambda match: match.start(),
     )
     for match in narrow_matches:
-        _append(match, "value")
+        _append(match, "value", "narrow")
 
     legacy_matches = list(_OPS_EX_RE.finditer(text))
     legacy_matches.sort(key=lambda match: match.group(2) is None)
@@ -2100,8 +2274,13 @@ def _ops_ex_candidates(text: str) -> List[tuple]:
                 for combined_start, combined_end in combined_spans
             ):
                 continue
-            _append(match, group)
-    return current_candidates + ordinary_combined_candidates + ordinary_candidates
+            _append(match, group, "legacy", context_after=30)
+    return sorted(candidates, key=lambda candidate: candidate.precedence)
+
+
+def _ops_ex_winner(text: str) -> Optional[_OpsExCandidate]:
+    candidates = _ops_ex_candidates(text)
+    return candidates[0] if candidates else None
 
 
 def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
@@ -2111,10 +2290,8 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
     if _looks_like_requirements_mismatch_nonviable(text):
         return None
 
-    candidates = _ops_ex_candidates(text)
-    if candidates:
-        return f"{candidates[0][2]:.2f}"
-    return None
+    winner = _ops_ex_winner(text)
+    return f"{winner.annualized_value:.2f}" if winner else None
 
 
 def _sf_match_is_component(text: str, match: "re.Match") -> bool:
@@ -3460,7 +3637,9 @@ def _strip_rejected_combined_total_opex_update(
         for value in (raw_value, annualized_value)
     }
     supported_values = {
-        value for _, _, value in _ops_ex_candidates(text)
+        value
+        for candidate in _ops_ex_candidates(text)
+        for value in (candidate.raw_value, candidate.annualized_value)
     }
     if proposed in rejected_values and proposed not in supported_values:
         _remove_proposal_update(proposal, opex_col)
@@ -3642,14 +3821,6 @@ def _augment_proposal_with_deterministic_extractions(
     return proposal
 
 
-# OPEX stated on an explicitly MONTHLY basis, e.g. "opex $0.21/SF/mo".
-_OPEX_MONTHLY_RE = re.compile(
-    r"(?:opex|ops\s*ex|op\s*ex|operating\s+expenses?|cam|n\.?n\.?n\.?)\b[^\d$]{0,20}\$?\s*"
-    r"([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
-    r"(?:/\s*sf|per\s+sf|psf|/\s*sq\.?\s*ft)?\s*/?\s*(?:mo|mos|month|monthly)\b",
-    re.IGNORECASE,
-)
-
 # Broker states there is NO separate opex figure (gross / all-in / no pass-through).
 _NO_SEPARATE_OPEX_RE = re.compile(
     r"\bno\s+(?:separate\s+)?(?:opex|op\s*ex|operating\s+expenses?|cam)\b"
@@ -3775,7 +3946,7 @@ def _augment_proposal_opex_basis(
     if opex_update is None:
         return proposal
 
-    text = _latest_inbound_text(conversation) or ""
+    text = _fresh_inbound_text(conversation) or ""
     current = str(opex_update.get("value") or "").strip()
 
     # FABRICATION guard — drop a fabricated zero/blank opex on a gross/all-in quote.
@@ -3788,22 +3959,22 @@ def _augment_proposal_opex_basis(
             proposal["updates"] = [u for u in updates if u is not opex_update]
             return proposal
 
-    # BASIS guard — annualize a monthly opex figure to match the annual rent basis.
-    monthly_match = _OPEX_MONTHLY_RE.search(text)
-    if monthly_match:
-        try:
-            monthly_val = float(monthly_match.group(1))
-            current_val = float(current) if current else None
-        except ValueError:
-            return proposal
-        annual_str = f"{monthly_val * 12:.2f}"
-        # Only rewrite when the update is still carrying the monthly figure.
-        if current_val is not None and abs(current_val - monthly_val) < 1e-9 and current != annual_str:
-            opex_update["value"] = annual_str
-            opex_update["reason"] = (
-                "Deterministic basis normalization: opex stated monthly, "
-                "annualized to match the rent basis."
-            )
+    # BASIS guard — use the same accepted evidence winner as extraction. Rewrite
+    # only the raw monthly value; an annualized, unrelated, or unsupported model
+    # value is already idempotent and remains untouched.
+    winner = _ops_ex_winner(text)
+    current_value = _normalized_numeric_value(current)
+    if (
+        winner is not None
+        and winner.basis == "monthly"
+        and winner.annualized_value != winner.raw_value
+        and current_value == winner.raw_value
+    ):
+        opex_update["value"] = f"{winner.annualized_value:.2f}"
+        opex_update["reason"] = (
+            "Deterministic basis normalization: opex stated monthly, "
+            "annualized to match the rent basis."
+        )
 
     return proposal
 
