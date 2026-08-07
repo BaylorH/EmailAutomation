@@ -1582,7 +1582,10 @@ _COMBINED_TOTAL_RENT_LABEL = (
 )
 _OPS_EX_COMPETING_BASIS_SUBJECT = (
     rf"(?:{_COMBINED_TOTAL_RENT_LABEL}|base\s+rate|parking|reports?|"
-    r"tax(?:es)?|insurance|utilities?|invoices?|statements?|summar(?:y|ies))"
+    r"utilities?|invoices?|statements?|summar(?:y|ies))"
+)
+_OPS_EX_DIRECT_BASIS_SUBJECT = (
+    rf"(?:{_OPS_EX_COMPETING_BASIS_SUBJECT}|tax(?:es)?|insurance)"
 )
 _COMBINED_TOTAL_RELATION = (
     r"(?:plus|and|on\s+top\s+of|in\s+addition\s+to)"
@@ -2082,7 +2085,8 @@ def _ops_ex_basis_values(
 
             if re.match(
                 rf"\s*(?:(?:[-:/]\s*)|\(\s*)?"
-                rf"(?:for\s+)?{_OPS_EX_COMPETING_BASIS_SUBJECT}\b",
+                rf"(?:for\s+{_OPS_EX_COMPETING_BASIS_SUBJECT}|"
+                rf"{_OPS_EX_DIRECT_BASIS_SUBJECT})\b",
                 text[marker_end:window_end],
                 re.IGNORECASE,
             ):
@@ -2203,12 +2207,50 @@ def _combined_total_opex_evidence(text: str) -> List[tuple]:
                 # Negative evidence must survive ambiguous/conflicting basis text.
                 # When the rejected total itself carries a monthly token, reject
                 # both the raw value and its conservative x12 counterpart.
+                attached_basis = re.match(
+                    r"(?:\s*/\s*(?:mo|mos|month|monthly|yr|year|annum|"
+                    r"annual|annually|yearly)\b)+",
+                    text[match.end():],
+                    re.IGNORECASE,
+                )
+                basis_text = match.group(0) + (
+                    attached_basis.group(0) if attached_basis else ""
+                )
                 annualized_value = (
                     raw_value * Decimal("12")
-                    if _MONTHLY_UNIT_RE.search(match.group(0))
+                    if _MONTHLY_UNIT_RE.search(basis_text)
                     else raw_value
                 )
             evidence.append((start, end, raw_value, annualized_value))
+    return evidence
+
+
+def _combined_base_rent_evidence(text: str) -> List[tuple]:
+    """Return combined-equation base rent as negative OpEx evidence."""
+    evidence = []
+    for match in _COMBINED_RENT_OPEX_RE.finditer(text or ""):
+        start, end = match.span(1)
+        try:
+            raw_value = Decimal(match.group(1))
+        except InvalidOperation:
+            continue
+        if raw_value < Decimal("0.01"):
+            continue
+        opex_basis_values = _ops_ex_basis_values(
+            text,
+            match.start(),
+            match.end(),
+            match.group(2),
+            numeric_span=match.span(2),
+            context_before=10,
+            context_after=30,
+        )
+        annualized_value = (
+            raw_value * Decimal("12")
+            if opex_basis_values is not None and opex_basis_values[2] == "monthly"
+            else raw_value
+        )
+        evidence.append((start, end, raw_value, annualized_value))
     return evidence
 
 
@@ -3750,7 +3792,9 @@ def _strip_rejected_combined_total_opex_update(
     rejected_values = {
         value
         for _, _, raw_value, annualized_value in (
-            _combined_total_opex_evidence(text) + _rejected_nnn_evidence(text)
+            _combined_total_opex_evidence(text)
+            + _combined_base_rent_evidence(text)
+            + _rejected_nnn_evidence(text)
         )
         for value in (raw_value, annualized_value)
     }
