@@ -167,6 +167,29 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "Prior CAM was $4.25/SF; current CAM is $3.90/SF."
         self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_current_cam_outranks_prior_component_list_estimate(self):
+        text = (
+            "Prior estimate: CAM, taxes, and insurance are estimated around $4.25/SF. "
+            "Current CAM is $3.90/SF."
+        )
+        self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_current_cam_preserves_matching_model_opex_over_prior_estimate(self):
+        text = (
+            "Prior estimate: CAM, taxes, and insurance are estimated around $4.25/SF. "
+            "Current CAM is $3.90/SF."
+        )
+        proposal = {"updates": [{"column": "Ops Ex / SF", "value": "3.90"}], "events": []}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertEqual(
+            "3.90",
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
+        )
+
     def test_unresolved_projected_opex_range_is_not_extracted(self):
         text = "CAM is projected between $3.50 and $4.25 per square foot."
         self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
