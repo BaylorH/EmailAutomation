@@ -1597,6 +1597,33 @@ _COMBINED_TOTAL_OPEX_RES = (
         re.IGNORECASE,
     ),
 )
+_OPS_EX_STALE_EVIDENCE_MARKER = (
+    r"(?:prior|stale|previous|historical|old|former)"
+)
+_OPS_EX_CURRENT_EVIDENCE_MARKER = (
+    r"(?:current(?:ly)?|now|revised|updated)"
+)
+_OPS_EX_EVIDENCE_DESCRIPTOR = (
+    r"(?:estimate|quote|quoted\s+rate|rate|figure|amount|value)"
+)
+_OPS_EX_STALE_EVIDENCE_PREFIX_RE = re.compile(
+    rf"\b{_OPS_EX_STALE_EVIDENCE_MARKER}\b"
+    rf"(?:\s+{_OPS_EX_EVIDENCE_DESCRIPTOR})?(?:\s+for)?[\s:,-]{{0,4}}$",
+    re.IGNORECASE,
+)
+_OPS_EX_CURRENT_EVIDENCE_PREFIX_RE = re.compile(
+    rf"\b{_OPS_EX_CURRENT_EVIDENCE_MARKER}\b"
+    rf"(?:\s+{_OPS_EX_EVIDENCE_DESCRIPTOR})?(?:\s+for)?[\s:,-]{{0,4}}$",
+    re.IGNORECASE,
+)
+_OPS_EX_STALE_EVIDENCE_LOCAL_RE = re.compile(
+    rf"\b{_OPS_EX_STALE_EVIDENCE_MARKER}\b",
+    re.IGNORECASE,
+)
+_OPS_EX_CURRENT_EVIDENCE_LOCAL_RE = re.compile(
+    rf"\b{_OPS_EX_CURRENT_EVIDENCE_MARKER}\b",
+    re.IGNORECASE,
+)
 # A rent keyword immediately preceding a $ figure marks that figure as the RENT
 # line. "nnn" is the ONLY lease-basis word in the OpEx label set above, so a
 # figure-first hit ending in "nnn" ("Rent $0.82 NNN") is ambiguous: the NNN is
@@ -1919,13 +1946,62 @@ def _combined_total_opex_evidence(text: str) -> List[tuple]:
     return evidence
 
 
+def _ops_ex_candidate_recency(text: str, match: "re.Match") -> str:
+    clause_start = max(
+        text.rfind(delimiter, 0, match.start())
+        for delimiter in (".", "!", "?", ";", "\n")
+    )
+    prefix = text[clause_start + 1:match.start()]
+    previous_figure = prefix.rfind("$")
+    if previous_figure >= 0:
+        prefix = prefix[previous_figure + 1:]
+
+    suffix_end = min(
+        (
+            position
+            for delimiter in (".", "!", "?", ";", "\n", "$")
+            if (position := text.find(delimiter, match.end())) >= 0
+        ),
+        default=len(text),
+    )
+    suffix = text[match.end():suffix_end]
+    candidate = match.group(0)
+
+    current = (
+        _OPS_EX_CURRENT_EVIDENCE_PREFIX_RE.search(prefix)
+        or _OPS_EX_CURRENT_EVIDENCE_LOCAL_RE.search(candidate)
+        or re.match(
+            rf"^\s*{_OPS_EX_CURRENT_EVIDENCE_MARKER}\b",
+            suffix,
+            re.IGNORECASE,
+        )
+    )
+    if current:
+        return "current"
+
+    stale = (
+        _OPS_EX_STALE_EVIDENCE_PREFIX_RE.search(prefix)
+        or _OPS_EX_STALE_EVIDENCE_LOCAL_RE.search(candidate)
+        or re.match(
+            rf"^\s*{_OPS_EX_STALE_EVIDENCE_MARKER}\b",
+            suffix,
+            re.IGNORECASE,
+        )
+    )
+    return "stale" if stale else "ordinary"
+
+
 def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
     """Return non-rejected `(numeric_start, numeric_end, annual_value)` evidence."""
     text = text or ""
     rejected = _combined_total_opex_evidence(text)
-    candidates = []
+    current_candidates = []
+    ordinary_candidates = []
 
     def _append(match: "re.Match", group: Any) -> None:
+        recency = _ops_ex_candidate_recency(text, match)
+        if recency == "stale":
+            return
         if _HYPOTHETICAL_RENT_RE.search(
             text[max(0, match.start() - 40):match.end()]
         ):
@@ -1943,7 +2019,8 @@ def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
             match.group(group),
         )
         if value is not None:
-            candidates.append((start, end, value))
+            target = current_candidates if recency == "current" else ordinary_candidates
+            target.append((start, end, value))
 
     narrow_matches = sorted(
         [
@@ -1964,7 +2041,7 @@ def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
         group = 1 if match.group(1) is not None else 2
         if match.group(group) is not None:
             _append(match, group)
-    return candidates
+    return current_candidates + ordinary_candidates
 
 
 def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
