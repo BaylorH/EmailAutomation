@@ -890,6 +890,96 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_negated_opex_figures_and_pronominal_corrections(self):
+        examples = (
+            (
+                "CAM is not $4.25/SF; it is $3.90/SF.",
+                "3.90",
+            ),
+            (
+                "CAM is $3.90/SF, not $4.25/SF.",
+                "4.25",
+            ),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, preseeded_rent in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": preseeded_rent},
+                        {"column": "Ops Ex / SF", "value": "3.90"},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [(None, "3.90", None, "3.90")] * len(examples),
+            results,
+        )
+
+    def test_negated_rent_figures_and_pronominal_corrections(self):
+        examples = (
+            "Rent is not $14.10/SF; it is $15.25/SF.",
+            "Rent is $15.25/SF, not $14.10/SF.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": "15.25"},
+                        {"column": "Ops Ex / SF", "value": "14.10"},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [("15.25", None, "15.25", None)] * len(examples),
+            results,
+        )
+
     def test_unrelated_later_rent_rate_does_not_correct_opex(self):
         examples = (
             "CAM is $4.25/SF; asking rate is $14.10/SF.",
