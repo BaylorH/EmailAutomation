@@ -19,6 +19,90 @@ def _conversation(body):
 
 
 class JillLiveCampaignRegressionTests(unittest.TestCase):
+    def test_rent_only_nnn_shorthand_is_not_opex(self):
+        examples = (
+            "For Space Center, we can offer 18,750 SF at $14.10 NNN.",
+            "The suite is available at $14.10 NNN.",
+        )
+
+        self.assertEqual(
+            [("14.10", None), ("14.10", None)],
+            [
+                (
+                    ai_processing._extract_rent_sf_yr_from_text(text),
+                    ai_processing._extract_ops_ex_sf_from_text(text),
+                )
+                for text in examples
+            ],
+        )
+
+    def test_rent_only_nnn_shorthand_never_survives_as_proposal_opex(self):
+        examples = (
+            "For Space Center, we can offer 18,750 SF at $14.10 NNN.",
+            "The suite is available at $14.10 NNN.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+
+        results = []
+        for text in examples:
+            for updates in (
+                [],
+                [{"column": "Ops Ex / SF", "value": "14.10"}],
+            ):
+                proposal = {"updates": [dict(update) for update in updates], "events": []}
+                result = ai_processing._augment_proposal_with_deterministic_extractions(
+                    proposal,
+                    ["4800 Space Center Blvd", "", ""],
+                    header,
+                    config,
+                    _conversation(text),
+                )
+                results.append(
+                    ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+                )
+
+        self.assertEqual([None, None, None, None], results)
+
+    def test_figure_first_explicit_opex_formats_remain_supported(self):
+        examples = (
+            "Separate operating expenses are $3.65 NNN.",
+            "Separate operating expenses are $3.65 CAM.",
+            "Separate operating expenses are $3.65 opex.",
+            "Separate operating expenses are $3.65 TMI.",
+        )
+        self.assertEqual(
+            ["3.65", "3.65", "3.65", "3.65"],
+            [ai_processing._extract_ops_ex_sf_from_text(text) for text in examples],
+        )
+
+    def test_bare_figure_first_nnn_is_neutral_without_field_ownership(self):
+        text = "$3.65 NNN."
+        self.assertIsNone(ai_processing._extract_rent_sf_yr_from_text(text))
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_same_field_nnn_expense_suffix_owns_figure_as_opex(self):
+        examples = (
+            "$3.65 NNN/CAM.",
+            "$3.65 NNN/OpEx.",
+            "$3.65 NNN/TMI.",
+        )
+        self.assertEqual(
+            [(None, "3.65")] * len(examples),
+            [
+                (
+                    ai_processing._extract_rent_sf_yr_from_text(text),
+                    ai_processing._extract_ops_ex_sf_from_text(text),
+                )
+                for text in examples
+            ],
+        )
+
+    def test_conflicting_rent_and_expense_ownership_abstains(self):
+        text = "Asking $14.10 NNN/CAM."
+        self.assertIsNone(ai_processing._extract_rent_sf_yr_from_text(text))
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_explicit_opex_wins_over_earlier_nnn_rent_basis(self):
         examples = {
             (
@@ -270,6 +354,64 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "$1.25 NNN + $0.34 OPEX = $1.59 PSF, billed monthly."
         self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_combined_equation_monthly_suffixes_normalize_shared_winner(self):
+        examples = (
+            "$1.25 NNN + $0.34 OPEX = $1.59/SF/month",
+            "$1.25 NNN + $0.34 OPEX = $1.59 per SF/month",
+            "$1.25 NNN + $0.34 OPEX = $1.59 per-SF/month",
+            "$1.25 NNN + $0.34 OPEX = $1.59 per sq. ft., billed monthly",
+            "$1.25 NNN + $0.34 OPEX = $1.59 per square foot, billed monthly",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            proposal = {"updates": [{"column": "Ops Ex / SF", "value": "0.34"}]}
+            normalized = ai_processing._augment_proposal_opex_basis(
+                proposal,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            results.append((
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                ai_processing._proposal_update_for_column(
+                    normalized,
+                    "Ops Ex / SF",
+                )["value"],
+            ))
+
+        self.assertEqual([("4.08", "4.08")] * len(examples), results)
+
+    def test_standalone_monthly_basis_phrasings_are_annualized(self):
+        examples = (
+            "CAM is $0.34 per square foot, billed monthly.",
+            "CAM is $0.34 per sq ft., billed monthly.",
+            "CAM is $0.34 per sq ft, billed monthly.",
+            "CAM is $0.34 per sq ft. monthly.",
+            "CAM is $0.34 per sq ft monthly.",
+            "CAM is $0.34 per square foot, billed on a monthly basis.",
+            "CAM is $0.34 per square foot, billed on the monthly basis.",
+        )
+        self.assertEqual(
+            ["4.08"] * len(examples),
+            [ai_processing._extract_ops_ex_sf_from_text(text) for text in examples],
+        )
+
+    def test_existing_monthly_basis_controls_remain_owned(self):
+        examples = (
+            "CAM is $0.34 PSF/month.",
+            "CAM is $4.00/SF; monthly: rent is $1.20/SF.",
+            "CAM is $0.34/SF/month, parking billed annually.",
+            "$1.25 NNN + $0.34 OPEX = $1.59/SF/month, parking billed annually.",
+        )
+        self.assertEqual(
+            ["4.08", "4.00", "4.08", "4.08"],
+            [ai_processing._extract_ops_ex_sf_from_text(text) for text in examples],
+        )
+
     def test_combined_component_ignores_prior_clause_monthly_context(self):
         text = "CAM $0.50/month fee. $14.00 NNN + $4.00 OPEX."
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
@@ -402,6 +544,18 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM is $4.00/SF, monthly report attached."
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_punctuated_monthly_subject_does_not_annualize_cam(self):
+        examples = (
+            "CAM is $4.00/SF, monthly-report attached.",
+            "CAM is $4.00/SF, monthly - rent is $1.20/SF.",
+            "CAM is $4.00/SF, monthly: rent is $1.20/SF.",
+            "CAM is $4.00/SF, monthly (rent is $1.20/SF).",
+        )
+        self.assertEqual(
+            ["4.00"] * len(examples),
+            [ai_processing._extract_ops_ex_sf_from_text(text) for text in examples],
+        )
+
     def test_monthly_report_inside_cam_clause_is_not_a_basis_marker(self):
         examples = (
             "CAM monthly report is $4.00/SF.",
@@ -484,6 +638,55 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "4.08",
             update["value"],
         )
+
+    def test_combined_total_rejection_ignores_unrelated_annual_parking(self):
+        text = "CAM plus rent is $1.50/SF/month, per year parking is $12/SF."
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+        for proposed_value in ("1.50", "18.00"):
+            proposal = {
+                "updates": [{"column": "Ops Ex / SF", "value": proposed_value}],
+                "events": [{"type": "property_unavailable", "reason": "leased"}],
+            }
+            result = ai_processing._augment_proposal_with_deterministic_extractions(
+                proposal,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            results.append(
+                ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+            )
+
+        self.assertEqual([None, None], results)
+
+    def test_conflicting_basis_combined_total_rejects_raw_and_monthly_values(self):
+        text = "CAM plus rent is $1.50/SF/month/year."
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for proposed_value in ("1.50", "18.00"):
+            proposal = {
+                "updates": [{"column": "Ops Ex / SF", "value": proposed_value}],
+                "events": [{"type": "property_unavailable", "reason": "leased"}],
+            }
+            result = ai_processing._augment_proposal_with_deterministic_extractions(
+                proposal,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            results.append(
+                ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+            )
+
+        self.assertEqual([None, None], results)
 
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
