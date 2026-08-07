@@ -3,17 +3,23 @@
 > **Execution mode:** local no-ship TDD. Do not push, deploy, or contact external
 > systems or people.
 
-**Goal:** Classify explicit OpEx evidence without duplicating rent, bind basis
-only to the winning candidate, and prevent rejected totals or rent-owned NNN
-figures from surviving as model-proposed OpEx writes.
+**Goal:** Classify explicit OpEx evidence without duplicating rent, bind complete
+rate suffixes and basis only to the winning candidate, and prevent rejected,
+rent-owned, or explicitly negated figures from surviving as unsupported
+model-proposed writes.
 
 **Deliverable:** both code and verified findings.
 
 **Architecture:** Build immutable `_OpsExCandidate` records containing raw and
 annualized `Decimal` values, basis, spans, source, and precedence. Select one
-winner for both extraction and proposal normalization. Keep rejected combined
-totals, combined-equation base-rent figures, and non-expense NNN figures in
-separate negative-evidence collections.
+winner for both extraction and proposal normalization. Resolve field ownership
+once, including the bounded pending/TBD override and bounded correction or
+pronominal inheritance, and retain the complete per-area, optional basis, and
+optional NNN rate suffix. Resolve a correction's basis only from its captured
+current figure. Keep rejected combined totals, combined-equation base-rent
+figures, non-expense NNN figures, and explicitly negated rates in separate
+negative-evidence collections so symmetric negated-rate sanitation removes only
+values without independent destination-field support.
 
 **Tech stack:** Python 3, `re`, `Decimal`, `NamedTuple`, `unittest`, pytest, and
 the existing `email_automation.ai_processing` pipeline.
@@ -30,9 +36,16 @@ the existing `email_automation.ai_processing` pipeline.
   cases using word `at`, `for`, `@`, colon, and typographic dash separators.
   Assert rent `14.10`, OpEx `None`, and no matching OpEx update after full
   augmentation from either an empty or preseeded proposal.
+- [x] Add pending/TBD expense-owner cases followed by a later Availability/offer
+  governor across `|`, `:`, hyphen, en dash, and em dash, with direct `CAM:` and
+  semicolon, period, and newline controls.
 - [x] Preserve explicit expense-owned `$3.65 NNN`, CAM, OpEx, and TMI forms.
   Assert bare NNN is neutral, immediate `/CAM|/OpEx|/TMI` owns the figure as
   expense, and conflicting asking-plus-expense ownership abstains.
+- [x] Add explicit-expense `per SF NNN` and `per square foot NNN` cases plus
+  composed `per SF/month NNN`, `per SF per month NNN`, and `per SF/year NNN`
+  cases. Assert Rent/OpEx extraction and proposal parity, correct annualization,
+  and no Rent duplication.
 - [x] Add combined equations using `/SF/month`, `per SF/month`, `per-SF/month`,
   `per sq. ft., billed monthly`, and `per square foot, billed monthly`. Assert
   direct extraction and raw proposal normalization both produce `4.08`.
@@ -48,6 +61,10 @@ the existing `email_automation.ai_processing` pipeline.
   `/SF NNN`, reversed tax/insurance order, competing rent-subject, relational
   governing-subject, bounded-keyword, correction-recency, and symmetric
   preseeded-write controls in separate RED commits.
+- [x] Add bounded elliptical OpEx and pronominal Rent/OpEx correction matrices,
+  including full suffix retention, current-figure-only basis changes,
+  negated-rate sanitation, unrelated later-rate controls, repeated
+  normalization, and extraction/proposal parity.
 - [x] Run the focused matrix against the pre-fix production code and capture the
   expected failures.
 - [x] Commit tests separately as `test: consolidate opex ownership edge cases`.
@@ -65,28 +82,36 @@ the existing `email_automation.ai_processing` pipeline.
   OpEx candidate admission, and rejected-NNN evidence.
 - [x] Generalize ownership through `_figure_field_owner`: ignore relational
   objects, select the nearest figure-governing explicit subject, let explicit
-  fields outrank contextual offer/area syntax, and reserve conflict for direct
-  same-figure co-ownership.
+  fields ordinarily outrank contextual offer/area syntax, and allow pending/TBD
+  expense ownership to yield to a later Availability/offer governor only across
+  the captured structural separators. Preserve direct CAM ownership, natural
+  clause boundaries, and conflict for direct same-figure co-ownership.
 - [x] Route explicit-unit rent and legacy OpEx admission through the shared
   owner, require true rent-keyword boundaries, and remove preseeded cross-field
   values unless independently supported by their destination field, including
   raw and annualized values from explicitly monthly rent.
 - [x] Consume combined equation totals and rate units in the combined matcher so
   the existing 10-before/30-after basis window reaches its owned suffix.
-- [x] Extend shared unit and monthly phrase handling for `per-SF`, punctuation in
-  `sq ft.`, and `billed on a|the monthly basis`.
+- [x] Extend shared rate-suffix handling for `per-SF`, punctuation in `sq ft.`,
+  `billed on a|the monthly basis`, and complete per-area figures with optional
+  `/month`, `per month`, `/year`, and trailing `NNN` composition.
 - [x] Reject basis markers followed by hyphenated, colon-delimited,
   parenthetical, or multiword competing subjects while preserving real clause
   boundaries, attached monthly syntax, and coordinated supporting
   tax-plus-insurance qualifiers in either order on explicit OpEx rates.
-- [x] Treat correction/corrected/correct/actually as current evidence and select
-  the latest equally specific candidate across sequential corrections.
+- [x] Treat correction/corrected/correct/actually as current evidence; bind only
+  the captured elliptical and `not $old...; it is $new...` forms to their prior
+  field, retain each figure's complete suffix, and resolve basis only from the
+  current replacement span. Keep unrelated later rates separate and select the
+  latest equally specific candidate across sequential corrections.
 - [x] Preserve combined-total raw negative evidence before basis resolution. On
   conflict, reject raw plus x12 whenever the owned basis context contains a
   monthly marker, independent of token order or partial outer-regex capture.
-- [x] Include rejected NNN, combined-total, and combined-equation base-rent
-  raw/annual values in proposal validation, but never remove a value also
-  supported by an accepted candidate.
+- [x] Exclude immediately negated rates from both extractors and include their
+  raw/annual values in symmetric Rent and OpEx proposal sanitation. Include
+  rejected NNN, combined-total, and combined-equation base-rent raw/annual
+  values in OpEx validation. Never remove a value independently supported by
+  its destination field.
 - [x] Run the consolidated matrix and full Jill file green before documentation.
 
 ## Task 3: Refresh architecture documentation
@@ -98,8 +123,10 @@ the existing `email_automation.ai_processing` pipeline.
 
 - [x] Replace the superseded narrow-candidate-only description with the shared
   candidate/winner architecture.
-- [x] Document field-owned basis, ambiguous NNN classification, separate
-  negative evidence, proposal idempotency, and no-ship boundaries.
+- [x] Document field-owned basis, complete rate suffixes, bounded pending and
+  correction inheritance, current-figure-only correction basis, ambiguous NNN
+  classification, negated negative evidence, symmetric proposal sanitation,
+  proposal idempotency, and no-ship boundaries.
 - [x] Remove stale pseudocode and acceptance statements that conflict with the
   implemented record shape or proposal flow.
 
