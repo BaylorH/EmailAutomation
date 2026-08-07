@@ -400,6 +400,79 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             [ai_processing._extract_ops_ex_sf_from_text(text) for text in examples],
         )
 
+    def test_attached_monthly_basis_survives_following_prose(self):
+        examples = (
+            "CAM is $0.34/SF/month plus tax.",
+            "CAM is $0.34/SF/month under the lease.",
+            "CAM is $0.34/SF/month estimated.",
+            "CAM is $0.34/SF, billed on a monthly basis under the lease.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            proposal = {"updates": [{"column": "Ops Ex / SF", "value": "0.34"}]}
+            normalized = ai_processing._augment_proposal_opex_basis(
+                proposal,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            results.append((
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                ai_processing._proposal_update_for_column(
+                    normalized,
+                    "Ops Ex / SF",
+                )["value"],
+            ))
+
+        self.assertEqual([("4.08", "4.08")] * len(examples), results)
+
+    def test_attached_monthly_basis_rejects_competing_subjects(self):
+        examples = (
+            "CAM is $4.00/SF/month parking is billed separately.",
+            "CAM is $4.00/SF/month: report attached.",
+            "CAM is $4.00/SF, billed on a monthly basis - parking is separate.",
+            "CAM is $4.00/SF, billed monthly (report attached).",
+        )
+        self.assertEqual(
+            ["4.00"] * len(examples),
+            [ai_processing._extract_ops_ex_sf_from_text(text) for text in examples],
+        )
+
+    def test_attached_monthly_basis_ignores_adjacent_subject_basis_markers(self):
+        examples = (
+            ("CAM is $0.34/SF/month, per year parking is $12/SF.", "0.34", "4.08"),
+            ("CAM is $4.00/SF, billed monthly for parking.", "4.00", "4.00"),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, raw_opex, expected in examples:
+            proposal = {"updates": [{"column": "Ops Ex / SF", "value": raw_opex}]}
+            normalized = ai_processing._augment_proposal_opex_basis(
+                proposal,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            results.append((
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                ai_processing._proposal_update_for_column(
+                    normalized,
+                    "Ops Ex / SF",
+                )["value"],
+            ))
+
+        self.assertEqual(
+            [(expected, expected) for _, _, expected in examples],
+            results,
+        )
+
     def test_existing_monthly_basis_controls_remain_owned(self):
         examples = (
             "CAM is $0.34 PSF/month.",
