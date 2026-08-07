@@ -81,6 +81,31 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM is still pending; the asking rent is $14.10 per square foot NNN."
         self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_pending_cam_does_not_cross_semicolon_into_quoted_rent(self):
+        text = "CAM is still pending; the quoted rate is $14.10 per square foot NNN."
+        proposal = {"updates": [], "events": []}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertIsNone(ai_processing._proposal_update_for_column(result, "Ops Ex / SF"))
+
+    def test_relational_base_rent_phrase_keeps_explicit_cam_figure(self):
+        text = (
+            "For Space Center, we can offer 18,750 SF at $14.10 NNN. "
+            "CAM, on top of the base rent, is $3.90 per square foot."
+        )
+        proposal = {"updates": [{"column": "Ops Ex / SF", "value": "14.10"}], "events": []}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertEqual("3.90", ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"])
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
