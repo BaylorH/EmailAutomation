@@ -7562,6 +7562,15 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
     except Exception:
         pass
 
+    # Earlier messages in a scanner batch are saved without full AI processing,
+    # but substantive inbound evidence must still become authoritative before the
+    # scanner marks that message processed. Quote-only messages intentionally keep
+    # their existing no-marker behavior; attachments remain substantive evidence.
+    fresh_text = strip_email_quotes(_full_text)
+    if not (_is_no_new_reply_text(fresh_text) and not has_attachments):
+        from .followup import cancel_followup_on_response
+        cancel_followup_on_response(user_id, thread_id)
+
     print(f"  📝 Saved batched message from {from_addr} to thread {thread_id[:20]}...")
 
 def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], top: int = 50):

@@ -147,7 +147,8 @@ class SourceMessageEnvelopeTests(unittest.TestCase):
         })), \
                 patch.object(processing, "save_message", side_effect=lambda *args: saved_messages.append(args) or True), \
                 patch.object(processing, "index_message_id", return_value=True), \
-                patch.object(processing, "_fs", FakeFirestore()):
+                patch.object(processing, "_fs", FakeFirestore()), \
+                patch("email_automation.followup.cancel_followup_on_response") as record_inbound:
             processing._save_message_to_thread(
                 "uid-1",
                 "thread-1",
@@ -156,9 +157,44 @@ class SourceMessageEnvelopeTests(unittest.TestCase):
             )
 
         message_record = saved_messages[0][3]
+        record_inbound.assert_called_once_with("uid-1", "thread-1")
         self.assertEqual(message_record["cc"], ["baylor@manifoldengineering.ai"])
         self.assertEqual(message_record["replyTo"], ["replyto-broker@example.com"])
         self.assertEqual(message_record["sourceMessage"]["cc"], ["baylor@manifoldengineering.ai"])
+
+    def test_batched_quote_only_message_does_not_record_inbound_authority(self):
+        quoted_only = (
+            "On Thu, Aug 6, 2026 at 9:00 PM Baylor wrote:\n"
+            "> Can you confirm the available power?"
+        )
+        msg = {
+            "id": "graph-quote-only",
+            "internetMessageId": "<quote-only@example.com>",
+            "subject": "RE: 410 Genesis Blvd",
+            "from": {"emailAddress": {"address": "bp21harrison@gmail.com"}},
+            "receivedDateTime": "2026-08-07T04:01:00Z",
+            "bodyPreview": quoted_only,
+            "hasAttachments": False,
+        }
+
+        with patch.object(processing, "exponential_backoff_request", return_value=FakeResponse({
+            "body": {"contentType": "Text", "content": quoted_only},
+            "hasAttachments": False,
+        })), patch.object(processing, "save_message", return_value=True), patch.object(
+            processing,
+            "index_message_id",
+            return_value=True,
+        ), patch.object(processing, "_fs", FakeFirestore()), patch(
+            "email_automation.followup.cancel_followup_on_response",
+        ) as record_inbound:
+            processing._save_message_to_thread(
+                "uid-1",
+                "thread-1",
+                msg,
+                {"Authorization": "Bearer token"},
+            )
+
+        record_inbound.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -4072,49 +4072,56 @@ def cancel_followup_on_response(user_id: str, thread_id: str):
     Firestore failures intentionally propagate to the inbox retry boundary so
     a content-bearing reply cannot be marked processed without these guards.
     """
+    from google.cloud.firestore import transactional
+
     thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-    thread_doc = thread_ref.get()
 
-    if not thread_doc.exists:
-        return
+    @transactional
+    def record_inbound_transaction(transaction, thread_ref):
+        thread_doc = thread_ref.get(transaction=transaction)
+        if not thread_doc.exists:
+            return None
 
-    thread_data = thread_doc.to_dict() or {}
-    followup_config = thread_data.get("followUpConfig", {}) or {}
-    current_followup_status = thread_data.get("followUpStatus")
-    current_thread_status = thread_data.get("status")
-    update_data = {
-        "hasInboundReply": True,
-        "lastInboundAt": SERVER_TIMESTAMP,
-        "updatedAt": SERVER_TIMESTAMP,
-    }
+        thread_data = thread_doc.to_dict() or {}
+        followup_config = thread_data.get("followUpConfig", {}) or {}
+        if not isinstance(followup_config, dict):
+            followup_config = {}
+        current_followup_status = thread_data.get("followUpStatus")
+        current_thread_status = thread_data.get("status")
+        update_data = {
+            "hasInboundReply": True,
+            "lastInboundAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
 
-    followup_is_terminal = current_followup_status in {
-        "paused",
-        "completed",
-        "max_reached",
-        "stopped",
-    }
-    thread_is_terminal = current_thread_status in {
-        "completed",
-        "stopped",
-        "archived",
-        "deleted",
-    }
-    if (
-        followup_config.get("enabled", False)
-        and not followup_is_terminal
-        and not thread_is_terminal
-    ):
-        update_data.update({
-            "followUpStatus": "paused",
-            "followUpConfig.pausedAt": SERVER_TIMESTAMP,
-            "followUpConfig.conversationStage": "mid_conversation",
-        })
+        thread_blocks_pause = current_thread_status in {
+            "paused",
+            "stopped",
+            "completed",
+            "archived",
+            "deleted",
+            "action_needed",
+            "needs_review",
+        }
+        should_pause = (
+            followup_config.get("enabled", False)
+            and current_followup_status == "waiting"
+            and not thread_blocks_pause
+        )
+        if should_pause:
+            update_data.update({
+                "followUpStatus": "paused",
+                "followUpConfig.pausedAt": SERVER_TIMESTAMP,
+                "followUpConfig.conversationStage": "mid_conversation",
+            })
 
-    thread_ref.update(update_data)
-    if update_data.get("followUpStatus") == "paused":
+        transaction.update(thread_ref, update_data)
+        return should_pause
+
+    paused = record_inbound_transaction(_fs.transaction(), thread_ref)
+    if paused:
         print(f"   Follow-up paused for thread {thread_id[:20]}... (broker responded)")
-    else:
+    elif paused is not None:
         print(f"   Inbound reply recorded for thread {thread_id[:20]}...")
 
 
