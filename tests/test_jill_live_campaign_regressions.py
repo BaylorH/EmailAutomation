@@ -402,6 +402,15 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM is $0.34/SF/month/year"
         self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_conflicting_owned_narrow_cam_basis_abstains(self):
+        examples = (
+            "CAM, taxes, and insurance are estimated around $0.34/SF/month/year.",
+            "CAM, on top of base rent, is $0.34/SF/month/year.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_conflicting_owned_bare_annual_basis_abstains(self):
         examples = (
             "CAM is $0.34/SF/month, annual",
@@ -415,6 +424,17 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
     def test_bare_annually_cam_basis_remains_annual(self):
         text = "CAM is $4.00/SF annually"
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_unrelated_billed_monthly_subject_does_not_annualize_cam(self):
+        examples = (
+            "CAM is $4.00/SF, base rate billed monthly.",
+            "CAM is $4.00/SF, lease billed monthly.",
+            "CAM is $4.00/SF, parking billed monthly.",
+            "CAM is $4.00/SF, report billed monthly.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
     def test_supported_raw_monthly_opex_survives_rejected_total_then_normalizes(self):
         text = (
