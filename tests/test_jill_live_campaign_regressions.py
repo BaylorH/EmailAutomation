@@ -803,6 +803,92 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
 
         self.assertEqual([("3.90", "3.90")] * len(examples), results)
 
+    def test_elliptical_opex_corrections_bind_to_prior_expense_field(self):
+        examples = (
+            "CAM is $4.25/SF, corrected to $3.90/SF.",
+            "CAM is $4.25/SF; correction: $3.90/SF.",
+            "CAM is $4.25/SF; actually $3.90/SF.",
+            "CAM is $4.25/SF, now $3.90/SF.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": "3.90"},
+                        {"column": "Ops Ex / SF", "value": "3.90"},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [(None, "3.90", None, "3.90")] * len(examples),
+            results,
+        )
+
+    def test_unrelated_later_rent_rate_does_not_correct_opex(self):
+        examples = (
+            "CAM is $4.25/SF; asking rate is $14.10/SF.",
+            "CAM is $4.25/SF. The lease rate is $14.10/SF.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": "14.10"},
+                        {"column": "Ops Ex / SF", "value": "4.25"},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [("14.10", "4.25", "14.10", "4.25")] * len(examples),
+            results,
+        )
+
     def test_current_cam_outranks_prior_component_list_estimate(self):
         text = (
             "Prior estimate: CAM, taxes, and insurance are estimated around $4.25/SF. "
