@@ -1548,16 +1548,22 @@ _OPS_EX_RE = re.compile(
 )
 _EXPLICIT_OPS_EX_RE = re.compile(
     r"\b(?:opex|op\s*ex|cam|tmi|operating\s+expenses?)\b"
-    r"([^.!?\n$]{0,96}?)"
+    r"([^.!?;\n$]{0,96}?)"
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
     r"(?:(?:/\s*|\bper\s+)(?:sf|psf|sq\.?\s*ft|square\s+foot))?"
     r"(?:\s*/?\s*(?:yr|year|annum|mo|month|monthly))?",
     re.IGNORECASE,
 )
 
-_RENT_REFERENCE_IN_OPS_EX_GAP_RE = re.compile(
-    r"\b(?:asking\s+(?:rental\s+)?rate|base\s+rent|lease\s+rate|"
-    r"rental\s+rate|asking\s+rent|rent\s+(?:is|at))\b",
+_RENT_ASSIGNMENT_IN_OPS_EX_GAP_RE = re.compile(
+    r"\b(?:asking\s+(?:rental\s+)?rate|quoted\s+(?:rental\s+)?rate|"
+    r"base\s+rent|lease\s+rate|rental\s+rate|asking\s+rent|rent)\b"
+    r"[^,;:]{0,24}?(?:\b(?:is|at|of|runs?|equals?)\b|[:=])\s*$",
+    re.IGNORECASE,
+)
+_OPS_EX_RELATION_TO_RENT_RE = re.compile(
+    r"\b(?:on\s+top\s+of|in\s+addition\s+to|plus)\s+"
+    r"(?:the\s+)?(?:base\s+)?rent\b",
     re.IGNORECASE,
 )
 # A rent keyword immediately preceding a $ figure marks that figure as the RENT
@@ -1871,7 +1877,11 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
                 return f"{annual:.2f}"
 
     for explicit in _EXPLICIT_OPS_EX_RE.finditer(text):
-        if _RENT_REFERENCE_IN_OPS_EX_GAP_RE.search(explicit.group(1)):
+        gap = explicit.group(1)
+        if (
+            _RENT_ASSIGNMENT_IN_OPS_EX_GAP_RE.search(gap)
+            and not _OPS_EX_RELATION_TO_RENT_RE.search(gap)
+        ):
             continue
         if not _HYPOTHETICAL_RENT_RE.search(
             text[max(0, explicit.start() - 40): explicit.end()]
