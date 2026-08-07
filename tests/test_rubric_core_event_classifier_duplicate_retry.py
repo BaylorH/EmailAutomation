@@ -8,11 +8,15 @@ os.environ.setdefault(
 import unittest
 from unittest.mock import patch
 
+from google.cloud.firestore_v1.field_path import FieldPath
+
 from email_automation import messaging
 
 
-# --- Minimal Firestore double honoring the exact API + dotted-field merge
-# semantics that messaging.mark_event_handled / get_handled_events rely on. ---
+# --- Minimal Firestore double honoring the real Python client semantics. ---
+# DocumentReference.set() treats a dotted key as a literal field name, while
+# DocumentReference.update() expands a field path (including backtick-escaped
+# segments emitted by FieldPath.to_api_repr()).
 class _FakeDoc:
     def __init__(self, data):
         self._data = data
@@ -43,15 +47,18 @@ class _FakeDocRef:
         else:
             existing = dict(existing)
         for key, value in data.items():
-            if "." in key:
-                # Real Firestore treats a dotted key as a nested field path,
-                # merging into the parent map without clobbering siblings.
-                head, tail = key.split(".", 1)
-                nested = dict(existing.get(head) or {})
-                nested[tail] = value
-                existing[head] = nested
-            else:
-                existing[key] = value
+            existing[key] = value
+        self._store[self._path] = existing
+
+    def update(self, data):
+        existing = dict(self._store.get(self._path) or {})
+        for key, value in data.items():
+            parts = FieldPath.from_string(key).parts
+            cursor = existing
+            for part in parts[:-1]:
+                cursor[part] = dict(cursor.get(part) or {})
+                cursor = cursor[part]
+            cursor[parts[-1]] = value
         self._store[self._path] = existing
 
 
@@ -80,19 +87,23 @@ class CoreEventClassifierDuplicateRetryTests(unittest.TestCase):
         user_id = "uid-dup"
         thread_id = "thread-dup"
 
-        # A "call_requested" event re-surfaced on two separate processing passes.
+        # A wrong-contact event with a dotted email key re-surfaced on two passes.
         # The second pass carries extra/noisy fields, but it is the same logical
         # event on the same thread -> must produce the identical dedup key.
-        event_first_pass = {"reason": "wants a call"}
-        event_retry_pass = {"reason": "wants a call", "extra": "noise", "ts": 123}
+        event_first_pass = {"suggestedEmail": "broker.name@example.test"}
+        event_retry_pass = {
+            "suggestedEmail": "broker.name@example.test",
+            "extra": "noise",
+            "ts": 123,
+        }
 
         with patch.object(messaging, "_fs", fake_fs):
-            key1 = messaging.build_event_key("call_requested", event_first_pass, thread_id)
-            key2 = messaging.build_event_key("call_requested", event_retry_pass, thread_id)
+            key1 = messaging.build_event_key("wrong_contact", event_first_pass, thread_id)
+            key2 = messaging.build_event_key("wrong_contact", event_retry_pass, thread_id)
 
             # Stable, thread-unique key regardless of incidental payload fields.
             self.assertEqual(key1, key2)
-            self.assertEqual(key1, "call_requested")
+            self.assertEqual(key1, "wrong_contact:broker.name@example.test")
 
             # First pass: not yet handled -> real classifier records it once.
             self.assertFalse(messaging.is_event_handled(user_id, thread_id, key1))

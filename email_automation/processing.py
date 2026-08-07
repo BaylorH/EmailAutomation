@@ -3419,7 +3419,7 @@ def _looks_like_explicit_tour_offer_or_request(text: str = "") -> bool:
         r"come\s+by|stop\s+by|take\s+a\s+look)"
     )
     patterns = [
-        rf"\b(?:schedule|arrange|set\s+up|book|coordinate)\s+(?:a\s+)?{tour_noun}\b",
+        rf"\b(?:schedule|arrange|set(?:\s+up)?|book|coordinate)\s+(?:a\s+)?{tour_noun}\b",
         rf"\b(?:would\s+you\s+like|do\s+you\s+want|want)\s+to\s+(?:schedule\s+)?{tour_noun}\b",
         r"\b(?:offered|sent|provided|gave)\s+(?:available\s+)?(?:tour\s+)?(?:times|windows|slots|availability)\b",
         rf"\b(?:happy|glad|able|available)\s+to\s+(?:show|tour|walk)\b",
@@ -5434,12 +5434,11 @@ def process_inbox_message(
         )
         return
 
-    # Cancel/pause any pending follow-ups since broker responded
-    try:
-        from .followup import cancel_followup_on_response
-        cancel_followup_on_response(user_id, thread_id)
-    except Exception as e:
-        print(f"⚠️ Failed to cancel follow-up: {e}")
+    # Record canonical inbound authority and pause any eligible follow-up.
+    # A failed marker write must keep this message retryable instead of allowing
+    # a later scheduler pass to send through an unrecorded broker response.
+    from .followup import cancel_followup_on_response
+    cancel_followup_on_response(user_id, thread_id)
 
     # Dump the conversation
     dump_thread_from_firestore(user_id, thread_id)
@@ -5824,15 +5823,9 @@ def process_inbox_message(
                 elif event_type == "tour_requested":
                     # Broker offered a tour - create notification with suggested response
                     try:
-                        if not _tour_actions_allowed(user_id):
-                            mark_event_handled(user_id, thread_id, event_key, msg_id, None)
-                            proposal["skip_response"] = True
-                            print(
-                                "🏠 Tour actions disabled for this user; "
-                                "marked event handled without notification or reply draft"
-                            )
-                            continue
-
+                        # Human-review tour escalations are part of the core inbox
+                        # contract for every user. Any allowlist for automated tour
+                        # planning must not hide the broker's request from the user.
                         tour_message_text = _clean_tour_signal_text(_text_for_ai or _full_text)
                         clean_event = dict(event)
                         clean_event["question"] = _clean_tour_signal_text(

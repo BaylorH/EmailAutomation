@@ -4062,41 +4062,60 @@ def schedule_followup_for_thread(
 
 def cancel_followup_on_response(user_id: str, thread_id: str):
     """
-    Pause pending follow-up when broker responds.
+    Record an inbound reply and pause any pending follow-up sequence.
     Called from processing.py when inbound message is detected.
 
-    The sequence can resume if the broker goes silent again.
+    Canonical inbound authority is independent of whether follow-ups were
+    enabled. The sequence can resume if the broker goes silent again, but a
+    terminal or already-paused follow-up state must not be reopened here.
+
+    Firestore failures intentionally propagate to the inbox retry boundary so
+    a content-bearing reply cannot be marked processed without these guards.
     """
-    try:
-        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-        thread_doc = thread_ref.get()
+    thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+    thread_doc = thread_ref.get()
 
-        if not thread_doc.exists:
-            return
+    if not thread_doc.exists:
+        return
 
-        thread_data = thread_doc.to_dict()
-        followup_config = thread_data.get("followUpConfig", {})
+    thread_data = thread_doc.to_dict() or {}
+    followup_config = thread_data.get("followUpConfig", {}) or {}
+    current_followup_status = thread_data.get("followUpStatus")
+    current_thread_status = thread_data.get("status")
+    update_data = {
+        "hasInboundReply": True,
+        "lastInboundAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    }
 
-        if not followup_config.get("enabled", False):
-            return
-
-        current_status = thread_data.get("followUpStatus")
-        if current_status in ["paused", "completed", "max_reached"]:
-            return
-
-        thread_ref.update({
-            "hasInboundReply": True,
-            "lastInboundAt": SERVER_TIMESTAMP,
+    followup_is_terminal = current_followup_status in {
+        "paused",
+        "completed",
+        "max_reached",
+        "stopped",
+    }
+    thread_is_terminal = current_thread_status in {
+        "completed",
+        "stopped",
+        "archived",
+        "deleted",
+    }
+    if (
+        followup_config.get("enabled", False)
+        and not followup_is_terminal
+        and not thread_is_terminal
+    ):
+        update_data.update({
             "followUpStatus": "paused",
             "followUpConfig.pausedAt": SERVER_TIMESTAMP,
             "followUpConfig.conversationStage": "mid_conversation",
-            "updatedAt": SERVER_TIMESTAMP
         })
 
+    thread_ref.update(update_data)
+    if update_data.get("followUpStatus") == "paused":
         print(f"   Follow-up paused for thread {thread_id[:20]}... (broker responded)")
-
-    except Exception as e:
-        print(f"   Error pausing follow-up: {e}")
+    else:
+        print(f"   Inbound reply recorded for thread {thread_id[:20]}...")
 
 
 def resume_followup_if_silent(user_id: str, thread_id: str, silence_threshold_days: int = 3):

@@ -173,6 +173,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         from_email="bp21harrison@gmail.com",
         row_below_nonviable=False,
         ensure_divider_side_effect=None,
+        cancel_followup_side_effect=None,
     ):
         client_id = "client-1"
         msg = self._common_graph_message(
@@ -242,6 +243,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
 
         send_reply = MagicMock(side_effect=fake_send_reply)
         mark_client_completed = MagicMock(side_effect=fake_mark_client_completed)
+        cancel_followup = MagicMock(side_effect=cancel_followup_side_effect)
         thread_docs = thread_docs or {thread_id: thread_ref}
         patches = [
             patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref, thread_docs=thread_docs)),
@@ -253,7 +255,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "save_message", return_value=True),
             patch.object(processing, "index_message_id", return_value=True),
             patch.object(processing, "dump_thread_from_firestore"),
-            patch("email_automation.followup.cancel_followup_on_response"),
+            patch(
+                "email_automation.followup.cancel_followup_on_response",
+                new=cancel_followup,
+            ),
             patch.object(
                 processing,
                 "fetch_and_log_sheet_for_thread",
@@ -316,9 +321,30 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "stopThreads": stop_threads,
             "sendReply": send_reply,
             "markClientCompleted": mark_client_completed,
+            "cancelFollowup": cancel_followup,
             "callTrace": call_trace,
             "threadRef": thread_ref,
         }
+
+    def test_inbound_marker_write_failure_escapes_to_retry_boundary(self):
+        body = "The property is available and has 600A power."
+        thread_id = "thread-marker-failure"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpConfig": {"enabled": False},
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "marker write unavailable"):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body=body,
+                proposal={"updates": [], "events": [], "response_email": None},
+                thread_ref=thread_ref,
+                cancel_followup_side_effect=RuntimeError("marker write unavailable"),
+            )
 
     def test_nonviable_sheet_failure_stages_all_split_roots_before_mutation(self):
         body = "Hi Baylor,\n\n951 E FM 646 is no longer available.\n\nBest,\nRyan"
@@ -617,7 +643,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             result["statusUpdates"],
         )
 
-    def test_non_allowlisted_user_tour_offer_creates_no_tour_action(self):
+    def test_non_allowlisted_user_tour_offer_creates_human_review_action(self):
         body = "Hi Baylor,\n\nThe space is available. Let me know if you would like to schedule a tour.\n\nBest,\nBP21"
         thread_id = "thread-normal-tour-offer"
         thread_ref = FakeDocumentRef({
@@ -646,18 +672,85 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             thread_ref=thread_ref,
         )
 
-        self.assertEqual([], result["notifications"])
+        self.assertEqual(1, len(result["notifications"]))
+        self.assertEqual(
+            "tour_requested",
+            result["notifications"][0]["kwargs"]["meta"]["reason"],
+        )
         result["sendReply"].assert_not_called()
-        self.assertFalse(
+        self.assertTrue(
             any(update["reason"] == "tour_requested" for update in result["statusUpdates"])
         )
         self.assertTrue(
             any(
                 handled["eventKey"] == "tour_requested"
-                and handled["notifId"] is None
+                and handled["notifId"] == result["notifications"][0]["id"]
                 for handled in result["handledEvents"]
             )
         )
+
+    def test_three_event_inbound_surfaces_every_human_action_and_never_auto_sends(self):
+        body = (
+            "What use does your client have in mind, and how much power do they need? "
+            "We can set a tour for Tuesday at 10:30. "
+            "Please call me at 713-555-0186."
+        )
+        thread_id = "thread-three-event-production"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        proposal = {
+            "updates": [],
+            "events": [
+                {
+                    "type": "needs_user_input",
+                    "reason": "client_question",
+                    "question": "What use and power does the client need?",
+                },
+                {
+                    "type": "tour_requested",
+                    "question": "We can set a tour for Tuesday at 10:30.",
+                    "suggestedEmail": "Hi Ryan, Tuesday at 10:30 works.",
+                },
+                {
+                    "type": "call_requested",
+                    "question": "Please call me at 713-555-0186.",
+                },
+            ],
+            "response_email": "Hi Ryan,\n\nThanks. I will follow up.",
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            user_id="regular-user",
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+        )
+
+        reasons = [
+            notification["kwargs"]["meta"]["reason"]
+            for notification in result["notifications"]
+        ]
+        self.assertCountEqual(
+            [
+                "needs_user_input:client_question",
+                "tour_requested",
+                "call_requested",
+            ],
+            reasons,
+        )
+        self.assertEqual(3, len(result["notifications"]))
+        self.assertEqual(3, len(result["handledEvents"]))
+        self.assertEqual(3, len(result["statusUpdates"]))
+        self.assertTrue(all(
+            update["status"] == processing.THREAD_STATUS["paused"]
+            for update in result["statusUpdates"]
+        ))
+        result["sendReply"].assert_not_called()
 
     def test_tour_invite_unavailable_process_does_not_move_row_or_stop_property(self):
         body = "Hi Baylor,\n\nThe space is still available, but tours are no longer available for this property.\n\nBest,\nBP21"

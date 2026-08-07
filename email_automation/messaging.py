@@ -2,6 +2,7 @@ import re
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
+from google.cloud.firestore_v1.field_path import FieldPath
 from .clients import _fs
 from .utils import b64url_id, clean_email_content, normalize_message_id, strip_email_quotes
 
@@ -687,13 +688,14 @@ def mark_event_handled(user_id: str, thread_id: str, event_key: str,
     """
     try:
         thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-        thread_ref.set({
-            f"handledEvents.{event_key}": {
+        event_path = FieldPath("handledEvents", event_key).to_api_repr()
+        thread_ref.update({
+            event_path: {
                 "detectedAt": SERVER_TIMESTAMP,
                 "detectedInMessageId": msg_id,
                 "notificationId": notif_id
             }
-        }, merge=True)
+        })
         print(f"📌 Marked event as handled: {event_key}")
         return True
     except Exception as e:
