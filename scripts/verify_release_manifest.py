@@ -8,6 +8,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlparse
@@ -28,6 +29,8 @@ BACKEND_KEYS = {
     "deployedRevision",
     "configHash",
     "configHashAlgorithm",
+    "deploymentConfigHash",
+    "deploymentConfigHashAlgorithm",
     "trafficPercent",
     "rollbackRevision",
     "observedDarkDeployment",
@@ -37,6 +40,9 @@ FRONTEND_KEYS = {
     "observedCandidateSha",
     "functionRevision",
     "functionCommitMapping",
+    "hostingReleaseId",
+    "hostingRollbackReleaseId",
+    "hostingCommitMapping",
 }
 CI_KEYS = {"runId", "url", "headSha", "status", "conclusion"}
 DARK_DEPLOYMENT_KEYS = {
@@ -60,6 +66,7 @@ DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 TAG_RE = re.compile(r"^[0-9a-f]{12}$")
 REVISION_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+PRODUCTION_CLEARANCE_WORKFLOW_DATABASE_ID = 327317922
 
 
 def _reject_duplicate_keys(pairs: Iterable[tuple[str, Any]]) -> dict[str, Any]:
@@ -139,6 +146,88 @@ def _validate_ci(value: Any, expected_sha: str, field: str) -> None:
         raise ValueError(f"{field}.url must identify the recorded GitHub Actions run")
 
 
+def _read_github_run(run_id: int) -> dict[str, Any]:
+    command = [
+        "gh",
+        "run",
+        "view",
+        str(run_id),
+        "--repo",
+        "BaylorH/EmailAutomation",
+        "--json",
+        (
+            "databaseId,url,headSha,status,conclusion,workflowName,"
+            "workflowDatabaseId,event"
+        ),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ValueError("GitHub CI attestation command could not run") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"gh exited {result.returncode}"
+        raise ValueError(f"GitHub CI attestation readback failed: {detail}")
+    try:
+        value = json.loads(
+            result.stdout,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonstandard_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("GitHub CI attestation returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("GitHub CI attestation returned a non-object")
+    return value
+
+
+def verify_github_attestations(manifest: dict[str, Any]) -> None:
+    for field in ("candidateCi", "receiptCi"):
+        expected = manifest["backend"][field]
+        actual = _read_github_run(expected["runId"])
+        attested = {
+            "runId": actual.get("databaseId"),
+            "url": actual.get("url"),
+            "headSha": actual.get("headSha"),
+            "status": actual.get("status"),
+            "conclusion": actual.get("conclusion"),
+        }
+        if (
+            actual.get("workflowName") != "Production Clearance CI"
+            or actual.get("workflowDatabaseId")
+            != PRODUCTION_CLEARANCE_WORKFLOW_DATABASE_ID
+            or actual.get("event") != "push"
+            or attested != expected
+        ):
+            raise ValueError(f"GitHub CI attestation mismatch for backend.{field}")
+
+
+def verify_controller_attestation(controller_sha: str, run_id: int) -> None:
+    expected_sha = _require_sha(controller_sha, "controllerSha")
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError("controllerCiRunId must be a positive integer")
+    actual = _read_github_run(run_id)
+    expected = {
+        "databaseId": run_id,
+        "url": (
+            "https://github.com/BaylorH/EmailAutomation/actions/runs/"
+            f"{run_id}"
+        ),
+        "headSha": expected_sha,
+        "status": "completed",
+        "conclusion": "success",
+        "workflowName": "Production Clearance CI",
+        "workflowDatabaseId": PRODUCTION_CLEARANCE_WORKFLOW_DATABASE_ID,
+        "event": "push",
+    }
+    if actual != expected:
+        raise ValueError("GitHub CI attestation mismatch for release controller")
+
+
 def validate_manifest(manifest: Any) -> None:
     root = _require_exact_keys(manifest, ROOT_KEYS, "root")
     if type(root["schemaVersion"]) is not int or root["schemaVersion"] != 1:
@@ -176,9 +265,18 @@ def validate_manifest(manifest: Any) -> None:
     _require_digest(backend["configHash"], "backend.configHash")
     if backend["configHashAlgorithm"] != "sha256:canonical-json(spec)":
         raise ValueError("backend.configHashAlgorithm is unsupported")
+    _require_digest(
+        backend["deploymentConfigHash"],
+        "backend.deploymentConfigHash",
+    )
+    if (
+        backend["deploymentConfigHashAlgorithm"]
+        != "sha256:canonical-json(spec,image=IMAGE_DIGEST_BOUND_AT_DEPLOY)"
+    ):
+        raise ValueError("backend.deploymentConfigHashAlgorithm is unsupported")
     traffic = backend["trafficPercent"]
-    if type(traffic) is not int or not 0 <= traffic <= 100:
-        raise ValueError("backend.trafficPercent must be an integer from 0 through 100")
+    if type(traffic) is not int or traffic != 100:
+        raise ValueError("backend.trafficPercent must be exactly 100")
     _require_revision(backend["rollbackRevision"], "backend.rollbackRevision")
 
     dark = _require_exact_keys(
@@ -213,16 +311,42 @@ def validate_manifest(manifest: Any) -> None:
     _require_sha(frontend["observedCandidateSha"], "frontend.observedCandidateSha")
     _require_revision(frontend["functionRevision"], "frontend.functionRevision")
     mapping = frontend["functionCommitMapping"]
-    if mapping == "BLOCKED_PROVENANCE":
-        if workflow_state != "BLOCKED_PROVENANCE":
-            raise ValueError("unresolved Function provenance requires BLOCKED_PROVENANCE")
-    else:
-        _require_sha(mapping, "frontend.functionCommitMapping")
+    if mapping != "BLOCKED_PROVENANCE":
+        raise ValueError(
+            "schemaVersion 1 cannot attest a Function commit; use BLOCKED_PROVENANCE"
+        )
+    for field in (
+        "hostingReleaseId",
+        "hostingRollbackReleaseId",
+        "hostingCommitMapping",
+    ):
+        if frontend[field] != "BLOCKED_PROVENANCE":
+            raise ValueError(f"frontend.{field} must remain BLOCKED_PROVENANCE")
+    if workflow_state != "BLOCKED_PROVENANCE":
+        raise ValueError("unresolved Firebase provenance requires BLOCKED_PROVENANCE")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path, help="production release manifest JSON")
+    parser.add_argument(
+        "--verify-github",
+        action="store_true",
+        help="read back the recorded GitHub Actions runs and compare exact metadata",
+    )
+    parser.add_argument(
+        "--expected-candidate-sha",
+        help="require backend.candidateSha to equal this exact commit",
+    )
+    parser.add_argument(
+        "--controller-sha",
+        help="exact release-controller commit to attest remotely",
+    )
+    parser.add_argument(
+        "--controller-ci-run-id",
+        type=int,
+        help="successful Production Clearance CI run for --controller-sha",
+    )
     return parser
 
 
@@ -231,10 +355,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         manifest = load_manifest(args.manifest)
         validate_manifest(manifest)
+        if args.expected_candidate_sha is not None:
+            expected_sha = _require_sha(
+                args.expected_candidate_sha,
+                "expectedCandidateSha",
+            )
+            if manifest["backend"]["candidateSha"] != expected_sha:
+                raise ValueError(
+                    "backend.candidateSha does not match expected candidate SHA"
+                )
+        if args.verify_github:
+            verify_github_attestations(manifest)
+        controller_args = (args.controller_sha, args.controller_ci_run_id)
+        if (controller_args[0] is None) != (controller_args[1] is None):
+            raise ValueError(
+                "--controller-sha and --controller-ci-run-id must be provided together"
+            )
+        if controller_args[0] is not None:
+            verify_controller_attestation(*controller_args)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"release manifest invalid: {exc}", file=sys.stderr)
         return 1
-    print(f"release manifest valid: {args.manifest} ({manifest['workflowState']})")
+    suffix_parts = []
+    if args.verify_github:
+        suffix_parts.append("GitHub attestations verified")
+    if args.controller_sha is not None:
+        suffix_parts.append("release controller attested")
+    suffix = f" {'; '.join(suffix_parts)}" if suffix_parts else ""
+    print(
+        f"release manifest valid: {args.manifest} "
+        f"({manifest['workflowState']}){suffix}"
+    )
     return 0
 
 

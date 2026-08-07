@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
@@ -26,6 +28,7 @@ PRODUCTION_DIGEST = "sha256:8c943805c87783b94361ca0e9fa7eee6fb2aac00e3211f3a2389
 PRODUCTION_REVISION = "process-user-jill-one-202608020520"
 DARK_DIGEST = "sha256:ab67d92dbf5983ffe862e87d982d8a17c7bb4ee3486cbd3940135c446cffd608"
 DARK_REVISION = "process-user-00058-biz"
+WORKFLOW_DATABASE_ID = 327317922
 
 
 def _read_manifest() -> dict:
@@ -33,13 +36,19 @@ def _read_manifest() -> dict:
 
 
 class ReleaseManifestTests(unittest.TestCase):
-    def _validate(self, manifest: dict) -> subprocess.CompletedProcess[str]:
+    def _validate(
+        self,
+        manifest: dict,
+        *validator_args: str,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "manifest.json"
             path.write_text(json.dumps(manifest), encoding="utf-8")
             return subprocess.run(
-                [sys.executable, str(VALIDATOR_PATH), str(path)],
+                [sys.executable, str(VALIDATOR_PATH), str(path), *validator_args],
                 cwd=REPO_ROOT,
+                env=env,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -90,6 +99,26 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(
             "BLOCKED_PROVENANCE",
             manifest["frontend"]["functionCommitMapping"],
+        )
+        self.assertEqual(
+            "BLOCKED_PROVENANCE",
+            manifest["frontend"]["hostingReleaseId"],
+        )
+        self.assertEqual(
+            "BLOCKED_PROVENANCE",
+            manifest["frontend"]["hostingRollbackReleaseId"],
+        )
+        self.assertEqual(
+            "BLOCKED_PROVENANCE",
+            manifest["frontend"]["hostingCommitMapping"],
+        )
+        self.assertRegex(
+            manifest["backend"]["deploymentConfigHash"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            "sha256:canonical-json(spec,image=IMAGE_DIGEST_BOUND_AT_DEPLOY)",
+            manifest["backend"]["deploymentConfigHashAlgorithm"],
         )
 
     def test_validator_accepts_the_canonical_manifest(self):
@@ -178,6 +207,14 @@ class ReleaseManifestTests(unittest.TestCase):
                 mutated["backend"][field] = value
                 self._assert_rejected(mutated)
 
+    def test_validator_requires_exactly_100_percent_production_traffic(self):
+        manifest = _read_manifest()
+        for traffic in (0, 1, 50, 99):
+            with self.subTest(traffic=traffic):
+                mutated = copy.deepcopy(manifest)
+                mutated["backend"]["trafficPercent"] = traffic
+                self._assert_rejected(mutated)
+
     def test_validator_rejects_invalid_dark_deployment_readback(self):
         manifest = _read_manifest()
         mutations = (
@@ -243,6 +280,24 @@ class ReleaseManifestTests(unittest.TestCase):
         branch_mapping["frontend"]["functionCommitMapping"] = "main"
         mutations.append(branch_mapping)
 
+        guessed_function_mapping = copy.deepcopy(manifest)
+        guessed_function_mapping["frontend"]["functionCommitMapping"] = "0" * 40
+        mutations.append(guessed_function_mapping)
+
+        guessed_hosting_release = copy.deepcopy(manifest)
+        guessed_hosting_release["frontend"]["hostingReleaseId"] = "release-123"
+        mutations.append(guessed_hosting_release)
+
+        guessed_hosting_rollback = copy.deepcopy(manifest)
+        guessed_hosting_rollback["frontend"]["hostingRollbackReleaseId"] = (
+            "release-122"
+        )
+        mutations.append(guessed_hosting_rollback)
+
+        guessed_hosting_mapping = copy.deepcopy(manifest)
+        guessed_hosting_mapping["frontend"]["hostingCommitMapping"] = "0" * 40
+        mutations.append(guessed_hosting_mapping)
+
         for index, mutated in enumerate(mutations):
             with self.subTest(case=index):
                 self._assert_rejected(mutated)
@@ -269,6 +324,125 @@ class ReleaseManifestTests(unittest.TestCase):
                     self.assertNotEqual(0, result.returncode)
                     self.assertEqual("", result.stdout)
 
+    def test_remote_attestation_verifies_real_github_run_readback(self):
+        manifest = _read_manifest()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir) / "bin"
+            bin_dir.mkdir()
+            fake_gh = bin_dir / "gh"
+            fake_gh.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    case "$*" in
+                      *"{manifest['backend']['candidateCi']['runId']}"*)
+                        printf '%s\\n' '{json.dumps({**manifest['backend']['candidateCi'], 'databaseId': manifest['backend']['candidateCi']['runId'], 'workflowName': 'Production Clearance CI', 'workflowDatabaseId': WORKFLOW_DATABASE_ID, 'event': 'push'}, separators=(',', ':'))}'
+                        ;;
+                      *"{manifest['backend']['receiptCi']['runId']}"*)
+                        printf '%s\\n' '{json.dumps({**manifest['backend']['receiptCi'], 'databaseId': manifest['backend']['receiptCi']['runId'], 'workflowName': 'Production Clearance CI', 'workflowDatabaseId': WORKFLOW_DATABASE_ID, 'event': 'push'}, separators=(',', ':'))}'
+                        ;;
+                      *) exit 44 ;;
+                    esac
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+            result = self._validate(
+                manifest,
+                "--verify-github",
+                env=env,
+            )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("GitHub attestations verified", result.stdout)
+
+    def test_remote_attestation_rejects_a_coherent_but_fabricated_ci_tuple(self):
+        manifest = _read_manifest()
+        fabricated = copy.deepcopy(manifest)
+        fabricated_run_id = 99999999999
+        fabricated_sha = "1" * 40
+        fabricated["backend"]["candidateSha"] = fabricated_sha
+        fabricated["backend"]["candidateCi"] = {
+            "runId": fabricated_run_id,
+            "url": (
+                "https://github.com/BaylorH/EmailAutomation/actions/runs/"
+                f"{fabricated_run_id}"
+            ),
+            "headSha": fabricated_sha,
+            "status": "completed",
+            "conclusion": "success",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir) / "bin"
+            bin_dir.mkdir()
+            fake_gh = bin_dir / "gh"
+            fake_gh.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    printf '%s\\n' '{json.dumps({**manifest['backend']['candidateCi'], 'databaseId': manifest['backend']['candidateCi']['runId'], 'workflowName': 'Production Clearance CI', 'workflowDatabaseId': WORKFLOW_DATABASE_ID, 'event': 'push'}, separators=(',', ':'))}'
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+            result = self._validate(
+                fabricated,
+                "--verify-github",
+                env=env,
+            )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("GitHub CI attestation mismatch", result.stderr)
+
+    def test_remote_attestation_rejects_manual_dispatch_with_matching_head_sha(self):
+        manifest = _read_manifest()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir) / "bin"
+            bin_dir.mkdir()
+            fake_gh = bin_dir / "gh"
+            candidate = {
+                **manifest["backend"]["candidateCi"],
+                "databaseId": manifest["backend"]["candidateCi"]["runId"],
+                "workflowName": "Production Clearance CI",
+                "workflowDatabaseId": WORKFLOW_DATABASE_ID,
+                "event": "workflow_dispatch",
+            }
+            receipt = {
+                **manifest["backend"]["receiptCi"],
+                "databaseId": manifest["backend"]["receiptCi"]["runId"],
+                "workflowName": "Production Clearance CI",
+                "workflowDatabaseId": WORKFLOW_DATABASE_ID,
+                "event": "push",
+            }
+            fake_gh.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    case "$*" in
+                      *"{candidate['databaseId']}"*) printf '%s\\n' '{json.dumps(candidate, separators=(',', ':'))}' ;;
+                      *"{receipt['databaseId']}"*) printf '%s\\n' '{json.dumps(receipt, separators=(',', ':'))}' ;;
+                      *) exit 44 ;;
+                    esac
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+            result = self._validate(manifest, "--verify-github", env=env)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("GitHub CI attestation mismatch", result.stderr)
+
     def test_ci_workflow_checks_out_and_verifies_an_exact_candidate_sha(self):
         workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("candidate_sha:", workflow)
@@ -280,6 +454,8 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertIn('^[0-9a-f]{40}$', workflow)
         self.assertIn("scripts/verify_release_manifest.py", workflow)
         self.assertIn("tests.test_release_manifest", workflow)
+        self.assertIn("tests.test_process_user_production_deploy_contract", workflow)
+        self.assertIn('--expected-candidate-sha "$CANDIDATE_SHA"', workflow)
 
 
 if __name__ == "__main__":

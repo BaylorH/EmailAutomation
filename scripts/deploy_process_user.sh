@@ -12,6 +12,8 @@ SERVICE="process-user"
 IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/${SERVICE}"
 SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+MANIFEST_PATH="$REPO_ROOT/docs/release-safety/production-release-manifest.json"
+MANIFEST_VALIDATOR="$REPO_ROOT/scripts/verify_release_manifest.py"
 
 mode="dry-run"
 case "${1:-}" in
@@ -29,21 +31,40 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
   printf 'Refusing: deployment checkout must be clean.\n' >&2
   exit 67
 fi
-full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-if [[ ! "$full_sha" =~ ^[0-9a-f]{40}$ ]]; then
-  printf 'Refusing: git HEAD did not resolve to an exact lowercase SHA.\n' >&2
+controller_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+if [[ ! "$controller_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'Refusing: release-controller HEAD did not resolve to an exact lowercase SHA.\n' >&2
   exit 68
 fi
-short_sha="${full_sha:0:12}"
+
+python3 "$MANIFEST_VALIDATOR" "$MANIFEST_PATH" >/dev/null
+manifest_fields="$({
+  python3 -c '
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+backend = manifest["backend"]
+print("{}\t{}\t{}".format(
+    backend["candidateSha"],
+    backend["candidateCi"]["runId"],
+    backend["deploymentConfigHash"],
+))
+' "$MANIFEST_PATH"
+})"
+IFS=$'\t' read -r candidate_sha candidate_ci_run_id expected_config_hash <<< "$manifest_fields"
+short_sha="${candidate_sha:0:12}"
 image_tag="${IMAGE_REPOSITORY}:${short_sha}"
 expected_revision="${SERVICE}-${short_sha}"
 
-build_command=(
+dry_run_build_command=(
   gcloud builds submit
   --account "$ACCOUNT"
   --project "$PROJECT"
   --tag "$image_tag"
-  "$REPO_ROOT"
+  --suppress-logs
+  --format=value\(id\)
+  "<candidate-archive:${candidate_sha}>"
 )
 digest_command=(
   gcloud artifacts docker images describe "$image_tag"
@@ -77,15 +98,58 @@ print_command() {
 
 if [[ "$mode" == "dry-run" ]]; then
   printf 'dry-run: zero gcloud commands will execute\n'
+  printf 'release controller: %s\n' "$controller_sha"
+  printf 'manifest candidate: %s\n' "$candidate_sha"
+  printf 'candidate CI run: %s\n' "$candidate_ci_run_id"
   printf 'image tag: %s\n' "$image_tag"
   printf 'expected revision: %s\n' "$expected_revision"
   print_command "${service_readback_command[@]}"
-  print_command "${build_command[@]}"
+  print_command "${dry_run_build_command[@]}"
   print_command "${digest_command[@]}"
   printf 'deploy image after digest resolution: %s@sha256:<64-hex-digest>\n' "$image_tag"
   print_command "${revision_readback_command[@]}"
   exit 0
 fi
+
+controller_ci_run_id="${PROCESS_USER_CONTROLLER_CI_RUN_ID:-}"
+if [[ ! "$controller_ci_run_id" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Refusing: PROCESS_USER_CONTROLLER_CI_RUN_ID must identify the successful exact-controller CI run.\n' >&2
+  exit 69
+fi
+
+python3 "$MANIFEST_VALIDATOR" \
+  "$MANIFEST_PATH" \
+  --expected-candidate-sha "$candidate_sha" \
+  --verify-github \
+  --controller-sha "$controller_sha" \
+  --controller-ci-run-id "$controller_ci_run_id" >/dev/null
+
+if ! git -C "$REPO_ROOT" cat-file -e "${candidate_sha}^{commit}"; then
+  printf 'Refusing: manifest candidate is unavailable in the approved repository.\n' >&2
+  exit 70
+fi
+
+build_root="$(mktemp -d "${TMPDIR:-/tmp}/sitesift-process-user-candidate.XXXXXX")"
+cleanup_build_root() {
+  rm -rf -- "$build_root"
+}
+trap cleanup_build_root EXIT
+git -C "$REPO_ROOT" archive --format=tar "$candidate_sha" | tar -xf - -C "$build_root"
+if [[ ! -f "$build_root/Dockerfile" || ! -f "$build_root/.gcloudignore" ]]; then
+  printf 'Refusing: exact candidate archive is missing deployment inputs.\n' >&2
+  exit 71
+fi
+printf 'candidate archive: %s from %s\n' "$build_root" "$candidate_sha"
+
+build_command=(
+  gcloud builds submit
+  --account "$ACCOUNT"
+  --project "$PROJECT"
+  --tag "$image_tag"
+  --suppress-logs
+  --format=value\(id\)
+  "$build_root"
+)
 
 process_user_gcloud_preflight apply
 
@@ -110,11 +174,46 @@ print(revision)
 ' <<< "$predeploy_service_json"
 )"
 
-"${build_command[@]}"
-digest="$("${digest_command[@]}")"
-if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  printf 'Refusing to deploy: Artifact Registry returned invalid digest %q.\n' "$digest" >&2
+build_id="$("${build_command[@]}")"
+if [[ ! "$build_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  printf 'Refusing to deploy: Cloud Build returned invalid build ID %q.\n' "$build_id" >&2
   exit 72
+fi
+build_readback_command=(
+  gcloud builds describe "$build_id"
+  --account "$ACCOUNT"
+  --project "$PROJECT"
+  '--format=json(id,status,results.images)'
+)
+build_json="$("${build_readback_command[@]}")"
+digest="$(
+  python3 -c '
+import json
+import re
+import sys
+
+build = json.load(sys.stdin)
+expected_id, expected_name = sys.argv[1:]
+if build.get("id") != expected_id:
+    raise SystemExit("Refusing to deploy: Cloud Build readback returned the wrong build.")
+if build.get("status") != "SUCCESS":
+    raise SystemExit("Refusing to deploy: exact Cloud Build did not succeed.")
+images = build.get("results", {}).get("images")
+if not isinstance(images, list) or len(images) != 1:
+    raise SystemExit("Refusing to deploy: exact Cloud Build image result is ambiguous.")
+image = images[0]
+if not isinstance(image, dict) or image.get("name") != expected_name:
+    raise SystemExit("Refusing to deploy: exact Cloud Build produced the wrong image tag.")
+digest = image.get("digest")
+if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+    raise SystemExit("Refusing to deploy: exact Cloud Build returned an invalid digest.")
+print(digest)
+' "$build_id" "$image_tag" <<< "$build_json"
+)"
+tag_digest="$("${digest_command[@]}")"
+if [[ ! "$tag_digest" =~ ^sha256:[0-9a-f]{64}$ || "$tag_digest" != "$digest" ]]; then
+  printf 'Refusing to deploy: image tag does not resolve to the exact Cloud Build digest.\n' >&2
+  exit 73
 fi
 
 immutable_image="${image_tag}@${digest}"
@@ -184,7 +283,7 @@ import json
 import sys
 
 revision = json.load(sys.stdin)
-expected_revision, expected_image = sys.argv[1:]
+expected_revision, expected_image, expected_config_hash = sys.argv[1:]
 if revision.get("metadata", {}).get("name") != expected_revision:
     raise SystemExit("Postdeploy mismatch: revision readback returned the wrong revision.")
 spec = revision.get("spec")
@@ -212,19 +311,35 @@ if outbound != "paused":
 if coordinator != "disabled":
     raise SystemExit("Postdeploy mismatch: coordinator mode is not disabled.")
 canonical_spec = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-config_hash = "sha256:" + hashlib.sha256(canonical_spec.encode("utf-8")).hexdigest()
+normalized_spec = json.loads(canonical_spec)
+for normalized_container in normalized_spec["containers"]:
+    normalized_container["image"] = "IMAGE_DIGEST_BOUND_AT_DEPLOY"
+canonical_normalized_spec = json.dumps(
+    normalized_spec,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
+config_hash = "sha256:" + hashlib.sha256(
+    canonical_normalized_spec.encode("utf-8")
+).hexdigest()
+if config_hash != expected_config_hash:
+    raise SystemExit(
+        "Postdeploy mismatch: configuration hash differs from the approved manifest."
+    )
 print(f"{outbound}\t{coordinator}\t{config_hash}")
-' "$expected_revision" "$canonical_image" <<< "$revision_json"
+' "$expected_revision" "$canonical_image" "$expected_config_hash" <<< "$revision_json"
 )"
 IFS=$'\t' read -r outbound_mode coordinator_mode config_hash <<< "$revision_readback"
 
-tag_digest="$("${digest_command[@]}")"
-if [[ ! "$tag_digest" =~ ^sha256:[0-9a-f]{64}$ || "$tag_digest" != "$digest" ]]; then
+post_tag_digest="$("${digest_command[@]}")"
+if [[ ! "$post_tag_digest" =~ ^sha256:[0-9a-f]{64}$ || "$post_tag_digest" != "$digest" ]]; then
   printf 'Postdeploy mismatch: commit tag no longer resolves to deployed digest.\n' >&2
-  exit 73
+  exit 74
 fi
 
 printf 'revision: %s\n' "$expected_revision"
+printf 'cloud build: %s\n' "$build_id"
 printf 'image digest: %s\n' "$digest"
 printf 'commit tag: %s\n' "$short_sha"
 printf 'config hash: %s\n' "$config_hash"

@@ -81,14 +81,22 @@ jobs:
           python -m unittest
           auth_service.test_auth_service_isolation
           tests.test_release_manifest
+          tests.test_process_user_production_deploy_contract
           tests.test_jill_live_campaign_regressions
           tests.test_full_campaign_e2e
           -v
 
       - name: Validate immutable release provenance
-        run: >-
-          python scripts/verify_release_manifest.py
-          docs/release-safety/production-release-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_args=()
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            manifest_args+=(--expected-candidate-sha "$CANDIDATE_SHA")
+          fi
+          python scripts/verify_release_manifest.py \
+            docs/release-safety/production-release-manifest.json \
+            "${manifest_args[@]}"
 
       - name: Run complete B1 focused suite
         run: >-

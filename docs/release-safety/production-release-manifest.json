@@ -28,6 +28,8 @@
     "deployedRevision": "process-user-jill-one-202608020520",
     "configHash": "sha256:91e7cbc747daa1f693ce3ec67ccc64052c5e9716eda62d28b80448efafa56589",
     "configHashAlgorithm": "sha256:canonical-json(spec)",
+    "deploymentConfigHash": "sha256:bd1f4eccf57a4116d415eccf21f6eea061ad343401e9e40d645f7780dfdd0d62",
+    "deploymentConfigHashAlgorithm": "sha256:canonical-json(spec,image=IMAGE_DIGEST_BOUND_AT_DEPLOY)",
     "trafficPercent": 100,
     "rollbackRevision": "process-user-jill-one-202608020520",
     "observedDarkDeployment": {
@@ -44,6 +46,9 @@
     "productionSha": "52aa66299751893bbf9ec596d7fa84c5a767933d",
     "observedCandidateSha": "45b182d244753769620ab78b4b9dd542a9cb055b",
     "functionRevision": "api-00110-cib",
-    "functionCommitMapping": "BLOCKED_PROVENANCE"
+    "functionCommitMapping": "BLOCKED_PROVENANCE",
+    "hostingReleaseId": "BLOCKED_PROVENANCE",
+    "hostingRollbackReleaseId": "BLOCKED_PROVENANCE",
+    "hostingCommitMapping": "BLOCKED_PROVENANCE"
   }
 }

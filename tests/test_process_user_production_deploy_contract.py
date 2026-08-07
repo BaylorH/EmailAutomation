@@ -1,6 +1,8 @@
 """Black-box safety contract for the process-user Release A deployment."""
 
 from pathlib import Path
+import copy
+import hashlib
 import json
 import os
 import re
@@ -15,6 +17,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_process_user.sh"
+RELEASE_MANIFEST = REPO_ROOT / "docs" / "release-safety" / "production-release-manifest.json"
 PREFLIGHT_HELPER = REPO_ROOT / "scripts" / "process_user_gcloud_preflight.sh"
 DEPLOY_README = REPO_ROOT / "deploy" / "README.md"
 GCLOUD_IGNORE = REPO_ROOT / ".gcloudignore"
@@ -25,7 +28,10 @@ PROJECT = "email-automation-cache"
 PROJECT_NUMBER = "248289505828"
 REGION = "us-central1"
 SERVICE = "process-user"
-SHA = "1234567890abcdef1234567890abcdef12345678"
+CONTROLLER_SHA = "1234567890abcdef1234567890abcdef12345678"
+CONTROLLER_CI_RUN_ID = 40000000000
+WORKFLOW_DATABASE_ID = 327317922
+SHA = "c3f452b31a34797b629c27e0397c77bf9beecdea"
 SHORT_SHA = SHA[:12]
 TAG = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
@@ -44,6 +50,8 @@ ROLLBACK_IMAGE = (
 )
 RELEASE_REVISION = "process-user-release-a-abc123"
 CREATED_REVISION = f"{SERVICE}-{SHORT_SHA}"
+CANDIDATE_ARCHIVE = "<candidate-archive>"
+BUILD_ID = "d9fb5b75-4c0d-4a2e-9811-5fd6da79c761"
 
 ENV_VARS = (
     "^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:"
@@ -62,6 +70,159 @@ SECRETS = (
     "GOOGLE_REFRESH_TOKEN=GOOGLE_REFRESH_TOKEN:latest"
 )
 
+FAKE_REVISION_SPEC = {
+    "containerConcurrency": 1,
+    "containers": [
+        {
+            "args": [
+                "--bind=:8080",
+                "--workers=1",
+                "--threads=8",
+                "--max-requests=1",
+                "--timeout=0",
+                "service:app",
+            ],
+            "command": ["gunicorn"],
+            "env": [
+                {
+                    "name": "FIREBASE_BUCKET",
+                    "value": "email-automation-cache.firebasestorage.app",
+                },
+                {"name": "ENFORCE_OPENAI_BUDGET", "value": "1"},
+                {"name": "USAGE_MONTHLY_BUDGET_USD", "value": "100"},
+                {
+                    "name": "SITESIFT_AUTO_REPLY_ALLOWLIST",
+                    "value": "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+                },
+                {
+                    "name": "AZURE_API_APP_ID",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "key": "latest",
+                            "name": "AZURE_API_APP_ID",
+                        }
+                    },
+                },
+                {
+                    "name": "AZURE_API_CLIENT_SECRET",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "key": "latest",
+                            "name": "AZURE_API_CLIENT_SECRET",
+                        }
+                    },
+                },
+                {
+                    "name": "FIREBASE_API_KEY",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "key": "latest",
+                            "name": "FIREBASE_API_KEY",
+                        }
+                    },
+                },
+                {
+                    "name": "OPENAI_API_KEY",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "key": "latest",
+                            "name": "OPENAI_API_KEY",
+                        }
+                    },
+                },
+                {
+                    "name": "GOOGLE_OAUTH_CLIENT_ID",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "key": "latest",
+                            "name": "GOOGLE_OAUTH_CLIENT_ID",
+                        }
+                    },
+                },
+                {
+                    "name": "GOOGLE_OAUTH_CLIENT_SECRET",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "key": "latest",
+                            "name": "GOOGLE_OAUTH_CLIENT_SECRET",
+                        }
+                    },
+                },
+                {
+                    "name": "GOOGLE_REFRESH_TOKEN",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "key": "latest",
+                            "name": "GOOGLE_REFRESH_TOKEN",
+                        }
+                    },
+                },
+                {"name": "SITESIFT_DAILY_SEND_CAP", "value": "5"},
+                {
+                    "name": "SITESIFT_TOUR_ACTION_ALLOWLIST",
+                    "value": "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+                },
+                {"name": "SITESIFT_OUTBOUND_MODE", "value": "paused"},
+                {"name": "SITESIFT_SOURCE_COORDINATOR_MODE", "value": "disabled"},
+            ],
+            "image": CANONICAL_IMAGE,
+            "name": "process-user-1",
+            "ports": [{"containerPort": 8080, "name": "http1"}],
+            "resources": {"limits": {"cpu": "1000m", "memory": "2Gi"}},
+            "startupProbe": {
+                "failureThreshold": 1,
+                "periodSeconds": 240,
+                "tcpSocket": {"port": 8080},
+                "timeoutSeconds": 240,
+            },
+        }
+    ],
+    "serviceAccountName": SERVICE_ACCOUNT,
+    "timeoutSeconds": 540,
+}
+
+
+def _normalized_config_hash(spec: dict) -> str:
+    normalized = copy.deepcopy(spec)
+    for container in normalized["containers"]:
+        container["image"] = "IMAGE_DIGEST_BOUND_AT_DEPLOY"
+    payload = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+FAKE_CONFIG_HASH = _normalized_config_hash(FAKE_REVISION_SPEC)
+
+
+def _fake_revision_json(scenario: str) -> str:
+    spec = copy.deepcopy(FAKE_REVISION_SPEC)
+    container = spec["containers"][0]
+    if scenario == "post_digest_mismatch":
+        container["image"] = (
+            "us-central1-docker.pkg.dev/email-automation-cache/"
+            "cloud-run-source-deploy/process-user@sha256:" + "b" * 64
+        )
+    elif scenario == "post_outbound_mismatch":
+        next(
+            row for row in container["env"]
+            if row["name"] == "SITESIFT_OUTBOUND_MODE"
+        )["value"] = "live"
+    elif scenario == "post_coordinator_mismatch":
+        next(
+            row for row in container["env"]
+            if row["name"] == "SITESIFT_SOURCE_COORDINATOR_MODE"
+        )["value"] = "enabled"
+    elif scenario == "post_config_mismatch":
+        spec["containerConcurrency"] = 2
+    return json.dumps(
+        {"metadata": {"name": CREATED_REVISION}, "spec": spec},
+        separators=(",", ":"),
+    )
+
 
 def _write_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
@@ -77,8 +238,8 @@ class DeployScriptContractTests(unittest.TestCase):
         self.bin_dir.mkdir()
         self.gcloud_log = self.tmp / "gcloud.log"
         self.git_log = self.tmp / "git.log"
+        self.gh_log = self.tmp / "gh.log"
         self.deploy_marker = self.tmp / "deployed"
-
         _write_executable(
             self.bin_dir / "git",
             textwrap.dedent(
@@ -99,8 +260,57 @@ class DeployScriptContractTests(unittest.TestCase):
                     ;;
                   "rev-parse --short=12 HEAD") printf '%s\\n' "${FAKE_GIT_SHA%????????????????????????????}"; exit 0 ;;
                   "rev-parse HEAD") printf '%s\\n' "$FAKE_GIT_SHA"; exit 0 ;;
+                  "cat-file -e "*)
+                    [ "$FAKE_GCLOUD_SCENARIO" = "candidate_missing" ] && exit 1
+                    exit 0
+                    ;;
+                  "archive --format=tar c3f452b31a34797b629c27e0397c77bf9beecdea")
+                    /usr/bin/tar -cf - -C "$FAKE_REPO_ROOT" Dockerfile .gcloudignore
+                    exit 0
+                    ;;
+                  "archive --format=tar "*) exit 66 ;;
                 esac
                 exit 64
+                """
+            ),
+        )
+        _write_executable(
+            self.bin_dir / "gh",
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
+                if [ "$FAKE_GCLOUD_SCENARIO" = "remote_ci_mismatch" ]; then
+                  printf '%s\\n' '{"databaseId":1,"url":"https://github.com/BaylorH/EmailAutomation/actions/runs/1","headSha":"0000000000000000000000000000000000000000","status":"completed","conclusion":"success","workflowName":"Production Clearance CI","workflowDatabaseId":327317922,"event":"push"}'
+                  exit 0
+                fi
+                if [ "$FAKE_GCLOUD_SCENARIO" = "controller_ci_mismatch" ] &&
+                   printf '%s' "$*" | grep -q "40000000000"; then
+                  printf '%s\\n' '{"databaseId":40000000000,"url":"https://github.com/BaylorH/EmailAutomation/actions/runs/40000000000","headSha":"0000000000000000000000000000000000000000","status":"completed","conclusion":"success","workflowName":"Production Clearance CI","workflowDatabaseId":327317922,"event":"push"}'
+                  exit 0
+                fi
+                if [ "$FAKE_GCLOUD_SCENARIO" = "controller_ci_dispatch" ] &&
+                   printf '%s' "$*" | grep -q "40000000000"; then
+                  printf '%s\\n' '{"databaseId":40000000000,"url":"https://github.com/BaylorH/EmailAutomation/actions/runs/40000000000","headSha":"1234567890abcdef1234567890abcdef12345678","status":"completed","conclusion":"success","workflowName":"Production Clearance CI","workflowDatabaseId":327317922,"event":"workflow_dispatch"}'
+                  exit 0
+                fi
+                if [ "$FAKE_GCLOUD_SCENARIO" = "controller_ci_wrong_workflow" ] &&
+                   printf '%s' "$*" | grep -q "40000000000"; then
+                  printf '%s\\n' '{"databaseId":40000000000,"url":"https://github.com/BaylorH/EmailAutomation/actions/runs/40000000000","headSha":"1234567890abcdef1234567890abcdef12345678","status":"completed","conclusion":"success","workflowName":"Production Clearance CI","workflowDatabaseId":999999999,"event":"push"}'
+                  exit 0
+                fi
+                case "$*" in
+                  *"40000000000"*)
+                    printf '%s\\n' '{"databaseId":40000000000,"url":"https://github.com/BaylorH/EmailAutomation/actions/runs/40000000000","headSha":"1234567890abcdef1234567890abcdef12345678","status":"completed","conclusion":"success","workflowName":"Production Clearance CI","workflowDatabaseId":327317922,"event":"push"}'
+                    ;;
+                  *"31131399984"*)
+                    printf '%s\\n' '{"databaseId":31131399984,"url":"https://github.com/BaylorH/EmailAutomation/actions/runs/31131399984","headSha":"c3f452b31a34797b629c27e0397c77bf9beecdea","status":"completed","conclusion":"success","workflowName":"Production Clearance CI","workflowDatabaseId":327317922,"event":"push"}'
+                    ;;
+                  *"31130849944"*)
+                    printf '%s\\n' '{"databaseId":31130849944,"url":"https://github.com/BaylorH/EmailAutomation/actions/runs/31130849944","headSha":"fb9eaae8e0398135355c636850553f5d54cc7754","status":"completed","conclusion":"success","workflowName":"Production Clearance CI","workflowDatabaseId":327317922,"event":"push"}'
+                    ;;
+                  *) exit 44 ;;
+                esac
                 """
             ),
         )
@@ -140,11 +350,33 @@ class DeployScriptContractTests(unittest.TestCase):
                     esac
                     exit 0
                     ;;
-                  "builds submit") exit 0 ;;
+                  "builds submit")
+                    case "$FAKE_GCLOUD_SCENARIO" in
+                      invalid_build_id) printf '%s\\n' 'not-a-build-id' ;;
+                      multiline_build_id) printf '%s\\n%s\\n' 'log noise' 'd9fb5b75-4c0d-4a2e-9811-5fd6da79c761' ;;
+                      *) printf '%s\\n' 'd9fb5b75-4c0d-4a2e-9811-5fd6da79c761' ;;
+                    esac
+                    exit 0
+                    ;;
+                  "builds describe")
+                    build_status='SUCCESS'
+                    build_name='us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user:c3f452b31a34'
+                    build_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                    case "$FAKE_GCLOUD_SCENARIO" in
+                      build_result_status_failure) build_status='FAILURE' ;;
+                      build_result_name_mismatch) build_name='us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user:other' ;;
+                      build_result_invalid_digest) build_digest='latest' ;;
+                    esac
+                    printf '{"id":"d9fb5b75-4c0d-4a2e-9811-5fd6da79c761","status":"%s","results":{"images":[{"name":"%s","digest":"%s"}]}}\\n' "$build_status" "$build_name" "$build_digest"
+                    exit 0
+                    ;;
                   "artifacts docker")
                     case "$FAKE_GCLOUD_SCENARIO" in
                       empty_digest) exit 0 ;;
                       invalid_digest) printf '%s\\n' 'latest' ;;
+                      build_result_digest_mismatch)
+                        printf '%s\\n' 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+                        ;;
                       post_tag_digest_mismatch)
                         artifact_count="$(grep -c '^artifacts docker' "$FAKE_GCLOUD_LOG")"
                         if [ "$artifact_count" -gt 1 ]; then
@@ -165,32 +397,22 @@ class DeployScriptContractTests(unittest.TestCase):
                     fi
                     case "$FAKE_GCLOUD_SCENARIO" in
                       post_revision_mismatch)
-                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-unexpected","traffic":[{"revisionName":"process-user-1234567890ab","tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":100}]}}'
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-unexpected","traffic":[{"revisionName":"process-user-c3f452b31a34","tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":100}]}}'
                         ;;
                       post_traffic_mismatch)
-                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-1234567890ab","traffic":[{"revisionName":"process-user-1234567890ab","percent":1,"tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":99}]}}'
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-c3f452b31a34","traffic":[{"revisionName":"process-user-c3f452b31a34","percent":1,"tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":99}]}}'
                         ;;
                       post_rollback_mismatch)
-                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-1234567890ab","traffic":[{"revisionName":"process-user-1234567890ab","tag":"release-a"},{"revisionName":"process-user-other","percent":100}]}}'
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-c3f452b31a34","traffic":[{"revisionName":"process-user-c3f452b31a34","tag":"release-a"},{"revisionName":"process-user-other","percent":100}]}}'
                         ;;
                       *)
-                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-1234567890ab","traffic":[{"revisionName":"process-user-1234567890ab","tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":100,"tag":"jill-one"}]}}'
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-c3f452b31a34","traffic":[{"revisionName":"process-user-c3f452b31a34","tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":100,"tag":"jill-one"}]}}'
                         ;;
                     esac
                     exit 0
                     ;;
                   "run revisions")
-                    revision_image='us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-                    outbound_mode='paused'
-                    coordinator_mode='disabled'
-                    case "$FAKE_GCLOUD_SCENARIO" in
-                      post_digest_mismatch)
-                        revision_image='us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-                        ;;
-                      post_outbound_mismatch) outbound_mode='live' ;;
-                      post_coordinator_mismatch) coordinator_mode='enabled' ;;
-                    esac
-                    printf '{"metadata":{"name":"process-user-1234567890ab"},"spec":{"containerConcurrency":1,"containers":[{"image":"%s","env":[{"name":"SITESIFT_OUTBOUND_MODE","value":"%s"},{"name":"SITESIFT_SOURCE_COORDINATOR_MODE","value":"%s"}]}]}}\\n' "$revision_image" "$outbound_mode" "$coordinator_mode"
+                    printf '%s\\n' "$FAKE_REVISION_JSON"
                     exit 0
                     ;;
                 esac
@@ -207,17 +429,25 @@ class DeployScriptContractTests(unittest.TestCase):
         scenario: str = "ok",
         cwd: Path = REPO_ROOT,
         impersonation_env: str | None = None,
+        controller_ci_run_id: int | None = CONTROLLER_CI_RUN_ID,
     ):
-        for path in (self.gcloud_log, self.git_log, self.deploy_marker):
+        for path in (self.gcloud_log, self.git_log, self.gh_log, self.deploy_marker):
             path.unlink(missing_ok=True)
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
         env["FAKE_GCLOUD_LOG"] = str(self.gcloud_log)
         env["FAKE_GIT_LOG"] = str(self.git_log)
-        env["FAKE_GIT_SHA"] = SHA
+        env["FAKE_GH_LOG"] = str(self.gh_log)
+        env["FAKE_GIT_SHA"] = CONTROLLER_SHA
         env["FAKE_REPO_ROOT"] = str(REPO_ROOT)
         env["FAKE_GCLOUD_SCENARIO"] = scenario
         env["FAKE_DEPLOY_MARKER"] = str(self.deploy_marker)
+        env["FAKE_REVISION_JSON"] = _fake_revision_json(scenario)
+        env.pop("PROCESS_USER_RELEASE_MANIFEST", None)
+        if controller_ci_run_id is None:
+            env.pop("PROCESS_USER_CONTROLLER_CI_RUN_ID", None)
+        else:
+            env["PROCESS_USER_CONTROLLER_CI_RUN_ID"] = str(controller_ci_run_id)
         if impersonation_env is None:
             env.pop("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", None)
         else:
@@ -238,7 +468,11 @@ class DeployScriptContractTests(unittest.TestCase):
     def _gcloud_calls(self) -> list[list[str]]:
         if not self.gcloud_log.exists():
             return []
-        return [shlex.split(line) for line in self.gcloud_log.read_text().splitlines()]
+        calls = [shlex.split(line) for line in self.gcloud_log.read_text().splitlines()]
+        for call in calls:
+            if call[:2] == ["builds", "submit"]:
+                call[-1] = CANDIDATE_ARCHIVE
+        return calls
 
     def _git_calls(self) -> list[list[str]]:
         if not self.git_log.exists():
@@ -252,6 +486,13 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(self._git_calls(), self._git_preflight_calls())
         self.assertIn(TAG, result.stdout)
         self.assertIn("dry-run", result.stdout.lower())
+
+    def test_fake_revision_matches_the_approved_deployment_config_hash(self):
+        manifest = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["backend"]["deploymentConfigHash"],
+            FAKE_CONFIG_HASH,
+        )
 
     def test_deploy_script_sources_shared_preflight_helper(self):
         script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
@@ -383,6 +624,92 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(self._gcloud_calls(), [])
         self.assertEqual(self._git_calls(), self._git_preflight_calls())
 
+    def test_dry_run_targets_manifest_candidate_not_ambient_controller_head(self):
+        result = self._run("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(SHORT_SHA, result.stdout)
+        image_section = result.stdout.split("image tag:", 1)[1]
+        self.assertNotIn(CONTROLLER_SHA[:12], image_section)
+
+    def test_apply_requires_remote_ci_attestation_before_gcloud(self):
+        result = self._run("--apply", scenario="remote_ci_mismatch")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_apply_requires_a_controller_ci_run_id(self):
+        result = self._run("--apply", controller_ci_run_id=None)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_apply_remotely_attests_the_exact_controller_head(self):
+        result = self._run("--apply", scenario="controller_ci_mismatch")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_apply_rejects_manual_dispatch_as_controller_attestation(self):
+        result = self._run("--apply", scenario="controller_ci_dispatch")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_apply_rejects_same_named_wrong_controller_workflow(self):
+        result = self._run("--apply", scenario="controller_ci_wrong_workflow")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_release_manifest_cannot_be_overridden_outside_the_controller_checkout(self):
+        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("PROCESS_USER_RELEASE_MANIFEST", script)
+
+    def test_apply_refuses_a_candidate_missing_from_the_approved_repository(self):
+        result = self._run("--apply", scenario="candidate_missing")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_apply_builds_an_exact_manifest_candidate_archive_not_repo_root(self):
+        result = self._run("--apply")
+        self.assertEqual(0, result.returncode, result.stderr)
+        build = next(call for call in self._gcloud_calls() if call[:2] == ["builds", "submit"])
+        self.assertEqual(CANDIDATE_ARCHIVE, build[-1])
+        self.assertIn("candidate archive", result.stdout)
+        self.assertIn(
+            ["-C", str(REPO_ROOT), "archive", "--format=tar", SHA],
+            self._git_calls(),
+        )
+
+    def test_apply_binds_digest_to_exact_successful_cloud_build_result(self):
+        result = self._run("--apply")
+        self.assertEqual(0, result.returncode, result.stderr)
+        calls = self._gcloud_calls()
+        self.assertLess(calls.index(self._build_call()), calls.index(self._build_readback_call()))
+        self.assertLess(calls.index(self._build_readback_call()), calls.index(self._digest_call()))
+        self.assertLess(calls.index(self._digest_call()), calls.index(self._deploy_call()))
+
+    def test_apply_rejects_build_result_or_tag_mismatch_before_deploy(self):
+        for scenario in (
+            "build_result_status_failure",
+            "build_result_name_mismatch",
+            "build_result_invalid_digest",
+            "build_result_digest_mismatch",
+        ):
+            with self.subTest(scenario=scenario):
+                result = self._run("--apply", scenario=scenario)
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(
+                    any(call[:2] == ["run", "deploy"] for call in self._gcloud_calls())
+                )
+
+    def test_apply_rejects_invalid_or_multiline_build_id_before_readback(self):
+        for scenario in ("invalid_build_id", "multiline_build_id"):
+            with self.subTest(scenario=scenario):
+                result = self._run("--apply", scenario=scenario)
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(
+                    any(call[:2] == ["builds", "describe"] for call in self._gcloud_calls())
+                )
+                self.assertFalse(
+                    any(call[:2] == ["run", "deploy"] for call in self._gcloud_calls())
+                )
+
     def test_missing_principal_stops_before_git_or_gcloud(self):
         result = self._run("--apply", account=None)
         self.assertNotEqual(result.returncode, 0)
@@ -468,14 +795,15 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(calls[:3], self._preflight_calls())
         self.assertEqual(calls[3], self._service_readback_call())
         self.assertEqual(calls[4], self._build_call())
-        self.assertEqual(calls[5], self._digest_call())
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(calls[5], self._build_readback_call())
+        self.assertEqual(calls[6], self._digest_call())
+        self.assertEqual(len(calls), 7)
 
     def test_invalid_digest_stops_before_deploy(self):
         result = self._run("--apply", scenario="invalid_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 7)
         self.assertEqual(calls[-1], self._digest_call())
         self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
 
@@ -488,6 +816,7 @@ class DeployScriptContractTests(unittest.TestCase):
                 *self._preflight_calls(),
                 self._service_readback_call(),
                 self._build_call(),
+                self._build_readback_call(),
                 self._digest_call(),
                 self._deploy_call(),
                 self._service_readback_call(),
@@ -519,6 +848,7 @@ class DeployScriptContractTests(unittest.TestCase):
             "post_traffic_mismatch",
             "post_rollback_mismatch",
             "post_tag_digest_mismatch",
+            "post_config_mismatch",
         )
         for scenario in scenarios:
             with self.subTest(scenario=scenario):
@@ -553,6 +883,12 @@ class DeployScriptContractTests(unittest.TestCase):
         env_vars = deploy[deploy.index("--update-env-vars") + 1]
         self.assertIn(":SITESIFT_OUTBOUND_MODE=paused:", env_vars)
         self.assertTrue(env_vars.endswith(":SITESIFT_SOURCE_COORDINATOR_MODE=disabled"))
+
+    def test_apply_compares_the_full_normalized_revision_config_to_manifest(self):
+        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("deploymentConfigHash", script)
+        self.assertIn("IMAGE_DIGEST_BOUND_AT_DEPLOY", script)
+        self.assertIn("configuration hash differs from the approved manifest", script)
 
     def test_every_gcloud_call_binds_explicit_account_and_project(self):
         result = self._run("--apply")
@@ -613,7 +949,20 @@ class DeployScriptContractTests(unittest.TestCase):
             "--account", ACCOUNT,
             "--project", PROJECT,
             "--tag", TAG,
-            str(REPO_ROOT),
+            "--suppress-logs",
+            "--format=value(id)",
+            CANDIDATE_ARCHIVE,
+        ]
+
+    @staticmethod
+    def _build_readback_call() -> list[str]:
+        return [
+            "builds",
+            "describe",
+            BUILD_ID,
+            "--account", ACCOUNT,
+            "--project", PROJECT,
+            "--format=json(id,status,results.images)",
         ]
 
     @staticmethod
