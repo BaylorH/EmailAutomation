@@ -132,6 +132,45 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_expense_owned_per_sf_nnn_never_duplicates_into_rent(self):
+        examples = (
+            "Expenses are $3.65/SF NNN.",
+            "Pass-throughs are $3.65/SF NNN.",
+            "TMI is $3.65/SF NNN.",
+            "Separate NNN charges are $3.65 per square foot.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {"updates": []},
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [(None, "3.65", None, "3.65")] * len(examples),
+            results,
+        )
+
     def test_bare_figure_first_nnn_is_neutral_without_field_ownership(self):
         text = "$3.65 NNN."
         self.assertIsNone(ai_processing._extract_rent_sf_yr_from_text(text))
