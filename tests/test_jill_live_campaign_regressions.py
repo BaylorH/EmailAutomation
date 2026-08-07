@@ -282,6 +282,23 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "Prior fee billed monthly. $14.00 NNN + $4.00 OPEX."
         self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_standalone_cam_monthly_sq_ft_variants_are_annualized(self):
+        examples = (
+            "CAM is $0.34 per sq. ft. monthly.",
+            "CAM is $0.34 per sq.ft. monthly.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_monthly_rent_after_colon_does_not_annualize_cam(self):
+        text = "CAM is $4.00/SF: monthly rent is $1.20/SF."
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_monthly_rent_after_comma_does_not_annualize_cam(self):
+        text = "CAM is $4.00/SF, monthly rent is $1.20/SF."
+        self.assertEqual("4.00", ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
