@@ -58,8 +58,11 @@ Decimal points and recognized square-foot abbreviation periods are not clause
 boundaries. Real sentence punctuation remains a boundary. A marker followed by
 a subject, including `monthly-report`, `monthly: rent`, `monthly - rent`,
 `monthly (rent ...)`, `per year parking`, or similar field language, is not
-owned by the OpEx candidate. Conflicting candidate-owned monthly and annual
-markers make an accepted candidate abstain.
+owned by the OpEx candidate. Direct multiword fields such as `property taxes`,
+`real estate taxes`, and `property insurance` are likewise competing subjects.
+By contrast, `for taxes and insurance` after an explicit OpEx rate is a
+supporting component qualifier, including after bare `monthly`. Conflicting
+candidate-owned monthly and annual markers make an accepted candidate abstain.
 
 ### Ambiguous NNN ownership
 
@@ -81,17 +84,24 @@ expense-owned `$3.65 NNN` forms remain supported.
 
 ### Negative evidence and proposal-write safety
 
-Rejected combined totals and non-expense NNN figures are not accepted
-`_OpsExCandidate` records. They remain separate negative evidence with their
-numeric spans plus raw and annualized values. Proposal validation removes only
-an exact rejected value that is not also supported by an accepted candidate.
+Rejected combined totals, combined-equation base-rent figures, and non-expense
+NNN figures are not accepted `_OpsExCandidate` records. They remain separate
+negative evidence with their numeric spans plus raw and annualized values.
+Combined-equation base rent inherits the recognized equation basis without
+entering the accepted winner set. Proposal validation removes only an exact
+rejected value that is not also supported by an accepted candidate.
 
 Combined-total rejection is intentionally stronger than candidate acceptance:
-negative evidence survives an ambiguous or conflicting basis. If the rejected
-total itself contains a monthly token, both raw and conservative x12 values are
-rejected. Thus `CAM plus rent is $1.50/SF/month/year` rejects both `1.50` and
-`18.00`, and unrelated `per year parking` cannot erase the rejection. This check
-runs before terminal-event early returns.
+negative evidence survives an ambiguous or conflicting basis. If the owned
+basis context contains any monthly token, both raw and conservative x12 values
+are rejected regardless of token order or which suffix the outer evidence regex
+captured. Thus combined totals ending in `/month/year`, `/year/month`,
+`per year/month`, `/year per month`, or `/year, billed monthly` reject both
+`1.50` and `18.00`. A conflicting combined equation likewise rejects base rent
+`1.25` and `15.00` even when candidate acceptance abstains. In a recognized
+monthly equation, legitimate OpEx `0.34` and `4.08` remain protected by accepted
+evidence. Unrelated `per year parking` cannot erase a rejection. This check runs
+before terminal-event early returns.
 
 ## Acceptance criteria
 
@@ -101,10 +111,12 @@ runs before terminal-event early returns.
   neutral and conflicting rent/expense ownership abstains.
 - All accepted combined-equation and standalone monthly forms annualize `0.34`
   to `4.08` in both extraction and proposal normalization.
-- Punctuated following subjects and unrelated rent or parking fields do not
-  contaminate candidate basis.
+- Punctuated or multiword following subjects and unrelated rent, parking, tax,
+  or insurance fields do not contaminate candidate basis; an attached
+  `for taxes and insurance` qualifier remains supporting OpEx context.
 - Rejected combined totals remove both raw and annualized proposal values even
-  with terminal events, unrelated annual fields, or `/month/year` conflicts.
+  with terminal events, unrelated annual fields, or monthly/annual conflicts in
+  either order; combined-equation base rent receives the same negative evidence.
 - Jill, the focused five-file backend suite, the release-critical suite, syntax
   compilation, diff checks, and the clean-worktree check pass.
 

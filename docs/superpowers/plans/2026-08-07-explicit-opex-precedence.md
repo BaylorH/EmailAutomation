@@ -61,13 +61,16 @@ the existing `email_automation.ai_processing` pipeline.
   the existing 10-before/30-after basis window reaches its owned suffix.
 - [x] Extend shared unit and monthly phrase handling for `per-SF`, punctuation in
   `sq ft.`, and `billed on a|the monthly basis`.
-- [x] Reject basis markers followed by hyphenated, colon-delimited, or
-  parenthetical subjects while preserving real clause boundaries and attached
-  monthly syntax.
+- [x] Reject basis markers followed by hyphenated, colon-delimited,
+  parenthetical, or multiword competing subjects while preserving real clause
+  boundaries, attached monthly syntax, and supporting `for taxes and insurance`
+  qualifiers on explicit OpEx rates.
 - [x] Preserve combined-total raw negative evidence before basis resolution. On
-  conflict, reject raw plus x12 when the total itself contains a monthly marker.
-- [x] Include rejected NNN and combined-total raw/annual values in proposal
-  validation, but never remove a value also supported by an accepted candidate.
+  conflict, reject raw plus x12 whenever the owned basis context contains a
+  monthly marker, independent of token order or partial outer-regex capture.
+- [x] Include rejected NNN, combined-total, and combined-equation base-rent
+  raw/annual values in proposal validation, but never remove a value also
+  supported by an accepted candidate.
 - [x] Run the consolidated matrix and full Jill file green before documentation.
 
 ## Task 3: Refresh architecture documentation

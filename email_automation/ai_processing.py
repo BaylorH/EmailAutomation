@@ -1584,8 +1584,14 @@ _OPS_EX_COMPETING_BASIS_SUBJECT = (
     rf"(?:{_COMBINED_TOTAL_RENT_LABEL}|base\s+rate|parking|reports?|"
     r"utilities?|invoices?|statements?|summar(?:y|ies))"
 )
+_OPS_EX_TAX_INSURANCE_SUBJECT = (
+    r"(?:(?:(?:property|real\s+estate)\s+)?(?:tax(?:es)?|insurance))"
+)
+_OPS_EX_SUPPORTING_BASIS_QUALIFIER = (
+    r"(?:tax(?:es)?\s+(?:and|&)\s+insurance)"
+)
 _OPS_EX_DIRECT_BASIS_SUBJECT = (
-    rf"(?:{_OPS_EX_COMPETING_BASIS_SUBJECT}|tax(?:es)?|insurance)"
+    rf"(?:{_OPS_EX_COMPETING_BASIS_SUBJECT}|{_OPS_EX_TAX_INSURANCE_SUBJECT})"
 )
 _COMBINED_TOTAL_RELATION = (
     r"(?:plus|and|on\s+top\s+of|in\s+addition\s+to)"
@@ -2082,12 +2088,13 @@ def _ops_ex_basis_values(
             marker_end = window_start + marker_match.end()
             marker = marker_match.group(0).strip().lower()
             bare_markers = {"monthly", "annual", "annually", "yearly"}
+            following_context = text[marker_end:window_end]
 
             if re.match(
                 rf"\s*(?:(?:[-:/]\s*)|\(\s*)?"
                 rf"(?:for\s+{_OPS_EX_COMPETING_BASIS_SUBJECT}|"
                 rf"{_OPS_EX_DIRECT_BASIS_SUBJECT})\b",
-                text[marker_end:window_end],
+                following_context,
                 re.IGNORECASE,
             ):
                 continue
@@ -2153,12 +2160,19 @@ def _ops_ex_basis_values(
                     continue
                 if not _basis_gap_is_attached(gap):
                     continue
-                if marker in bare_markers and re.match(
-                    r"\s*(?:(?:[-:]\s*)|\(\s*)?[a-z]",
-                    text[marker_end:window_end],
-                    re.IGNORECASE,
-                ):
-                    continue
+                if marker in bare_markers:
+                    followed_by_prose = re.match(
+                        r"\s*(?:(?:[-:]\s*)|\(\s*)?[a-z]",
+                        following_context,
+                        re.IGNORECASE,
+                    )
+                    supporting_qualifier = re.match(
+                        rf"\s+for\s+{_OPS_EX_SUPPORTING_BASIS_QUALIFIER}\b",
+                        following_context,
+                        re.IGNORECASE,
+                    )
+                    if followed_by_prose and not supporting_qualifier:
+                        continue
 
             spans.append((marker_start, marker_end))
         return spans
@@ -2183,6 +2197,18 @@ def _ops_ex_basis_values(
     )
 
 
+def _negative_evidence_has_monthly_basis(
+    basis_values: Optional[Tuple[Decimal, Decimal, str, Tuple[int, int]]],
+    raw_value: Decimal,
+) -> bool:
+    """Keep owned monthly evidence even when monthly and annual conflict."""
+    if basis_values is not None:
+        return basis_values[2] == "monthly"
+    # A parsed value at or above the accepted floor reaches None only when the
+    # basis resolver owns both monthly and annual markers and abstains.
+    return raw_value >= Decimal("0.01")
+
+
 def _combined_total_opex_evidence(text: str) -> List[tuple]:
     evidence = []
     for pattern in _COMBINED_TOTAL_OPEX_RES:
@@ -2201,26 +2227,14 @@ def _combined_total_opex_evidence(text: str) -> List[tuple]:
                 match.group("value"),
                 numeric_span=(start, end),
             )
-            if basis_values is not None:
-                _, annualized_value, _, _ = basis_values
-            else:
-                # Negative evidence must survive ambiguous/conflicting basis text.
-                # When the rejected total itself carries a monthly token, reject
-                # both the raw value and its conservative x12 counterpart.
-                attached_basis = re.match(
-                    r"(?:\s*/\s*(?:mo|mos|month|monthly|yr|year|annum|"
-                    r"annual|annually|yearly)\b)+",
-                    text[match.end():],
-                    re.IGNORECASE,
+            annualized_value = (
+                raw_value * Decimal("12")
+                if _negative_evidence_has_monthly_basis(
+                    basis_values,
+                    raw_value,
                 )
-                basis_text = match.group(0) + (
-                    attached_basis.group(0) if attached_basis else ""
-                )
-                annualized_value = (
-                    raw_value * Decimal("12")
-                    if _MONTHLY_UNIT_RE.search(basis_text)
-                    else raw_value
-                )
+                else raw_value
+            )
             evidence.append((start, end, raw_value, annualized_value))
     return evidence
 
@@ -2232,6 +2246,7 @@ def _combined_base_rent_evidence(text: str) -> List[tuple]:
         start, end = match.span(1)
         try:
             raw_value = Decimal(match.group(1))
+            opex_raw_value = Decimal(match.group(2))
         except InvalidOperation:
             continue
         if raw_value < Decimal("0.01"):
@@ -2247,7 +2262,10 @@ def _combined_base_rent_evidence(text: str) -> List[tuple]:
         )
         annualized_value = (
             raw_value * Decimal("12")
-            if opex_basis_values is not None and opex_basis_values[2] == "monthly"
+            if _negative_evidence_has_monthly_basis(
+                opex_basis_values,
+                opex_raw_value,
+            )
             else raw_value
         )
         evidence.append((start, end, raw_value, annualized_value))
