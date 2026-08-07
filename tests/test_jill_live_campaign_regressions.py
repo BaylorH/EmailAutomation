@@ -458,6 +458,38 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "Prior CAM was $4.25/SF; current CAM is $3.90/SF."
         self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_correction_discourse_marks_later_opex_as_current(self):
+        examples = (
+            "CAM is $4.25/SF; correction: CAM is $3.90/SF.",
+            "CAM is $4.25/SF; corrected CAM is $3.90/SF.",
+            "CAM is $4.25/SF; the correct CAM is $3.90/SF.",
+            "CAM is $4.25/SF; actually, CAM is $3.90/SF.",
+            "CAM is $4.25/SF; revised CAM is $3.90/SF.",
+            "CAM is $4.25/SF; updated CAM is $3.90/SF.",
+            "CAM is $4.25/SF; now CAM is $3.90/SF.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {"updates": [{"column": "Ops Ex / SF", "value": "3.90"}]},
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            results.append((
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                ai_processing._proposal_update_for_column(
+                    augmented,
+                    "Ops Ex / SF",
+                )["value"],
+            ))
+
+        self.assertEqual([("3.90", "3.90")] * len(examples), results)
+
     def test_current_cam_outranks_prior_component_list_estimate(self):
         text = (
             "Prior estimate: CAM, taxes, and insurance are estimated around $4.25/SF. "
