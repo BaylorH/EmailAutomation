@@ -1546,25 +1546,56 @@ _OPS_EX_RE = re.compile(
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)",
     re.IGNORECASE,
 )
-_EXPLICIT_OPS_EX_RE = re.compile(
-    r"\b(?:opex|op\s*ex|cam|tmi|operating\s+expenses?)\b"
-    r"([^.!?;\n$]{0,96}?)"
-    r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+_OPS_EX_EXPLICIT_LABEL = r"(?:opex|op\s*ex|cam|tmi|operating\s+expenses?)"
+_OPS_EX_DOLLAR_VALUE = (
+    r"\$\s*(?P<value>[0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
     r"(?:(?:/\s*|\bper\s+)(?:sf|psf|sq\.?\s*ft|square\s+foot))?"
-    r"(?:\s*/?\s*(?:yr|year|annum|mo|month|monthly))?",
+    r"(?:\s*/?\s*(?:yr|year|annum|mo|month|monthly))?"
+)
+_OPS_EX_COMPONENT_LIST_RE = re.compile(
+    rf"\b{_OPS_EX_EXPLICIT_LABEL}\b"
+    r"\s*,\s*(?:property\s+)?tax(?:es)?\s*,?\s*(?:and|&)\s+insurance\b"
+    r"\s+(?:is|are)\s+"
+    r"(?:(?:running|estimated)(?:\s+(?:roughly|approximately|about|around))?|"
+    r"(?:roughly|approximately|about|around))\s*"
+    rf"{_OPS_EX_DOLLAR_VALUE}",
     re.IGNORECASE,
 )
-
-_RENT_ASSIGNMENT_IN_OPS_EX_GAP_RE = re.compile(
-    r"\b(?:asking\s+(?:rental\s+)?rate|quoted\s+(?:rental\s+)?rate|"
-    r"base\s+rent|lease\s+rate|rental\s+rate|asking\s+rent|rent)\b"
-    r"[^,;:]{0,24}?(?:\b(?:is|at|of|runs?|equals?)\b|[:=])\s*$",
+_OPS_EX_RENT_MODIFIER = (
+    r"(?:on\s+top\s+of|in\s+addition\s+to)\s+"
+    r"(?:the\s+)?(?:base\s+)?rent"
+)
+_OPS_EX_RENT_MODIFIER_RE = re.compile(
+    rf"\b{_OPS_EX_EXPLICIT_LABEL}\b\s*"
+    rf"(?:,\s*{_OPS_EX_RENT_MODIFIER}\s*,|"
+    rf"\(\s*{_OPS_EX_RENT_MODIFIER}\s*\))"
+    rf"\s*(?:is|are)\s*{_OPS_EX_DOLLAR_VALUE}",
     re.IGNORECASE,
 )
-_OPS_EX_RELATION_TO_RENT_RE = re.compile(
-    r"\b(?:on\s+top\s+of|in\s+addition\s+to)\s+"
-    r"(?:the\s+)?(?:base\s+)?rent\b",
-    re.IGNORECASE,
+_COMBINED_TOTAL_RENT_LABEL = (
+    r"(?:(?:base|asking)\s+rent|rent|lease\s+rate|rental\s+rate)"
+)
+_COMBINED_TOTAL_RELATION = (
+    r"(?:plus|and|on\s+top\s+of|in\s+addition\s+to)"
+)
+_COMBINED_TOTAL_PREDICATE = (
+    r"(?:(?:(?:combined(?:\s+total)?|all[-\s]?in|gross)"
+    r"(?:\s+(?:rent|rate|cost))?\s+)?"
+    r"(?:is|are|equals?|totals?|comes?\s+to|amounts?\s+to))"
+)
+_COMBINED_TOTAL_OPEX_RES = (
+    re.compile(
+        rf"\b{_OPS_EX_EXPLICIT_LABEL}\b\s+{_COMBINED_TOTAL_RELATION}\s+"
+        rf"(?:the\s+)?{_COMBINED_TOTAL_RENT_LABEL}\b\s+"
+        rf"{_COMBINED_TOTAL_PREDICATE}\s*{_OPS_EX_DOLLAR_VALUE}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{_COMBINED_TOTAL_RENT_LABEL}\b\s+{_COMBINED_TOTAL_RELATION}\s+"
+        rf"{_OPS_EX_EXPLICIT_LABEL}\b\s+{_COMBINED_TOTAL_PREDICATE}\s*"
+        rf"{_OPS_EX_DOLLAR_VALUE}",
+        re.IGNORECASE,
+    ),
 )
 # A rent keyword immediately preceding a $ figure marks that figure as the RENT
 # line. "nnn" is the ONLY lease-basis word in the OpEx label set above, so a
@@ -1857,6 +1888,85 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _annualized_ops_ex_decimal(
+    text: str,
+    start: int,
+    end: int,
+    raw: str,
+) -> Optional[Decimal]:
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    window = text[max(0, start - 15):min(len(text), end + 25)]
+    annual = value * Decimal("12") if _is_monthly_context(window) else value
+    return annual if annual >= Decimal("0.01") else None
+
+
+def _combined_total_opex_evidence(text: str) -> List[tuple]:
+    evidence = []
+    for pattern in _COMBINED_TOTAL_OPEX_RES:
+        for match in pattern.finditer(text or ""):
+            start, end = match.span("value")
+            value = _annualized_ops_ex_decimal(
+                text,
+                match.start(),
+                match.end(),
+                match.group("value"),
+            )
+            if value is not None:
+                evidence.append((start, end, value))
+    return evidence
+
+
+def _ops_ex_standalone_candidates(text: str) -> List[tuple]:
+    """Return non-rejected `(numeric_start, numeric_end, annual_value)` evidence."""
+    text = text or ""
+    rejected = _combined_total_opex_evidence(text)
+    candidates = []
+
+    def _append(match: "re.Match", group: Any) -> None:
+        if _HYPOTHETICAL_RENT_RE.search(
+            text[max(0, match.start() - 40):match.end()]
+        ):
+            return
+        start, end = match.span(group)
+        if any(
+            start < rejected_end and rejected_start < end
+            for rejected_start, rejected_end, _ in rejected
+        ):
+            return
+        value = _annualized_ops_ex_decimal(
+            text,
+            match.start(),
+            match.end(),
+            match.group(group),
+        )
+        if value is not None:
+            candidates.append((start, end, value))
+
+    narrow_matches = sorted(
+        [
+            match
+            for pattern in (_OPS_EX_COMPONENT_LIST_RE, _OPS_EX_RENT_MODIFIER_RE)
+            for match in pattern.finditer(text)
+        ],
+        key=lambda match: match.start(),
+    )
+    for match in narrow_matches:
+        _append(match, "value")
+
+    legacy_matches = list(_OPS_EX_RE.finditer(text))
+    legacy_matches.sort(key=lambda match: match.group(2) is None)
+    for match in legacy_matches:
+        if _opex_match_is_rent_basis_line(text, match):
+            continue
+        group = 1 if match.group(1) is not None else 2
+        if match.group(group) is not None:
+            _append(match, group)
+    return candidates
+
+
 def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
     """Deterministic OpEx / NNN / CAM per-SF-per-year fallback (annualized)."""
     if not text:
@@ -1876,44 +1986,9 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
             if annual >= 0.01:
                 return f"{annual:.2f}"
 
-    for explicit in _EXPLICIT_OPS_EX_RE.finditer(text):
-        gap = explicit.group(1)
-        if (
-            _RENT_ASSIGNMENT_IN_OPS_EX_GAP_RE.search(gap)
-            and not _OPS_EX_RELATION_TO_RENT_RE.search(gap)
-        ):
-            continue
-        if not _HYPOTHETICAL_RENT_RE.search(
-            text[max(0, explicit.start() - 40): explicit.end()]
-        ):
-            value = float(explicit.group(2))
-            window = text[
-                max(0, explicit.start() - 15): min(len(text), explicit.end() + 25)
-            ]
-            annual = value * 12 if _is_monthly_context(window) else value
-            if annual >= 0.01:
-                return f"{annual:.2f}"
-
-    matches = list(_OPS_EX_RE.finditer(text))
-    # An explicit keyword-first figure ("OPEX $4", "CAM is $3") is more
-    # authoritative than an earlier rent figure whose trailing NNN merely names
-    # the lease basis ("$14 NNN, OPEX $4").
-    matches.sort(key=lambda match: match.group(2) is None)
-    for m in matches:
-        if _HYPOTHETICAL_RENT_RE.search(text[max(0, m.start() - 40): m.end()]):
-            continue
-        # Skip a rent-basis line ("Rent $0.82 NNN") so the rent figure is never
-        # mined as OpEx; keep scanning for a genuine OpEx figure downstream.
-        if _opex_match_is_rent_basis_line(text, m):
-            continue
-        raw = m.group(1) or m.group(2)
-        if raw is None:
-            continue
-        val = float(raw)
-        window = text[max(0, m.start() - 15): min(len(text), m.end() + 25)]
-        annual = val * 12 if _is_monthly_context(window) else val
-        if annual >= 0.01:
-            return f"{annual:.2f}"
+    candidates = _ops_ex_standalone_candidates(text)
+    if candidates:
+        return f"{candidates[0][2]:.2f}"
     return None
 
 
@@ -3245,6 +3320,25 @@ def _remove_proposal_update(proposal: dict, column_name: Optional[str]) -> None:
     ]
 
 
+def _strip_rejected_combined_total_opex_update(
+    proposal: dict,
+    opex_col: Optional[str],
+    text: str,
+) -> None:
+    update = _proposal_update_for_column(proposal, opex_col) if opex_col else None
+    if update is None:
+        return
+    proposed = _normalized_numeric_value(update.get("value"))
+    rejected_values = {
+        value for _, _, value in _combined_total_opex_evidence(text)
+    }
+    supported_values = {
+        value for _, _, value in _ops_ex_standalone_candidates(text)
+    }
+    if proposed in rejected_values and proposed not in supported_values:
+        _remove_proposal_update(proposal, opex_col)
+
+
 def _augment_proposal_with_deterministic_extractions(
     proposal: dict,
     rowvals: List[str],
@@ -3263,6 +3357,7 @@ def _augment_proposal_with_deterministic_extractions(
     fresh_text = _fresh_inbound_text(conversation)
     target_anchor = get_row_anchor(rowvals, header)
     rent_col = mappings.get("rent_sf_yr") or _find_header_name(header, "Rent/SF /Yr")
+    opex_col = mappings.get("ops_ex_sf") or _find_header_name(header, "Ops Ex /SF")
     total_sf_col = mappings.get("total_sf") or _find_header_name(header, "Total SF")
 
     fresh_rent = _extract_rent_sf_yr_from_text(fresh_text)
@@ -3357,6 +3452,8 @@ def _augment_proposal_with_deterministic_extractions(
         ):
             _remove_proposal_update(proposal, total_sf_col)
 
+    _strip_rejected_combined_total_opex_update(proposal, opex_col, fresh_text)
+
     # LIVE break (900 Alt Suggest St): when the reply kills the current row or
     # pitches an alternate property, do not mine fallback specs into this row.
     event_types = {
@@ -3396,7 +3493,7 @@ def _augment_proposal_with_deterministic_extractions(
         "Deterministic fallback parsed asking rent per SF per year from the latest broker message.",
     )
     _fill(
-        mappings.get("ops_ex_sf") or _find_header_name(header, "Ops Ex /SF"),
+        opex_col,
         _extract_ops_ex_sf_from_text(fresh_text),
         "Deterministic fallback parsed operating expenses per SF per year from the latest broker message.",
     )
