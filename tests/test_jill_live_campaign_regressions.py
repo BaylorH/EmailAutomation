@@ -27,6 +27,13 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "The suite is available @ $14.10 NNN.",
             "18,750 SF — $14.10 NNN.",
             "The suite is available – $14.10 NNN.",
+            "The suite is offered at $14.10 NNN.",
+            "We are offering the suite at $14.10 NNN.",
+            "Availability at $14.10 NNN.",
+            "Availability: $14.10 NNN.",
+            "We can offer the suite for $14.10 NNN.",
+            "The suite is available for $14.10 NNN.",
+            "18,750 SF for $14.10 NNN.",
         )
 
         self.assertEqual(
