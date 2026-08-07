@@ -229,7 +229,7 @@ def fetch_outlook_conversations():
         return
 
     access_token = result["access_token"]
-    print(f"✅ Got access token: {access_token[:40]}...")
+    print("✅ Got access token")
 
     headers = {
         "Authorization": f"Bearer {access_token}",

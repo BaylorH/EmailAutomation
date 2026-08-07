@@ -316,7 +316,7 @@ def refresh_and_process_user(user_id: str):
             "expiresIn": exp_secs,
         }
 
-        print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s – preview: {access_token[:40]}")
+        print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s")
 
         # (Optional) sanity check on JWT-shaped token & appid
         if access_token.count(".") == 2:
