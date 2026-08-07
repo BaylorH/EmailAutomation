@@ -522,6 +522,8 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "OpEx is $0.34/SF monthly for real estate taxes and insurance.",
             "OpEx is $0.34/SF/month for property taxes and insurance.",
             "OpEx is $0.34/SF, billed monthly for real estate taxes and insurance.",
+            "OpEx is $0.34/SF/month for insurance and taxes.",
+            "OpEx is $0.34/SF/month for property insurance and real estate taxes.",
         )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
