@@ -390,6 +390,49 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_opex_rent_modifiers_do_not_duplicate_into_rent(self):
+        examples = (
+            "CAM, on top of base rent, is $3.65 NNN.",
+            "CAM, on top of base rent, is $3.65 per square foot.",
+            "CAM (in addition to base rent) is $3.65 NNN.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": "3.65"},
+                        {"column": "Ops Ex / SF", "value": "3.65"},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [(None, "3.65", None, "3.65")] * len(examples),
+            results,
+        )
+
     def test_coordinated_nnn_clause_uses_figure_governing_subject(self):
         examples = (
             ("Rent is separate and CAM is $3.65 NNN.", None, "3.65"),
