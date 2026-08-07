@@ -1726,15 +1726,29 @@ _STRUCTURAL_FIELD_SEPARATOR_RE = re.compile(r"[|:–—-]")
 
 _RATE_NUMBER = r"[0-9]{1,3}(?:\.[0-9]{1,2})?"
 _RATE_UNIT_SUFFIX = rf"(?:(?:/\s*|\bper\s+)?{_OPS_EX_RATE_UNIT})"
+_RATE_BASIS_WORD = (
+    r"(?:monthly|annually|annual|yearly|month|annum|year|mos|mo|yr)"
+)
+_RATE_BASIS_SUFFIX = (
+    rf"(?:\s*(?:/\s*|\bper\s+){_RATE_BASIS_WORD}\b|"
+    rf"\s+{_RATE_BASIS_WORD}\b|"
+    r"\s*,?\s*\bbilled\s+"
+    r"(?:(?:on\s+(?:a|the)\s+)?monthly(?:\s+basis)?)\b)?"
+)
+_RATE_NNN_SUFFIX = r"\s*\bnnn\b"
+_RATE_TRAILING_SUFFIX = rf"{_RATE_BASIS_SUFFIX}(?:{_RATE_NNN_SUFFIX})?"
 _PRIOR_RATE_FIGURE = (
     rf"\$\s*(?P<prior_value>{_RATE_NUMBER})\s*{_RATE_UNIT_SUFFIX}"
+    rf"{_RATE_TRAILING_SUFFIX}"
 )
 _CURRENT_RATE_FIGURE = (
-    rf"\$\s*(?P<value>{_RATE_NUMBER})\s*{_RATE_UNIT_SUFFIX}"
+    rf"(?P<current_evidence>\$\s*(?P<value>{_RATE_NUMBER})\s*"
+    rf"{_RATE_UNIT_SUFFIX}{_RATE_TRAILING_SUFFIX})"
 )
 _OPS_EX_OWNER_NNN_RATE_RE = re.compile(
-    rf"\b{_OPS_EX_NNN_OWNER}\b[^\d$\n]{{0,18}}?{_CURRENT_RATE_FIGURE}"
-    r"\s*\bnnn\b",
+    rf"\b{_OPS_EX_NNN_OWNER}\b[^\d$\n]{{0,18}}?"
+    rf"(?P<current_evidence>\$\s*(?P<value>{_RATE_NUMBER})\s*"
+    rf"{_RATE_UNIT_SUFFIX}{_RATE_BASIS_SUFFIX}{_RATE_NNN_SUFFIX})",
     re.IGNORECASE,
 )
 _OPS_EX_ELLIPTICAL_CORRECTION_RE = re.compile(
@@ -1753,8 +1767,7 @@ _PRONOMINAL_RATE_CORRECTION_RE = re.compile(
 )
 _NEGATED_RATE_RE = re.compile(
     rf"\bnot\s+\$\s*(?P<value>{_RATE_NUMBER})\s*{_RATE_UNIT_SUFFIX}"
-    r"(?:\s*/?\s*(?:monthly|annually|annual|yearly|month|annum|year|"
-    r"mos|mo|yr)\b)?(?:\s*\bnnn\b)?",
+    rf"{_RATE_TRAILING_SUFFIX}",
     re.IGNORECASE,
 )
 
@@ -2753,14 +2766,25 @@ def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
             ):
                 return
 
+        basis_start, basis_end = match.start(), match.end()
+        basis_context_before = context_before
+        basis_context_after = context_after
+        if match.re in (
+            _OPS_EX_ELLIPTICAL_CORRECTION_RE,
+            _PRONOMINAL_RATE_CORRECTION_RE,
+        ):
+            basis_start, basis_end = match.span("current_evidence")
+            basis_context_before = 0
+            basis_context_after = 0
+
         basis_values = _ops_ex_basis_values(
             text,
-            match.start(),
-            match.end(),
+            basis_start,
+            basis_end,
             match.group(group),
             numeric_span=(numeric_start, numeric_end),
-            context_before=context_before,
-            context_after=context_after,
+            context_before=basis_context_before,
+            context_after=basis_context_after,
         )
         if basis_values is not None:
             raw_value, annualized_value, basis, owned_span = basis_values
