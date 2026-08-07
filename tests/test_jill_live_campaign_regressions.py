@@ -198,6 +198,64 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         self.assertIsNone(ai_processing._extract_rent_sf_yr_from_text(text))
         self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_relational_expense_modifiers_preserve_governing_nnn_subject(self):
+        examples = (
+            ("Rent before expenses is $14.10 NNN.", "14.10", None),
+            (
+                "Base rent, excluding operating expenses, is $14.10 NNN.",
+                "14.10",
+                None,
+            ),
+            (
+                "Asking rent does not include CAM and is $14.10 NNN.",
+                "14.10",
+                None,
+            ),
+            ("Rent net of expenses is $14.10 NNN.", "14.10", None),
+            ("Rent excluding pass-throughs is $14.10 NNN.", "14.10", None),
+            ("Expenses are separate; rent is $14.10 NNN.", "14.10", None),
+            (
+                "Operating expenses excluding rent are $3.65 NNN.",
+                None,
+                "3.65",
+            ),
+            ("CAM does not include rent and is $3.65 NNN.", None, "3.65"),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, expected_rent, expected_opex in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {"updates": []},
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [
+                (expected_rent, expected_opex, expected_rent, expected_opex)
+                for _, expected_rent, expected_opex in examples
+            ],
+            results,
+        )
+
     def test_explicit_opex_wins_over_earlier_nnn_rent_basis(self):
         examples = {
             (
