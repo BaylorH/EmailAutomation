@@ -110,15 +110,78 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         text = "CAM plus base rent equals $18.00 per square foot."
         self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
 
-    def test_cam_plus_base_rent_total_does_not_write_opex(self):
+    def test_combined_total_phrasings_are_not_opex(self):
+        examples = (
+            "CAM plus base rent equals $18.00 per square foot.",
+            "CAM on top of base rent totals $18.00 per square foot.",
+            "CAM in addition to base rent equals $18.00 per square foot.",
+            "CAM and base rent total $18.00 per square foot.",
+            "Base rent plus CAM equals $18.00 per square foot.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_rejected_combined_total_removes_model_opex_before_event_return(self):
         text = "CAM plus base rent equals $18.00 per square foot."
-        proposal = {"updates": [], "events": []}
+        proposal = {
+            "updates": [{"column": "Ops Ex / SF", "value": "18.00"}],
+            "events": [{"type": "property_unavailable", "reason": "leased"}],
+        }
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
         result = ai_processing._augment_proposal_with_deterministic_extractions(
             proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
         )
         self.assertIsNone(ai_processing._proposal_update_for_column(result, "Ops Ex / SF"))
+
+    def test_later_standalone_opex_wins_over_rejected_combined_total(self):
+        text = (
+            "CAM plus base rent totals $18.00/SF. "
+            "CAM alone is $3.90/SF."
+        )
+        proposal = {"updates": [{"column": "Ops Ex / SF", "value": "18.00"}], "events": []}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertEqual(
+            "3.90",
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
+        )
+
+    def test_pending_or_unknown_opex_does_not_capture_later_costs(self):
+        examples = (
+            "CAM is not finalized; rent is $14.10 per square foot.",
+            "CAM is pending; the asking rate is $14.10 per square foot.",
+            "CAM is unknown; total occupancy cost is $18.00 per square foot.",
+            "CAM is pending; taxes are $3.90 per square foot.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_current_opex_wins_over_prior_figure(self):
+        text = "Prior CAM was $4.25/SF; current CAM is $3.90/SF."
+        self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_unresolved_projected_opex_range_is_not_extracted(self):
+        text = "CAM is projected between $3.50 and $4.25 per square foot."
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_evidence_bounded_opex_positive_matrix(self):
+        examples = {
+            "CAM, on top of base rent, is $3.90 per square foot.": "3.90",
+            "CAM (in addition to base rent) is $3.90 per square foot.": "3.90",
+            "Rent is $14.10 and CAM is $3.90 per square foot.": "3.90",
+            "2,000 SF: $1.25 NNN + $0.34 OPEX = $1.59 PSF / Month.": "4.08",
+            "CAM is $0.34/SF/month.": "4.08",
+        }
+        for text, expected in examples.items():
+            with self.subTest(text=text):
+                self.assertEqual(expected, ai_processing._extract_ops_ex_sf_from_text(text))
 
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
