@@ -246,26 +246,32 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 )
 
     def test_reversed_conflicting_basis_combined_total_removes_monthly_values(self):
-        text = "CAM plus rent is $1.50/SF/year/month."
+        examples = (
+            "CAM plus rent is $1.50/SF/year/month.",
+            "CAM plus rent is $1.50/SF per year/month.",
+            "CAM plus rent is $1.50/SF/year per month.",
+            "CAM plus rent is $1.50/SF/year, billed monthly.",
+        )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
 
-        for proposed_value in ("1.50", "18.00"):
-            with self.subTest(proposed_value=proposed_value):
-                proposal = {
-                    "updates": [{"column": "Ops Ex / SF", "value": proposed_value}],
-                    "events": [{"type": "property_unavailable", "reason": "leased"}],
-                }
-                result = ai_processing._augment_proposal_with_deterministic_extractions(
-                    proposal,
-                    ["4800 Space Center Blvd", "", ""],
-                    header,
-                    config,
-                    _conversation(text),
-                )
-                self.assertIsNone(
-                    ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
-                )
+        for text in examples:
+            for proposed_value in ("1.50", "18.00"):
+                with self.subTest(text=text, proposed_value=proposed_value):
+                    proposal = {
+                        "updates": [{"column": "Ops Ex / SF", "value": proposed_value}],
+                        "events": [{"type": "property_unavailable", "reason": "leased"}],
+                    }
+                    result = ai_processing._augment_proposal_with_deterministic_extractions(
+                        proposal,
+                        ["4800 Space Center Blvd", "", ""],
+                        header,
+                        config,
+                        _conversation(text),
+                    )
+                    self.assertIsNone(
+                        ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+                    )
 
     def test_later_standalone_opex_wins_over_rejected_combined_total(self):
         text = (
@@ -453,39 +459,50 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         self.assertEqual([("4.08", "4.08")] * len(examples), results)
 
     def test_attached_monthly_opex_keeps_supporting_tax_context(self):
-        text = "OpEx is $0.34/SF/month for taxes and insurance."
-        proposal = {"updates": [{"column": "Ops Ex / SF", "value": "0.34"}]}
+        examples = (
+            "OpEx is $0.34/SF/month for taxes and insurance.",
+            "OpEx is $0.34/SF monthly for taxes and insurance.",
+        )
         header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
         config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
 
-        extracted = ai_processing._augment_proposal_with_deterministic_extractions(
-            proposal,
-            ["4800 Space Center Blvd", "", ""],
-            header,
-            config,
-            _conversation(text),
-        )
-        normalized = ai_processing._augment_proposal_opex_basis(
-            extracted,
-            ["4800 Space Center Blvd", "", ""],
-            header,
-            config,
-            _conversation(text),
-        )
+        for text in examples:
+            proposal = {"updates": [{"column": "Ops Ex / SF", "value": "0.34"}]}
+            extracted = ai_processing._augment_proposal_with_deterministic_extractions(
+                proposal,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            normalized = ai_processing._augment_proposal_opex_basis(
+                extracted,
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            results.append((
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                ai_processing._proposal_update_for_column(
+                    normalized,
+                    "Ops Ex / SF",
+                )["value"],
+            ))
 
-        self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
-        self.assertEqual(
-            "4.08",
-            ai_processing._proposal_update_for_column(
-                normalized,
-                "Ops Ex / SF",
-            )["value"],
-        )
+        self.assertEqual([("4.08", "4.08")] * len(examples), results)
 
     def test_direct_monthly_tax_subject_does_not_annualize_cam(self):
         examples = (
             "CAM is $4.00/SF, per month taxes are $0.50/SF.",
             "CAM is $4.00/SF, per month insurance is $0.50/SF.",
+            "CAM is $4.00/SF, per month property taxes are $0.50/SF.",
+            "CAM is $4.00/SF, per month real estate taxes are $0.50/SF.",
+            "CAM is $4.00/SF, per month property insurance is $0.50/SF.",
+            "CAM is $4.00/SF, monthly for property taxes: $0.50/SF.",
+            "CAM is $4.00/SF, monthly for real estate taxes: $0.50/SF.",
+            "CAM is $4.00/SF, monthly for property insurance: $0.50/SF.",
         )
         self.assertEqual(
             ["4.00"] * len(examples),
@@ -679,6 +696,28 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results.append(update["value"] if update is not None else None)
 
         self.assertEqual([None, None, "0.34", "4.08"], results)
+
+    def test_conflicting_combined_basis_keeps_base_values_negative(self):
+        text = "$1.25 NNN + $0.34 OPEX = $1.59/SF/year/month."
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+
+        for proposed_value in ("1.25", "15.00"):
+            with self.subTest(proposed_value=proposed_value):
+                proposal = {
+                    "updates": [{"column": "Ops Ex / SF", "value": proposed_value}],
+                    "events": [{"type": "property_unavailable", "reason": "leased"}],
+                }
+                result = ai_processing._augment_proposal_with_deterministic_extractions(
+                    proposal,
+                    ["4800 Space Center Blvd", "", ""],
+                    header,
+                    config,
+                    _conversation(text),
+                )
+                self.assertIsNone(
+                    ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+                )
 
     def test_proposal_opex_basis_ignores_entirely_quoted_monthly_candidate(self):
         proposal = {"updates": [{"column": "Ops Ex / SF", "value": "0.34"}]}
