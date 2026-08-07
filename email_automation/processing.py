@@ -96,7 +96,7 @@ from .campaign_safety import (
     get_client_automation_decision,
     stopped_followup_patch,
 )
-from .system_health import RESOLVED_DEAD_LETTER_STATUSES
+from .system_health import _is_terminal_dead_letter
 
 logger = logging.getLogger(__name__)
 
@@ -2003,12 +2003,7 @@ def _maybe_mark_client_completed(
             .stream()
         ):
             data = doc.to_dict() or {}
-            dead_letter_status = str(data.get("status") or "").strip().lower()
-            recovery_status = str(data.get("recoveryStatus") or "").strip().lower()
-            if (
-                dead_letter_status not in RESOLVED_DEAD_LETTER_STATUSES
-                and recovery_status not in RESOLVED_DEAD_LETTER_STATUSES
-            ):
+            if not _is_terminal_dead_letter(data):
                 unresolved_dead_letter_docs.append(doc)
 
         if (

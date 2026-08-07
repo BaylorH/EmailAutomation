@@ -341,6 +341,34 @@ class DeadLetterInspectEndpointTests(unittest.TestCase):
         # ...but no active alert.
         self.assertIsNone(data["alert"])
 
+    def test_stale_nonretryable_processing_failure_is_not_actionable(self):
+        users = {
+            "uid-1": {
+                "processingFailures": [
+                    FakeDoc(
+                        "pf-stale",
+                        {
+                            "retryable": False,
+                            "recoveryStatus": "stale_manual_review",
+                        },
+                    ),
+                    FakeDoc(
+                        "pf-retryable",
+                        {"retryable": True},
+                    ),
+                ],
+            }
+        }
+
+        payload = self._run(users)
+        coll = payload["data"]["users"]["uid-1"]["collections"]["processingFailures"]
+
+        self.assertEqual(2, coll["count"])
+        self.assertEqual(1, coll["activeCount"])
+        self.assertFalse(coll["items"][0]["actionable"])
+        self.assertTrue(coll["items"][1]["actionable"])
+        self.assertEqual(1, payload["data"]["actionableProcessingFailures"])
+
 
 if __name__ == "__main__":
     unittest.main()

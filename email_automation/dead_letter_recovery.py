@@ -15,6 +15,7 @@ from .sent_mail_guard import (
     find_sent_conversation_continuation_for_retry,
     sent_after_from_retry_data,
 )
+from .system_health import _is_terminal_dead_letter
 
 
 RESOLUTION_ACTIONS = {
@@ -211,6 +212,9 @@ def _requeue_verified_unsent(
     operator_id: Optional[str],
     note: Optional[str],
 ) -> Dict[str, Any]:
+    if _is_terminal_dead_letter(data):
+        return {"success": False, "code": "terminal_dead_letter"}
+
     if data.get("alreadySent"):
         _mark_dead_letter(ref, "blocked_already_sent", operator_id=operator_id, note=note)
         return {"success": False, "code": "unsafe_already_sent"}

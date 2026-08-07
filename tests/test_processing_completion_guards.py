@@ -905,7 +905,7 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertFalse(completed)
         self.assertEqual([], client_ref.set_calls)
 
-    def test_does_not_mark_client_completed_with_current_action_or_pending_outbox(self):
+    def test_current_work_blocks_completion_but_terminal_dead_letter_history_does_not(self):
         class FakeDoc:
             def __init__(self, doc_id, data=None):
                 self.id = doc_id
@@ -1032,6 +1032,25 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             ]),
         ))
         self.assertEqual("completed", with_resolved_reconciliation._data["status"])
+
+        with_campaign_stopped_history = FakeDoc("client-1", {"status": "live"})
+        self.assertTrue(processing._maybe_mark_client_completed(
+            "uid-1",
+            "client-1",
+            client_ref=with_campaign_stopped_history,
+            threads_ref=terminal_threads,
+            notifications_ref=FakeQuery([]),
+            outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([
+                FakeDoc("dead-1", {
+                    "clientId": "client-1",
+                    "status": "dead_lettered",
+                    "recoveryStatus": "campaign_stopped",
+                }),
+            ]),
+        ))
+        self.assertEqual("completed", with_campaign_stopped_history._data["status"])
 
     def test_deterministic_rent_fallback_extracts_asking_rent_not_nnn(self):
         value = ai_processing._extract_rent_sf_yr_from_text(

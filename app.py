@@ -2878,7 +2878,10 @@ def api_firestore_inspect():
 
     try:
         from email_automation.clients import _fs
-        from email_automation.system_health import _is_resolved_dead_letter
+        from email_automation.system_health import (
+            _is_actionable_processing_failure,
+            _is_terminal_dead_letter,
+        )
 
         result = {"users": {}}
         # Only ever inspect the caller's own subtree.
@@ -2887,6 +2890,7 @@ def api_firestore_inspect():
         # Rail 4 aggregates across all users.
         total_active_dead_letters = 0
         total_needs_reconciliation = 0
+        total_actionable_processing_failures = 0
         dead_letter_read_error = False
 
         for uid in users:
@@ -2900,6 +2904,7 @@ def api_firestore_inspect():
                 "convIndex",
                 "outbox",
                 "deadLetterQueue",
+                "processingFailures",
                 "processedMessages",
                 "sheetChangeLog",
                 "optedOutContacts",
@@ -2923,8 +2928,8 @@ def api_firestore_inspect():
                             for d in docs:
                                 dd = d.to_dict() or {}
                                 status = str(dd.get("status") or "").strip().lower()
-                                resolved = _is_resolved_dead_letter(dd)
-                                if not resolved:
+                                terminal = _is_terminal_dead_letter(dd)
+                                if not terminal:
                                     active_count += 1
                                 if status == "needs_reconciliation":
                                     needs_recon_count += 1
@@ -2932,13 +2937,30 @@ def api_firestore_inspect():
                                     "id": d.id,
                                     "reason": _dead_letter_reason(dd)[:200],
                                     "status": dd.get("status", ""),
-                                    "resolved": resolved,
+                                    "resolved": terminal,
                                 })
                             coll_data["items"] = dl_items
                             coll_data["activeCount"] = active_count
                             coll_data["needsReconciliation"] = needs_recon_count
                             total_active_dead_letters += active_count
                             total_needs_reconciliation += needs_recon_count
+                        elif coll_name == "processingFailures":
+                            failure_items = []
+                            active_count = 0
+                            for d in docs:
+                                failure_data = d.to_dict() or {}
+                                actionable = _is_actionable_processing_failure(failure_data)
+                                if actionable:
+                                    active_count += 1
+                                failure_items.append({
+                                    "id": d.id,
+                                    "retryable": failure_data.get("retryable", True),
+                                    "recoveryStatus": failure_data.get("recoveryStatus", ""),
+                                    "actionable": actionable,
+                                })
+                            coll_data["items"] = failure_items
+                            coll_data["activeCount"] = active_count
+                            total_actionable_processing_failures += active_count
                         elif coll_name == "clients":
                             coll_data["items"] = [{"id": d.id, "name": d.to_dict().get("name", "")} for d in docs]
 
@@ -2973,6 +2995,7 @@ def api_firestore_inspect():
             total_needs_reconciliation,
             read_error=dead_letter_read_error,
         )
+        result["actionableProcessingFailures"] = total_actionable_processing_failures
 
         return jsonify({"success": True, "data": result})
 

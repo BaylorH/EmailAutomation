@@ -134,6 +134,65 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual("warning", payload["status"])
         self.assertEqual(1, payload["queues"]["deadLetterQueue"])
 
+    def test_collect_user_health_ignores_cancelled_campaign_stopped_dead_letters(self):
+        fs = FakeFirestore(
+            {
+                "outbox": 0,
+                "pendingResponses": 0,
+                "processingFailures": 0,
+            },
+            docs_by_collection={
+                "deadLetterQueue": [
+                    FakeHealthDoc({"status": "cancelled"}),
+                    FakeHealthDoc({"status": "canceled"}),
+                    FakeHealthDoc({
+                        "status": "dead_lettered",
+                        "recoveryStatus": "campaign_stopped",
+                    }),
+                ],
+            },
+        )
+
+        payload = system_health.collect_user_health(
+            "uid-1",
+            fs_client=fs,
+            token_state={"status": "healthy"},
+            graph_state={"status": "healthy"},
+        )
+
+        self.assertEqual("healthy", payload["status"])
+        self.assertEqual(0, payload["queues"]["deadLetterQueue"])
+
+    def test_collect_user_health_ignores_nonretryable_and_stale_processing_failures(self):
+        fs = FakeFirestore(
+            {
+                "outbox": 0,
+                "deadLetterQueue": 0,
+                "pendingResponses": 0,
+            },
+            docs_by_collection={
+                "processingFailures": [
+                    FakeHealthDoc({
+                        "retryable": False,
+                    }),
+                    FakeHealthDoc({
+                        "retryable": True,
+                        "recoveryStatus": "stale_manual_review",
+                    }),
+                ],
+            },
+        )
+
+        payload = system_health.collect_user_health(
+            "uid-1",
+            fs_client=fs,
+            token_state={"status": "healthy"},
+            graph_state={"status": "healthy"},
+        )
+
+        self.assertEqual("healthy", payload["status"])
+        self.assertEqual(0, payload["queues"]["processingFailures"])
+
     def test_collect_user_health_errors_on_token_failure(self):
         fs = FakeFirestore({
             "outbox": 0,

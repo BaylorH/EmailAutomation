@@ -25,6 +25,25 @@ RESOLVED_DEAD_LETTER_STATUSES = {
     "requeued",
 }
 
+TERMINAL_DEAD_LETTER_STATUSES = RESOLVED_DEAD_LETTER_STATUSES | {
+    "cancelled",
+    "canceled",
+    "campaign_stopped",
+}
+
+NON_ACTIONABLE_PROCESSING_FAILURE_RECOVERY_STATUSES = {
+    "blocked_existing_outbound_artifact",
+    "blocked_manual_continuation",
+    "blocked_manual_conversation_continued",
+    "blocked_manual_retry_guard_unreadable",
+    "blocked_retry_guard_unreadable",
+    "campaign_stopped",
+    "operator_replay_blocked_artifact",
+    "operator_replay_blocked_postcondition",
+    "replayed",
+    "stale_manual_review",
+}
+
 
 # A queue count of this sentinel means the Firestore read failed — the count is
 # UNKNOWN, not zero. Health must never treat an unknown count as an empty queue.
@@ -67,10 +86,25 @@ def _snapshot_data(snapshot) -> Dict:
     return {}
 
 
-def _is_resolved_dead_letter(data: Dict) -> bool:
+def _is_terminal_dead_letter(data: Dict) -> bool:
     status = str(data.get("status") or "").strip().lower()
     recovery_status = str(data.get("recoveryStatus") or "").strip().lower()
-    return status in RESOLVED_DEAD_LETTER_STATUSES or recovery_status in RESOLVED_DEAD_LETTER_STATUSES
+    return (
+        status in TERMINAL_DEAD_LETTER_STATUSES
+        or recovery_status in TERMINAL_DEAD_LETTER_STATUSES
+    )
+
+
+def _is_resolved_dead_letter(data: Dict) -> bool:
+    """Backward-compatible alias for the shared terminal predicate."""
+    return _is_terminal_dead_letter(data)
+
+
+def _is_actionable_processing_failure(data: Dict) -> bool:
+    if data.get("retryable") is False:
+        return False
+    recovery_status = str(data.get("recoveryStatus") or "").strip().lower()
+    return recovery_status not in NON_ACTIONABLE_PROCESSING_FAILURE_RECOVERY_STATUSES
 
 
 def _count_active_dead_letters(user_ref, limit: int = 500) -> int:
@@ -80,10 +114,24 @@ def _count_active_dead_letters(user_ref, limit: int = 500) -> int:
         return sum(
             1
             for snapshot in query.stream()
-            if not _is_resolved_dead_letter(_snapshot_data(snapshot))
+            if not _is_terminal_dead_letter(_snapshot_data(snapshot))
         )
     except Exception as exc:
         print(f"⚠️ Could not count active deadLetterQueue: {exc}")
+        return COUNT_ERROR
+
+
+def _count_actionable_processing_failures(user_ref, limit: int = 500) -> int:
+    try:
+        collection_ref = user_ref.collection("processingFailures")
+        query = collection_ref.limit(limit) if hasattr(collection_ref, "limit") else collection_ref
+        return sum(
+            1
+            for snapshot in query.stream()
+            if _is_actionable_processing_failure(_snapshot_data(snapshot))
+        )
+    except Exception as exc:
+        print(f"⚠️ Could not count actionable processingFailures: {exc}")
         return COUNT_ERROR
 
 
@@ -121,7 +169,11 @@ def collect_user_health(
         name: (
             _count_active_dead_letters(user_ref)
             if name == "deadLetterQueue"
-            else _count_collection(user_ref, name)
+            else (
+                _count_actionable_processing_failures(user_ref)
+                if name == "processingFailures"
+                else _count_collection(user_ref, name)
+            )
         )
         for name in QUEUE_COLLECTIONS
     }

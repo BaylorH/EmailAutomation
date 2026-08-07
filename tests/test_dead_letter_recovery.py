@@ -138,6 +138,28 @@ class DeadLetterRecoveryTests(unittest.TestCase):
         self.assertEqual([], fake_fs.add_calls)
         self.assertEqual("blocked_manual_continuation", fake_fs.update_calls[-1][1]["recoveryStatus"])
 
+    def test_requeue_refuses_terminal_dead_letter_before_provider_or_outbox_effects(self):
+        fake_fs = FakeFirestore(base_dead_letter(recoveryStatus="campaign_stopped"))
+
+        with self.fake_clients(fake_fs), \
+             patch.object(dead_letter_recovery, "find_matching_sent_message_for_retry") as sent_guard, \
+             patch.object(dead_letter_recovery, "find_sent_conversation_continuation_for_retry") as continuation_guard:
+            result = dead_letter_recovery.resolve_dead_letter_item(
+                "uid-1",
+                "dead-1",
+                action="requeue_verified_unsent",
+                headers={"Authorization": "Bearer fake"},
+                operator_id="operator-1",
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual("terminal_dead_letter", result["code"])
+        sent_guard.assert_not_called()
+        continuation_guard.assert_not_called()
+        self.assertEqual([], fake_fs.add_calls)
+        self.assertEqual([], fake_fs.set_calls)
+        self.assertEqual([], fake_fs.update_calls)
+
     def test_requeue_matching_sent_item_records_reconciliation_without_resending(self):
         fake_fs = FakeFirestore(base_dead_letter())
         sent_match = {
