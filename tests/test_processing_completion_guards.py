@@ -1052,6 +1052,25 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         ))
         self.assertEqual("completed", with_campaign_stopped_history._data["status"])
 
+        with_nonretryable_history = FakeDoc("client-1", {"status": "live"})
+        self.assertTrue(processing._maybe_mark_client_completed(
+            "uid-1",
+            "client-1",
+            client_ref=with_nonretryable_history,
+            threads_ref=terminal_threads,
+            notifications_ref=FakeQuery([]),
+            outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([
+                FakeDoc("dead-1", {
+                    "clientId": "client-1",
+                    "status": "dead_lettered",
+                    "retryable": False,
+                }),
+            ]),
+        ))
+        self.assertEqual("completed", with_nonretryable_history._data["status"])
+
     def test_deterministic_rent_fallback_extracts_asking_rent_not_nnn(self):
         value = ai_processing._extract_rent_sf_yr_from_text(
             "Asking $9.00/SF/year, NNN $0.39/SF, power is 200 amps."

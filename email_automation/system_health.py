@@ -90,7 +90,8 @@ def _is_terminal_dead_letter(data: Dict) -> bool:
     status = str(data.get("status") or "").strip().lower()
     recovery_status = str(data.get("recoveryStatus") or "").strip().lower()
     return (
-        status in TERMINAL_DEAD_LETTER_STATUSES
+        data.get("retryable") is False
+        or status in TERMINAL_DEAD_LETTER_STATUSES
         or recovery_status in TERMINAL_DEAD_LETTER_STATUSES
     )
 

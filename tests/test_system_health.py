@@ -163,6 +163,33 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual("healthy", payload["status"])
         self.assertEqual(0, payload["queues"]["deadLetterQueue"])
 
+    def test_collect_user_health_ignores_nonretryable_dead_letter(self):
+        fs = FakeFirestore(
+            {
+                "outbox": 0,
+                "pendingResponses": 0,
+                "processingFailures": 0,
+            },
+            docs_by_collection={
+                "deadLetterQueue": [
+                    FakeHealthDoc({
+                        "status": "dead_lettered",
+                        "retryable": False,
+                    }),
+                ],
+            },
+        )
+
+        payload = system_health.collect_user_health(
+            "uid-1",
+            fs_client=fs,
+            token_state={"status": "healthy"},
+            graph_state={"status": "healthy"},
+        )
+
+        self.assertEqual("healthy", payload["status"])
+        self.assertEqual(0, payload["queues"]["deadLetterQueue"])
+
     def test_collect_user_health_ignores_nonretryable_and_stale_processing_failures(self):
         fs = FakeFirestore(
             {
