@@ -106,6 +106,20 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         )
         self.assertEqual("3.90", ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"])
 
+    def test_cam_plus_base_rent_total_is_not_opex(self):
+        text = "CAM plus base rent equals $18.00 per square foot."
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_cam_plus_base_rent_total_does_not_write_opex(self):
+        text = "CAM plus base rent equals $18.00 per square foot."
+        proposal = {"updates": [], "events": []}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertIsNone(ai_processing._proposal_update_for_column(result, "Ops Ex / SF"))
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
