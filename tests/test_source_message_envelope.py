@@ -247,6 +247,24 @@ class SourceMessageEnvelopeTests(unittest.TestCase):
         )
         record_inbound.assert_not_called()
 
+    def test_batched_send_on_behalf_message_does_not_record_inbound_authority(self):
+        msg = {
+            "id": "graph-send-on-behalf",
+            "internetMessageId": "<send-on-behalf@example.com>",
+            "subject": "FW: 410 Genesis Blvd",
+            "from": {"emailAddress": {"address": "shared-mailbox@example.com"}},
+            "sender": {"emailAddress": {"address": "operator@example.com"}},
+            "receivedDateTime": "2026-08-07T04:03:30Z",
+            "bodyPreview": "Forwarding this campaign message from the shared mailbox.",
+            "hasAttachments": False,
+        }
+
+        record_inbound = self._record_batched_authority(
+            msg,
+            "Forwarding this campaign message from the shared mailbox.",
+        )
+        record_inbound.assert_not_called()
+
     def test_batched_substantive_broker_reply_records_inbound_authority(self):
         msg = {
             "id": "graph-broker-reply",

@@ -174,14 +174,21 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         row_below_nonviable=False,
         ensure_divider_side_effect=None,
         cancel_followup_side_effect=None,
+        msg_id=None,
+        internet_message_id=None,
+        persist_handled_events=False,
+        notification_error=None,
+        send_reply_mock=None,
+        complete_threads_mock=None,
+        mark_client_completed_mock=None,
     ):
         client_id = "client-1"
         msg = self._common_graph_message(
-            msg_id=f"msg-{thread_id}",
+            msg_id=msg_id or f"msg-{thread_id}",
             subject=f"RE: Tour slot: {row_anchor}",
             from_email=from_email,
             body=body,
-            internet_message_id=f"<{thread_id}@mock.test>",
+            internet_message_id=internet_message_id or f"<{thread_id}@mock.test>",
             conversation_id=f"conv-{thread_id}",
         )
         header = [
@@ -216,15 +223,29 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         status_updates = []
 
         def fake_write_notification(*args, **kwargs):
+            if notification_error:
+                raise notification_error
             notif_id = f"notif-{len(notifications) + 1}"
             notifications.append({"args": args, "kwargs": kwargs, "id": notif_id})
             return notif_id
 
         def fake_mark_event_handled(_user_id, _thread_id, event_key, _msg_id, notif_id):
             handled_events.append({"eventKey": event_key, "notifId": notif_id})
+            if persist_handled_events:
+                thread_ref._data.setdefault("handledEvents", {})[event_key] = {
+                    "detectedInMessageId": _msg_id,
+                    "notificationId": notif_id,
+                }
+            return True
+
+        def fake_is_event_handled(_user_id, _thread_id, event_key):
+            if not persist_handled_events:
+                return False
+            return event_key in thread_ref._data.get("handledEvents", {})
 
         def fake_update_thread_status(_user_id, _thread_id, status, reason):
             status_updates.append({"status": status, "reason": reason})
+            return True
 
         move_row = MagicMock(return_value=11)
         ensure_divider = MagicMock(return_value=10)
@@ -241,8 +262,11 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             call_trace.append("complete")
             return True
 
-        send_reply = MagicMock(side_effect=fake_send_reply)
-        mark_client_completed = MagicMock(side_effect=fake_mark_client_completed)
+        send_reply = send_reply_mock or MagicMock(side_effect=fake_send_reply)
+        mark_client_completed = mark_client_completed_mock or MagicMock(
+            side_effect=fake_mark_client_completed
+        )
+        complete_threads = complete_threads_mock or MagicMock(return_value=1)
         cancel_followup = MagicMock(side_effect=cancel_followup_side_effect)
         thread_docs = thread_docs or {thread_id: thread_ref}
         patches = [
@@ -280,7 +304,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "propose_sheet_updates", return_value=proposal),
             patch.object(processing, "_sheets_client", return_value=MagicMock()),
             patch.object(processing, "_get_first_tab_title", return_value="Sheet1"),
-            patch.object(processing, "is_event_handled", return_value=False),
+            patch.object(processing, "is_event_handled", side_effect=fake_is_event_handled),
             patch.object(processing, "write_notification", side_effect=fake_write_notification),
             patch.object(processing, "mark_event_handled", side_effect=fake_mark_event_handled),
             patch.object(processing, "_is_row_below_nonviable", return_value=row_below_nonviable),
@@ -294,7 +318,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "highlight_row"),
             patch.object(processing, "send_reply_in_thread", side_effect=send_reply),
             patch.object(processing, "update_thread_status", side_effect=fake_update_thread_status),
-            patch.object(processing, "complete_threads_for_row", return_value=1),
+            patch.object(processing, "complete_threads_for_row", new=complete_threads),
             patch.object(processing, "_clear_thread_action_notifications"),
             patch.object(processing, "_maybe_mark_client_completed", side_effect=mark_client_completed),
             patch.object(processing, "check_missing_required_fields", return_value=[]),
@@ -321,6 +345,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "stopThreads": stop_threads,
             "sendReply": send_reply,
             "markClientCompleted": mark_client_completed,
+            "completeThreads": complete_threads,
             "cancelFollowup": cancel_followup,
             "callTrace": call_trace,
             "threadRef": thread_ref,
@@ -688,6 +713,230 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 for handled in result["handledEvents"]
             )
         )
+
+    def test_reviewed_tour_invite_confirmation_survives_persisted_offer_dedupe(self):
+        thread_id = "thread-tour-sequence-confirmed"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        offer = {
+            "updates": [],
+            "events": [{
+                "type": "tour_requested",
+                "question": "I can show the property Tuesday morning.",
+                "suggestedEmail": "Could we tour at 10:15 AM?",
+            }],
+            "response_email": "Thanks for the offer.",
+        }
+
+        offer_result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="I can show the property Tuesday morning.",
+            proposal=offer,
+            thread_ref=thread_ref,
+            msg_id="msg-tour-offer",
+            internet_message_id="<tour-offer@mock.test>",
+            persist_handled_events=True,
+        )
+
+        self.assertIn("tour_requested", thread_ref._data["handledEvents"])
+        offer_result["sendReply"].assert_not_called()
+
+        # The operator reviewed the first action and sent a tour invite. The
+        # original offer's handled-event record remains on the same thread.
+        thread_ref._data.update({
+            "status": processing.THREAD_STATUS["active"],
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "10:15 AM",
+                "departureTime": "10:45 AM",
+                "status": "sent",
+            },
+        })
+        confirmation_result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="Tuesday at 10:15 AM works for us. Confirmed.",
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": "Tuesday at 10:15 AM works for us. Confirmed.",
+                    "suggestedEmail": "",
+                }],
+                "response_email": "Great, thanks for confirming.",
+            },
+            thread_ref=thread_ref,
+            msg_id="msg-tour-confirmation",
+            internet_message_id="<tour-confirmation@mock.test>",
+            persist_handled_events=True,
+        )
+
+        confirmation_result["sendReply"].assert_not_called()
+        self.assertEqual("confirmed", thread_ref._data["tourInvite.status"])
+        self.assertEqual("confirmed", thread_ref._data["tourStatus"])
+        confirmation_result["completeThreads"].assert_called_once()
+        self.assertTrue(any(
+            key.startswith("tour_requested:confirmed:")
+            for key in thread_ref._data["handledEvents"]
+        ))
+
+    def test_reviewed_tour_invite_reschedule_survives_persisted_offer_dedupe(self):
+        thread_id = "thread-tour-sequence-reschedule"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="We can show the property Tuesday morning.",
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": "We can show the property Tuesday morning.",
+                    "suggestedEmail": "Could we tour at 10:15 AM?",
+                }],
+                "response_email": None,
+            },
+            thread_ref=thread_ref,
+            msg_id="msg-tour-offer",
+            internet_message_id="<tour-offer@mock.test>",
+            persist_handled_events=True,
+        )
+        thread_ref._data.update({
+            "status": processing.THREAD_STATUS["active"],
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "10:15 AM",
+                "departureTime": "10:45 AM",
+                "status": "sent",
+            },
+        })
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="10:15 AM will not work. Can we do 11:45 AM instead?",
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": "10:15 AM will not work. Can we do 11:45 AM instead?",
+                    "suggestedEmail": "Let me check.",
+                }],
+                "response_email": "Thanks, I will make that change.",
+            },
+            thread_ref=thread_ref,
+            msg_id="msg-tour-reschedule",
+            internet_message_id="<tour-reschedule@mock.test>",
+            persist_handled_events=True,
+        )
+
+        result["sendReply"].assert_not_called()
+        self.assertEqual(1, len(result["notifications"]))
+        self.assertEqual(
+            "tour_reschedule_requested",
+            result["notifications"][0]["kwargs"]["meta"]["reason"],
+        )
+        self.assertEqual("alternate_requested", thread_ref._data["tourInvite.status"])
+        self.assertTrue(any(
+            key.startswith("tour_requested:alternate_requested:")
+            for key in thread_ref._data["handledEvents"]
+        ))
+
+    def test_tour_notification_failure_is_retryable_without_send_or_completion(self):
+        send_reply = MagicMock(return_value=True)
+        complete_threads = MagicMock(return_value=1)
+        mark_client_completed = MagicMock(return_value=True)
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "tour handoff",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id="thread-tour-notification-failure",
+                body="I can show the property Tuesday morning.",
+                proposal={
+                    "updates": [],
+                    "events": [{
+                        "type": "tour_requested",
+                        "question": "I can show the property Tuesday morning.",
+                        "suggestedEmail": "Could we tour at 10:15 AM?",
+                    }],
+                    "response_email": "Thanks, Tuesday should work.",
+                },
+                thread_ref=thread_ref,
+                notification_error=RuntimeError("notification create unavailable"),
+                send_reply_mock=send_reply,
+                complete_threads_mock=complete_threads,
+                mark_client_completed_mock=mark_client_completed,
+            )
+
+        send_reply.assert_not_called()
+        complete_threads.assert_not_called()
+        mark_client_completed.assert_not_called()
+
+    def test_tour_thread_state_failure_is_retryable_without_send_or_completion(self):
+        send_reply = MagicMock(return_value=True)
+        complete_threads = MagicMock(return_value=1)
+        mark_client_completed = MagicMock(return_value=True)
+        thread_ref = FakeDocumentRef(
+            {
+                "clientId": "client-1",
+                "email": ["bp21harrison@gmail.com"],
+                "status": processing.THREAD_STATUS["active"],
+                "rowNumber": 3,
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {
+                    "tourDate": "2026-06-23",
+                    "arrivalTime": "10:15 AM",
+                    "departureTime": "10:45 AM",
+                    "status": "sent",
+                },
+            },
+            update_error=RuntimeError("thread handoff update unavailable"),
+        )
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "tour handoff",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id="thread-tour-state-failure",
+                body="10:15 AM will not work. Can we do 11:45 AM instead?",
+                proposal={
+                    "updates": [],
+                    "events": [{
+                        "type": "tour_requested",
+                        "question": "10:15 AM will not work. Can we do 11:45 AM instead?",
+                        "suggestedEmail": "Let me check.",
+                    }],
+                    "response_email": "Thanks, I will make that change.",
+                },
+                thread_ref=thread_ref,
+                send_reply_mock=send_reply,
+                complete_threads_mock=complete_threads,
+                mark_client_completed_mock=mark_client_completed,
+            )
+
+        send_reply.assert_not_called()
+        complete_threads.assert_not_called()
+        mark_client_completed.assert_not_called()
 
     def test_three_event_inbound_surfaces_every_human_action_and_never_auto_sends(self):
         body = (
@@ -1151,6 +1400,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         notifications = []
         handled_events = []
         status_updates = []
+        send_reply = MagicMock(return_value=True)
 
         def fake_write_notification(*args, **kwargs):
             notif_id = f"notif-{len(notifications) + 1}"
@@ -1223,7 +1473,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                     "body": "Hi BP21 Broker, can you send details?",
                 },
             ),
-            patch.object(processing, "send_reply_in_thread", return_value=True),
+            patch.object(processing, "send_reply_in_thread", new=send_reply),
             patch.object(processing, "update_thread_status", side_effect=fake_update_thread_status),
             patch.object(processing, "_maybe_mark_client_completed"),
         ]
@@ -1252,6 +1502,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         self.assertIn("property_unavailable", notification_kinds)
         self.assertIn("new_property_pending_approval", action_reasons)
         self.assertNotIn("tour_requested", action_reasons)
+        send_reply.assert_called_once()
         self.assertFalse(
             any(
                 update["status"] == processing.THREAD_STATUS["paused"]

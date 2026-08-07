@@ -5059,7 +5059,11 @@ def _inbound_authority_ineligibility_reason(
 
     normalized_own_email = str(own_email or "").strip().lower()
     normalized_from_addr = str(from_addr or "").strip().lower()
-    if normalized_own_email and normalized_from_addr == normalized_own_email:
+    normalized_sender_addr = str(sender_addr or "").strip().lower()
+    if normalized_own_email and normalized_own_email in {
+        normalized_from_addr,
+        normalized_sender_addr,
+    }:
         return "self_email"
 
     if _is_no_new_reply_text(fresh_text) and not has_attachments:
@@ -5068,38 +5072,70 @@ def _inbound_authority_ineligibility_reason(
 
 
 def _resolve_current_mailbox_email(headers: Dict[str, str]) -> Optional[str]:
-    """Resolve the authenticated Graph mailbox using the existing fallbacks."""
-    my_email = None
-    my_email_resp = requests.get(
-        "https://graph.microsoft.com/v1.0/me",
-        headers=headers,
-        params={"$select": "mail,userPrincipalName"},
-        timeout=10,
-    )
-    if my_email_resp.status_code == 200:
-        my_data = my_email_resp.json()
-        my_email = (
-            my_data.get("mail") or my_data.get("userPrincipalName") or ""
-        ).lower()
+    """Resolve the authenticated Graph mailbox or keep the scan retryable.
 
-    if not my_email:
-        sent_resp = requests.get(
-            "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
+    Both endpoints are attempted independently because `/me` can omit `mail`
+    while SentItems still exposes the effective sending identity. Returning no
+    identity would make self/send-on-behalf messages look like broker replies,
+    so an unresolved mailbox is a retryable safety failure rather than `None`.
+    """
+    my_email = None
+    resolution_failures = []
+    try:
+        my_email_resp = requests.get(
+            "https://graph.microsoft.com/v1.0/me",
             headers=headers,
-            params={"$top": "1", "$select": "from"},
+            params={"$select": "mail,userPrincipalName"},
             timeout=10,
         )
-        if sent_resp.status_code == 200:
-            sent_data = sent_resp.json()
-            if sent_data.get("value"):
-                my_email = (
-                    sent_data["value"][0]
-                    .get("from", {})
-                    .get("emailAddress", {})
-                    .get("address")
-                    or ""
-                ).lower()
-    return my_email or None
+        if my_email_resp.status_code == 200:
+            my_data = my_email_resp.json()
+            my_email = (
+                my_data.get("mail") or my_data.get("userPrincipalName") or ""
+            ).strip().lower()
+        else:
+            resolution_failures.append(f"/me HTTP {my_email_resp.status_code}")
+    except Exception as e:
+        resolution_failures.append(f"/me {type(e).__name__}: {e}")
+
+    if not my_email:
+        try:
+            sent_resp = requests.get(
+                "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
+                headers=headers,
+                params={"$top": "1", "$select": "from"},
+                timeout=10,
+            )
+            if sent_resp.status_code == 200:
+                sent_data = sent_resp.json()
+                if sent_data.get("value"):
+                    my_email = (
+                        sent_data["value"][0]
+                        .get("from", {})
+                        .get("emailAddress", {})
+                        .get("address")
+                        or ""
+                    ).strip().lower()
+                if not my_email:
+                    resolution_failures.append(
+                        "SentItems HTTP 200 without a mailbox identity"
+                    )
+            else:
+                resolution_failures.append(
+                    f"SentItems HTTP {sent_resp.status_code}"
+                )
+        except Exception as e:
+            resolution_failures.append(
+                f"SentItems {type(e).__name__}: {e}"
+            )
+
+    if not my_email:
+        details = "; ".join(resolution_failures) or "no mailbox identity returned"
+        raise RetryableProcessingError(
+            "Authenticated Graph mailbox identity could not be resolved; "
+            f"leaving inbound messages retryable ({details})"
+        )
+    return my_email
 
 
 def _validate_operator_replay_claims(
@@ -5138,6 +5174,7 @@ def process_inbox_message(
     *,
     allow_outbound_reply: bool = True,
     operator_replay_attempt_id: Optional[str] = None,
+    authenticated_mailbox_email: Optional[str] = None,
 ):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
     if not allow_outbound_reply:
@@ -5246,7 +5283,10 @@ def process_inbox_message(
     # SAFETY: Skip emails from ourselves (e.g., forwarded back via auto-forward rules)
     # This prevents our own outbound emails from being processed as broker replies
     try:
-        my_email = _resolve_current_mailbox_email(headers)
+        my_email = (
+            authenticated_mailbox_email
+            or _resolve_current_mailbox_email(headers)
+        )
         authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
             subject=subject,
             from_addr=from_addr,
@@ -5260,6 +5300,8 @@ def process_inbox_message(
             print(f"⏭️ Skipping self-email (forwarded back): {subject}")
             print(f"   Sender {from_addr} matches our own address - likely auto-forwarded")
             return
+    except RetryableProcessingError:
+        raise
     except Exception as e:
         # Don't fail the whole process if this check fails
         print(f"⚠️ Could not check for self-email: {e}")
@@ -5794,8 +5836,81 @@ def process_inbox_message(
                 print(f"\n🔄 Event {i+1}/{len(events)}: {event_type}")
                 print(f"   Event data: {event}")
 
+                # Calculate the terminal-row gate before tour preprocessing.
+                # A stale tour mention must not suppress the valid response for
+                # the property-unavailable/replacement events that remain.
+                event_stale_skip_flag = old_row_became_nonviable or (
+                    row_will_go_nonviable
+                    and event_type not in _TERMINALIZING_EVENT_TYPES
+                )
+                event_should_skip_after_terminal = (
+                    _should_skip_event_after_original_row_terminalized(
+                        event_type,
+                        old_row_became_nonviable=event_stale_skip_flag,
+                    )
+                )
+
+                tour_message_text = ""
+                clean_tour_event = None
+                tour_reply_classification = None
+                tour_needs_operator_action = False
+                if event_type == "tour_requested":
+                    # Tour replies have a lifecycle on one long-lived thread:
+                    # broker offer -> reviewed operator invite -> broker
+                    # confirmation/reschedule. Classify the current inbound
+                    # before consulting the thread's handled-event map so the
+                    # first offer cannot suppress a later lifecycle phase.
+                    tour_message_text = _clean_tour_signal_text(
+                        _text_for_ai or _full_text
+                    )
+                    clean_tour_event = dict(event)
+                    clean_tour_event["question"] = _clean_tour_signal_text(
+                        event.get("question") or tour_message_text
+                    ) or tour_message_text
+                    tour_reply_classification = _classify_tour_invite_reply(
+                        tour_message_text,
+                        event=clean_tour_event,
+                        thread_data=thread_data,
+                        contact_name=contact_name,
+                        recipient_email=to_addr_lower,
+                    )
+                    tour_needs_operator_action = _tour_event_needs_operator_action(
+                        clean_tour_event,
+                        tour_message_text,
+                        thread_data,
+                    )
+                    # A tour handoff or a confirmed invite is always no-send.
+                    # Set this before dedupe and before every fallible durable
+                    # write so no retry/error path can reach the generic sender.
+                    if (
+                        not event_should_skip_after_terminal
+                        and (
+                            tour_needs_operator_action
+                            or tour_reply_classification.get("canCloseThread")
+                        )
+                    ):
+                        proposal["skip_response"] = True
+
                 # Build event key for deduplication
                 event_key = build_event_key(event_type, event, thread_id)
+                if (
+                    event_type == "tour_requested"
+                    and _is_tour_invite_thread(thread_data)
+                    and tour_reply_classification
+                    and tour_reply_classification.get("outcome") != "not_tour"
+                ):
+                    lifecycle_phase = str(
+                        tour_reply_classification.get("outcome") or "reply"
+                    ).strip().lower()
+                    source_identity = str(
+                        internet_message_id or msg_id or "unknown-message"
+                    )
+                    source_digest = hashlib.sha256(
+                        source_identity.encode("utf-8")
+                    ).hexdigest()[:16]
+                    event_key = (
+                        f"tour_requested:{lifecycle_phase}:{source_digest}"
+                    )
                 print(f"   Event key: {event_key}")
 
                 # Check if this event was already handled - prevents duplicate notifications
@@ -5807,14 +5922,7 @@ def process_inbox_message(
                 # The precomputed flag only gates INFORMATIONAL events — the
                 # terminalizing events themselves (ordered last) must always
                 # process, else property_unavailable would self-skip.
-                _stale_skip_flag = old_row_became_nonviable or (
-                    row_will_go_nonviable
-                    and event_type not in _TERMINALIZING_EVENT_TYPES
-                )
-                if _should_skip_event_after_original_row_terminalized(
-                    event_type,
-                    old_row_became_nonviable=_stale_skip_flag,
-                ):
+                if event_should_skip_after_terminal:
                     print(
                         "   ℹ️ Skipping stale original-row event after non-viable move; "
                         "replacement/opt-out events will continue."
@@ -5886,26 +5994,22 @@ def process_inbox_message(
                         # Human-review tour escalations are part of the core inbox
                         # contract for every user. Any allowlist for automated tour
                         # planning must not hide the broker's request from the user.
-                        tour_message_text = _clean_tour_signal_text(_text_for_ai or _full_text)
-                        clean_event = dict(event)
-                        clean_event["question"] = _clean_tour_signal_text(
-                            event.get("question") or tour_message_text
-                        ) or tour_message_text
-                        tour_reply_classification = _classify_tour_invite_reply(
-                            tour_message_text,
-                            event=clean_event,
-                            thread_data=thread_data,
-                            contact_name=contact_name,
-                            recipient_email=to_addr_lower,
-                        )
+                        clean_event = clean_tour_event or dict(event)
 
-                        if not _tour_event_needs_operator_action(clean_event, tour_message_text, thread_data):
-                            mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                        if not tour_needs_operator_action:
                             if tour_reply_classification.get("canCloseThread"):
-                                update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "tour_confirmed")
                                 if thread_ref:
                                     thread_ref.update(
                                         _build_tour_invite_reply_state_update(tour_reply_classification)
+                                    )
+                                if not update_thread_status(
+                                    user_id,
+                                    thread_id,
+                                    THREAD_STATUS["completed"],
+                                    "tour_confirmed",
+                                ):
+                                    raise RetryableProcessingError(
+                                        "tour handoff thread status update failed"
                                     )
                                 complete_threads_for_row(
                                     user_id,
@@ -5915,7 +6019,16 @@ def process_inbox_message(
                                 )
                                 _clear_thread_action_notifications(user_id, client_id, thread_id)
                                 _maybe_mark_client_completed(user_id, client_id)
-                                proposal["skip_response"] = True
+                            if not mark_event_handled(
+                                user_id,
+                                thread_id,
+                                event_key,
+                                msg_id,
+                                None,
+                            ):
+                                raise RetryableProcessingError(
+                                    "tour handoff event marker update failed"
+                                )
                             print(f"🏠 Skipped non-actionable tour event: {tour_reply_classification.get('outcome')}")
                             continue
 
@@ -6006,22 +6119,41 @@ def process_inbox_message(
                                 else f"tour_requested:{thread_id}"
                             )
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        # Update thread status to paused - waiting for user to handle tour
+                        if not update_thread_status(
+                            user_id,
+                            thread_id,
+                            THREAD_STATUS["paused"],
+                            reason,
+                        ):
+                            raise RetryableProcessingError(
+                                "tour handoff thread status update failed"
+                            )
+                        if not mark_event_handled(
+                            user_id,
+                            thread_id,
+                            event_key,
+                            msg_id,
+                            notif_id,
+                        ):
+                            raise RetryableProcessingError(
+                                "tour handoff event marker update failed"
+                            )
                         print(f"🏠 Created {reason} notification with suggested email")
 
-                        # Update thread status to paused - waiting for user to handle tour
-                        update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], reason)
-
                         # Don't auto-respond - user will send the approved email
-                        proposal["skip_response"] = True
                         # Highlight blue - row needs user attention (paused)
                         try:
                             highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
                         except Exception as e:
                             print(f"⚠️ Could not highlight row: {e}")
 
+                    except RetryableProcessingError:
+                        raise
                     except Exception as e:
-                        print(f"❌ Failed to write tour_requested notification: {e}")
+                        raise RetryableProcessingError(
+                            f"tour handoff failed: {e}"
+                        ) from e
 
                 elif event_type == "needs_user_input":
                     # Client asked a question or made a request the AI cannot handle
@@ -7343,6 +7475,32 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     processed_count = 0
     batched_count = 0
 
+    # Resolve the authenticated mailbox once for the entire scan and share it
+    # with every singleton, orphan, batch shortcut, and newest-message path.
+    # Without a verified identity, any From/Sender comparison would fail open
+    # and could turn a self/send-on-behalf message into canonical broker
+    # authority, so leave every message unprocessed for the next scan.
+    authenticated_mailbox_email = None
+    if thread_messages or orphan_messages:
+        try:
+            authenticated_mailbox_email = _resolve_current_mailbox_email(headers)
+        except Exception as e:
+            print(f"🔁 Mailbox identity unresolved; leaving inbox batch retryable: {e}")
+            return {
+                "status": "error",
+                "operation": "inbox_scan",
+                "retryable": True,
+                "error": str(e),
+                "scanned": scanned_count,
+                "processed": 0,
+                "batched": sum(
+                    max(0, len(messages) - 1)
+                    for messages in thread_messages.values()
+                ),
+                "skipped": skipped_count,
+                "orphaned": len(orphan_messages),
+            }
+
     # Process thread batches (multiple messages in same thread)
     # Add delay between processing to avoid Google Sheets rate limits (60 reads/min)
     RATE_LIMIT_DELAY = 3  # seconds between processing each thread
@@ -7359,9 +7517,17 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             # First, save all the messages to Firestore so they appear in conversation
             for msg in messages[:-1]:  # All but the last
                 try:
-                    _save_message_to_thread(user_id, thread_id, msg, headers)
+                    _save_message_to_thread(
+                        user_id,
+                        thread_id,
+                        msg,
+                        headers,
+                        authenticated_mailbox_email=authenticated_mailbox_email,
+                    )
                     processed_key = msg.get("internetMessageId") or msg.get("id")
                     mark_processed(user_id, processed_key)
+                except RetryableProcessingError:
+                    raise
                 except Exception as e:
                     print(f"⚠️ Failed to save batched message: {e}")
 
@@ -7373,7 +7539,12 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                 skipped_count += 1
                 continue
             try:
-                process_inbox_message(user_id, headers, last_msg)
+                process_inbox_message(
+                    user_id,
+                    headers,
+                    last_msg,
+                    authenticated_mailbox_email=authenticated_mailbox_email,
+                )
                 processed_count += 1
                 _clear_ai_processing_failure(user_id, thread_id, last_msg.get("internetMessageId") or last_msg.get("id"))
             except Exception as e:
@@ -7400,7 +7571,15 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                 skipped_count += 1
                 continue
             try:
-                process_inbox_message(user_id, headers, msg)
+                if authenticated_mailbox_email:
+                    process_inbox_message(
+                        user_id,
+                        headers,
+                        msg,
+                        authenticated_mailbox_email=authenticated_mailbox_email,
+                    )
+                else:
+                    process_inbox_message(user_id, headers, msg)
                 processed_count += 1
                 _clear_ai_processing_failure(user_id, thread_id, msg.get("internetMessageId") or msg.get("id"))
             except Exception as e:
@@ -7428,7 +7607,15 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         processing_error = None
         processed_key = msg.get("internetMessageId") or msg.get("id")
         try:
-            process_inbox_message(user_id, headers, msg)
+            if authenticated_mailbox_email:
+                process_inbox_message(
+                    user_id,
+                    headers,
+                    msg,
+                    authenticated_mailbox_email=authenticated_mailbox_email,
+                )
+            else:
+                process_inbox_message(user_id, headers, msg)
         except Exception as e:
             processing_error = e
             print(f"❌ Failed to process orphan message: {e}")
@@ -7527,7 +7714,14 @@ def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional
     return None
 
 
-def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: dict):
+def _save_message_to_thread(
+    user_id: str,
+    thread_id: str,
+    msg: dict,
+    headers: dict,
+    *,
+    authenticated_mailbox_email: Optional[str] = None,
+):
     """
     Save a message to a thread without full processing.
     Used for batching - saves earlier messages so they appear in conversation history.
@@ -7643,19 +7837,19 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
         has_attachments=has_attachments,
     )
     if authority_ineligibility_reason not in {"auto_reply", "no_new_content"}:
-        try:
-            my_email = _resolve_current_mailbox_email(headers)
-            authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
-                subject=subject,
-                from_addr=from_addr,
-                sender_addr=sender_addr,
-                internet_message_headers=internet_message_headers,
-                own_email=my_email,
-                fresh_text=fresh_text,
-                has_attachments=has_attachments,
-            )
-        except Exception as e:
-            print(f"⚠️ Could not check batched message for self-email: {e}")
+        my_email = (
+            authenticated_mailbox_email
+            or _resolve_current_mailbox_email(headers)
+        )
+        authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
+            subject=subject,
+            from_addr=from_addr,
+            sender_addr=sender_addr,
+            internet_message_headers=internet_message_headers,
+            own_email=my_email,
+            fresh_text=fresh_text,
+            has_attachments=has_attachments,
+        )
 
     if authority_ineligibility_reason is None:
         from .followup import cancel_followup_on_response
