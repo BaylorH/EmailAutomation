@@ -1,42 +1,106 @@
-# Explicit OpEx Precedence Hotfix
+# Evidence-Bounded OpEx Precedence Correction
 
 Date: 2026-08-07
 
 Status: approved within the active SiteSift production-readiness build
 
-## Production finding
+## Production finding and audit correction
 
-The Wave B-M1 broker reply stated an asking rent of `$14.10 NNN` and later stated `CAM, taxes, and insurance ... $3.90 per square foot`. The deterministic OpEx fallback returned `14.10`, causing the Sheet to duplicate rent into `Ops Ex / SF` and calculate monthly gross rent as `$44,062.50` instead of `$28,125.00`.
+The Wave B-M1 broker reply stated an asking rent of `$14.10 NNN` and later stated
+`CAM, taxes, and insurance are running roughly $3.90 per square foot`. The
+deployed deterministic fallback returned `14.10`, duplicating rent into
+`Ops Ex / SF`.
 
-The failure is deterministic: `_OPS_EX_RE` finds only the earlier figure-first `$14.10 NNN` match because the later keyword-first `CAM` clause exceeds the regex's short linking-clause grammar. `_opex_match_is_rent_basis_line` also does not reject the first match because the nearby phrase is `we can offer ... at`, not one of its rent-keyword forms.
+The first hotfix added an arbitrary 96-character keyword-first matcher. Audit
+rejected that architecture: it repaired the production sentence but admitted
+nine plausible non-OpEx figures that the deployed extractor had correctly left
+alone. A negative extractor result was also insufficient because proposal
+augmentation retained a model-proposed OpEx update unless deterministic evidence
+provided a replacement.
 
 ## Considered approaches
 
-1. Rank explicit keyword-first OpEx evidence before ambiguous figure-first `NNN` evidence. This is the selected approach because `CAM`, `OpEx`, `TMI`, and `operating expenses` explicitly name the field while bare `NNN` commonly describes rent basis.
-2. Expand the rent-line guard to recognize `offer ... at $X NNN`. This fixes the observed sentence but leaves the parser dependent on an incomplete list of rent phrasings.
-3. Stop deterministically correcting model-proposed OpEx. This would make the production result model-dependent and remove a safety layer that already catches known extraction errors.
+1. **Evidence-bounded positive and negative grammars — selected.** Add only the
+   two explicit positive structures required by production evidence, detect
+   combined rent-and-OpEx totals separately, and use the negative evidence both
+   while extracting and while validating an existing model proposal.
+2. **Keep the broad matcher and enumerate exclusions — rejected.** Each new
+   exclusion leaves another plausible prose path through the arbitrary gap and
+   repeats the audit failure mode.
+3. **Remove deterministic proposal reconciliation — rejected.** This would make
+   the production result model-dependent and would discard established compact
+   OpEx, monthly, and combined-component safeguards.
 
 ## Design
 
-Add a narrow explicit keyword-first candidate extractor that accepts ordinary prose between an unambiguous OpEx label and a nearby dollar figure, including commas and phrases such as `taxes, and insurance are running roughly`. It must stop at sentence, newline, semicolon, or intervening-dollar boundaries and must not treat bare `NNN` as an explicit keyword-first label.
+### Evidence precedence
 
-The rent-reference guard must reject only a rent phrase that assigns the captured dollar figure, such as `asking rent is $14.10`. It must not reject relational language in a genuine OpEx clause, such as `CAM, on top of the base rent, is $3.90`.
+`_COMBINED_RENT_OPEX_RE` remains highest specificity for component expressions
+such as `$14 + $4 OpEx` and `$1.25 NNN + $0.34 OPEX`. Its OpEx component is
+returned before any total rejection or standalone matching.
 
-`_extract_ops_ex_sf_from_text` will preserve the existing combined base-plus-OpEx matcher as the highest-specificity path, then evaluate this explicit candidate before general `_OPS_EX_RE` candidates. Existing monthly-basis normalization and hypothetical-language rejection remain in force. The existing general matcher remains the fallback for compact forms such as `$8/SF opex` and `NNN charges are $7.25/SF/yr`.
+All other extraction uses two kinds of evidence:
 
-No notification, recipient, outbox, access-control, replacement, or deployment behavior changes in this hotfix.
+- **Rejected combined totals.** Two bounded, symmetric patterns require an
+  OpEx/CAM label, a rent label, an additive or inclusion relation (`plus`, `and`,
+  `on top of`, or `in addition to`), a totalizing predicate (`is`, `equals`,
+  `totals`, `comes to`, or `amounts to`, with optional `combined`, `all-in`, or
+  `gross` wording), and one dollar figure. The detector returns the exact numeric
+  span and its annualized `Decimal` value.
+- **Valid standalone candidates.** Two narrow positive patterns cover only the
+  audited production component-list form (`CAM, taxes, and insurance are running
+  roughly $3.90`) and a structurally parenthetical rent modifier (`CAM, on top of
+  base rent, is $3.90` or `CAM (in addition to base rent) is $3.90`). Ordinary
+  compact forms remain owned by `_OPS_EX_RE`.
+
+The arbitrary 96-character matcher and its rent-relation exceptions are removed.
+Bare `NNN` remains excluded from the narrow positive patterns because it commonly
+describes the rent basis rather than a separate operating-expense component.
+
+### Extraction safety
+
+The standalone-candidate collector evaluates narrow positives before legacy
+candidates so the exact production `3.90` outranks the earlier `$14.10 NNN`
+lease-basis match. It applies the existing hypothetical and monthly guards and
+rejects any candidate whose numeric span overlaps combined-total evidence.
+Legacy fallback uses the same rejected spans, so a rent-first total such as
+`Base rent plus CAM equals $18` cannot be re-admitted by `_OPS_EX_RE`.
+
+Multiple sentences remain independent: in
+`CAM plus base rent totals $18/SF. CAM alone is $3.90/SF.`, only the first numeric
+span is rejected and the later standalone `3.90` is returned.
+
+### Proposal-write safety
+
+Before the event-specific early return and before `_fill`, proposal augmentation
+resolves the configured OpEx column and compares an existing model value with the
+normalized rejected combined-total values from the fresh inbound text. It removes
+only an exact matching model OpEx update, and only when the same normalized value
+is not also supported by a valid standalone OpEx candidate. No other model update
+or event is altered.
+
+This ordering prevents terminal or new-property proposals from carrying a known
+combined total into the Sheet, while allowing `_fill` to add a later valid
+standalone value after a rejected model total is removed.
 
 ## Acceptance criteria
 
-- The exact Wave B-M1 production sentence returns rent `14.10` and OpEx `3.90`.
-- The proposal augmentation replaces a conflicting model OpEx value of `14.10` with `3.90` before the Sheet write.
-- Explicit OpEx figures continue to win over earlier rent-basis `NNN` figures.
-- NNN-only rent statements do not fabricate OpEx.
-- `CAM pending; quoted rate $14.10 NNN` does not cross the semicolon and fabricate OpEx.
-- `CAM, on top of base rent, is $3.90` retains the explicit OpEx value.
-- Hypothetical and monthly-basis safeguards remain green.
-- Focused extraction tests, Jill live-regression tests, the backend safety suite, deploy contracts, syntax checks, and diff checks pass before release.
+- The exact Wave B-M1 sentence extracts `3.90` and overwrites model OpEx `14.10`.
+- Each audited rent-and-CAM total, including rent-first order, extracts no OpEx.
+- A preseeded model OpEx equal to a rejected total is removed before an event
+  early return.
+- A later standalone `3.90` wins over an earlier rejected combined total in both
+  direct extraction and proposal augmentation.
+- Pending, unknown, prior, and unresolved projected-range language does not
+  fabricate an OpEx value; a current standalone value remains eligible.
+- Parenthetical rent modifiers, distinct rent and CAM figures, combined component
+  expressions, and monthly annualization remain green.
+- The focused five-file regression suite, syntax compilation, diff checks, and
+  clean-worktree check pass.
 
-## Production verification
+## Scope and release boundary
 
-Deploy only the reviewed exact commit to a no-traffic Cloud Run revision, verify immutable image/config/health, promote to the Baylor-only lane, and run a new browser-driven internal campaign using fresh wording that contains a rent-basis figure followed by an explicit OpEx/CAM figure. The live Sheet must contain the correct distinct values and gross formula result.
+Only `email_automation/ai_processing.py`, its focused regression tests, and these
+planning artifacts change. Recipient, outbox, access, notification, scheduler,
+and deployment code are out of scope. This correction is committed and reviewed
+locally; it is not pushed or deployed in this task.
