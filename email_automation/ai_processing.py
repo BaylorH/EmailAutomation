@@ -1580,8 +1580,12 @@ _OPS_EX_RENT_MODIFIER_RE = re.compile(
 _COMBINED_TOTAL_RENT_LABEL = (
     r"(?:(?:base|asking)\s+rent|rent|lease\s+rate|rental\s+rate)"
 )
+_OPS_EX_COMPETING_RENT_SUBJECT = (
+    rf"(?:{_COMBINED_TOTAL_RENT_LABEL}|(?:base|asking|quoted)\s+rate|"
+    r"(?:lease|asking)\s+price)"
+)
 _OPS_EX_COMPETING_BASIS_SUBJECT = (
-    rf"(?:{_COMBINED_TOTAL_RENT_LABEL}|base\s+rate|parking|reports?|"
+    rf"(?:{_OPS_EX_COMPETING_RENT_SUBJECT}|parking|reports?|"
     r"utilities?|invoices?|statements?|summar(?:y|ies))"
 )
 _OPS_EX_TAX_SUBJECT = (
@@ -1594,8 +1598,10 @@ _OPS_EX_TAX_INSURANCE_SUBJECT = (
     rf"(?:{_OPS_EX_TAX_SUBJECT}|{_OPS_EX_INSURANCE_SUBJECT})"
 )
 _OPS_EX_SUPPORTING_BASIS_QUALIFIER = (
-    rf"(?:{_OPS_EX_TAX_SUBJECT}\s+(?:and|&)\s+"
-    rf"{_OPS_EX_INSURANCE_SUBJECT})"
+    rf"(?:(?:{_OPS_EX_TAX_SUBJECT}\s+(?:and|&)\s+"
+    rf"{_OPS_EX_INSURANCE_SUBJECT})|"
+    rf"(?:{_OPS_EX_INSURANCE_SUBJECT}\s+(?:and|&)\s+"
+    rf"{_OPS_EX_TAX_SUBJECT}))"
 )
 _OPS_EX_DIRECT_BASIS_SUBJECT = (
     rf"(?:{_OPS_EX_COMPETING_BASIS_SUBJECT}|{_OPS_EX_TAX_INSURANCE_SUBJECT})"
@@ -1626,7 +1632,7 @@ _OPS_EX_STALE_EVIDENCE_MARKER = (
     r"(?:prior|stale|previous|historical|old|former)"
 )
 _OPS_EX_CURRENT_EVIDENCE_MARKER = (
-    r"(?:current(?:ly)?|now|revised|updated)"
+    r"(?:current(?:ly)?|now|revised|updated|correction|corrected|correct|actually)"
 )
 _OPS_EX_EVIDENCE_DESCRIPTOR = (
     r"(?:estimate|quote|quoted\s+rate|rate|figure|amount|value)"
@@ -1649,47 +1655,75 @@ _OPS_EX_CURRENT_EVIDENCE_LOCAL_RE = re.compile(
     rf"\b{_OPS_EX_CURRENT_EVIDENCE_MARKER}\b",
     re.IGNORECASE,
 )
-# A rent keyword immediately preceding a $ figure marks that figure as the RENT
-# line. "nnn" is the ONLY lease-basis word in the OpEx label set above, so a
-# figure-first hit ending in "nnn" ("Rent $0.82 NNN") is ambiguous: the NNN is
-# the rent's triple-net BASIS, not a separate OpEx figure. Guard #19's extractor
-# from mistaking such a rent line for OpEx (which would overwrite a valid LLM
-# OpEx and land rent+opex on mixed bases before #15 annualizes).
-_RENT_KW_BEFORE_FIGURE_RE = re.compile(
-    r"(?:asking(?:\s+(?:rental\s+)?rate)?|base\s+rent|lease\s+rate|"
-    r"rental\s+rate|rent|rate)\b[^\d$]{0,32}$",
+_RENT_NNN_EXPLICIT_OWNER = (
+    r"(?:asking\s+(?:rent|(?:rental\s+)?rate)|asking|base\s+rent|"
+    r"lease\s+rate|rental\s+rate|rent|rate)"
+)
+_RENT_NNN_EXPLICIT_OWNER_RE = re.compile(
+    rf"\b{_RENT_NNN_EXPLICIT_OWNER}\b",
     re.IGNORECASE,
 )
+_OPS_EX_NNN_OWNER = (
+    r"(?:operating\s+(?:expenses?|costs?)|expenses?|opex|op\s*ex|cam|tmi|"
+    r"pass[\s-]?throughs?)"
+)
 _OPS_EX_NNN_OWNER_RE = re.compile(
-    r"\b(?:operating\s+(?:expenses?|costs?)|expenses?|opex|op\s*ex|cam|tmi|"
-    r"pass[\s-]?throughs?)\b",
+    rf"\b{_OPS_EX_NNN_OWNER}\b",
+    re.IGNORECASE,
+)
+_NNN_RELATIONAL_OBJECT_RE = re.compile(
+    rf"\b(?:before|excluding|exclusive\s+of|net[\s-]+of|"
+    rf"(?:does|do|did)\s+not\s+include|not\s+including|separate\s+from)\s+"
+    rf"(?:the\s+)?(?P<object>{_RENT_NNN_EXPLICIT_OWNER}|"
+    rf"{_OPS_EX_NNN_OWNER})\b",
+    re.IGNORECASE,
+)
+_NNN_DIRECT_COOWNER_RE = re.compile(
+    rf"(?:\b{_RENT_NNN_EXPLICIT_OWNER}\b\s*(?:and|&|plus|/)\s*"
+    rf"(?:the\s+)?\b{_OPS_EX_NNN_OWNER}\b|"
+    rf"\b{_OPS_EX_NNN_OWNER}\b\s*(?:and|&|plus|/)\s*"
+    rf"(?:the\s+)?\b{_RENT_NNN_EXPLICIT_OWNER}\b)[^\d$]{{0,16}}$",
+    re.IGNORECASE,
+)
+_NNN_POSTPOSITIVE_RENT_OWNER_RE = re.compile(
+    rf"^\s*{_RENT_NNN_EXPLICIT_OWNER}\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_NNN_POSTPOSITIVE_EXPENSE_OWNER_RE = re.compile(
+    rf"^\s*{_OPS_EX_NNN_OWNER}(?:\s+(?:charges?|figure|rate))?\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
 _RENT_OFFER_AVAILABILITY_CONTEXT = (
     r"(?:offer(?:s|ed|ing)?|avail(?:able|ability)?)"
 )
 _RENT_RATE_SEPARATOR = r"(?:\b(?:at|for)\b|[@＠﹫,|:–—-])"
-_RENT_NNN_OWNER_RES = (
-    _RENT_KW_BEFORE_FIGURE_RE,
+_RENT_RATE_MODIFIER = (
+    r"(?:(?:approximately|approx\.?|about|around|roughly)\s+)?"
+)
+_CONTEXTUAL_RENT_NNN_OWNER_RES = (
     re.compile(
         rf"\b{_RENT_OFFER_AVAILABILITY_CONTEXT}\b[^$]{{0,80}}"
-        rf"{_RENT_RATE_SEPARATOR}\s*$",
+        rf"{_RENT_RATE_SEPARATOR}\s*{_RENT_RATE_MODIFIER}$",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:\d{1,3}(?:,\d{3})*|\d{4,})\s*"
         r"(?:sf|sq\.?\s*ft\.?|square\s+f(?:ee|oo)t)"
-        rf"\s*{_RENT_RATE_SEPARATOR}\s*$",
+        rf"\s*{_RENT_RATE_SEPARATOR}\s*{_RENT_RATE_MODIFIER}$",
         re.IGNORECASE,
     ),
 )
 
 
 def _nnn_clause_start(text: str, start: int) -> int:
-    """Return the prior clause boundary, ignoring square-foot abbreviations."""
+    """Return the prior clause boundary, ignoring recognized abbreviations."""
     unit_abbreviation_periods = {
         position
-        for abbreviation in re.finditer(r"\bsq\.?\s*ft\.?", text, re.IGNORECASE)
+        for abbreviation in re.finditer(
+            r"\b(?:sq\.?\s*ft\.?|approx\.)",
+            text,
+            re.IGNORECASE,
+        )
         for position in range(abbreviation.start(), abbreviation.end())
         if text[position] == "."
     }
@@ -1702,20 +1736,45 @@ def _nnn_clause_start(text: str, start: int) -> int:
     return -1
 
 
-def _nnn_figure_owner(text: str, start: int, end: Optional[int] = None) -> str:
-    """Classify ambiguous figure-first NNN evidence without using magnitude."""
+def _figure_field_owner(text: str, start: int, end: Optional[int] = None) -> str:
+    """Resolve the explicit field subject governing a nearby rate figure."""
     clause_start = _nnn_clause_start(text, start)
     prefix = text[clause_start + 1:start]
-    owners = [
+    relational_objects = [
+        match.span("object")
+        for match in _NNN_RELATIONAL_OBJECT_RE.finditer(prefix)
+    ]
+
+    def _is_relational_object(match: "re.Match") -> bool:
+        return any(
+            object_start <= match.start() and match.end() <= object_end
+            for object_start, object_end in relational_objects
+        )
+
+    explicit_owners = [
         (match.start(), "opex")
         for match in _OPS_EX_NNN_OWNER_RE.finditer(prefix)
+        if not _is_relational_object(match)
     ]
-    owners.extend(
+    explicit_owners.extend(
         (match.start(), "rent")
-        for pattern in _RENT_NNN_OWNER_RES
-        for match in pattern.finditer(prefix)
+        for match in _RENT_NNN_EXPLICIT_OWNER_RE.finditer(prefix)
+        if not _is_relational_object(match)
     )
-    prefix_owner = max(owners)[1] if owners else "neutral"
+    prefix_owner = max(explicit_owners)[1] if explicit_owners else "neutral"
+    contextual_rent = any(
+        pattern.search(prefix)
+        for pattern in _CONTEXTUAL_RENT_NNN_OWNER_RES
+    )
+    remainder = text[end:] if end is not None else ""
+    postpositive_expense = bool(
+        end is not None
+        and _NNN_POSTPOSITIVE_EXPENSE_OWNER_RE.fullmatch(remainder)
+    )
+    postpositive_rent = bool(
+        end is not None
+        and _NNN_POSTPOSITIVE_RENT_OWNER_RE.fullmatch(remainder)
+    )
     expense_suffix = bool(
         end is not None
         and re.match(
@@ -1724,11 +1783,54 @@ def _nnn_figure_owner(text: str, start: int, end: Optional[int] = None) -> str:
             re.IGNORECASE,
         )
     )
+    if _NNN_DIRECT_COOWNER_RE.search(prefix):
+        return "conflict"
+    if postpositive_expense and postpositive_rent:
+        return "conflict"
+    if postpositive_expense:
+        return "conflict" if prefix_owner == "rent" else "opex"
+    if postpositive_rent:
+        return "conflict" if prefix_owner == "opex" else "rent"
     if expense_suffix and prefix_owner == "rent":
         return "conflict"
     if expense_suffix:
         return "opex"
-    return prefix_owner
+    if prefix_owner != "neutral":
+        return prefix_owner
+    if contextual_rent:
+        return "rent"
+    return "neutral"
+
+
+def _nnn_figure_owner(text: str, start: int, end: Optional[int] = None) -> str:
+    """Classify ambiguous NNN evidence through the shared field resolver."""
+    return _figure_field_owner(text, start, end)
+
+
+_NNN_AFTER_NUMERIC_RE = re.compile(
+    r"\s*(?:(?:(?:/|\bper\s+)\s*)?"
+    r"(?:psf|sf|sq\.?\s*ft\.?|square\s+foot))?"
+    r"\s*(?:(?:/|\bper\s+)(?:mo|mos|month|monthly|yr|year|annum)\b|"
+    r"\b(?:monthly|annually|annual|yearly)\b)?"
+    r"\s*\bnnn\b",
+    re.IGNORECASE,
+)
+
+
+def _currency_figure_start(text: str, numeric_start: int) -> int:
+    """Include an adjacent dollar sign when resolving a numeric owner."""
+    start = numeric_start
+    while start > 0 and text[start - 1].isspace():
+        start -= 1
+    if start > 0 and text[start - 1] == "$":
+        return start - 1
+    return numeric_start
+
+
+def _nnn_suffix_end(text: str, numeric_end: int) -> Optional[int]:
+    """Return the end of a rate-unit-plus-NNN suffix after a numeric figure."""
+    match = _NNN_AFTER_NUMERIC_RE.match(text[numeric_end:])
+    return numeric_end + match.end() if match else None
 
 
 def _opex_match_is_rent_basis_line(text: str, m: "re.Match") -> bool:
@@ -1918,7 +2020,7 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     # 4) Generic asking-rent patterns (HEAD pattern set).
     # Rent stated with a leading rent keyword, e.g. "asking $9.75/SF/yr".
     rent_context = re.compile(
-        r"(?:asking|base\s+rent|rent|rate)[^\d$]{0,24}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+        r"\b(?:asking|base\s+rent|rent|rate)\b[^\d$]{0,24}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
         r"(?:/|\s+per\s+)?\s*(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
         re.IGNORECASE,
     )
@@ -1968,22 +2070,63 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     # "asking rent" reach across the comma and incorrectly bind to the OpEx figure.
     for pattern in (dollar_per_sf, rent_context, dollar_rate_basis, dollar_less_basis, cents_basis):
         for match in pattern.finditer(text):
+            numeric_start, numeric_end = match.span(1)
+            figure_start = _currency_figure_start(text, numeric_start)
+            nnn_end = (
+                match.end()
+                if re.search(r"\bnnn\b", match.group(0), re.IGNORECASE)
+                else _nnn_suffix_end(text, match.end())
+            )
+            figure_owner = _figure_field_owner(
+                text,
+                figure_start,
+                nnn_end if nnn_end is not None else match.end(),
+            )
             if (
-                pattern in (dollar_rate_basis, dollar_less_basis)
-                and re.search(r"\bnnn\b", match.group(0), re.IGNORECASE)
-                and not explicit_rate_unit.search(match.group(0))
-                and _nnn_figure_owner(text, match.start(), match.end()) != "rent"
+                nnn_end is not None
+                and figure_owner == "neutral"
+                and pattern is rent_context
+            ):
+                # Structured attachment text can put an explicit "Asking Rate"
+                # header on the line above its value. The bounded rent-context
+                # match remains valid even though newline clause scoping makes
+                # the figure-local owner neutral.
+                figure_owner = "rent"
+            if nnn_end is not None and figure_owner == "neutral" and (
+                pattern in (dollar_per_sf, cents_basis)
+                or (
+                    pattern is dollar_less_basis
+                    and explicit_rate_unit.search(match.group(0))
+                )
+            ):
+                # A figure-first NNN rate with a real per-SF unit is established
+                # broker rent shorthand even without a separate rent noun.
+                figure_owner = "rent"
+            if nnn_end is not None and figure_owner != "rent":
+                continue
+            if nnn_end is None and figure_owner in {"opex", "conflict"}:
+                continue
+            # Every per-SF path, including the rent-keyword pattern, must screen
+            # adjacent non-rent ownership. Basis-bearing figures ignore trailing
+            # labels because those may describe a separate following figure.
+            check_after = pattern not in basis_patterns
+            if figure_owner == "neutral" and _figure_is_non_rent(
+                text,
+                match.start(),
+                match.end(),
+                check_after=check_after,
             ):
                 continue
-            # rent_context already required an explicit rent keyword, so trust it.
-            # The keyword-less patterns must screen out non-rent cost figures
-            # (TI allowance/credit, taxes, parking, opex, buildout) in a $/SF shape.
-            if pattern is not rent_context:
-                # Basis-bearing figures already carry an explicit lease basis, so a
-                # trailing opex/tax labels a different figure — screen only the lead.
-                check_after = pattern not in basis_patterns
-                if _figure_is_non_rent(text, match.start(), match.end(), check_after=check_after):
-                    continue
+            clause_start = _nnn_clause_start(text, figure_start)
+            if (
+                figure_owner == "neutral"
+                and re.search(
+                    r"\bnnn\b",
+                    text[clause_start + 1:figure_start],
+                    re.IGNORECASE,
+                )
+            ):
+                continue
             # Cents figures are expressed in cents/SF; convert to dollars/SF.
             value = float(match.group(1)) / 100.0 if pattern is cents_basis else float(match.group(1))
             before_unit_context = text[max(0, match.start() - 40):match.start()]
@@ -2003,23 +2146,17 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
             annual_value = value * 12 if is_monthly else value
             if annual_value < 1:
                 continue
-            # #19 concession / opex / hypothetical screens for the keyword-less
-            # generic patterns (the basis patterns already carry an explicit lease
-            # basis and are screened by _figure_is_non_rent above).
-            if pattern not in basis_patterns:
-                before = text[max(0, match.start() - 30): match.start()].lower()
-                if any(marker in before for marker in ("nnn", "cam", "ops", "opex", "operating expense")):
-                    continue
-                # A TI allowance / concession figure is not the asking rent. The
-                # concession word may follow ("$30/SF in TI allowance") or precede it
-                # ("TI allowance of $30/SF"). Match-local: truncate each side at the
-                # nearest OTHER $ figure so a concession bound to a different figure
-                # can't suppress this one ("Asking $20/SF with a $25/SF TI
-                # allowance." → 20.00).
-                after_ctx = text[match.end(): match.end() + 40].split("$", 1)[0]
-                before_ctx = text[max(0, match.start() - 22): match.start()].rsplit("$", 1)[-1]
-                if _CONCESSION_MARKER_RE.search(after_ctx) or _CONCESSION_MARKER_RE.search(before_ctx):
-                    continue
+            # A TI allowance / concession figure is never the asking rent, even
+            # when an explicit field subject appears elsewhere in the clause.
+            # Truncate at another figure so an unrelated allowance cannot suppress
+            # the actual rent ("Asking $20/SF with a $25/SF TI allowance").
+            after_ctx = text[match.end(): match.end() + 40].split("$", 1)[0]
+            before_ctx = text[max(0, match.start() - 22): match.start()].rsplit("$", 1)[-1]
+            if (
+                _CONCESSION_MARKER_RE.search(after_ctx)
+                or _CONCESSION_MARKER_RE.search(before_ctx)
+            ):
+                continue
             # Past-tense hypothetical rent ("rent would've been $16/SF") is not a
             # current asking figure. The conditional phrase often sits INSIDE the
             # match span, so the window must reach match.end().
@@ -2312,22 +2449,31 @@ def _rejected_nnn_evidence(text: str) -> List[tuple]:
     """Return non-expense NNN values separately from accepted OpEx evidence."""
     evidence = []
     for match in _OPS_EX_RE.finditer(text or ""):
-        if (
-            match.group(1) is None
-            or not match.group(0).rstrip().lower().endswith("nnn")
-            or _nnn_figure_owner(text, match.start(), match.end()) == "opex"
-        ):
+        group = 1 if match.group(1) is not None else 2
+        start, end = match.span(group)
+        nnn_end = (
+            match.end()
+            if group == 1 and match.group(0).rstrip().lower().endswith("nnn")
+            else _nnn_suffix_end(text, end)
+        )
+        if nnn_end is None:
             continue
-        start, end = match.span(1)
+        owner = _nnn_figure_owner(
+            text,
+            _currency_figure_start(text, start),
+            nnn_end,
+        )
+        if owner == "opex":
+            continue
         try:
-            raw_value = Decimal(match.group(1))
+            raw_value = Decimal(match.group(group))
         except InvalidOperation:
             continue
         basis_values = _ops_ex_basis_values(
             text,
             match.start(),
-            match.end(),
-            match.group(1),
+            max(match.end(), nnn_end),
+            match.group(group),
             numeric_span=(start, end),
             context_after=30,
         )
@@ -2409,6 +2555,17 @@ def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
         ):
             return
 
+        legacy_owner = None
+        if source == "legacy" and group == 2:
+            nnn_end = _nnn_suffix_end(text, numeric_end)
+            legacy_owner = _figure_field_owner(
+                text,
+                _currency_figure_start(text, numeric_start),
+                nnn_end if nnn_end is not None else match.end(),
+            )
+            if legacy_owner in {"rent", "conflict"}:
+                return
+
         if source == "legacy" and group == 2:
             label_text = text[match.start():numeric_start]
             rent_labels = list(re.finditer(
@@ -2421,7 +2578,7 @@ def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
                 label_text,
                 re.IGNORECASE,
             ))
-            if rent_labels and (
+            if legacy_owner == "neutral" and rent_labels and (
                 not opex_labels
                 or rent_labels[-1].start() > opex_labels[-1].start()
             ):
@@ -2487,7 +2644,19 @@ def _ops_ex_candidates(text: str) -> List[_OpsExCandidate]:
             ):
                 continue
             _append(match, group, "legacy", context_after=50)
-    return sorted(candidates, key=lambda candidate: candidate.precedence)
+    # Current/corrected candidates use precedence 0-2. When equally specific,
+    # the last correction governs; ordinary evidence preserves source order.
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.precedence,
+            (
+                -candidate.numeric_span[0]
+                if candidate.precedence < 10
+                else candidate.numeric_span[0]
+            ),
+        ),
+    )
 
 
 def _ops_ex_winner(text: str) -> Optional[_OpsExCandidate]:
@@ -3834,10 +4003,43 @@ def _remove_proposal_update(proposal: dict, column_name: Optional[str]) -> None:
     ]
 
 
-def _strip_rejected_combined_total_opex_update(
+def _rent_rejected_opex_values(
+    text: str,
+    extracted_rent: Optional[str],
+) -> set[Decimal]:
+    """Return annual rent and any explicitly monthly raw rate it came from."""
+    annual_value = _normalized_numeric_value(extracted_rent)
+    if annual_value is None:
+        return set()
+
+    values = {annual_value}
+    monthly_raw_value = annual_value / Decimal("12")
+    for match in _RENT_NUMERIC_VALUE_RE.finditer(text or ""):
+        try:
+            raw_value = Decimal(match.group(1).replace(",", ""))
+        except InvalidOperation:
+            continue
+        if raw_value != monthly_raw_value:
+            continue
+
+        before = text[max(0, match.start() - 40):match.start()]
+        prior_figure = list(_RENT_NUMERIC_VALUE_RE.finditer(before))
+        if prior_figure:
+            before = before[prior_figure[-1].end():]
+        after = text[match.end():min(len(text), match.end() + 50)]
+        next_figure = _RENT_NUMERIC_VALUE_RE.search(after)
+        if next_figure:
+            after = after[:next_figure.start()]
+        if _is_monthly_context(before + match.group(0) + after):
+            values.add(raw_value)
+    return values
+
+
+def _strip_unsupported_opex_update(
     proposal: dict,
     opex_col: Optional[str],
     text: str,
+    extracted_rent: Optional[str] = None,
 ) -> None:
     update = _proposal_update_for_column(proposal, opex_col) if opex_col else None
     if update is None:
@@ -3852,6 +4054,9 @@ def _strip_rejected_combined_total_opex_update(
         )
         for value in (raw_value, annualized_value)
     }
+    rejected_values.update(
+        _rent_rejected_opex_values(text, extracted_rent)
+    )
     supported_values = {
         value
         for candidate in _ops_ex_candidates(text)
@@ -3940,6 +4145,18 @@ def _augment_proposal_with_deterministic_extractions(
                 proposed_rent in competing_pdf_rents
                 and proposed_rent not in trusted_rents
             )
+            or (
+                proposed_rent
+                in {
+                    value
+                    for candidate in _ops_ex_candidates(fresh_text)
+                    for value in (
+                        candidate.raw_value,
+                        candidate.annualized_value,
+                    )
+                }
+                and proposed_rent not in trusted_rents
+            )
         ):
             _remove_proposal_update(proposal, rent_col)
 
@@ -3974,7 +4191,12 @@ def _augment_proposal_with_deterministic_extractions(
         ):
             _remove_proposal_update(proposal, total_sf_col)
 
-    _strip_rejected_combined_total_opex_update(proposal, opex_col, fresh_text)
+    _strip_unsupported_opex_update(
+        proposal,
+        opex_col,
+        fresh_text,
+        extracted_rent=fresh_rent,
+    )
 
     # LIVE break (900 Alt Suggest St): when the reply kills the current row or
     # pitches an alternate property, do not mine fallback specs into this row.

@@ -44,6 +44,10 @@ the existing `email_automation.ai_processing` pipeline.
 - [x] Add rejected-total tests proving raw `1.50` and annualized `18.00` are
   removed before a terminal event despite unrelated annual parking or a
   `/month/year` conflict.
+- [x] Add qualified rent-owner, explicit expense-plus-area, expense-owned
+  `/SF NNN`, reversed tax/insurance order, competing rent-subject, relational
+  governing-subject, bounded-keyword, correction-recency, and symmetric
+  preseeded-write controls in separate RED commits.
 - [x] Run the focused matrix against the pre-fix production code and capture the
   expected failures.
 - [x] Commit tests separately as `test: consolidate opex ownership edge cases`.
@@ -59,6 +63,14 @@ the existing `email_automation.ai_processing` pipeline.
 - [x] Add `_nnn_figure_owner` for explicit `rent|opex|neutral|conflict`
   classification without magnitude inference. Reuse it in rent extraction,
   OpEx candidate admission, and rejected-NNN evidence.
+- [x] Generalize ownership through `_figure_field_owner`: ignore relational
+  objects, select the nearest figure-governing explicit subject, let explicit
+  fields outrank contextual offer/area syntax, and reserve conflict for direct
+  same-figure co-ownership.
+- [x] Route explicit-unit rent and legacy OpEx admission through the shared
+  owner, require true rent-keyword boundaries, and remove preseeded cross-field
+  values unless independently supported by their destination field, including
+  raw and annualized values from explicitly monthly rent.
 - [x] Consume combined equation totals and rate units in the combined matcher so
   the existing 10-before/30-after basis window reaches its owned suffix.
 - [x] Extend shared unit and monthly phrase handling for `per-SF`, punctuation in
@@ -66,8 +78,9 @@ the existing `email_automation.ai_processing` pipeline.
 - [x] Reject basis markers followed by hyphenated, colon-delimited,
   parenthetical, or multiword competing subjects while preserving real clause
   boundaries, attached monthly syntax, and coordinated supporting
-  `for [property|real estate] taxes and insurance` qualifiers on explicit OpEx
-  rates.
+  tax-plus-insurance qualifiers in either order on explicit OpEx rates.
+- [x] Treat correction/corrected/correct/actually as current evidence and select
+  the latest equally specific candidate across sequential corrections.
 - [x] Preserve combined-total raw negative evidence before basis resolution. On
   conflict, reject raw plus x12 whenever the owned basis context contains a
   monthly marker, independent of token order or partial outer-regex capture.

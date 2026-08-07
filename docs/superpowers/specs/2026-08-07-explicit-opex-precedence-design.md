@@ -30,7 +30,10 @@ Every accepted OpEx candidate is represented by `_OpsExCandidate` with:
 - explicit precedence.
 
 `_ops_ex_candidates` applies recency, hypothetical, combined-total, field-owner,
-and overlap guards before ranking candidates. `_ops_ex_winner` selects once.
+and overlap guards before ranking candidates. Current evidence includes explicit
+correction/corrected/correct/actually discourse as well as current/now/revised/
+updated markers. When equally specific current candidates occur in sequence, the
+later correction wins. `_ops_ex_winner` selects once.
 Both `_extract_ops_ex_sf_from_text` and `_augment_proposal_opex_basis` consume
 that same winner from the same fresh, quote-stripped inbound text. Proposal
 normalization changes only a value equal to the winning monthly candidate's raw
@@ -61,21 +64,34 @@ a subject, including `monthly-report`, `monthly: rent`, `monthly - rent`,
 owned by the OpEx candidate. Direct multiword fields such as `property taxes`,
 `real estate taxes`, and `property insurance` are likewise competing subjects.
 By contrast, a coordinated `for [property|real estate] taxes and insurance`
-list after an explicit OpEx rate is a supporting component qualifier, including
-after bare `monthly`. Conflicting candidate-owned monthly and annual markers
-make an accepted candidate abstain.
+list after an explicit OpEx rate is a supporting component qualifier in either
+tax-to-insurance or insurance-to-tax order, including after bare `monthly`.
+Direct tax or insurance fields remain competing, as do asking/quoted rates and
+lease/asking prices. Conflicting candidate-owned monthly and annual markers make
+an accepted candidate abstain.
 
 ### Ambiguous NNN ownership
 
 Figure-first `NNN` is ambiguous because it can describe rent basis or operating
-expenses. `_nnn_figure_owner` classifies it as `rent`, `opex`, `neutral`, or
-`conflict` from explicit field ownership; magnitude never decides the field.
+expenses. `_figure_field_owner` is the shared span-bounded resolver used by rent
+and OpEx admission; `_nnn_figure_owner` exposes the same decision to NNN negative
+evidence. It classifies a figure as `rent`, `opex`, `neutral`, or `conflict`
+without using magnitude.
 
 - Asking/rent/rate, offer/offered/offering, available/availability, and area
   syntax owns the figure as rent; explicit separators include word `at`, `for`,
-  `@`, colon, and typographic dashes.
+  `@`, colon, and typographic dashes. Safe rate modifiers include approximately,
+  `approx.`, about, around, and roughly.
 - An explicit expense noun, CAM, OpEx, TMI, or an immediate same-field
   `/CAM`, `/OpEx`, or `/TMI` suffix owns it as OpEx.
+- Explicit field nouns outrank contextual offer/area syntax. Relational objects
+  after before/excluding/net-of/does-not-include language do not displace the
+  governing subject, and a coordinated `X is separate and Y is $...` clause is
+  owned by `Y`. Direct same-figure rent/expense co-ownership remains a conflict.
+- Every generic `/SF ... NNN` rent path uses the same owner gate. A real explicit
+  rate unit can preserve established figure-first rent shorthand, while expense-
+  owned NNN is OpEx-only and unrelated `rate` substrings in words such as
+  `separate`, `corporate`, or `accurate` never create rent ownership.
 - A recognized second addend remains owned by the combined-expression source.
 - Bare `$3.65 NNN` is neutral.
 - Conflicting ownership such as `Asking $14.10 NNN/CAM` abstains.
@@ -91,7 +107,11 @@ NNN figures are not accepted `_OpsExCandidate` records. They remain separate
 negative evidence with their numeric spans plus raw and annualized values.
 Combined-equation base rent inherits the recognized equation basis without
 entering the accepted winner set. Proposal validation removes only an exact
-rejected value that is not also supported by an accepted candidate.
+rejected value that is not also supported by an accepted candidate. The same
+ownership decision is applied symmetrically to preseeded writes: an expense-only
+value cannot survive in Rent, and a rent-only value cannot survive in OpEx.
+Explicitly monthly rent contributes both its raw and annualized values to that
+OpEx rejection set.
 
 Combined-total rejection is intentionally stronger than candidate acceptance:
 negative evidence survives an ambiguous or conflicting basis. If the owned
@@ -109,15 +129,20 @@ before terminal-event early returns.
 
 - Offer/offered/offering, available/availability, and area `$14.10 NNN`
   shorthand using word `at`, `for`, `@`, colon, or typographic dashes extracts
-  rent `14.10`, never OpEx, and removes a matching model-proposed OpEx value
-  during full augmentation.
+  rent `14.10`, never OpEx, including with safe approximation modifiers, and
+  removes a matching model-proposed OpEx value during full augmentation.
 - Explicit expense-owned NNN/CAM/OpEx/TMI forms remain eligible; bare NNN is
-  neutral and conflicting rent/expense ownership abstains.
+  neutral, explicit `/SF NNN` never duplicates into rent, governing relational
+  and coordinated subjects remain symmetric, and direct conflicting ownership
+  abstains.
 - All accepted combined-equation and standalone monthly forms annualize `0.34`
   to `4.08` in both extraction and proposal normalization.
 - Punctuated or multiword following subjects and unrelated rent, parking, tax,
   or insurance fields do not contaminate candidate basis; an attached
-  coordinated tax-plus-insurance qualifier remains supporting OpEx context.
+  coordinated tax-plus-insurance qualifier remains supporting OpEx context in
+  either order, while asking/quoted rates and lease/asking prices compete.
+- Correction/corrected/correct/actually discourse selects the later OpEx value;
+  sequential corrections select the latest equally specific current candidate.
 - Rejected combined totals remove both raw and annualized proposal values even
   with terminal events, unrelated annual fields, or monthly/annual conflicts in
   either order; combined-equation base rent receives the same negative evidence.
