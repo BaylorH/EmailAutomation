@@ -82,6 +82,87 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
 
         self.assertEqual([None, None, None, None], results)
 
+    def test_later_availability_context_outranks_pending_cam(self):
+        examples = (
+            "CAM: TBD | Availability: $14.10 NNN.",
+            "CAM is pending: the suite is available at $14.10 NNN.",
+            "CAM is pending — the suite is available at $14.10 NNN.",
+            "CAM: pending - availability at $14.10 NNN.",
+            "CAM is pending; Availability: $14.10 NNN.",
+            "CAM is pending. Availability: $14.10 NNN.",
+            "CAM is pending\nAvailability: $14.10 NNN.",
+            "Availability: $14.10 NNN.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": "14.10"},
+                        {"column": "Ops Ex / SF", "value": "14.10"},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [("14.10", None, "14.10", None)] * len(examples),
+            results,
+        )
+
+    def test_direct_cam_colon_nnn_remains_expense_owned(self):
+        text = "CAM: $3.65 NNN."
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+            {
+                "updates": [
+                    {"column": "Rent/SF/Yr", "value": "3.65"},
+                    {"column": "Ops Ex / SF", "value": "3.65"},
+                ]
+            },
+            ["4800 Space Center Blvd", "", ""],
+            header,
+            config,
+            _conversation(text),
+        )
+
+        self.assertEqual(
+            (None, "3.65", None, "3.65"),
+            (
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                ai_processing._proposal_update_for_column(
+                    augmented,
+                    "Rent/SF/Yr",
+                ),
+                ai_processing._proposal_update_for_column(
+                    augmented,
+                    "Ops Ex / SF",
+                )["value"],
+            ),
+        )
+
     def test_figure_first_explicit_opex_formats_remain_supported(self):
         examples = (
             "Separate operating expenses are $3.65 NNN.",
