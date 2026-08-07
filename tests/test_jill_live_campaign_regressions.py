@@ -122,6 +122,10 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_monthly_combined_total_is_not_opex(self):
+        text = "CAM plus rent is $1.50/SF/month."
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_rejected_combined_total_removes_model_opex_before_event_return(self):
         text = "CAM plus base rent equals $18.00 per square foot."
         proposal = {
@@ -134,6 +138,28 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
         )
         self.assertIsNone(ai_processing._proposal_update_for_column(result, "Ops Ex / SF"))
+
+    def test_monthly_combined_total_removes_raw_and_annualized_model_opex(self):
+        text = "CAM plus rent is $1.50/SF/month."
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+
+        for proposed_value in ("1.50", "18.00"):
+            with self.subTest(proposed_value=proposed_value):
+                proposal = {
+                    "updates": [{"column": "Ops Ex / SF", "value": proposed_value}],
+                    "events": [{"type": "property_unavailable", "reason": "leased"}],
+                }
+                result = ai_processing._augment_proposal_with_deterministic_extractions(
+                    proposal,
+                    ["4800 Space Center Blvd", "", ""],
+                    header,
+                    config,
+                    _conversation(text),
+                )
+                self.assertIsNone(
+                    ai_processing._proposal_update_for_column(result, "Ops Ex / SF")
+                )
 
     def test_later_standalone_opex_wins_over_rejected_combined_total(self):
         text = (
@@ -189,6 +215,40 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "3.90",
             ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
         )
+
+    def test_current_cam_outranks_prior_combined_component(self):
+        text = "Prior quote: $14.00 NNN + $4.25 OPEX. Current CAM is $3.90/SF."
+        self.assertEqual("3.90", ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_current_cam_preserves_model_value_over_prior_combined_component(self):
+        text = "Prior quote: $14.00 NNN + $4.25 OPEX. Current CAM is $3.90/SF."
+        proposal = {"updates": [{"column": "Ops Ex / SF", "value": "3.90"}], "events": []}
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertEqual(
+            "3.90",
+            ai_processing._proposal_update_for_column(result, "Ops Ex / SF")["value"],
+        )
+
+    def test_rent_first_combined_total_with_article_is_not_opex(self):
+        text = "Base rent plus the CAM equals $18.00 per square foot."
+        self.assertIsNone(ai_processing._extract_ops_ex_sf_from_text(text))
+
+    def test_rent_first_combined_total_with_article_removes_model_opex(self):
+        text = "Base rent plus the CAM equals $18.00 per square foot."
+        proposal = {
+            "updates": [{"column": "Ops Ex / SF", "value": "18.00"}],
+            "events": [{"type": "property_unavailable", "reason": "leased"}],
+        }
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        result = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, ["4800 Space Center Blvd", "", ""], header, config, _conversation(text)
+        )
+        self.assertIsNone(ai_processing._proposal_update_for_column(result, "Ops Ex / SF"))
 
     def test_unresolved_projected_opex_range_is_not_extracted(self):
         text = "CAM is projected between $3.50 and $4.25 per square foot."
