@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "observedAt": "2026-08-06T23:53:19Z",
+  "workflowState": "BLOCKED_PROVENANCE",
+  "backend": {
+    "projectId": "email-automation-cache",
+    "region": "us-central1",
+    "service": "process-user",
+    "productionSha": "92de8ab5bf841f5faa453de34cc3846bd65611af",
+    "candidateSha": "c3f452b31a34797b629c27e0397c77bf9beecdea",
+    "candidateCi": {
+      "runId": 31131399984,
+      "url": "https://github.com/BaylorH/EmailAutomation/actions/runs/31131399984",
+      "headSha": "c3f452b31a34797b629c27e0397c77bf9beecdea",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    "receiptSha": "fb9eaae8e0398135355c636850553f5d54cc7754",
+    "receiptCi": {
+      "runId": 31130849944,
+      "url": "https://github.com/BaylorH/EmailAutomation/actions/runs/31130849944",
+      "headSha": "fb9eaae8e0398135355c636850553f5d54cc7754",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    "artifactDigest": "sha256:8c943805c87783b94361ca0e9fa7eee6fb2aac00e3211f3a2389bcc08c71daa9",
+    "artifactTag": "92de8ab5bf84",
+    "deployedRevision": "process-user-jill-one-202608020520",
+    "configHash": "sha256:91e7cbc747daa1f693ce3ec67ccc64052c5e9716eda62d28b80448efafa56589",
+    "configHashAlgorithm": "sha256:canonical-json(spec)",
+    "trafficPercent": 100,
+    "rollbackRevision": "process-user-jill-one-202608020520",
+    "observedDarkDeployment": {
+      "sourceSha": "ed64554b5e65fbbdd471364bc76b59209e4801af",
+      "artifactDigest": "sha256:ab67d92dbf5983ffe862e87d982d8a17c7bb4ee3486cbd3940135c446cffd608",
+      "artifactTag": "ed64554b5e65",
+      "revision": "process-user-00058-biz",
+      "trafficPercent": 0,
+      "outboundMode": "paused",
+      "coordinatorMode": "disabled"
+    }
+  },
+  "frontend": {
+    "productionSha": "52aa66299751893bbf9ec596d7fa84c5a767933d",
+    "observedCandidateSha": "45b182d244753769620ab78b4b9dd542a9cb055b",
+    "functionRevision": "api-00110-cib",
+    "functionCommitMapping": "BLOCKED_PROVENANCE"
+  }
+}

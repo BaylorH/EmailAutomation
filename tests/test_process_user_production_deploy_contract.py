@@ -36,12 +36,14 @@ IMAGE = f"{TAG}@{DIGEST}"
 CANONICAL_IMAGE = f"{TAG.rsplit(':', 1)[0]}@{DIGEST}"
 SERVICE_ACCOUNT = "248289505828-compute@developer.gserviceaccount.com"
 ROLLBACK_REVISION = "process-user-lock-0837727b"
+DEPLOY_ROLLBACK_REVISION = "process-user-jill-one-202608020520"
 ROLLBACK_DIGEST = "sha256:" + "c" * 64
 ROLLBACK_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     f"cloud-run-source-deploy/process-user@{ROLLBACK_DIGEST}"
 )
 RELEASE_REVISION = "process-user-release-a-abc123"
+CREATED_REVISION = f"{SERVICE}-{SHORT_SHA}"
 
 ENV_VARS = (
     "^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:"
@@ -75,6 +77,7 @@ class DeployScriptContractTests(unittest.TestCase):
         self.bin_dir.mkdir()
         self.gcloud_log = self.tmp / "gcloud.log"
         self.git_log = self.tmp / "git.log"
+        self.deploy_marker = self.tmp / "deployed"
 
         _write_executable(
             self.bin_dir / "git",
@@ -95,6 +98,7 @@ class DeployScriptContractTests(unittest.TestCase):
                     exit 0
                     ;;
                   "rev-parse --short=12 HEAD") printf '%s\\n' "${FAKE_GIT_SHA%????????????????????????????}"; exit 0 ;;
+                  "rev-parse HEAD") printf '%s\\n' "$FAKE_GIT_SHA"; exit 0 ;;
                 esac
                 exit 64
                 """
@@ -141,11 +145,54 @@ class DeployScriptContractTests(unittest.TestCase):
                     case "$FAKE_GCLOUD_SCENARIO" in
                       empty_digest) exit 0 ;;
                       invalid_digest) printf '%s\\n' 'latest' ;;
+                      post_tag_digest_mismatch)
+                        artifact_count="$(grep -c '^artifacts docker' "$FAKE_GCLOUD_LOG")"
+                        if [ "$artifact_count" -gt 1 ]; then
+                          printf '%s\\n' 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+                        else
+                          printf '%s\\n' 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                        fi
+                        ;;
                       *) printf '%s\\n' "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;;
                     esac
                     exit 0
                     ;;
-                  "run deploy") exit 0 ;;
+                  "run deploy") : > "$FAKE_DEPLOY_MARKER"; exit 0 ;;
+                  "run services")
+                    if [ ! -f "$FAKE_DEPLOY_MARKER" ]; then
+                      printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-00058-biz","traffic":[{"revisionName":"process-user-lock-0837727b","tag":"lock"},{"revisionName":"process-user-jill-one-202608020520","percent":100,"tag":"jill-one"}]}}'
+                      exit 0
+                    fi
+                    case "$FAKE_GCLOUD_SCENARIO" in
+                      post_revision_mismatch)
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-unexpected","traffic":[{"revisionName":"process-user-1234567890ab","tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":100}]}}'
+                        ;;
+                      post_traffic_mismatch)
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-1234567890ab","traffic":[{"revisionName":"process-user-1234567890ab","percent":1,"tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":99}]}}'
+                        ;;
+                      post_rollback_mismatch)
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-1234567890ab","traffic":[{"revisionName":"process-user-1234567890ab","tag":"release-a"},{"revisionName":"process-user-other","percent":100}]}}'
+                        ;;
+                      *)
+                        printf '%s\\n' '{"status":{"latestCreatedRevisionName":"process-user-1234567890ab","traffic":[{"revisionName":"process-user-1234567890ab","tag":"release-a"},{"revisionName":"process-user-jill-one-202608020520","percent":100,"tag":"jill-one"}]}}'
+                        ;;
+                    esac
+                    exit 0
+                    ;;
+                  "run revisions")
+                    revision_image='us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                    outbound_mode='paused'
+                    coordinator_mode='disabled'
+                    case "$FAKE_GCLOUD_SCENARIO" in
+                      post_digest_mismatch)
+                        revision_image='us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+                        ;;
+                      post_outbound_mismatch) outbound_mode='live' ;;
+                      post_coordinator_mismatch) coordinator_mode='enabled' ;;
+                    esac
+                    printf '{"metadata":{"name":"process-user-1234567890ab"},"spec":{"containerConcurrency":1,"containers":[{"image":"%s","env":[{"name":"SITESIFT_OUTBOUND_MODE","value":"%s"},{"name":"SITESIFT_SOURCE_COORDINATOR_MODE","value":"%s"}]}]}}\\n' "$revision_image" "$outbound_mode" "$coordinator_mode"
+                    exit 0
+                    ;;
                 esac
                 printf 'unexpected fake gcloud command: %s\\n' "$*" >&2
                 exit 65
@@ -161,6 +208,8 @@ class DeployScriptContractTests(unittest.TestCase):
         cwd: Path = REPO_ROOT,
         impersonation_env: str | None = None,
     ):
+        for path in (self.gcloud_log, self.git_log, self.deploy_marker):
+            path.unlink(missing_ok=True)
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
         env["FAKE_GCLOUD_LOG"] = str(self.gcloud_log)
@@ -168,6 +217,7 @@ class DeployScriptContractTests(unittest.TestCase):
         env["FAKE_GIT_SHA"] = SHA
         env["FAKE_REPO_ROOT"] = str(REPO_ROOT)
         env["FAKE_GCLOUD_SCENARIO"] = scenario
+        env["FAKE_DEPLOY_MARKER"] = str(self.deploy_marker)
         if impersonation_env is None:
             env.pop("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", None)
         else:
@@ -364,8 +414,8 @@ class DeployScriptContractTests(unittest.TestCase):
         foreign.mkdir()
         result = self._run("--apply", cwd=foreign)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self._gcloud_calls()[-1], self._deploy_call())
-        self.assertEqual(self._gcloud_calls()[-3], self._build_call())
+        self.assertEqual(self._gcloud_calls()[-1], self._digest_call())
+        self.assertEqual(self._gcloud_calls()[4], self._build_call())
 
     def test_auth_missing_stops_before_project_or_mutation(self):
         result = self._run("--apply", scenario="auth_missing")
@@ -416,15 +466,16 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
         self.assertEqual(calls[:3], self._preflight_calls())
-        self.assertEqual(calls[3], self._build_call())
-        self.assertEqual(calls[4], self._digest_call())
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(calls[3], self._service_readback_call())
+        self.assertEqual(calls[4], self._build_call())
+        self.assertEqual(calls[5], self._digest_call())
+        self.assertEqual(len(calls), 6)
 
     def test_invalid_digest_stops_before_deploy(self):
         result = self._run("--apply", scenario="invalid_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 6)
         self.assertEqual(calls[-1], self._digest_call())
         self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
 
@@ -433,13 +484,52 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self._gcloud_calls(),
-            [*self._preflight_calls(), self._build_call(), self._digest_call(), self._deploy_call()],
+            [
+                *self._preflight_calls(),
+                self._service_readback_call(),
+                self._build_call(),
+                self._digest_call(),
+                self._deploy_call(),
+                self._service_readback_call(),
+                self._revision_readback_call(),
+                self._digest_call(),
+            ],
         )
+
+    def test_apply_prints_the_verified_postdeploy_contract(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"revision: {CREATED_REVISION}", result.stdout)
+        self.assertIn(f"image digest: {DIGEST}", result.stdout)
+        self.assertIn(f"commit tag: {SHORT_SHA}", result.stdout)
+        self.assertRegex(result.stdout, r"config hash: sha256:[0-9a-f]{64}")
+        self.assertIn("outbound mode: paused", result.stdout)
+        self.assertIn("coordinator mode: disabled", result.stdout)
+        self.assertIn("traffic percent: 0", result.stdout)
+        self.assertIn(f"rollback revision: {DEPLOY_ROLLBACK_REVISION}", result.stdout)
+        self.assertIn("rollback traffic percent: 100", result.stdout)
+        self.assertIn("Deployment readback verified", result.stdout)
+
+    def test_each_postdeploy_mismatch_fails_closed(self):
+        scenarios = (
+            "post_revision_mismatch",
+            "post_digest_mismatch",
+            "post_outbound_mismatch",
+            "post_coordinator_mismatch",
+            "post_traffic_mismatch",
+            "post_rollback_mismatch",
+            "post_tag_digest_mismatch",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                result = self._run("--apply", scenario=scenario)
+                self.assertNotEqual(0, result.returncode, result.stdout)
+                self.assertNotIn("Deployment readback verified", result.stdout)
 
     def test_deploy_omits_service_wide_scaling_flags(self):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
-        deploy = self._gcloud_calls()[-1]
+        deploy = next(call for call in self._gcloud_calls() if call[:2] == ["run", "deploy"])
         self.assertNotIn("--min", deploy)
         self.assertNotIn("--max", deploy)
         self.assertEqual(deploy[deploy.index("--min-instances") + 1], "0")
@@ -450,7 +540,7 @@ class DeployScriptContractTests(unittest.TestCase):
     def test_deploy_updates_config_without_erasing_panic_switch_or_other_secrets(self):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
-        deploy = self._gcloud_calls()[-1]
+        deploy = next(call for call in self._gcloud_calls() if call[:2] == ["run", "deploy"])
         self.assertIn("--update-env-vars", deploy)
         self.assertIn("--update-secrets", deploy)
         self.assertNotIn("--set-env-vars", deploy)
@@ -459,7 +549,7 @@ class DeployScriptContractTests(unittest.TestCase):
     def test_deploy_explicitly_locks_outbound_and_coordinator_safe(self):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
-        deploy = self._gcloud_calls()[-1]
+        deploy = next(call for call in self._gcloud_calls() if call[:2] == ["run", "deploy"])
         env_vars = deploy[deploy.index("--update-env-vars") + 1]
         self.assertIn(":SITESIFT_OUTBOUND_MODE=paused:", env_vars)
         self.assertTrue(env_vars.endswith(":SITESIFT_SOURCE_COORDINATOR_MODE=disabled"))
@@ -479,7 +569,7 @@ class DeployScriptContractTests(unittest.TestCase):
         prefix = ["-C", str(REPO_ROOT)]
         return [
             [*prefix, "status", "--porcelain"],
-            [*prefix, "rev-parse", "--short=12", "HEAD"],
+            [*prefix, "rev-parse", "HEAD"],
         ]
 
     @staticmethod
@@ -549,6 +639,7 @@ class DeployScriptContractTests(unittest.TestCase):
             "--project", PROJECT,
             "--region", REGION,
             "--image", IMAGE,
+            "--revision-suffix", SHORT_SHA,
             "--command", "gunicorn",
             "--args=--bind=:8080,--workers=1,--threads=8,--max-requests=1,--timeout=0,service:app",
             "--service-account", SERVICE_ACCOUNT,
@@ -562,6 +653,32 @@ class DeployScriptContractTests(unittest.TestCase):
             "--update-secrets", SECRETS,
             "--no-traffic",
             "--tag", "release-a",
+        ]
+
+    @staticmethod
+    def _service_readback_call() -> list[str]:
+        return [
+            "run",
+            "services",
+            "describe",
+            SERVICE,
+            "--account", ACCOUNT,
+            "--project", PROJECT,
+            "--region", REGION,
+            "--format=json(status.latestCreatedRevisionName,status.traffic)",
+        ]
+
+    @staticmethod
+    def _revision_readback_call() -> list[str]:
+        return [
+            "run",
+            "revisions",
+            "describe",
+            CREATED_REVISION,
+            "--account", ACCOUNT,
+            "--project", PROJECT,
+            "--region", REGION,
+            "--format=json(metadata.name,spec)",
         ]
 
 
