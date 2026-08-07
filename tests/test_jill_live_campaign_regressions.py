@@ -292,6 +292,85 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_coordinated_nnn_clause_uses_figure_governing_subject(self):
+        examples = (
+            ("Rent is separate and CAM is $3.65 NNN.", None, "3.65"),
+            ("CAM is separate and rent is $14.10 NNN.", "14.10", None),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, _, _ in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {"updates": []},
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [
+                (expected_rent, expected_opex, expected_rent, expected_opex)
+                for _, expected_rent, expected_opex in examples
+            ],
+            results,
+        )
+
+    def test_relational_rent_owner_applies_to_explicit_per_sf_rates(self):
+        examples = (
+            "Base rent, excluding operating expenses, is $14.10/SF.",
+            "Asking rent does not include CAM and is $14.10/SF.",
+            "Base rent, excluding operating expenses, is $14.10/SF NNN.",
+            "Asking rent does not include CAM and is $14.10/SF NNN.",
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {"updates": []},
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                ai_processing._extract_rent_sf_yr_from_text(text),
+                ai_processing._extract_ops_ex_sf_from_text(text),
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [("14.10", None, "14.10", None)] * len(examples),
+            results,
+        )
+
     def test_explicit_opex_wins_over_earlier_nnn_rent_basis(self):
         examples = {
             (
