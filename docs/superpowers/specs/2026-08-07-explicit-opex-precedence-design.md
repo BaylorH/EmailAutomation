@@ -36,13 +36,15 @@ updated markers. Field inheritance is syntax-bounded: an expense-owned prior
 rate can govern an unlabeled replacement only in `, corrected to`, `, now`,
 `; correction:`, or `; actually` form, while a pronominal replacement can
 inherit either field only in `not $old...; it is $new...`. Both figures must be
-dollar rates with recognized per-area units, and their complete optional
-basis/NNN suffixes stay attached. Unrelated later asking or lease rates do not
-inherit OpEx ownership. For a correction candidate, basis resolution is confined
-to the replacement figure's captured `current_evidence` span, so the prior
-figure's monthly or annual basis cannot contaminate the replacement. When
-equally specific current candidates occur in sequence, the later correction
-wins. `_ops_ex_winner` selects once.
+dollar rates with recognized per-area units, and their complete bounded rate
+tails stay attached. When both a captured basis and `NNN` are present, the tail
+may place the basis before `NNN` or `NNN` before the basis. Unrelated later
+asking or lease rates do not inherit OpEx ownership. For a correction candidate,
+`current_evidence` spans the replacement figure through its entire bounded rate
+tail, and basis resolution is confined to that span, so the prior figure's
+monthly or annual basis cannot contaminate the replacement. When equally
+specific current candidates occur in sequence, the later correction wins.
+`_ops_ex_winner` selects once.
 Both `_extract_ops_ex_sf_from_text` and `_augment_proposal_opex_basis` consume
 that same winner from the same fresh, quote-stripped inbound text. Proposal
 normalization changes only a value equal to the winning monthly candidate's raw
@@ -58,13 +60,15 @@ annual equivalents. Rate units include `PSF`, `/SF`, `per SF`, `per-SF`,
 `sq. ft.`, `sq.ft.`, `sq ft.`, and `square foot`.
 
 For bounded explicit-expense and correction forms, one owned rate span consumes
-the per-area unit together with an optional attached basis suffix and optional
-trailing `NNN`. Captured compositions include `per SF/month NNN`,
-`per SF per month NNN`, and `per SF/year NNN`. Monthly forms annualize before
-extraction and proposal normalization, while annual forms retain their raw
-value. Explicit expense owners such as `Expenses`, `Operating expenses`,
-`Operating costs`, `CAM`, and `Pass-throughs` admit `per SF NNN` and
-`per square foot NNN` figures without duplicating them into Rent.
+the per-area unit together with its complete rate tail. Captured basis and `NNN`
+may occur in either bounded order: basis-first compositions include
+`per SF/month NNN`, `per SF per month NNN`, and `per SF/year NNN`; NNN-first
+compositions include `per SF NNN/month` and `per SF NNN, billed monthly`.
+Monthly forms annualize before extraction and proposal normalization, while
+annual forms retain their raw value. Explicit expense owners such as `Expenses`,
+`Operating expenses`, `Operating costs`, `CAM`, and `Pass-throughs` admit
+`per SF NNN` and `per square foot NNN` figures without duplicating them into
+Rent.
 
 Combined equations remain the most specific source. Their matcher consumes the
 equation total and unit so a 30-character trailing ownership window still covers
@@ -166,9 +170,10 @@ before terminal-event early returns.
   and coordinated subjects remain symmetric, and direct conflicting ownership
   abstains.
 - Explicit expense-owned `per SF NNN` and `per square foot NNN` figures, plus
-  composed `per SF/month NNN`, `per SF per month NNN`, and `per SF/year NNN`
-  forms, retain their owner and basis through extraction and proposal
-  normalization without duplicating into Rent.
+  basis-first `per SF/month NNN`, `per SF per month NNN`, and
+  `per SF/year NNN` forms and NNN-first `per SF NNN/month` and
+  `per SF NNN, billed monthly` forms, retain their owner and basis through
+  extraction and proposal normalization without duplicating into Rent.
 - All accepted combined-equation and standalone monthly forms annualize `0.34`
   to `4.08` in both extraction and proposal normalization.
 - Punctuated or multiword following subjects and unrelated rent, parking, tax,
@@ -177,10 +182,12 @@ before terminal-event early returns.
   either order, while asking/quoted rates and lease/asking prices compete.
 - Correction/corrected/correct/actually discourse selects the later OpEx value;
   bounded elliptical OpEx and pronominal `not $old...; it is $new...` forms
-  inherit only their prior field and retain complete `/month`, `per month`,
-  `/year`, or `NNN` suffixes. Basis comes only from the current replacement
-  figure, unrelated later rates remain separate, and sequential corrections
-  select the latest equally specific current candidate.
+  inherit only their prior field and retain the complete rate tail with basis
+  and `NNN` in either bounded order, including `NNN/month` and
+  `NNN, billed monthly`. `current_evidence` includes the whole replacement tail,
+  basis comes only from that current replacement, unrelated later rates remain
+  separate, and sequential corrections select the latest equally specific
+  current candidate.
 - Explicitly negated rates are excluded from both extractors and sanitized
   symmetrically from preseeded proposals unless independently supported in the
   destination field.

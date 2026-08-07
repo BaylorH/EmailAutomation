@@ -14,12 +14,13 @@ model-proposed writes.
 annualized `Decimal` values, basis, spans, source, and precedence. Select one
 winner for both extraction and proposal normalization. Resolve field ownership
 once, including the bounded pending/TBD override and bounded correction or
-pronominal inheritance, and retain the complete per-area, optional basis, and
-optional NNN rate suffix. Resolve a correction's basis only from its captured
-current figure. Keep rejected combined totals, combined-equation base-rent
-figures, non-expense NNN figures, and explicitly negated rates in separate
-negative-evidence collections so symmetric negated-rate sanitation removes only
-values without independent destination-field support.
+pronominal inheritance, and retain the complete per-area rate tail with optional
+basis and `NNN` in either bounded order. Capture a correction's entire current
+rate tail as `current_evidence` and resolve basis only from that span. Keep
+rejected combined totals, combined-equation base-rent figures, non-expense NNN
+figures, and explicitly negated rates in separate negative-evidence collections
+so symmetric negated-rate sanitation removes only values without independent
+destination-field support.
 
 **Tech stack:** Python 3, `re`, `Decimal`, `NamedTuple`, `unittest`, pytest, and
 the existing `email_automation.ai_processing` pipeline.
@@ -37,8 +38,8 @@ the existing `email_automation.ai_processing` pipeline.
   Assert rent `14.10`, OpEx `None`, and no matching OpEx update after full
   augmentation from either an empty or preseeded proposal.
 - [x] Add pending/TBD expense-owner cases followed by a later Availability/offer
-  governor across `|`, `:`, hyphen, en dash, and em dash, with direct `CAM:` and
-  semicolon, period, and newline controls.
+  governor, independently covering `|`, `:`, ASCII hyphen, en dash, and em dash,
+  with direct `CAM:` and semicolon, period, and newline controls.
 - [x] Preserve explicit expense-owned `$3.65 NNN`, CAM, OpEx, and TMI forms.
   Assert bare NNN is neutral, immediate `/CAM|/OpEx|/TMI` owns the figure as
   expense, and conflicting asking-plus-expense ownership abstains.
@@ -46,6 +47,8 @@ the existing `email_automation.ai_processing` pipeline.
   composed `per SF/month NNN`, `per SF per month NNN`, and `per SF/year NNN`
   cases. Assert Rent/OpEx extraction and proposal parity, correct annualization,
   and no Rent duplication.
+- [x] Add a standalone long-form `Expenses ... per SF NNN, billed monthly`
+  extraction control that preserves NNN-first basis ownership and annualization.
 - [x] Add combined equations using `/SF/month`, `per SF/month`, `per-SF/month`,
   `per sq. ft., billed monthly`, and `per square foot, billed monthly`. Assert
   direct extraction and raw proposal normalization both produce `4.08`.
@@ -65,6 +68,10 @@ the existing `email_automation.ai_processing` pipeline.
   including full suffix retention, current-figure-only basis changes,
   negated-rate sanitation, unrelated later-rate controls, repeated
   normalization, and extraction/proposal parity.
+- [x] Add focused NNN-first correction cases covering prior
+  `NNN, billed monthly` tails in elliptical and pronominal forms and current
+  `NNN/month` plus `NNN, billed monthly` tails in elliptical forms. Assert
+  extraction/proposal parity and repeated normalization.
 - [x] Run the focused matrix against the pre-fix production code and capture the
   expected failures.
 - [x] Commit tests separately as `test: consolidate opex ownership edge cases`.
@@ -93,17 +100,19 @@ the existing `email_automation.ai_processing` pipeline.
 - [x] Consume combined equation totals and rate units in the combined matcher so
   the existing 10-before/30-after basis window reaches its owned suffix.
 - [x] Extend shared rate-suffix handling for `per-SF`, punctuation in `sq ft.`,
-  `billed on a|the monthly basis`, and complete per-area figures with optional
-  `/month`, `per month`, `/year`, and trailing `NNN` composition.
+  `billed on a|the monthly basis`, and complete per-area tails with optional
+  basis and `NNN` in either bounded order, including `NNN/month` and
+  `NNN, billed monthly`.
 - [x] Reject basis markers followed by hyphenated, colon-delimited,
   parenthetical, or multiword competing subjects while preserving real clause
   boundaries, attached monthly syntax, and coordinated supporting
   tax-plus-insurance qualifiers in either order on explicit OpEx rates.
 - [x] Treat correction/corrected/correct/actually as current evidence; bind only
   the captured elliptical and `not $old...; it is $new...` forms to their prior
-  field, retain each figure's complete suffix, and resolve basis only from the
-  current replacement span. Keep unrelated later rates separate and select the
-  latest equally specific candidate across sequential corrections.
+  field, retain each figure's complete rate tail in either bounded order, capture
+  the whole current tail as `current_evidence`, and resolve basis only from that
+  span. Keep unrelated later rates separate and select the latest equally
+  specific candidate across sequential corrections.
 - [x] Preserve combined-total raw negative evidence before basis resolution. On
   conflict, reject raw plus x12 whenever the owned basis context contains a
   monthly marker, independent of token order or partial outer-regex capture.
@@ -123,9 +132,9 @@ the existing `email_automation.ai_processing` pipeline.
 
 - [x] Replace the superseded narrow-candidate-only description with the shared
   candidate/winner architecture.
-- [x] Document field-owned basis, complete rate suffixes, bounded pending and
-  correction inheritance, current-figure-only correction basis, ambiguous NNN
-  classification, negated negative evidence, symmetric proposal sanitation,
+- [x] Document field-owned basis, complete two-order rate tails, bounded pending
+  and correction inheritance, whole-current-evidence correction basis, ambiguous
+  NNN classification, negated negative evidence, symmetric proposal sanitation,
   proposal idempotency, and no-ship boundaries.
 - [x] Remove stale pseudocode and acceptance statements that conflict with the
   implemented record shape or proposal flow.
