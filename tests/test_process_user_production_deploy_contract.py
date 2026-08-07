@@ -48,6 +48,7 @@ ENV_VARS = (
     "ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:"
     "SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:"
     "SITESIFT_DAILY_SEND_CAP=20:"
+    "SITESIFT_GLOBAL_DAILY_SEND_CAP=20:"
     "SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:"
     "SITESIFT_OUTBOUND_MODE=live"
 )
@@ -464,6 +465,7 @@ class DeployScriptContractTests(unittest.TestCase):
         env_vars = deploy[deploy.index("--update-env-vars") + 1]
         self.assertIn("SITESIFT_OUTBOUND_MODE=live", env_vars)
         self.assertIn("SITESIFT_DAILY_SEND_CAP=20", env_vars)
+        self.assertIn("SITESIFT_GLOBAL_DAILY_SEND_CAP=20", env_vars)
         self.assertIn(
             "SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2",
             env_vars,
