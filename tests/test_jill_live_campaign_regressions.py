@@ -371,6 +371,66 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_governing_owner_removes_preseeded_wrong_field_update(self):
+        examples = (
+            ("Expenses are $3.65/SF NNN.", "3.65", None, "3.65"),
+            (
+                "Rent is separate and CAM is $3.65 NNN.",
+                "3.65",
+                None,
+                "3.65",
+            ),
+            (
+                "Base rent, excluding operating expenses, is $14.10/SF.",
+                "14.10",
+                "14.10",
+                None,
+            ),
+            (
+                "CAM is separate and rent is $14.10 NNN.",
+                "14.10",
+                "14.10",
+                None,
+            ),
+        )
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for text, value, _, _ in examples:
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Rent/SF/Yr", "value": value},
+                        {"column": "Ops Ex / SF", "value": value},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            opex_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Ops Ex / SF",
+            )
+            results.append((
+                rent_update["value"] if rent_update is not None else None,
+                opex_update["value"] if opex_update is not None else None,
+            ))
+
+        self.assertEqual(
+            [
+                (expected_rent, expected_opex)
+                for _, _, expected_rent, expected_opex in examples
+            ],
+            results,
+        )
+
     def test_explicit_opex_wins_over_earlier_nnn_rent_basis(self):
         examples = {
             (
