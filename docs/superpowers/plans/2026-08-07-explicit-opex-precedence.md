@@ -12,7 +12,8 @@ figures from surviving as model-proposed OpEx writes.
 **Architecture:** Build immutable `_OpsExCandidate` records containing raw and
 annualized `Decimal` values, basis, spans, source, and precedence. Select one
 winner for both extraction and proposal normalization. Keep rejected combined
-totals and non-expense NNN figures in separate negative-evidence collections.
+totals, combined-equation base-rent figures, and non-expense NNN figures in
+separate negative-evidence collections.
 
 **Tech stack:** Python 3, `re`, `Decimal`, `NamedTuple`, `unittest`, pytest, and
 the existing `email_automation.ai_processing` pipeline.
@@ -25,9 +26,10 @@ the existing `email_automation.ai_processing` pipeline.
 
 - Modify: `tests/test_jill_live_campaign_regressions.py`
 
-- [x] Add rent-only offer-at and available-at NNN cases. Assert rent `14.10`,
-  OpEx `None`, and no matching OpEx update after full augmentation from either an
-  empty or preseeded proposal.
+- [x] Add rent-only offer/offered/offering, available/availability, and area NNN
+  cases using word `at`, `for`, `@`, colon, and typographic dash separators.
+  Assert rent `14.10`, OpEx `None`, and no matching OpEx update after full
+  augmentation from either an empty or preseeded proposal.
 - [x] Preserve explicit expense-owned `$3.65 NNN`, CAM, OpEx, and TMI forms.
   Assert bare NNN is neutral, immediate `/CAM|/OpEx|/TMI` owns the figure as
   expense, and conflicting asking-plus-expense ownership abstains.
@@ -63,8 +65,9 @@ the existing `email_automation.ai_processing` pipeline.
   `sq ft.`, and `billed on a|the monthly basis`.
 - [x] Reject basis markers followed by hyphenated, colon-delimited,
   parenthetical, or multiword competing subjects while preserving real clause
-  boundaries, attached monthly syntax, and supporting `for taxes and insurance`
-  qualifiers on explicit OpEx rates.
+  boundaries, attached monthly syntax, and coordinated supporting
+  `for [property|real estate] taxes and insurance` qualifiers on explicit OpEx
+  rates.
 - [x] Preserve combined-total raw negative evidence before basis resolution. On
   conflict, reject raw plus x12 whenever the owned basis context contains a
   monthly marker, independent of token order or partial outer-regex capture.

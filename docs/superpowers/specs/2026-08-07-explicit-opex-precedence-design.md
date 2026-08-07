@@ -60,9 +60,10 @@ a subject, including `monthly-report`, `monthly: rent`, `monthly - rent`,
 `monthly (rent ...)`, `per year parking`, or similar field language, is not
 owned by the OpEx candidate. Direct multiword fields such as `property taxes`,
 `real estate taxes`, and `property insurance` are likewise competing subjects.
-By contrast, `for taxes and insurance` after an explicit OpEx rate is a
-supporting component qualifier, including after bare `monthly`. Conflicting
-candidate-owned monthly and annual markers make an accepted candidate abstain.
+By contrast, a coordinated `for [property|real estate] taxes and insurance`
+list after an explicit OpEx rate is a supporting component qualifier, including
+after bare `monthly`. Conflicting candidate-owned monthly and annual markers
+make an accepted candidate abstain.
 
 ### Ambiguous NNN ownership
 
@@ -70,8 +71,9 @@ Figure-first `NNN` is ambiguous because it can describe rent basis or operating
 expenses. `_nnn_figure_owner` classifies it as `rent`, `opex`, `neutral`, or
 `conflict` from explicit field ownership; magnitude never decides the field.
 
-- Asking/rent/rate, offer-at, available-at, and area-at syntax owns the figure as
-  rent.
+- Asking/rent/rate, offer/offered/offering, available/availability, and area
+  syntax owns the figure as rent; explicit separators include word `at`, `for`,
+  `@`, colon, and typographic dashes.
 - An explicit expense noun, CAM, OpEx, TMI, or an immediate same-field
   `/CAM`, `/OpEx`, or `/TMI` suffix owns it as OpEx.
 - A recognized second addend remains owned by the combined-expression source.
@@ -105,15 +107,17 @@ before terminal-event early returns.
 
 ## Acceptance criteria
 
-- Offer-at and available-at `$14.10 NNN` shorthand extracts rent `14.10`, never
-  OpEx, and removes a matching model-proposed OpEx value during full augmentation.
+- Offer/offered/offering, available/availability, and area `$14.10 NNN`
+  shorthand using word `at`, `for`, `@`, colon, or typographic dashes extracts
+  rent `14.10`, never OpEx, and removes a matching model-proposed OpEx value
+  during full augmentation.
 - Explicit expense-owned NNN/CAM/OpEx/TMI forms remain eligible; bare NNN is
   neutral and conflicting rent/expense ownership abstains.
 - All accepted combined-equation and standalone monthly forms annualize `0.34`
   to `4.08` in both extraction and proposal normalization.
 - Punctuated or multiword following subjects and unrelated rent, parking, tax,
   or insurance fields do not contaminate candidate basis; an attached
-  `for taxes and insurance` qualifier remains supporting OpEx context.
+  coordinated tax-plus-insurance qualifier remains supporting OpEx context.
 - Rejected combined totals remove both raw and annualized proposal values even
   with terminal events, unrelated annual fields, or monthly/annual conflicts in
   either order; combined-equation base rent receives the same negative evidence.

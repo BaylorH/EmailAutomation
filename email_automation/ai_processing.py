@@ -1584,11 +1584,18 @@ _OPS_EX_COMPETING_BASIS_SUBJECT = (
     rf"(?:{_COMBINED_TOTAL_RENT_LABEL}|base\s+rate|parking|reports?|"
     r"utilities?|invoices?|statements?|summar(?:y|ies))"
 )
+_OPS_EX_TAX_SUBJECT = (
+    r"(?:(?:property|real\s+estate)\s+)?tax(?:es)?"
+)
+_OPS_EX_INSURANCE_SUBJECT = (
+    r"(?:(?:property|real\s+estate)\s+)?insurance"
+)
 _OPS_EX_TAX_INSURANCE_SUBJECT = (
-    r"(?:(?:(?:property|real\s+estate)\s+)?(?:tax(?:es)?|insurance))"
+    rf"(?:{_OPS_EX_TAX_SUBJECT}|{_OPS_EX_INSURANCE_SUBJECT})"
 )
 _OPS_EX_SUPPORTING_BASIS_QUALIFIER = (
-    r"(?:tax(?:es)?\s+(?:and|&)\s+insurance)"
+    rf"(?:{_OPS_EX_TAX_SUBJECT}\s+(?:and|&)\s+"
+    rf"{_OPS_EX_INSURANCE_SUBJECT})"
 )
 _OPS_EX_DIRECT_BASIS_SUBJECT = (
     rf"(?:{_OPS_EX_COMPETING_BASIS_SUBJECT}|{_OPS_EX_TAX_INSURANCE_SUBJECT})"
@@ -1658,23 +1665,46 @@ _OPS_EX_NNN_OWNER_RE = re.compile(
     r"pass[\s-]?throughs?)\b",
     re.IGNORECASE,
 )
+_RENT_OFFER_AVAILABILITY_CONTEXT = (
+    r"(?:offer(?:s|ed|ing)?|avail(?:able|ability)?)"
+)
+_RENT_RATE_SEPARATOR = r"(?:\b(?:at|for)\b|[@＠﹫,|:–—-])"
 _RENT_NNN_OWNER_RES = (
     _RENT_KW_BEFORE_FIGURE_RE,
-    re.compile(r"\b(?:offer|avail(?:able)?)\b[^$]{0,80}(?:\bat\b|[,|:-])\s*$", re.IGNORECASE),
     re.compile(
-        r"\b\d{1,3}(?:,\d{3})*\s*(?:sf|sq\.?\s*ft\.?|square\s+f(?:ee|oo)t)"
-        r"\s*(?:\bat\b|[,|:-])\s*$",
+        rf"\b{_RENT_OFFER_AVAILABILITY_CONTEXT}\b[^$]{{0,80}}"
+        rf"{_RENT_RATE_SEPARATOR}\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:\d{1,3}(?:,\d{3})*|\d{4,})\s*"
+        r"(?:sf|sq\.?\s*ft\.?|square\s+f(?:ee|oo)t)"
+        rf"\s*{_RENT_RATE_SEPARATOR}\s*$",
         re.IGNORECASE,
     ),
 )
 
 
+def _nnn_clause_start(text: str, start: int) -> int:
+    """Return the prior clause boundary, ignoring square-foot abbreviations."""
+    unit_abbreviation_periods = {
+        position
+        for abbreviation in re.finditer(r"\bsq\.?\s*ft\.?", text, re.IGNORECASE)
+        for position in range(abbreviation.start(), abbreviation.end())
+        if text[position] == "."
+    }
+    for position in range(start - 1, -1, -1):
+        character = text[position]
+        if character in "!?;\n":
+            return position
+        if character == "." and position not in unit_abbreviation_periods:
+            return position
+    return -1
+
+
 def _nnn_figure_owner(text: str, start: int, end: Optional[int] = None) -> str:
     """Classify ambiguous figure-first NNN evidence without using magnitude."""
-    clause_start = max(
-        text.rfind(delimiter, 0, start)
-        for delimiter in (".", "!", "?", ";", "\n")
-    )
+    clause_start = _nnn_clause_start(text, start)
     prefix = text[clause_start + 1:start]
     owners = [
         (match.start(), "opex")
@@ -2088,15 +2118,26 @@ def _ops_ex_basis_values(
             marker_end = window_start + marker_match.end()
             marker = marker_match.group(0).strip().lower()
             bare_markers = {"monthly", "annual", "annually", "yearly"}
-            following_context = text[marker_end:window_end]
+            following_context_end = min(len(text), marker_end + 60)
+            for position in range(marker_end, following_context_end):
+                if _is_clause_boundary(position):
+                    following_context_end = position
+                    break
+            following_context = text[marker_end:following_context_end]
 
-            if re.match(
+            following_subject = re.match(
                 rf"\s*(?:(?:[-:/]\s*)|\(\s*)?"
-                rf"(?:for\s+{_OPS_EX_COMPETING_BASIS_SUBJECT}|"
-                rf"{_OPS_EX_DIRECT_BASIS_SUBJECT})\b",
+                rf"(?:for\s+)?{_OPS_EX_DIRECT_BASIS_SUBJECT}\b",
                 following_context,
                 re.IGNORECASE,
-            ):
+            )
+            supporting_qualifier = re.match(
+                rf"\s*(?:(?:[-:/]\s*)|\(\s*)?for\s+"
+                rf"{_OPS_EX_SUPPORTING_BASIS_QUALIFIER}\b",
+                following_context,
+                re.IGNORECASE,
+            )
+            if following_subject and not supporting_qualifier:
                 continue
 
             if marker_end <= start:
@@ -2163,11 +2204,6 @@ def _ops_ex_basis_values(
                 if marker in bare_markers:
                     followed_by_prose = re.match(
                         r"\s*(?:(?:[-:]\s*)|\(\s*)?[a-z]",
-                        following_context,
-                        re.IGNORECASE,
-                    )
-                    supporting_qualifier = re.match(
-                        rf"\s+for\s+{_OPS_EX_SUPPORTING_BASIS_QUALIFIER}\b",
                         following_context,
                         re.IGNORECASE,
                     )
