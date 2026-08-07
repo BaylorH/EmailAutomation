@@ -433,6 +433,38 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             results,
         )
 
+    def test_monthly_rent_rejects_raw_and_annualized_preseeded_opex(self):
+        text = "Rent is $1.20/SF/month."
+        header = ["Property Address", "Rent/SF/Yr", "Ops Ex / SF"]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF/Yr", "ops_ex_sf": "Ops Ex / SF"}}
+        results = []
+
+        for preseeded_opex in ("1.20", "14.40"):
+            augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+                {
+                    "updates": [
+                        {"column": "Ops Ex / SF", "value": preseeded_opex},
+                    ]
+                },
+                ["4800 Space Center Blvd", "", ""],
+                header,
+                config,
+                _conversation(text),
+            )
+            rent_update = ai_processing._proposal_update_for_column(
+                augmented,
+                "Rent/SF/Yr",
+            )
+            results.append((
+                rent_update["value"] if rent_update is not None else None,
+                ai_processing._proposal_update_for_column(
+                    augmented,
+                    "Ops Ex / SF",
+                ),
+            ))
+
+        self.assertEqual([("14.40", None), ("14.40", None)], results)
+
     def test_explicit_opex_wins_over_earlier_nnn_rent_basis(self):
         examples = {
             (
