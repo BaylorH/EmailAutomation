@@ -266,6 +266,10 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(expected, ai_processing._extract_ops_ex_sf_from_text(text))
 
+    def test_combined_component_keeps_trailing_monthly_context(self):
+        text = "$1.25 NNN + $0.34 OPEX = $1.59 PSF, billed monthly."
+        self.assertEqual("4.08", ai_processing._extract_ops_ex_sf_from_text(text))
+
     def test_rampable_dock_is_not_a_terminal_drive_in_mismatch(self):
         proposal = {
             "updates": [],
