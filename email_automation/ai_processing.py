@@ -1361,6 +1361,7 @@ _INDEPENDENT_TERMINAL_CLOSE_REASONS = {
     "exclusivewithanother",
     "dealpending",
     "naturalend",
+    "notafit",
 }
 
 

@@ -215,6 +215,10 @@ class ZeroDriveStateMachineTests(unittest.TestCase):
                 "natural_end",
                 "Thanks for reaching out, and good luck with your search.",
             ),
+            (
+                "not_a_fit",
+                "We can't help right now because we're not a fit to work together.",
+            ),
         )
         for close_reason, terminal_text in cases:
             with self.subTest(close_reason=close_reason):
