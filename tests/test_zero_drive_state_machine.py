@@ -177,6 +177,30 @@ class ZeroDriveStateMachineTests(unittest.TestCase):
         self.assertTrue(_events(result, "needs_user_input"))
         self.assertIsNone(result["response_email"])
 
+    def test_rampability_review_removes_contradictory_close_event(self):
+        result = _run(
+            "100 Main St has no drive-in door and one loading dock. The dock "
+            "can potentially be ramped for drive-in access. The unit is 7,753 SF.",
+            updates=[
+                _update("Drive Ins", "1"),
+                _update("Docks", "1"),
+                _update("Total SF", "7753"),
+            ],
+            events=[
+                {"type": "property_unavailable", "reason": "requirements_mismatch"},
+                {"type": "close_conversation", "reason": "all_info_gathered"},
+            ],
+            response_email="Thanks for confirming the property details.",
+        )
+
+        self.assertEqual("0", _value(result))
+        self.assertEqual([], _events(result, "property_unavailable"))
+        review_events = _events(result, "needs_user_input")
+        self.assertEqual(1, len(review_events))
+        self.assertEqual("drive_access_requires_review", review_events[0]["reason"])
+        self.assertEqual([], _events(result, "close_conversation"))
+        self.assertIsNone(result["response_email"])
+
     def test_last_trusted_target_assertion_wins_corrections(self):
         cases = (
             (

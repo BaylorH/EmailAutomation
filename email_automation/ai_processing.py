@@ -1419,6 +1419,10 @@ def _reconcile_target_current_drive(
             or (suppress_availability and _availability_reason_alias((event or {}).get("reason")))))]
     if len(proposal["events"]) != len(original_events): proposal["response_email"] = None
     if evidence.requires_review:
+        proposal["events"] = [
+            event for event in proposal["events"]
+            if (event or {}).get("type") != "close_conversation"
+        ]
         if not any((event or {}).get("type") == "needs_user_input" for event in proposal["events"]):
             proposal["events"].append({"type": "needs_user_input",
                                        "reason": "drive_access_requires_review",
