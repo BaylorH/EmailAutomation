@@ -394,7 +394,7 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
     access_mismatch = bool(
         re.search(
             negation
-            + r"\s+(?:any\s+)?(?:drive[-\s]?in|grade[-\s]?level|dock)"
+            + r"\s+(?:any\s+)?(?:drive[-\s]?ins?|grade[-\s]?level|dock)"
             r"(?:\s+(?:doors?|access|space|loading))?\b",
             latest_text,
         )
@@ -1209,6 +1209,224 @@ def _suppress_quote_only_events(proposal: dict, conversation: List[dict]) -> dic
     return proposal
 
 
+_DriveEvidence = NamedTuple("_DriveEvidence", [("value", Optional[str]), ("saw_drive_language", bool), ("allow_terminal_mismatch", bool), ("requires_review", bool)])
+
+
+_DRIVE_FEATURE = r"(?:drive[-\s]?ins?(?:\s+doors?)?|grade[-\s]?level(?:\s+(?:doors?|access))?)"
+_DRIVE_TERM_RE = re.compile(rf"\b{_DRIVE_FEATURE}\b", re.IGNORECASE)
+_CURRENT_DRIVE_ZERO_RE = re.compile(
+    rf"\b(?:has|have|with|there\s+(?:is|are))\s+(?:absolutely\s+)?no\s+(?:current\s+)?{_DRIVE_FEATURE}\b|"
+    rf"\b(?:does\s+not|doesn['’]?t|do\s+not|don['’]?t)\s+have\s+(?:any\s+)?{_DRIVE_FEATURE}\b|"
+    rf"\bwithout\s+(?:any\s+)?{_DRIVE_FEATURE}\b|\bno\s+(?:current\s+)?{_DRIVE_FEATURE}\b|"
+    rf"\b(?:0|zero)\s+{_DRIVE_FEATURE}\b", re.IGNORECASE)
+_NONCURRENT_DRIVE_RE = re.compile(
+    r"\?|\b(?:if|whether|would|could|may|might|proposed|planned|potential|hypothetical|"
+    r"unknown|not\s+known|do\s+not\s+know|don['’]?t\s+know|information\s+(?:is\s+)?unavailable|previously|formerly|before\s+(?:renovation|construction|redevelopment|conversion|improvements?|upgrades?))\b|"
+    r"\b(?:old|prior|previous|earlier)\s+(?:plan|proposal|layout|listing|info(?:rmation)?|specs?|specifications?|notes?|details?|data)\b", re.IGNORECASE)
+_DRIVE_REQUIREMENT_RE = re.compile(r"\b(?:requires?|requirements?|needs?|minimum|at\s+least|no\s+fewer\s+than|must\s+have)\b", re.IGNORECASE)
+_POSITIVE_REQUIREMENT_COUNT_RE = re.compile(r"\b(?:requires?|needs?|minimum(?:\s+of)?|at\s+least|no\s+fewer\s+than|must\s+have)"
+    r"[^.!?;\n]{0,35}?\b(?:[1-9]\d{0,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", re.IGNORECASE)
+_EXPLICIT_DRIVE_NONFIT_RE = re.compile(
+    r"\b(?:not\s+(?:a\s+|the\s+)?(?:good\s+|right\s+)?fit|won['’]?t\s+work|"
+    r"will\s+not\s+work|wouldn['’]?t\s+work|doesn['’]?t\s+meet|does\s+not\s+meet|"
+    r"fails?\s+(?:the\s+)?requirements?|could\s+not\s+be\s+ramped|couldn['’]?t\s+be\s+ramped|"
+    r"not\s+rampable)\b", re.IGNORECASE)
+_INDEPENDENT_DRIVE_NONFIT_RE = re.compile(
+    r"\b(?:office[-\s]?heavy|too\s+office|mostly\s+office|primarily\s+office|"
+    r"not\s+(?:a\s+)?(?:(?:true|real|proper)\s+)?warehouse|no\s+(?:proper\s+|real\s+|true\s+)?"
+    r"warehouse|lacks?\s+(?:sufficient\s+)?warehouse|clear\s+height[^.!?]{0,35}"
+    r"(?:below|under|less\s+than))\b", re.IGNORECASE)
+_OTHER_DRIVE_SUBJECT_RE = re.compile(
+    r"\b(?:another|different|other)\s+(?:one|property|building|suite|space|unit|listing)\b|"
+    r"\bthe\s+other\s+one\b|\b(?:the\s+)?(?:(?:parking|trailer)\s+lot|trailer|yard|"
+    r"outparcel|out-?lot)\s+(?:has|have|with|contains?|is|are|lacks?|without)\b", re.IGNORECASE)
+_CURRENT_TARGET_SUBJECT_RE = re.compile(r"\b(?:target|subject|current|this)\s+(?:property|building|suite|space|unit|listing)\b", re.IGNORECASE)
+_COLLATERAL_SUBJECT_RE = re.compile(r"\b(?:optional\s+)?(?:flyer|brochure|attachment|document|pdf|website|webpage|link|url)\b", re.IGNORECASE)
+_ATTACHMENT_REFERENCE_RE = re.compile(r"\b(?:attached|attachment|flyer|brochure|pdf|document|spec\s+sheet)\b", re.IGNORECASE)
+_TARGET_ZERO_UPDATE_REASON = "Deterministic current-target drive evidence: explicit zero."
+
+
+def _drive_units(text: str) -> List[str]:
+    units = re.split(
+        r"(?<=[.!?;])\s+|\n+|,\s*(?:but|while|whereas)\s+|"
+        r"\s+(?:and|but|while|whereas)\s+(?=\d{1,6}\s+[A-Za-z])|\s*(?:,|—|-)?\s*\b(?:correction|actually|scratch\s+that|i\s+mean)\b\s*[:,]?\s*",
+        text or "", flags=re.IGNORECASE)
+    return [unit.strip(" ,") for unit in units if unit.strip(" ,")]
+
+
+def _has_positive_drive_requirement(text: str) -> bool:
+    for unit in _drive_units(text):
+        if ((match := _POSITIVE_REQUIREMENT_COUNT_RE.search(unit)) and
+            (_DRIVE_TERM_RE.search(unit) or not re.search(
+                r"\b(?:days?|hours?|weeks?|months?|tours?|docks?|parking|sf|square\s+feet|"
+                r"feet|foot|amps?|volts?)\b", unit[match.start():], re.IGNORECASE))):
+            return True
+    return False
+
+
+def _drive_property_claims(text: str) -> List[tuple]:
+    return [claim for claim in _street_claim_spans(text or "") if not (claim[4] == "drive"
+            and re.match(r"[-\s]*in\b", (text or "")[claim[1]:], re.IGNORECASE))]
+
+
+def _drive_count_in_unit(unit: str) -> Optional[str]:
+    unit = re.sub(rf"\bnot\s+(?:0|zero)\s+{_DRIVE_FEATURE}\b", "", unit or "", flags=re.IGNORECASE)
+    if _CURRENT_DRIVE_ZERO_RE.search(unit):
+        return "0"
+    return (_parse_feature_count(match.group(1)) if (match := _DRIVE_IN_COUNT_RE.search(unit or ""))
+            else _extract_dimensioned_singular_drive_in_count(unit or ""))
+
+
+def _current_target_drive_evidence(text: str, target_anchor: Optional[str]) -> _DriveEvidence:
+    fresh, target_identity = _strip_quoted_history(text or ""), _target_street_identity(target_anchor or "")
+    last_binding = last_value = None
+    target_explicit_nonfit = target_independent_nonfit = False
+    saw_drive = False
+    for unit in _drive_units(fresh):
+        claims = _drive_property_claims(unit)
+        identities = {_claim_identity(claim) for claim in claims}
+        if target_identity and target_identity in identities and len(identities) == 1:
+            binding = "target"
+        elif identities:
+            binding = "competing"
+        elif _CURRENT_TARGET_SUBJECT_RE.search(unit):
+            binding = "target"
+        elif _COLLATERAL_SUBJECT_RE.search(unit) and re.search(r"\b(?:has|contains?|lists?|shows?|provides?)\s+no\b[^.!?;]{0,30}\bdrive", unit, re.IGNORECASE): binding = "competing"
+        elif _OTHER_DRIVE_SUBJECT_RE.search(unit):
+            binding = "competing"
+        else:
+            binding = last_binding or "target"
+        last_binding = binding
+        if binding == "target":
+            target_explicit_nonfit |= bool(_EXPLICIT_DRIVE_NONFIT_RE.search(unit))
+            target_independent_nonfit |= bool(_INDEPENDENT_DRIVE_NONFIT_RE.search(unit))
+        if not _DRIVE_TERM_RE.search(unit):
+            continue
+        saw_drive = True
+        value = _drive_count_in_unit(unit)
+        value_match = _CURRENT_DRIVE_ZERO_RE.search(unit) or _DRIVE_IN_COUNT_RE.search(unit)
+        before = unit[:value_match.end()] if value_match else unit
+        after = unit[value_match.end():] if value_match else ""
+        if (value is None or binding != "target" or "?" in unit
+                or _NONCURRENT_DRIVE_RE.search(before) or _NONCURRENT_FEATURE_AFTER_RE.search(after) or (value_match and _NONCURRENT_FEATURE_BEFORE_RE.search(unit[:value_match.start()]))
+                or re.search(r"\bbefore\s+(?:renovation|construction|redevelopment|conversion|improvements?|upgrades?)\b", after, re.IGNORECASE)
+                or re.search(r"\b(?:under\s+(?:the\s+)?proposed|planned|hypothetical)\b",
+                             after[:80], re.IGNORECASE)):
+            continue
+        direct_zero = re.search(
+            r"\b(?:has|have|with|there\s+(?:is|are))\s+(?:absolutely\s+)?no\b|"
+            r"\b(?:does\s+not|doesn['’]?t|do\s+not|don['’]?t)\s+have\b|\bwithout\b",
+            unit, re.IGNORECASE)
+        if not (_DRIVE_REQUIREMENT_RE.search(unit) and not direct_zero):
+            last_value = value
+    remediation = bool(last_value == "0" and _looks_like_access_remediation(fresh))
+    positive_requirement = bool(last_value == "0" and _has_positive_drive_requirement(fresh))
+    allow_terminal = bool(target_independent_nonfit or (target_explicit_nonfit and not remediation))
+    return _DriveEvidence(last_value, saw_drive, allow_terminal,
+                          bool((remediation or positive_requirement) and not target_independent_nonfit))
+
+
+def _drive_reason_alias(reason: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(reason or "").lower())
+    aliases = {"requirementsmismatch", "physicalnonfit", "badfit", "nodriveins",
+               "missingdriveins", "nogradelevelaccess", "zerodriveins"}
+    return normalized in aliases or bool(
+        ("drivein" in normalized or "gradelevel" in normalized)
+        and any(token in normalized for token in ("no", "zero", "missing", "lack")))
+
+
+def _availability_reason_alias(reason: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(reason or "").lower())
+    return normalized in ({re.sub(r"[^a-z0-9]", "", value.lower()) for value, _ in _UNAVAILABLE_PATTERNS}
+                          | {"unavailable", "propertyunavailable"})
+
+
+def _collateral_only_unavailable(text: str, target_anchor: Optional[str]) -> bool:
+    collateral = _COLLATERAL_SUBJECT_RE.search(text or "")
+    if not collateral:
+        return False
+    target_identity = _target_street_identity(target_anchor or "")
+    segments = ((text or "")[:collateral.start()], (text or "")[collateral.end():])
+    if any((generic := re.search(r"\b(?:target|subject|current|this|the)\s+(?:property|building|suite|space|unit|listing)\b", segment, re.IGNORECASE)) and _contains_unavailable_signal(segment[generic.start():]) for segment in segments):
+        return False
+    claims = []
+    for claim in _drive_property_claims(text or ""):
+        between = (text or "")[collateral.end():claim[0]]
+        if (target_identity and _claim_identity(claim) == target_identity
+                and not re.search(r"\b(?:for|of)\s*$", between, re.IGNORECASE)):
+            claims.append(claim)
+    for claim in claims:
+        suffix = (text or "")[claim[0]:]
+        if any(re.search(pattern, suffix, re.IGNORECASE) for _, pattern in _UNAVAILABLE_PATTERNS):
+            return False
+    boundary = min((claim[0] for claim in claims), default=len(text or ""))
+    window = (text or "")[collateral.start():boundary]
+    return bool(re.search(
+        r"\b(?:no\s+longer\s+available|not\s+available|isn['’]?t\s+available|unavailable|off\s+(?:the\s+)?market|expired)\b",
+        window, re.IGNORECASE))
+
+
+def _reconcile_target_current_drive(
+    proposal: dict, conversation: List[dict], target_anchor: Optional[str],
+    header: Optional[List[str]], effective_config: Optional[dict],
+    extra_texts: Optional[List[str]] = None,
+) -> _DriveEvidence:
+    fresh = _fresh_inbound_text(conversation)
+    evidence = _current_target_drive_evidence(fresh, target_anchor)
+    if evidence.value is None and _ATTACHMENT_REFERENCE_RE.search(fresh or ""):
+        sources = []
+        for source in extra_texts or []:
+            claims = _drive_property_claims(source or "")
+            if claims and not _source_mentions_target_property(source, target_anchor or ""):
+                continue
+            source_evidence = _current_target_drive_evidence(source, target_anchor)
+            if source_evidence.value is not None:
+                sources.append(source_evidence)
+        values = {source.value for source in sources}
+        if len(values) == 1:
+            value = values.pop()
+            terminal = evidence.allow_terminal_mismatch or any(source.allow_terminal_mismatch for source in sources)
+            review = (evidence.requires_review or any(source.requires_review for source in sources) or bool(value == "0" and (_looks_like_access_remediation(fresh) or _has_positive_drive_requirement(fresh))))
+            evidence = evidence._replace(value=value, saw_drive_language=True, allow_terminal_mismatch=terminal, requires_review=bool(review and not terminal))
+    mappings = (effective_config or {}).get("mappings", {})
+    drive_col = mappings.get("drive_ins")
+    fallback_drive_col = (_find_header_name(header or [], "Drive Ins") or _find_header_name(header or [], "Drive-Ins"))
+    if drive_col is None and effective_config is None:
+        drive_col = fallback_drive_col
+    elif drive_col is None:
+        _remove_proposal_update(proposal, fallback_drive_col)
+    if drive_col:
+        update = _proposal_update_for_column(proposal, drive_col)
+        if evidence.value == "0":
+            if update is None:
+                proposal.setdefault("updates", []).append({
+                    "column": drive_col, "value": "0", "confidence": 1.0,
+                    "reason": _TARGET_ZERO_UPDATE_REASON})
+            else:
+                update.update(value="0", reason=_TARGET_ZERO_UPDATE_REASON)
+        elif update is not None and (evidence.value is None
+                                     or str(update.get("value") or "").strip() != evidence.value):
+            _remove_proposal_update(proposal, drive_col)
+    detected_terminal = _detect_target_terminal_reason(fresh, target_anchor)
+    target_viable = any(_VIABILITY_RE.search(unit) and _source_mentions_target_property(unit, target_anchor or "") for unit in _drive_units(fresh))
+    suppress_availability = (_collateral_only_unavailable(fresh, target_anchor)
+                             or (target_viable and detected_terminal is None))
+    original_events = proposal.get("events") or []
+    proposal["events"] = [event for event in original_events if not (
+        (event or {}).get("type") == "property_unavailable" and (
+            (evidence.saw_drive_language and not evidence.allow_terminal_mismatch
+             and _drive_reason_alias((event or {}).get("reason")))
+            or (suppress_availability and _availability_reason_alias((event or {}).get("reason")))))]
+    if len(proposal["events"]) != len(original_events): proposal["response_email"] = None
+    if evidence.requires_review:
+        if not any((event or {}).get("type") == "needs_user_input" for event in proposal["events"]):
+            proposal["events"].append({"type": "needs_user_input",
+                                       "reason": "drive_access_requires_review",
+                                       "question": fresh[:500]})
+        proposal["response_email"] = None
+    return evidence
+
+
 def _augment_events_with_deterministic_signals(
     proposal: dict,
     conversation: List[dict],
@@ -1216,6 +1434,9 @@ def _augment_events_with_deterministic_signals(
     sender_email: Optional[str] = None,
     sender_name: Optional[str] = None,
     contact_name: Optional[str] = None,
+    header: Optional[List[str]] = None,
+    effective_config: Optional[dict] = None,
+    extra_texts: Optional[List[str]] = None,
 ) -> dict:
     """Add high-confidence event signals from broker phrases the model can miss,
     and strip wrong LLM-emitted events (retention guards)."""
@@ -1314,29 +1535,19 @@ def _augment_events_with_deterministic_signals(
         sender_name=sender_name,
         contact_name=contact_name,
     )
-    access_remediation_requires_review = (
-        _looks_like_access_remediation(latest_text)
-        and not target_requirements_mismatch
-        and not _detect_target_terminal_reason(latest_text, target_anchor)
-    )
-    if access_remediation_requires_review:
-        removed_terminal = any(
-            (event or {}).get("type") == "property_unavailable"
-            for event in events
-        )
-        if removed_terminal:
-            events = [
-                event for event in events
-                if (event or {}).get("type") != "property_unavailable"
-            ]
-            if not any((event or {}).get("type") == "needs_user_input" for event in events):
-                events.append({
-                    "type": "needs_user_input",
-                    "reason": "access_remediation_requires_review",
-                    "question": latest_text_raw[:500],
-                })
-            proposal["response_email"] = None
     proposal["events"] = events
+    if target_anchor:
+        drive_evidence = _reconcile_target_current_drive(
+            proposal,
+            conversation,
+            target_anchor,
+            header,
+            effective_config,
+            extra_texts,
+        )
+        if drive_evidence.saw_drive_language and not drive_evidence.allow_terminal_mismatch:
+            target_requirements_mismatch = False
+        events = proposal["events"]
 
     # A physical non-fit (office-heavy / not-a-warehouse / no drive-in / below-spec
     # clear height) is a statement about the PROPERTY itself, not about touring, so
@@ -1353,7 +1564,10 @@ def _augment_events_with_deterministic_signals(
     property_unavailable_reason = None
     if target_requirements_mismatch:
         property_unavailable_reason = "requirements_mismatch"
-    elif not looks_like_tour_only_unavailable(latest_text_raw):
+    elif (
+        not looks_like_tour_only_unavailable(latest_text_raw)
+        and not _collateral_only_unavailable(latest_text_raw, target_anchor)
+    ):
         property_unavailable_reason = _detect_target_terminal_reason(latest_text, target_anchor)
 
     if property_unavailable_reason:
@@ -4010,7 +4224,11 @@ def _suppress_cross_property_current_row_updates(
     events = proposal.get("events") or []
     event_types = {(event or {}).get("type") for event in events}
     if "property_unavailable" in event_types:
-        proposal["updates"] = []
+        proposal["updates"] = [
+            update for update in (proposal.get("updates") or [])
+            if str((update or {}).get("value") or "").strip() == "0"
+            and (update or {}).get("reason") == _TARGET_ZERO_UPDATE_REASON
+        ]
         return proposal
     if "new_property" not in event_types:
         return proposal
@@ -4556,7 +4774,7 @@ _DIMENSIONED_SINGULAR_DRIVE_IN_RE = re.compile(
 )
 _NONCURRENT_FEATURE_BEFORE_RE = re.compile(
     r"(?:does\s+not\s+have|doesn't\s+have|do\s+not\s+have|don't\s+have|"
-    r"is\s+not|without|needs?|would\s+need|could\s+(?:add|have)|"
+    r"is\s+not(?:\s+equipped\s+with)?|without|needs?|would\s+need|could\s+(?:add|have)|"
     r"plans?\s+for|proposed)\s*$",
     re.IGNORECASE,
 )
@@ -5754,7 +5972,9 @@ FIELD MINING HINTS:
 EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 
 - "property_unavailable": Emit when the CURRENT TARGET PROPERTY is explicitly stated as unavailable/leased/off-market/no longer available OR when the broker clearly says the property is non-viable for the client's requirements.
-  • Treat requirements-fit failures as non-viable when the broker says the space/property is not a good fit because it is office-heavy, not a true warehouse, lacks drive-in/grade-level access, lacks required industrial use, or otherwise fails the requested physical requirements.
+  • A factual zero (for example, no drive-in doors) is sheet data, not proof the property is unavailable or a bad fit.
+  • Emit a requirements mismatch only when the broker explicitly rules out the target as a fit or states an independent physical non-fit such as office-heavy, not a true warehouse, or below-spec clear height.
+  • If zero access conflicts with a stated positive minimum or may be remediated (for example by ramping a dock), emit needs_user_input and do not draft a reply.
   • DO NOT emit property_unavailable when the broker says only tours/showings are unavailable. "The space is no longer available for tours" means tour scheduling cannot continue, not that the property/listing is unavailable.
   • Do NOT use this for vague relationship refusals like "we are not a fit to work together" unless the property itself is being ruled out.
   • ALWAYS populate a non-empty "reason" so downstream has an evidence trail: use "requirements_mismatch" for a physical non-fit, otherwise a short terminal reason such as "leased", "off_market", "under_contract", "signed_lease", or "no_longer_available".
@@ -6331,6 +6551,9 @@ OUTPUT ONLY valid JSON in this exact format:
             sender_email=sender_email,
             sender_name=sender_display_name,
             contact_name=contact_name,
+            header=header,
+            effective_config=effective_config,
+            extra_texts=_evidence_extra_texts,
         )
         # A genuine contact opt-out must never write the opted-out row (LIVE break
         # adv_optout_with_specs). Runs AFTER the event augmenter so the engaged-
