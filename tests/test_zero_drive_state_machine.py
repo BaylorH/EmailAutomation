@@ -188,7 +188,7 @@ class ZeroDriveStateMachineTests(unittest.TestCase):
             ],
             events=[
                 {"type": "property_unavailable", "reason": "requirements_mismatch"},
-                {"type": "close_conversation", "reason": "all_info_gathered"},
+                {"type": "close_conversation", "notes": "all_info_gathered"},
             ],
             response_email="Thanks for confirming the property details.",
         )
@@ -200,6 +200,47 @@ class ZeroDriveStateMachineTests(unittest.TestCase):
         self.assertEqual("drive_access_requires_review", review_events[0]["reason"])
         self.assertEqual([], _events(result, "close_conversation"))
         self.assertIsNone(result["response_email"])
+
+    def test_rampability_review_yields_to_independent_terminal_close_events(self):
+        cases = (
+            (
+                "exclusive_with_another",
+                "We're going exclusive with another tenant rep.",
+            ),
+            (
+                "deal_pending",
+                "We're already in negotiations with another tenant and expect to sign next week.",
+            ),
+            (
+                "natural_end",
+                "Thanks for reaching out, and good luck with your search.",
+            ),
+        )
+        for close_reason, terminal_text in cases:
+            with self.subTest(close_reason=close_reason):
+                result = _run(
+                    "100 Main St has no drive-ins and the dock could be ramped. "
+                    + terminal_text,
+                    updates=[_update("Drive Ins", "1")],
+                    events=[
+                        {"type": "property_unavailable", "reason": "requirements_mismatch"},
+                        {"type": "close_conversation", "notes": close_reason},
+                        {
+                            "type": "needs_user_input",
+                            "reason": "drive_access_requires_review",
+                            "question": "Review the potentially rampable dock.",
+                        },
+                    ],
+                    response_email="Thanks for confirming the property details.",
+                )
+
+                self.assertEqual("0", _value(result))
+                self.assertEqual([], _events(result, "property_unavailable"))
+                self.assertEqual([], _events(result, "needs_user_input"))
+                close_events = _events(result, "close_conversation")
+                self.assertEqual(1, len(close_events))
+                self.assertEqual(close_reason, close_events[0]["notes"])
+                self.assertIsNone(result["response_email"])
 
     def test_last_trusted_target_assertion_wins_corrections(self):
         cases = (

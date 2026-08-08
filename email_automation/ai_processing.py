@@ -1341,6 +1341,29 @@ def _availability_reason_alias(reason: str) -> bool:
                           | {"unavailable", "propertyunavailable"})
 
 
+def _normalized_close_event_reason(event: dict) -> Optional[str]:
+    if (event or {}).get("type") != "close_conversation":
+        return None
+    reason = (
+        event.get("notes")
+        or event.get("reason")
+        or event.get("closeReason")
+        or "all_info_gathered"
+    )
+    return re.sub(r"[^a-z0-9]", "", str(reason).lower())
+
+
+def _is_all_info_close_event(event: dict) -> bool:
+    return _normalized_close_event_reason(event) == "allinfogathered"
+
+
+_INDEPENDENT_TERMINAL_CLOSE_REASONS = {
+    "exclusivewithanother",
+    "dealpending",
+    "naturalend",
+}
+
+
 def _collateral_only_unavailable(text: str, target_anchor: Optional[str]) -> bool:
     collateral = _COLLATERAL_SUBJECT_RE.search(text or "")
     if not collateral:
@@ -1421,9 +1444,18 @@ def _reconcile_target_current_drive(
     if evidence.requires_review:
         proposal["events"] = [
             event for event in proposal["events"]
-            if (event or {}).get("type") != "close_conversation"
+            if not _is_all_info_close_event(event)
         ]
-        if not any((event or {}).get("type") == "needs_user_input" for event in proposal["events"]):
+        has_independent_terminal_close = any(
+            _normalized_close_event_reason(event) in _INDEPENDENT_TERMINAL_CLOSE_REASONS
+            for event in proposal["events"]
+        )
+        if has_independent_terminal_close:
+            proposal["events"] = [
+                event for event in proposal["events"]
+                if (event or {}).get("type") != "needs_user_input"
+            ]
+        elif not any((event or {}).get("type") == "needs_user_input" for event in proposal["events"]):
             proposal["events"].append({"type": "needs_user_input",
                                        "reason": "drive_access_requires_review",
                                        "question": fresh[:500]})
