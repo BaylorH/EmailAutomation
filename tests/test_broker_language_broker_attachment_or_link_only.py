@@ -586,6 +586,57 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
         )
         send_reply.assert_not_called()
 
+    def test_process_passes_exact_rate_message_url_evidence_to_sheet_gate(self):
+        body = (
+            "Hi John, the suite is available. It contains 22,400 square feet, the "
+            "asking rent is $12.95 per square foot per year NNN, and estimated "
+            "operating expenses are $2.85 per square foot. The property flyer and "
+            "listing details are here: https://sitesiftai.com/help. Please let me "
+            "know if you need a tour. Best, Jordan"
+        )
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "22400", "confidence": 0.99},
+                {"column": "Rent/SF /Yr", "value": "12.95", "confidence": 0.99},
+                {"column": "Op Ex", "value": "2.85", "confidence": 0.99},
+                {
+                    "column": "Flyer/Link",
+                    "value": "https://sitesiftai.com/help",
+                    "confidence": 0.99,
+                },
+            ],
+            "events": [
+                {"type": "tour_requested", "question": "Need a tour?"},
+            ],
+            "skip_response": True,
+        }
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body=body,
+            has_attachments=False,
+            fh_patches=[
+                mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),
+                mock.patch.object(
+                    proc,
+                    "fetch_and_process_linked_assets",
+                    return_value=[],
+                ),
+                # Tour classification is covered independently; this regression
+                # pins only message -> proposal -> Flyer/Link evidence wiring.
+                mock.patch.object(proc, "_order_events_for_processing", return_value=[]),
+            ],
+            proposal=proposal,
+        )
+
+        self.assertIsNone(error)
+        self.apply_proposal.assert_called_once()
+        self.assertEqual(
+            ["https://sitesiftai.com/help"],
+            self.apply_proposal.call_args.kwargs["broker_flyer_url_evidence"],
+        )
+        self.assertEqual(proposal, self.apply_proposal.call_args.args[-1])
+        send_reply.assert_not_called()
+
     def test_alternate_attachment_does_not_suppress_current_target_url_evidence(self):
         proposal = {
             "updates": [

@@ -4060,6 +4060,46 @@ _ALTERNATE_PROPERTY_CUE_RE = re.compile(
 _STREET_SUFFIX_SENTENCE_BREAK_RE = re.compile(
     r"\.(?=\s+(?:[A-Z0-9]|(?i:for|suite|unit|the|see|use|regarding|as)\b))"
 )
+_SQUARE_FOOT_RATE_RE = re.compile(
+    r"(?P<currency>(?:(?:USD\s*)?\$|USD\b))?\s*"
+    r"(?P<amount>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
+    r"(?:\s+(?:nnn|gross|net))?\s+per\s+"
+    r"(?:(?:rentable|usable)\s+)?"
+    r"(?:square|sq\.?)(?:\s+|[/-])(?:foot|feet|ft\.?)\b",
+    re.IGNORECASE,
+)
+_RATE_CONTEXT_BEFORE_AMOUNT_RE = re.compile(
+    r"(?:asking\s+(?:rent|rate)|rent(?:al)?(?:\s+rate)?|lease\s+rate|opex|"
+    r"operating\s+expenses?|expenses?)\s*"
+    r"(?:is|are|of|at|:|=)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _square_foot_rate_spans(text: str) -> List[tuple[int, int]]:
+    """Return bounded monetary/rate phrases such as ``$12.95 per square foot``."""
+    spans = []
+    for match in _SQUARE_FOOT_RATE_RE.finditer(text or ""):
+        context = (text or "")[max(0, match.start("amount") - 48):match.start("amount")]
+        if match.group("currency") or _RATE_CONTEXT_BEFORE_AMOUNT_RE.search(context):
+            spans.append((match.start(), match.end()))
+    return spans
+
+
+def _flyer_property_street_claim_spans(text: str) -> List[tuple]:
+    """Return address claims without treating ``per square foot`` as a street."""
+    text = text or ""
+    rate_spans = _square_foot_rate_spans(text)
+    return [
+        claim for claim in _street_claim_spans(text)
+        if not (
+            claim[4] in {"sq", "square"}
+            and any(
+                rate_start <= claim[0] and claim[1] <= rate_end
+                for rate_start, rate_end in rate_spans
+            )
+        )
+    ]
 
 
 def _property_unit_identities(text: str) -> set[str]:
@@ -4082,7 +4122,7 @@ def _url_preserving_property_clause_spans(
     masked_text = "".join(masked)
     base_spans = _property_clause_spans(masked_text)
     street_claim_ends = {
-        claim[1] for claim in _street_claim_spans(masked_text)
+        claim[1] for claim in _flyer_property_street_claim_spans(masked_text)
     }
     street_sentence_breaks = {
         match.start()
@@ -4123,10 +4163,10 @@ def _current_target_flyer_url_evidence(
         if normalized is not None:
             candidates.append((match.start(), match.start() + len(cleaned), normalized))
 
-    claims = _street_claim_spans(fresh_text)
+    claims = _flyer_property_street_claim_spans(fresh_text)
     target_identity = _target_street_identity(target_anchor)
     if target_identity is None:
-        target_claims = _street_claim_spans(target_anchor or "")
+        target_claims = _flyer_property_street_claim_spans(target_anchor or "")
         if target_claims:
             target_identity = (
                 target_claims[0][2],
@@ -4141,7 +4181,9 @@ def _current_target_flyer_url_evidence(
     ]
     same_street_new_property = False
     for event in new_property_events:
-        event_claims = _street_claim_spans(_event_text(event, "address"))
+        event_claims = _flyer_property_street_claim_spans(
+            _event_text(event, "address")
+        )
         if target_identity and any(
             (claim[2], claim[3], claim[4]) == target_identity
             for claim in event_claims
@@ -4186,7 +4228,7 @@ def _current_target_flyer_url_evidence(
             clause_text = fresh_text[containing_clause[0]:containing_clause[1]]
             clause_identities = {
                 (claim[2], claim[3], claim[4])
-                for claim in _street_claim_spans(clause_text)
+                for claim in _flyer_property_street_claim_spans(clause_text)
             }
             if (
                 target_identity not in clause_identities

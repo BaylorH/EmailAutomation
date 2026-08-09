@@ -6,6 +6,14 @@ from email_automation import ai_processing as ai
 from email_automation import processing as proc
 
 
+PRODUCTION_CANARY_BODY = (
+    "Hi John, the suite is available. It contains 22,400 square feet, the asking "
+    "rent is $12.95 per square foot per year NNN, and estimated operating expenses "
+    "are $2.85 per square foot. The property flyer and listing details are here: "
+    "https://sitesiftai.com/help. Please let me know if you need a tour. Best, Jordan"
+)
+
+
 class FlyerLinkApplyTests(unittest.TestCase):
     def _apply(
         self,
@@ -15,6 +23,7 @@ class FlyerLinkApplyTests(unittest.TestCase):
         existing_value="",
         confidence=0.99,
         fresh_value=None,
+        flyer_column="Flyer / Link",
     ):
         sheets = mock.MagicMock()
         append_meta = mock.MagicMock()
@@ -50,13 +59,13 @@ class FlyerLinkApplyTests(unittest.TestCase):
                 uid="user-1",
                 client_id="client-1",
                 sheet_id="sheet-1",
-                header=["Property Address", "Flyer / Link"],
+                header=["Property Address", flyer_column],
                 rownum=3,
                 current_rowvals=["9250 W Thunderbird Rd", existing_value],
                 proposal={
                     "updates": [
                         {
-                            "column": "Flyer / Link",
+                            "column": flyer_column,
                             "value": proposed_url,
                             "confidence": confidence,
                         }
@@ -169,9 +178,134 @@ class FlyerLinkApplyTests(unittest.TestCase):
         sheets.spreadsheets.return_value.values.return_value.batchUpdate.assert_not_called()
         self.assertEqual(["read_flyer_link_before_fallback"], self.retry_operations)
 
+    def test_exact_production_message_url_reaches_sheet_gate(self):
+        events = [{"type": "tour_requested", "question": "Need a tour?"}]
+        evidence = proc._current_target_flyer_url_evidence(
+            PRODUCTION_CANARY_BODY,
+            "4402 Rex Rd, Houston",
+            events,
+        )
+
+        result, _, _ = self._apply(
+            proposed_url="https://sitesiftai.com/help",
+            evidence_urls=evidence,
+            flyer_column="Flyer/Link",
+        )
+
+        self.assertEqual(
+            [("Flyer/Link", "https://sitesiftai.com/help")],
+            [
+                (item.get("column"), item.get("newValue"))
+                for item in result["applied"]
+            ],
+        )
+        self.assertNotIn(
+            "unverified-current-message-url",
+            {item.get("reason") for item in result["skipped"]},
+        )
+
 
 class CurrentMessageFlyerEvidenceTests(unittest.TestCase):
     TARGET = "9250 W Thunderbird Rd, Peoria"
+
+    def test_exact_production_rate_language_does_not_create_property_claims(self):
+        events = [{"type": "tour_requested", "question": "Need a tour?"}]
+
+        self.assertEqual(
+            ["https://sitesiftai.com/help"],
+            proc._current_target_flyer_url_evidence(
+                PRODUCTION_CANARY_BODY,
+                "4402 Rex Rd, Houston",
+                events,
+            ),
+        )
+
+    def test_integer_per_square_rate_does_not_create_property_claim(self):
+        body = (
+            "The asking rent is 12 per square foot NNN. "
+            "Flyer: https://target.example.com/flyer.pdf"
+        )
+
+        self.assertEqual(
+            ["https://target.example.com/flyer.pdf"],
+            proc._current_target_flyer_url_evidence(body, self.TARGET, []),
+        )
+
+    def test_common_square_foot_rate_variants_do_not_create_property_claims(self):
+        for rate_phrase in (
+            "$12.95 per square ft",
+            "$12.95 per sq foot",
+            "$12.95 per sq. foot",
+            "$12.95 per sq feet",
+            "$12.95 per square/foot",
+            "Asking rate: 12.95 per square foot",
+            "$12.95 per rentable square foot",
+            "$12.95 per usable square foot",
+            "$12.95 NNN per square foot",
+            "$12.95 gross per square foot",
+            "$12.95 net per square foot",
+            "Rent: USD 12.95 per square foot",
+        ):
+            with self.subTest(rate_phrase=rate_phrase):
+                body = (
+                    f"{rate_phrase}. "
+                    "Flyer: https://target.example.com/flyer.pdf"
+                )
+                self.assertEqual(
+                    ["https://target.example.com/flyer.pdf"],
+                    proc._current_target_flyer_url_evidence(body, self.TARGET, []),
+                )
+
+    def test_rate_language_does_not_hide_real_other_property_claim(self):
+        body = (
+            "The asking rent is $12.95 per square foot. "
+            "For 500 W Cactus Rd, use https://other.example.com/flyer.pdf"
+        )
+        events = [{"type": "new_property", "address": "500 W Cactus Rd"}]
+
+        self.assertEqual(
+            [],
+            proc._current_target_flyer_url_evidence(body, self.TARGET, events),
+        )
+
+    def test_real_square_street_suffix_remains_property_identity(self):
+        body = (
+            "For 95 Market Square, use https://target.example.com/flyer.pdf. "
+            "For 500 W Cactus Rd, no flyer is available."
+        )
+        events = [{"type": "new_property", "address": "500 W Cactus Rd"}]
+
+        self.assertEqual(
+            ["https://target.example.com/flyer.pdf"],
+            proc._current_target_flyer_url_evidence(
+                body,
+                "95 Market Square, Houston",
+                events,
+            ),
+        )
+
+    def test_square_street_is_not_erased_by_following_foot_language(self):
+        for body in (
+            "For 500 Market Square. Foot traffic is excellent. "
+            "Flyer: https://listing.example.com/flyer.pdf",
+            "For 500 Market Sq. Foot traffic is excellent. "
+            "Flyer: https://listing.example.com/flyer.pdf",
+            "For 500 Market Square-Foot traffic is excellent. "
+            "Flyer: https://listing.example.com/flyer.pdf",
+            "For 500 Market Square/Foot traffic is excellent. "
+            "Flyer: https://listing.example.com/flyer.pdf",
+            "For 500 Market Sq. Ft Worth brochure: "
+            "https://listing.example.com/flyer.pdf",
+            "For 500 Per Square. Foot traffic is excellent. "
+            "Flyer: https://listing.example.com/flyer.pdf",
+            "For 500 NNN Per Square. Foot traffic is excellent. "
+            "Flyer: https://listing.example.com/flyer.pdf",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    [],
+                    proc._current_target_flyer_url_evidence(body, self.TARGET, []),
+                )
 
     def test_quoted_history_url_is_not_current_message_evidence(self):
         body = (
