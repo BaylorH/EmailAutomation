@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 with patch("google.cloud.firestore.Client", return_value=MagicMock()):
-    from email_automation import campaign_safety, processing
+    from email_automation import ai_processing, campaign_safety, processing
 
 
 class FakeSnapshot:
@@ -182,6 +182,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         complete_threads_mock=None,
         mark_client_completed_mock=None,
         missing_required_fields=None,
+        apply_proposal_result=None,
     ):
         client_id = "client-1"
         msg = self._common_graph_message(
@@ -272,6 +273,11 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             side_effect=fake_mark_client_completed
         )
         complete_threads = complete_threads_mock or MagicMock(return_value=1)
+        apply_proposal = (
+            MagicMock(return_value=apply_proposal_result)
+            if apply_proposal_result is not None
+            else None
+        )
         cancel_followup = MagicMock(side_effect=cancel_followup_side_effect)
         thread_docs = thread_docs or {thread_id: thread_ref}
         patches = [
@@ -333,6 +339,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 return_value=list(missing_required_fields or []),
             ),
         ]
+        if apply_proposal is not None:
+            patches.append(
+                patch.object(processing, "apply_proposal_to_sheet", new=apply_proposal)
+            )
 
         for patcher in patches:
             patcher.start()
@@ -359,6 +369,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "sendReply": send_reply,
             "markClientCompleted": mark_client_completed,
             "completeThreads": complete_threads,
+            "applyProposal": apply_proposal,
             "cancelFollowup": cancel_followup,
             "callTrace": call_trace,
             "threadRef": thread_ref,
@@ -766,6 +777,160 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             )
         )
 
+    def test_production_missing_opex_then_dated_tour_offer_pauses_before_completion(self):
+        first_body = (
+            "Hi John, the suite is still available. It contains 18,750 SF and rent is "
+            "$14.40/SF/year NNN. I need to confirm the current operating expenses. "
+            "Please let me know if you need a tour. Best, Jordan"
+        )
+        missing_opex_followup = (
+            "Hi Jordan, thanks for the update. Could you confirm the current operating "
+            "expenses per square foot? Best, John"
+        )
+
+        for index, (tour_window, next_sentence) in enumerate((
+            ("Tuesday, August 11 at 2:00 PM", ""),
+            ("Tuesday, August 11, 2026 at 2:00 PM", ""),
+            ("Tuesday, Aug. 11 at 2 PM", ""),
+            ("Tue., Aug. 11, 2026 at 2 p.m", ""),
+            (
+                "Tue., Aug. 11, 2026 at 2 p.m",
+                " In the meantime, the rent schedule is attached.",
+            ),
+            (
+                "Tue., Aug. 11, 2026 at 2 p.m",
+                " in the meantime, the rent schedule is attached.",
+            ),
+            (
+                "Tue., Aug. 11, 2026 at 2 p.m",
+                " online pricing is available.",
+            ),
+            (
+                "Tue., Aug. 11, 2026 at 2 p.m",
+                " via email, I sent the flyer.",
+            ),
+        )):
+            with self.subTest(tour_window=tour_window):
+                thread_id = f"thread-production-dated-tour-{index}"
+                thread_ref = FakeDocumentRef({
+                    "clientId": "client-1",
+                    "email": ["bp21harrison@gmail.com"],
+                    "status": processing.THREAD_STATUS["active"],
+                    "rowNumber": 3,
+                })
+                first_conversation = [{"direction": "inbound", "content": first_body}]
+                first_proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {
+                        "updates": [
+                            {"column": "Total SF", "value": "18750", "confidence": 1.0},
+                            {"column": "Rent/SF/Yr", "value": "14.40", "confidence": 1.0},
+                        ],
+                        "events": [{
+                            "type": "tour_requested",
+                            "reason": "tour_offer",
+                            "question": "Please let me know if you need a tour.",
+                            "suggestedEmail": "",
+                        }],
+                        "response_email": missing_opex_followup,
+                    },
+                    first_conversation,
+                    target_anchor="912-930 Gemini St",
+                )
+                first_result = self._run_tour_invite_reply_processing(
+                    user_id="regular-user",
+                    thread_id=thread_id,
+                    body=first_body,
+                    proposal=first_proposal,
+                    thread_ref=thread_ref,
+                    msg_id=f"msg-production-passive-{index}",
+                    internet_message_id=f"<production-passive-{index}@mock.test>",
+                    persist_handled_events=True,
+                    missing_required_fields=["Ops Ex / SF"],
+                    apply_proposal_result={
+                        "applied": [
+                            {"column": "Total SF", "newValue": "18750"},
+                            {"column": "Rent/SF/Yr", "newValue": "14.40"},
+                        ],
+                        "skipped": [],
+                    },
+                )
+
+                self.assertFalse(any(
+                    event.get("type") == "tour_requested"
+                    for event in first_proposal["events"]
+                ))
+                self.assertEqual([], first_result["notifications"])
+                first_result["sendReply"].assert_called_once()
+                first_result["completeThreads"].assert_not_called()
+                first_result["markClientCompleted"].assert_not_called()
+                self.assertEqual(processing.THREAD_STATUS["active"], thread_ref._data["status"])
+
+                tour_sentence = (
+                    "Let me know if your client wants to schedule a tour "
+                    f"{tour_window}."
+                )
+                second_body = (
+                    "Hi John, operating expenses are $3.10/SF/year. "
+                    f"{tour_sentence}{next_sentence} Best, Jordan"
+                )
+                second_proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {
+                        "updates": [{
+                            "column": "Ops Ex / SF",
+                            "value": "3.10",
+                            "confidence": 1.0,
+                        }],
+                        "events": [{
+                            "type": "tour_requested",
+                            "reason": "tour_offer",
+                            "question": tour_sentence,
+                            "suggestedEmail": "",
+                        }],
+                        "response_email": None,
+                    },
+                    [
+                        {"direction": "inbound", "content": first_body},
+                        {"direction": "outbound", "content": missing_opex_followup},
+                        {"direction": "inbound", "content": second_body},
+                    ],
+                    target_anchor="912-930 Gemini St",
+                )
+                second_result = self._run_tour_invite_reply_processing(
+                    user_id="regular-user",
+                    thread_id=thread_id,
+                    body=second_body,
+                    proposal=second_proposal,
+                    thread_ref=thread_ref,
+                    msg_id=f"msg-production-dated-tour-{index}",
+                    internet_message_id=f"<production-dated-tour-{index}@mock.test>",
+                    persist_handled_events=True,
+                    missing_required_fields=[],
+                    apply_proposal_result={
+                        "applied": [{"column": "Ops Ex / SF", "newValue": "3.10"}],
+                        "skipped": [],
+                    },
+                )
+
+                second_result["applyProposal"].assert_called_once()
+                second_result["completeThreads"].assert_not_called()
+                second_result["markClientCompleted"].assert_not_called()
+                second_result["sendReply"].assert_not_called()
+                self.assertEqual(1, len(second_result["notifications"]))
+                self.assertEqual(
+                    "tour_requested",
+                    second_result["notifications"][0]["kwargs"]["meta"]["reason"],
+                )
+                self.assertTrue(any(
+                    update["status"] == processing.THREAD_STATUS["paused"]
+                    and update["reason"] == "tour_requested"
+                    for update in second_result["statusUpdates"]
+                ))
+                self.assertEqual(1, len(second_result["handledEvents"]))
+                self.assertTrue(any(
+                    event.get("type") == "tour_requested"
+                    for event in second_proposal["events"]
+                ))
+
     def test_subject_bound_tour_clauses_control_process_outcome(self):
         offer_thread = FakeDocumentRef({
             "clientId": "client-1",
@@ -982,6 +1147,14 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "We can accommodate a visit Tuesday to discuss pricing.",
             "I can provide access at 2 PM to the floor plan.",
             "The tour report is available Tuesday.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM via Zoom.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM online.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM in the financial model.",
+            "The flyer is dated Tuesday, August 11 at 2:00 PM. Please let me know if you need a tour.",
+            "A tour video is available Tuesday, August 11 at 2:00 PM.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. via Zoom.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. online.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. in the financial model.",
         )
         for index, body in enumerate(messages):
             with self.subTest(body=body):

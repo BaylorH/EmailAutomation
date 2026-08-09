@@ -39,6 +39,45 @@ _TOUR_DAY_TOKEN = (
     r"fri(?:day)?|sat(?:urday)?|sun(?:day)?|today|tomorrow)"
 )
 _TOUR_CLOCK_TOKEN = r"(?:\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)|morning|afternoon|noon)"
+_TOUR_CALENDAR_WEEKDAY_TOKEN = (
+    r"(?:mon\.?|monday|tue\.?|tues\.?|tuesday|wed\.?|wednesday|"
+    r"thu\.?|thur\.?|thurs\.?|thursday|fri\.?|friday|"
+    r"sat\.?|saturday|sun\.?|sunday)"
+)
+_TOUR_MONTH_TOKEN = (
+    r"(?:jan\.?|january|feb\.?|february|mar\.?|march|apr\.?|april|may|"
+    r"jun\.?|june|jul\.?|july|aug\.?|august|"
+    r"sep\.?|sept\.?|september|oct\.?|october|"
+    r"nov\.?|november|dec\.?|december)"
+)
+_TOUR_MONTH_DAY_TOKEN = r"(?:0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?"
+_TOUR_CALENDAR_DATE_TOKEN = (
+    rf"(?:(?:{_TOUR_CALENDAR_WEEKDAY_TOKEN})\s*,?\s+)?"
+    rf"{_TOUR_MONTH_TOKEN}\s+{_TOUR_MONTH_DAY_TOKEN}(?:\s*,\s*\d{{4}})?|"
+    r"(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/\d{2,4})?"
+)
+_CALENDAR_ABBREVIATION_PERIOD_RE = re.compile(
+    rf"\b(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\."
+    rf"(?=,?\s+{_TOUR_MONTH_TOKEN}\s+{_TOUR_MONTH_DAY_TOKEN})|"
+    rf"\b(?:jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\."
+    rf"(?=\s+{_TOUR_MONTH_DAY_TOKEN})",
+    re.IGNORECASE,
+)
+_DOTTED_CLOCK_SAME_CLAUSE_QUALIFIER = (
+    r"(?:"
+    r"(?:via|using)\s+(?:zoom|microsoft\s+teams|teams|google\s+meet|"
+    r"video(?:\s+(?:call|conference))?)|"
+    r"online|virtually|remotely|"
+    r"in\s+(?:person|(?:the|a|an)\s+financial\s+model)|"
+    r"on[-\s]?site"
+    r")"
+)
+_DOTTED_CLOCK_TAIL_CONTINUATION_PERIOD_RE = re.compile(
+    rf"\b[aApP]\.[mM]\."
+    rf"(?=\s+{_DOTTED_CLOCK_SAME_CLAUSE_QUALIFIER}\s*"
+    r"(?:[.!?](?=\s|$)|$))",
+    re.IGNORECASE,
+)
 _CONCRETE_TOUR_LOGISTICS_RE = re.compile(
     rf"\b(?:{_TOUR_DAY_TOKEN}|{_TOUR_CLOCK_TOKEN})\b|"
     r"\b(?:which|what)\s+(?:day|time|window)\b",
@@ -78,6 +117,7 @@ _DIRECT_PHYSICAL_SHOW_SEE_RE = re.compile(
 _DIRECT_PHYSICAL_SHOW_SEE_TAIL_RE = re.compile(
     rf"\s*,?\s*(?:(?:in\s+person|on[-\s]?site)\s+)?"
     rf"(?:"
+    rf"(?:on\s+)?(?:{_TOUR_CALENDAR_DATE_TOKEN})\s+(?:at\s+)?{_TOUR_CLOCK_TOKEN}|"
     rf"(?:(?:on|at)\s+)?{_TOUR_DAY_TOKEN}(?:\s+(?:at\s+)?{_TOUR_CLOCK_TOKEN})?|"
     rf"(?:at\s+)?{_TOUR_CLOCK_TOKEN}|"
     r"(?:next|this)\s+week|"
@@ -313,9 +353,21 @@ _PHYSICAL_DISCOURSE_CONTEXT_RE = re.compile(
 
 def split_tour_semantic_segments(text: str = "") -> List[str]:
     """Split independent tour clauses without separating day/time lists."""
+    source_text = str(text or "")
+    abbreviation_period = "\ue000"
+    while abbreviation_period in source_text:
+        abbreviation_period += "\ue000"
+    protected_text = _CALENDAR_ABBREVIATION_PERIOD_RE.sub(
+        lambda match: f"{match.group(0)[:-1]}{abbreviation_period}",
+        source_text,
+    )
+    protected_text = _DOTTED_CLOCK_TAIL_CONTINUATION_PERIOD_RE.sub(
+        lambda match: f"{match.group(0)[:-1]}{abbreviation_period}",
+        protected_text,
+    )
     return [
-        segment.strip(" \t,")
-        for segment in _TOUR_SEMANTIC_SEGMENT_RE.split(str(text or ""))
+        segment.replace(abbreviation_period, ".").strip(" \t,")
+        for segment in _TOUR_SEMANTIC_SEGMENT_RE.split(protected_text)
         if segment.strip(" \t,")
     ]
 

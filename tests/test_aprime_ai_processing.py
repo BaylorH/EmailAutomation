@@ -34,6 +34,7 @@ from email_automation.tour_scheduling import (
     TOUR_INTENT_COURTESY,
     classify_tour_intent,
     looks_like_tour_scheduling_reply,
+    subject_bound_tour_segments,
 )
 
 
@@ -397,6 +398,68 @@ class FIX11_TourCourtesyInvitationRetention(unittest.TestCase):
         )
         for text in offers:
             with self.subTest(text=text):
+                self.assertEqual(TOUR_INTENT_ACTIONABLE, classify_tour_intent(text))
+                self.assertIn("tour_requested", self._types_after_model_tour(text))
+
+    def test_calendar_dated_generic_tour_invitations_are_actionable(self):
+        for tour_window in (
+            "Tuesday, August 11 at 2:00 PM",
+            "Tuesday August 11 at 2 PM",
+            "August 11 at 2 PM",
+            "Tue, Aug 11, 2026 at 2 PM",
+            "Tuesday, Aug. 11 at 2 PM",
+            "Tue., Aug. 11, 2026 at 2 p.m",
+            "8/11 at 2 PM",
+            "August 11th at 2 PM",
+        ):
+            with self.subTest(tour_window=tour_window):
+                text = (
+                    "Let me know if your client wants to schedule a tour "
+                    f"{tour_window}."
+                )
+                self.assertEqual(TOUR_INTENT_ACTIONABLE, classify_tour_intent(text))
+                self.assertTrue(looks_like_tour_scheduling_reply(text))
+                self.assertIn("tour_requested", self._types_after_model_tour(text))
+
+    def test_calendar_date_does_not_make_virtual_or_artifact_tour_copy_actionable(self):
+        for text in (
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM via Zoom.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM online.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM in the financial model.",
+            "The flyer is dated Tuesday, August 11 at 2:00 PM. Please let me know if you need a tour.",
+            "A tour video is available Tuesday, August 11 at 2:00 PM.",
+            "Let me know if your client wants to schedule a tour August 0 at 2 PM.",
+            "Let me know if your client wants to schedule a tour August 32 at 2 PM.",
+            "Let me know if your client wants to schedule a tour 13/11 at 2 PM.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. via Zoom.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. online.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. in the financial model.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(TOUR_INTENT_COURTESY, classify_tour_intent(text))
+                self.assertFalse(looks_like_tour_scheduling_reply(text))
+                self.assertNotIn("tour_requested", self._types_after_model_tour(text))
+
+    def test_dotted_clock_tour_offer_still_splits_a_true_next_sentence(self):
+        tour_sentence = (
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, "
+            "2026 at 2 p.m."
+        )
+        for next_sentence in (
+            "The rent schedule is confirmed.",
+            "In the meantime, the rent schedule is attached.",
+            "Online pricing is available.",
+            "Via email, I sent the flyer.",
+            "in the meantime, the rent schedule is attached.",
+            "online pricing is available.",
+            "via email, I sent the flyer.",
+        ):
+            with self.subTest(next_sentence=next_sentence):
+                text = f"{tour_sentence} {next_sentence}"
+                self.assertEqual(
+                    [tour_sentence],
+                    subject_bound_tour_segments(text),
+                )
                 self.assertEqual(TOUR_INTENT_ACTIONABLE, classify_tour_intent(text))
                 self.assertIn("tour_requested", self._types_after_model_tour(text))
 
@@ -789,6 +852,9 @@ class FIX02_TourSlotNarrowing(unittest.TestCase):
             "We can accommodate a visit Tuesday to discuss pricing.",
             "I can provide access at 2 PM to the floor plan.",
             "The tour report is available Tuesday.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. via Zoom.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. online.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. in the financial model.",
         )
         for message in messages:
             with self.subTest(message=message):

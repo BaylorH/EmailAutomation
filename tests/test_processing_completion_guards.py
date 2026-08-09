@@ -637,6 +637,14 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             "We can accommodate a visit Tuesday to discuss pricing.",
             "I can provide access at 2 PM to the floor plan.",
             "The tour report is available Tuesday.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM via Zoom.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM online.",
+            "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM in the financial model.",
+            "The flyer is dated Tuesday, August 11 at 2:00 PM. Please let me know if you need a tour.",
+            "A tour video is available Tuesday, August 11 at 2:00 PM.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. via Zoom.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. online.",
+            "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. in the financial model.",
         )
         for message in messages:
             with self.subTest(message=message):
@@ -684,6 +692,38 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             ("The requested tour slot works.", "confirmed"),
             (
                 "Let me know if your client wants to schedule a tour Tuesday at 2 PM.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tuesday, August 11 at 2:00 PM.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tue, Aug 11, 2026 at 2 PM.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tuesday, Aug. 11 at 2 PM.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. The rent schedule is confirmed.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. in the meantime, the rent schedule is attached.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. online pricing is available.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Let me know if your client wants to schedule a tour Tue., Aug. 11, 2026 at 2 p.m. via email, I sent the flyer.",
                 "tour_offer_or_request",
             ),
         )
