@@ -1,6 +1,5 @@
 import os
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -11,18 +10,31 @@ os.environ.setdefault(
 
 
 class PropertyImageResolverTests(unittest.TestCase):
-    def test_processing_initializes_link_buckets_before_optional_pdf_manifest(self):
-        processing_source = Path("email_automation/processing.py").read_text()
+    def test_processing_categorizes_optional_property_asset_manifest(self):
+        from email_automation.processing import _categorize_property_asset_links
 
-        pdf_manifest_branch = processing_source.index("if pdf_manifest:")
-        flyer_bucket = processing_source.index("flyer_links = []")
-        floorplan_bucket = processing_source.index("floorplan_links = []")
-        linked_asset_branch = processing_source.index("linked_asset_manifest = fetch_and_process_linked_assets")
+        self.assertEqual(([], []), _categorize_property_asset_links(None))
 
-        self.assertLess(flyer_bucket, pdf_manifest_branch)
-        self.assertLess(floorplan_bucket, pdf_manifest_branch)
-        self.assertLess(flyer_bucket, linked_asset_branch)
-        self.assertLess(floorplan_bucket, linked_asset_branch)
+        flyer_links, floorplan_links = _categorize_property_asset_links([
+            {
+                "name": "4402 Rex Rd Flyer.pdf",
+                "drive_link": "https://drive.google.com/file/d/flyer/view",
+            },
+            {
+                "name": "4402 Rex Rd Floor Plan.pdf",
+                "drive_link": "https://drive.google.com/file/d/floorplan/view",
+            },
+            {"name": "missing-link.pdf"},
+        ])
+
+        self.assertEqual(
+            ["https://drive.google.com/file/d/flyer/view"],
+            flyer_links,
+        )
+        self.assertEqual(
+            ["https://drive.google.com/file/d/floorplan/view"],
+            floorplan_links,
+        )
 
     def test_download_candidates_allow_drive_and_dropbox_but_skip_listing_pages(self):
         from email_automation.property_images import build_download_candidate

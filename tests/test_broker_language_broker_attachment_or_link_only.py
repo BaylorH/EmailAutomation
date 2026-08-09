@@ -552,6 +552,129 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
         self.asset_warning_recorder.assert_not_called()
         send_reply.assert_not_called()
 
+    def test_process_passes_current_target_url_evidence_to_sheet_gate(self):
+        proposal = {
+            "updates": [
+                {
+                    "column": "Flyer / Link",
+                    "value": "https://example.com/current-flyer",
+                    "confidence": 0.99,
+                }
+            ],
+            "events": [],
+            "skip_response": True,
+        }
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body="The current flyer is https://example.com/current-flyer",
+            has_attachments=False,
+            fh_patches=[
+                mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),
+            ],
+            proposal=proposal,
+        )
+
+        self.assertIsNone(error)
+        self.apply_proposal.assert_called_once()
+        self.assertIn(
+            "broker_flyer_url_evidence",
+            self.apply_proposal.call_args.kwargs,
+        )
+        self.assertEqual(
+            ["https://example.com/current-flyer"],
+            self.apply_proposal.call_args.kwargs["broker_flyer_url_evidence"],
+        )
+        send_reply.assert_not_called()
+
+    def test_alternate_attachment_does_not_suppress_current_target_url_evidence(self):
+        proposal = {
+            "updates": [
+                {
+                    "column": "Flyer / Link",
+                    "value": "https://example.com/current-flyer",
+                    "confidence": 0.99,
+                }
+            ],
+            "events": [
+                {"type": "new_property", "address": "500 W Cactus Rd"},
+            ],
+            "skip_response": True,
+        }
+        alternate_manifest = [{
+            "name": "500 W Cactus Rd Flyer.pdf",
+            "text": "Offering flyer for 500 W Cactus Rd",
+            "drive_link": "https://drive.google.com/file/d/alternate/view",
+            "method": "local",
+        }]
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body=(
+                "For 4402 Rex Rd, the current flyer is "
+                "https://example.com/current-flyer. "
+                "For 500 W Cactus Rd, see the attached alternate flyer."
+            ),
+            has_attachments=True,
+            fh_patches=[
+                mock.patch.object(
+                    proc,
+                    "fetch_and_process_pdfs",
+                    return_value=alternate_manifest,
+                ),
+                mock.patch.object(
+                    proc,
+                    "fetch_and_process_linked_assets",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    proc,
+                    "_property_exists_in_sheet",
+                    return_value=True,
+                ),
+            ],
+            proposal=proposal,
+        )
+
+        self.assertIsNone(error)
+        self.apply_proposal.assert_called_once()
+        self.assertEqual(
+            ["https://example.com/current-flyer"],
+            self.apply_proposal.call_args.kwargs["broker_flyer_url_evidence"],
+        )
+        send_reply.assert_not_called()
+
+    def test_quoted_history_url_never_enters_linked_asset_pipeline(self):
+        linked_assets = mock.MagicMock(return_value=[])
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "18,500", "confidence": 0.99}
+            ],
+            "events": [],
+            "skip_response": True,
+        }
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body=(
+                "Thanks, I will confirm the remaining details.\n\n"
+                "On Fri, Aug 7, 2026 at 1:00 PM Avery wrote:\n"
+                "> Old flyer: https://history.example.com/old-listing"
+            ),
+            has_attachments=False,
+            fh_patches=[
+                mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),
+                mock.patch.object(
+                    proc,
+                    "fetch_and_process_linked_assets",
+                    new=linked_assets,
+                ),
+            ],
+            proposal=proposal,
+        )
+
+        self.assertIsNone(error)
+        linked_assets.assert_called_once_with([])
+        self.assertEqual([], self.propose_sheet_updates.call_args.kwargs["url_texts"])
+        send_reply.assert_not_called()
+
     def test_broken_link_with_rejected_placeholder_update_stays_retryable(self):
         fh_patches = [
             mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),

@@ -30,6 +30,9 @@ from .ai_processing import (
     _append_ai_meta,
     _detect_target_terminal_reason,
     _looks_like_requirements_mismatch_nonviable,
+    _normalize_safe_broker_flyer_url,
+    _property_clause_spans,
+    _split_fresh_and_quoted,
     _source_mentions_target_property,
     _street_claim_spans,
     _target_street_identity,
@@ -4043,6 +4046,167 @@ def _categorize_property_asset_links(
     return flyer_links, floorplan_links
 
 
+_BROKER_HTTP_URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
+_PROPERTY_UNIT_RE = re.compile(
+    r"\b(?:suite|ste\.?|unit)\s*(?:#\s*)?"
+    r"([a-z]?(?:\d[a-z0-9-]*)|[a-z])\b",
+    re.IGNORECASE,
+)
+_ALTERNATE_PROPERTY_CUE_RE = re.compile(
+    r"\b(?:alternate|alternative|another|different|other|replacement)\b"
+    r"|\bnew\s+(?:property|building|listing|location|address|suite|unit|space)\b",
+    re.IGNORECASE,
+)
+_STREET_SUFFIX_SENTENCE_BREAK_RE = re.compile(
+    r"\.(?=\s+(?:[A-Z0-9]|(?i:for|suite|unit|the|see|use|regarding|as)\b))"
+)
+
+
+def _property_unit_identities(text: str) -> set[str]:
+    return {
+        match.group(1).lower().rstrip(".")
+        for match in _PROPERTY_UNIT_RE.finditer(text or "")
+    }
+
+
+def _url_preserving_property_clause_spans(
+    text: str,
+    url_candidates: List[tuple[int, int, str]],
+) -> List[tuple]:
+    """Split broker prose while leaving punctuation inside URLs non-structural."""
+    masked = list(text or "")
+    for start, end, _ in url_candidates:
+        for index in range(start, min(end, len(masked))):
+            if masked[index] in ".!?;":
+                masked[index] = "_"
+    masked_text = "".join(masked)
+    base_spans = _property_clause_spans(masked_text)
+    street_claim_ends = {
+        claim[1] for claim in _street_claim_spans(masked_text)
+    }
+    street_sentence_breaks = {
+        match.start()
+        for match in _STREET_SUFFIX_SENTENCE_BREAK_RE.finditer(masked_text)
+        if match.start() in street_claim_ends
+    }
+    refined_spans = []
+    for start, end in base_spans:
+        cursor = start
+        for boundary in sorted(
+            position for position in street_sentence_breaks
+            if start <= position < end
+        ):
+            if cursor < boundary:
+                refined_spans.append((cursor, boundary))
+            cursor = boundary + 1
+        if cursor < end:
+            refined_spans.append((cursor, end))
+    return refined_spans
+
+
+def _current_target_flyer_url_evidence(
+    message_text: str,
+    target_anchor: str,
+    events: List[Dict[str, Any]],
+) -> List[str]:
+    """Return safe URLs bound to the current message and target property.
+
+    A tracked thread supplies implicit target context only while the fresh reply
+    mentions no competing property. Once a competing/new property appears, the
+    URL's bounded clause must unambiguously name the exact target identity.
+    """
+    fresh_text, _ = _split_fresh_and_quoted(message_text or "")
+    candidates = []
+    for match in _BROKER_HTTP_URL_RE.finditer(fresh_text):
+        cleaned = _sanitize_url(match.group(0))
+        normalized = _normalize_safe_broker_flyer_url(cleaned)
+        if normalized is not None:
+            candidates.append((match.start(), match.start() + len(cleaned), normalized))
+
+    claims = _street_claim_spans(fresh_text)
+    target_identity = _target_street_identity(target_anchor)
+    if target_identity is None:
+        target_claims = _street_claim_spans(target_anchor or "")
+        if target_claims:
+            target_identity = (
+                target_claims[0][2],
+                target_claims[0][3],
+                target_claims[0][4],
+            )
+    target_units = _property_unit_identities(target_anchor)
+    fresh_units = _property_unit_identities(fresh_text)
+    new_property_events = [
+        event for event in (events or [])
+        if (event or {}).get("type") == "new_property"
+    ]
+    same_street_new_property = False
+    for event in new_property_events:
+        event_claims = _street_claim_spans(_event_text(event, "address"))
+        if target_identity and any(
+            (claim[2], claim[3], claim[4]) == target_identity
+            for claim in event_claims
+        ):
+            same_street_new_property = True
+            break
+    has_competing_claim = bool(
+        claims
+        and (
+            target_identity is None
+            or any(
+                (claim[2], claim[3], claim[4]) != target_identity
+                for claim in claims
+            )
+        )
+    )
+    has_competing_unit = bool(
+        target_units
+        and any(unit not in target_units for unit in fresh_units)
+    )
+    requires_explicit_target = bool(
+        has_competing_claim
+        or new_property_events
+        or has_competing_unit
+        or _ALTERNATE_PROPERTY_CUE_RE.search(fresh_text)
+    )
+    clause_spans = _url_preserving_property_clause_spans(fresh_text, candidates)
+
+    urls = []
+    for start, _, normalized in candidates:
+        if normalized in urls:
+            continue
+        if requires_explicit_target:
+            if target_identity is None:
+                continue
+            containing_clause = next((
+                span for span in clause_spans
+                if span[0] <= start < span[1]
+            ), None)
+            if containing_clause is None:
+                continue
+            clause_text = fresh_text[containing_clause[0]:containing_clause[1]]
+            clause_identities = {
+                (claim[2], claim[3], claim[4])
+                for claim in _street_claim_spans(clause_text)
+            }
+            if (
+                target_identity not in clause_identities
+                or clause_identities != {target_identity}
+                or _ALTERNATE_PROPERTY_CUE_RE.search(clause_text)
+            ):
+                continue
+
+            clause_units = _property_unit_identities(clause_text)
+            if target_units and (
+                not (clause_units & target_units)
+                or not clause_units.issubset(target_units)
+            ):
+                continue
+            if not target_units and same_street_new_property:
+                continue
+        urls.append(normalized)
+    return urls
+
+
 def _has_new_property_path(
     events: List[Dict[str, Any]],
     new_row_created: bool = False,
@@ -5624,8 +5788,6 @@ def process_inbox_message(
 
         # NEW: Handle PDF attachments with enhanced extraction for current message only
         pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
-        flyer_links = []
-        floorplan_links = []
 
         if pdf_manifest:
             # Categorize PDFs into flyers vs floorplans based on filename
@@ -5637,10 +5799,8 @@ def process_inbox_message(
 
                 filename = pdf.get('name', '')
                 if is_floorplan_filename(filename):
-                    floorplan_links.append(link)
                     print(f"   📐 Categorized as floorplan: {filename}")
                 else:
-                    flyer_links.append(link)
                     print(f"   📄 Categorized as flyer: {filename}")
 
             # NOTE: PDF links will be written AFTER event detection
@@ -5651,7 +5811,8 @@ def process_inbox_message(
         url_texts = []
         clean_urls = []
         url_pattern = r'https?://[^\s<>"\']+'
-        urls_found = re.findall(url_pattern, _full_text)
+        fresh_url_source, _ = _split_fresh_and_quoted(_full_text)
+        urls_found = re.findall(url_pattern, fresh_url_source)
         
         for url in urls_found[:3]:  # Limit to 3 URLs to avoid overwhelming
             clean = _sanitize_url(url)
@@ -5669,10 +5830,8 @@ def process_inbox_message(
                     continue
                 filename = asset.get("name", "")
                 if is_floorplan_filename(filename):
-                    floorplan_links.append(link)
                     print(f"   📐 Categorized linked asset as floorplan: {filename}")
                 else:
-                    flyer_links.append(link)
                     print(f"   📄 Categorized linked asset as flyer: {filename}")
 
         asset_failures = _extraction_failure_entries(pdf_manifest)
@@ -5693,6 +5852,22 @@ def process_inbox_message(
         if proposal:
             # Process updates
             if proposal.get("updates"):
+                broker_flyer_url_evidence = None
+                proposal_events = _proposal_events(proposal)
+                current_target_manifest, _ = _partition_property_attachments(
+                    pdf_manifest,
+                    current_anchor=get_row_anchor(rowvals, header),
+                    events=proposal_events,
+                )
+                current_target_flyer_links, _ = _categorize_property_asset_links(
+                    current_target_manifest,
+                )
+                if not current_target_flyer_links:
+                    broker_flyer_url_evidence = _current_target_flyer_url_evidence(
+                        _full_text,
+                        get_row_anchor(rowvals, header),
+                        proposal_events,
+                    )
                 apply_result = apply_proposal_to_sheet(
                     user_id,
                     client_id,
@@ -5702,6 +5877,7 @@ def process_inbox_message(
                     rowvals,
                     proposal,
                     column_config=column_config,
+                    broker_flyer_url_evidence=broker_flyer_url_evidence,
                 )
 
                 # Store applied record in sheetChangeLog

@@ -1,11 +1,15 @@
 import csv
 import json
 import hashlib
+import ipaddress
 import logging
 import re
+import socket
+import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
 from .messaging import build_conversation_payload
@@ -13,6 +17,7 @@ from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execu
 from .column_config import (
     CANONICAL_FIELDS,
     build_column_rules_prompt,
+    canonical_field_for_column,
     get_required_fields_for_close,
     get_column_config_error,
     find_notes_comment_column_index,
@@ -5607,6 +5612,96 @@ def _is_formula_column(col_name: str) -> bool:
     return (col_name or "").strip().lower() in _FORMULA_COLUMN_ALIASES
 
 
+def _normalize_safe_broker_flyer_url(value: Any) -> Optional[str]:
+    """Return a canonical public HTTP(S) URL, or ``None`` when unsafe."""
+    text = str(value or "").strip()
+    if (
+        not text
+        or "\\" in text
+        or any(
+            char.isspace() or unicodedata.category(char).startswith("C")
+            for char in text
+        )
+        or re.search(r"%(?![0-9A-Fa-f]{2})", text)
+    ):
+        return None
+
+    try:
+        parsed = urlsplit(text)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+
+    host = host[:-1] if host.endswith(".") else host
+    if (
+        scheme not in {"http", "https"}
+        or not host
+        or "%" in host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port == 0
+    ):
+        return None
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+
+    if address is not None:
+        if not address.is_global or address.is_multicast:
+            return None
+        ascii_host = address.compressed
+    else:
+        # Reject legacy numeric IPv4 spellings (127.1, 2130706433, 0x7f000001)
+        # that URL consumers may resolve to a local address.
+        try:
+            socket.inet_aton(host)
+        except OSError:
+            pass
+        else:
+            return None
+
+        try:
+            ascii_host = host.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            return None
+        local_suffixes = ("localhost", "local", "internal", "lan", "home", "home.arpa")
+        if any(
+            ascii_host == suffix or ascii_host.endswith(f".{suffix}")
+            for suffix in local_suffixes
+        ):
+            return None
+        if "." not in ascii_host or len(ascii_host) > 253:
+            return None
+        labels = ascii_host.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) is None
+            for label in labels
+        ):
+            return None
+        if labels[-1].isdigit():
+            return None
+
+    normalized_host = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    if port is not None and not (
+        (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    ):
+        normalized_host = f"{normalized_host}:{port}"
+    return urlunsplit((
+        scheme,
+        normalized_host,
+        parsed.path or "/",
+        parsed.query,
+        parsed.fragment,
+    ))
+
+
 def apply_proposal_to_sheet(
     uid: str,
     client_id: str,
@@ -5616,9 +5711,15 @@ def apply_proposal_to_sheet(
     current_rowvals: List[str],
     proposal: dict,
     column_config: Optional[dict] = None,
+    broker_flyer_url_evidence: Optional[List[str]] = None,
 ) -> dict:
     """
     Applies proposal['updates'] to the sheet row with AI write guards.
+
+    ``broker_flyer_url_evidence`` is a trusted caller-supplied allowlist from
+    the fresh inbound message. ``None`` leaves every asset column under the
+    existing Drive/attachment pipeline; a list opens only the primary
+    Flyer/Link fallback and still requires an exact normalized URL match.
     Returns {"applied":[...], "skipped":[...]} items with old/new values.
     """
     if not proposal or not isinstance(proposal.get("updates"), list) or not proposal["updates"]:
@@ -5648,12 +5749,19 @@ def apply_proposal_to_sheet(
 
         data_payload = []
         applied, skipped = [], []
+        flyer_fallback_write_guards = {}
+        verified_broker_flyer_urls = {
+            normalized
+            for value in (broker_flyer_url_evidence or [])
+            if (normalized := _normalize_safe_broker_flyer_url(value)) is not None
+        }
 
         for upd in proposal["updates"]:
             col_name = (upd.get("column") or "").strip()
             new_val  = "" if upd.get("value") is None else str(upd.get("value"))
             conf     = upd.get("confidence")
             reason   = upd.get("reason")
+            is_verified_flyer_fallback = False
 
             key = col_name.strip().lower()
             if key not in idx_map:
@@ -5666,11 +5774,26 @@ def apply_proposal_to_sheet(
                 skipped.append({"column": col_name, "reason": "formula-column"})
                 continue
 
-            # Skip Flyer/Floorplan columns - these are handled directly via Drive upload
-            # AI sometimes proposes local file:// paths from PDF metadata which we don't want
+            # Flyer/Floorplan columns normally remain owned by the Drive upload
+            # pipeline. Only the primary Flyer/Link field can use the ordinary
+            # broker-URL fallback, and only when the caller supplied evidence.
             if is_asset_column_name(col_name, column_config):
-                skipped.append({"column": col_name, "reason": "handled-by-asset-pipeline"})
-                continue
+                canonical_asset = canonical_field_for_column(col_name, column_config)
+                if canonical_asset != "flyer_link" or broker_flyer_url_evidence is None:
+                    skipped.append({"column": col_name, "reason": "handled-by-asset-pipeline"})
+                    continue
+                normalized_url = _normalize_safe_broker_flyer_url(new_val)
+                if normalized_url is None:
+                    skipped.append({"column": col_name, "reason": "invalid-asset-url"})
+                    continue
+                if normalized_url not in verified_broker_flyer_urls:
+                    skipped.append({
+                        "column": col_name,
+                        "reason": "unverified-current-message-url",
+                    })
+                    continue
+                new_val = normalized_url
+                is_verified_flyer_fallback = True
 
             # Reject any file:// URLs - these are local paths that shouldn't be in the sheet
             if new_val.startswith("file://"):
@@ -5724,6 +5847,18 @@ def apply_proposal_to_sheet(
                 })
                 continue
 
+            # Ordinary broker links only fill an empty Flyer/Link cell. The
+            # generic high-confidence rule below must never replace a curated
+            # human URL (and replacing an existing Drive/AI asset is unsafe too).
+            if is_verified_flyer_fallback and (old_val or "").strip():
+                skipped.append({
+                    "column": col_name,
+                    "reason": "existing-human-value",
+                    "oldValue": old_val,
+                    "confidence": conf,
+                })
+                continue
+
             # Check AI_META for write guards
             meta = _find_ai_meta_row(
                 ai_meta_rows,
@@ -5771,6 +5906,48 @@ def apply_proposal_to_sheet(
                 "newValue": new_val,
                 "confidence": conf,
                 "reason": reason,
+            })
+            if is_verified_flyer_fallback:
+                flyer_fallback_write_guards[rng] = {
+                    "column": col_name,
+                    "columnIndex": col_idx - 1,
+                    "confidence": conf,
+                }
+
+        # The proposal snapshot predates attachment/link processing and the
+        # model call. Re-read every ordinary Flyer/Link fallback at the latest
+        # possible gate, immediately before the batch write is constructed.
+        # Any non-empty live value wins regardless of proposal confidence.
+        for fallback_range, guard in flyer_fallback_write_guards.items():
+            fresh_response = _execute_with_retry(
+                sheets.spreadsheets().values().get(
+                    spreadsheetId=sheet_id,
+                    range=fallback_range,
+                ),
+                "read_flyer_link_before_fallback",
+            )
+            fresh_rows = (fresh_response or {}).get("values") or []
+            fresh_old_val = (
+                fresh_rows[0][0]
+                if fresh_rows and fresh_rows[0]
+                else ""
+            )
+            if not str(fresh_old_val or "").strip():
+                continue
+            data_payload = [
+                item for item in data_payload
+                if item.get("range") != fallback_range
+            ]
+            applied = [
+                item for item in applied
+                if item.get("range") != fallback_range
+            ]
+            row_after[guard["columnIndex"]] = fresh_old_val
+            skipped.append({
+                "column": guard["column"],
+                "reason": "existing-human-value",
+                "oldValue": fresh_old_val,
+                "confidence": guard["confidence"],
             })
 
         if not data_payload:
