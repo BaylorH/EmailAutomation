@@ -29,6 +29,12 @@ from email_automation.ai_processing import (
     _looks_like_requirements_mismatch_nonviable,
 )
 from email_automation.column_config import detect_column_mapping
+from email_automation.tour_scheduling import (
+    TOUR_INTENT_ACTIONABLE,
+    TOUR_INTENT_COURTESY,
+    classify_tour_intent,
+    looks_like_tour_scheduling_reply,
+)
 
 
 def _inbound(text):
@@ -271,6 +277,224 @@ class FIX04_RetentionGuards(unittest.TestCase):
         self.assertNotIn("contact_optout", _types(out))
 
 
+class FIX11_TourCourtesyInvitationRetention(unittest.TestCase):
+    """A generic broker sign-off is not an actionable tour request."""
+
+    def _types_after_model_tour(self, text):
+        proposal = {
+            "events": [{
+                "type": "tour_requested",
+                "reason": "tour_offer",
+                "question": text,
+                "suggestedEmail": "Would Tuesday work?",
+            }],
+            "response_email": None,
+        }
+        return _types(augment(proposal, _inbound(text)))
+
+    def test_exact_flyer_canary_invitation_is_not_a_tour_event(self):
+        text = (
+            "Hi John, the suite is available. It contains 22,400 square feet, "
+            "the asking rent is $12.95 per square foot per year NNN, and estimated "
+            "operating expenses are $2.85 per square foot. The property flyer and "
+            "listing details are here: https://sitesiftai.com/help. Please let me "
+            "know if you need a tour. Best, Jordan"
+        )
+        self.assertNotIn("tour_requested", self._types_after_model_tour(text))
+
+    def test_generic_tour_invitation_signoffs_are_not_events(self):
+        invitations = (
+            "Let me know if you want a tour.",
+            "Please let me know if your client needs a showing.",
+            "Let me know if you'd like to schedule a walkthrough.",
+            "Feel free to let me know if you want to see it.",
+            "The flyer is dated Tuesday. Please let me know if you need a tour.",
+            "I can send the flyer Tuesday. Let me know if you want a tour.",
+            "Please let me know if you need a tour. I am OOO Tuesday.",
+            "Tours are available upon request.",
+            "Happy to arrange a tour if useful.",
+            "Virtual tours are available at https://example.com/virtual.",
+            "A 360 tour is available in the flyer.",
+            "The video walkthrough is available here.",
+            "The virtual showing is available on request.",
+            "Would you like to see the space in the attached photos?",
+            "Can you see the virtual tour link?",
+            "I can arrange a tour if needed.",
+            "A walkthrough is available online.",
+            "The flyer arrives Tuesday at 2 PM, so let me know if your client wants to schedule a tour.",
+            "I can schedule a tour if you want.",
+            "We can arrange a showing upon request.",
+            "An online showing is available Tuesday.",
+        )
+        for text in invitations:
+            with self.subTest(text=text):
+                self.assertEqual(TOUR_INTENT_COURTESY, classify_tour_intent(text))
+                self.assertNotIn("tour_requested", self._types_after_model_tour(text))
+
+    def test_direct_or_concrete_tour_offers_remain_actionable(self):
+        offers = (
+            "Would you like to see the space?",
+            "Happy to show you the suite; when works for you?",
+            "Happy to show you the space, when works for you?",
+            "Happy to show you the property if Tuesday works for you.",
+            "Happy to show you the property whenever works for you.",
+            "You are welcome to visit the property Tuesday.",
+            "I can let your client into the property Tuesday.",
+            "We can accommodate a visit Tuesday.",
+            "I can provide access Tuesday.",
+            "I can provide access at 2 PM.",
+            "You are welcome to visit the property Tuesday with your client.",
+            "We can accommodate a visit Tuesday at the property.",
+            "I can provide access at 2 PM to the suite.",
+            "Tours are available next week.",
+            "Can your client tour Tuesday at 2 PM?",
+            "Let me know if Tuesday at 2 PM works for a tour.",
+            "When would your client like to tour?",
+            "Please send two times next week so I can schedule the showing.",
+            "What day works for a tour?",
+            "Please propose a few windows for a showing.",
+            "Let me know if your client can tour.",
+            "Are there any dates that work for a walkthrough?",
+            "Could your client make a showing next week?",
+            "Does Tuesday afternoon work for a walkthrough?",
+            "I have Tuesday and Thursday open for tours.",
+            "Pick a time for the showing.",
+            "Please confirm the Wednesday 10 AM showing.",
+            "The owner is offering Tuesday at 3 PM for a walkthrough.",
+            "Which of these tour windows works for your client?",
+            "Send me your availability and I will arrange the tour.",
+            "When should we meet at the property?",
+            "Could we meet at the front entrance Tuesday?",
+            "Let me know when your client wants to walk the space.",
+            "Tour Friday at 2 PM?",
+            "Can do a showing Monday.",
+            "Keen to arrange a viewing of the unit at your convenience.",
+            "We can do a walkthrough Thursday morning.",
+            "Virtual tours are available online, but I can show the property Tuesday.",
+            "Let me know if you need a tour, but I can show the property Tuesday.",
+            "Let me know if your client wants to schedule a tour Tuesday at 2 PM.",
+            "Can your client see the property Tuesday afternoon?",
+            "Virtual tours are available online, and I can show the property Tuesday.",
+            "Virtual tours are available online and I can show the property Tuesday.",
+            "Virtual tours are available online, I can show the property Tuesday.",
+            "I can show the property Tuesday, so let me know if you need a tour.",
+            "Would your client like to see the property?",
+            "Can I show you the property Tuesday?",
+            "I can show you the property Tuesday in person.",
+            "Would your client like a tour?",
+            "Do you want a tour?",
+            "Does your client want a tour?",
+            "Come see the property Tuesday.",
+            "The property is available, and I can show it Tuesday.",
+            "The suite is ready. I can show it Tuesday.",
+            "The building is open and I can walk through it Tuesday.",
+            "The property is available. You can see it Tuesday.",
+            "This one is a warehouse. You can see it Tuesday.",
+            "The current tenant will vacate next month. We can show it Tuesday.",
+            "The tenant moves out Friday. You can walk through it Tuesday.",
+            "Virtual tours are available online or I can show the property Tuesday.",
+            "Virtual tours are available online — I can show the property Tuesday.",
+        )
+        for text in offers:
+            with self.subTest(text=text):
+                self.assertEqual(TOUR_INTENT_ACTIONABLE, classify_tour_intent(text))
+                self.assertIn("tour_requested", self._types_after_model_tour(text))
+
+    def test_subject_bound_helper_matches_physical_and_rejects_virtual_only(self):
+        for text in (
+            "The property is available, and I can show it Tuesday.",
+            "The suite is ready. I can show it Tuesday.",
+            "The building is open and I can walk through it Tuesday.",
+            "Would your client like a tour?",
+            "Do you want a tour?",
+            "Does your client want a tour?",
+            "Come see the property Tuesday.",
+            "The property is available. You can see it Tuesday.",
+            "This one is a warehouse. You can see it Tuesday.",
+            "You are welcome to visit the property Tuesday.",
+            "I can let your client into the property Tuesday.",
+            "We can accommodate a visit Tuesday.",
+            "I can provide access Tuesday.",
+            "I can provide access at 2 PM.",
+            "You are welcome to visit the property Tuesday with your client.",
+            "We can accommodate a visit Tuesday at the property.",
+            "I can provide access at 2 PM to the suite.",
+            "The current tenant will vacate next month. We can show it Tuesday.",
+            "The tenant moves out Friday. You can walk through it Tuesday.",
+            "Virtual tours are available online or I can show the property Tuesday.",
+            "Virtual tours are available online — I can show the property Tuesday.",
+            "Let me know if your client wants to schedule a tour Tuesday at 2 PM.",
+            "The Tuesday slot works for us.",
+            "The 2 PM slot is confirmed.",
+            "The requested tour slot works.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(looks_like_tour_scheduling_reply(text))
+
+        self.assertFalse(
+            looks_like_tour_scheduling_reply("Virtual tours are available online.")
+        )
+
+        for text in (
+            "The rent review at that time is confirmed.",
+            "The pricing call at that slot works for us.",
+            "The financial model at that time is unavailable.",
+            "The floor plan at that slot is confirmed.",
+            "The lease schedule at that time doesn't work.",
+            "Rent is confirmed at that time.",
+            "Pricing does not work at that slot.",
+            "Model review is unavailable at that time.",
+            "Floor plan is confirmed at that slot.",
+            "Lease terms work for us at that time.",
+            "The tour report at that time is confirmed.",
+            "We reviewed when the tenant vacates. I can show it Tuesday.",
+            "We discussed when the tenant moves out. I can show it Tuesday.",
+            "The schedule notes when the tenant vacates. I can show it Tuesday.",
+            "The timeline records when the tenant moves out. I can show it Tuesday.",
+            "We discussed the tour schedule for when the tenant moves out. I can show it Tuesday.",
+            "The tour timeline notes when the tenant vacates. I can show it Tuesday.",
+            "The pricing call is at 2 PM. That time works.",
+            "The rent review is scheduled for Tuesday. That time is confirmed.",
+            "The pricing call is confirmed. That no longer works.",
+            "The lease meeting is at 10 AM. That slot is unavailable.",
+            "I can provide access to the tenant schedule after the tenant moves out. I can show it Tuesday.",
+            "I can let them review the floor plan after the tenant moves out. I can show it Tuesday.",
+            "I can visit the pricing model once the tenant vacates. I can show it Tuesday.",
+            "I can show you the property Tuesday online.",
+            "I can show you the property Tuesday in the financial model.",
+            "Would your client like to see the property on the listing page?",
+            "Let me know if your client wants to schedule a tour Tuesday via Zoom.",
+            "Let me know if your client wants to schedule a tour Tuesday online.",
+            "Let me know if your client wants to schedule a tour Tuesday in the financial model.",
+            "You are welcome to visit the property Tuesday to review the lease.",
+            "I can let your client into the property Tuesday for the pricing call.",
+            "We can accommodate a visit Tuesday to discuss pricing.",
+            "I can provide access at 2 PM to the floor plan.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(looks_like_tour_scheduling_reply(text))
+
+    def test_unknown_tour_report_is_preserved_for_processing_fail_closed_boundary(self):
+        text = "The tour report is available Tuesday."
+
+        self.assertNotEqual(TOUR_INTENT_ACTIONABLE, classify_tour_intent(text))
+        self.assertFalse(looks_like_tour_scheduling_reply(text))
+        self.assertIn("tour_requested", self._types_after_model_tour(text))
+
+    def test_fresh_bare_time_model_event_is_preserved_without_inventing_ai_context(self):
+        text = "2 PM."
+        proposal = {
+            "events": [{
+                "type": "tour_requested",
+                "reason": "tour_slot_reply",
+                "question": text,
+            }],
+        }
+
+        out = augment(proposal, _inbound(text))
+
+        self.assertIn("tour_requested", _types(out))
+
 # ===========================================================================
 # FIX-09 — new_property notes-contradiction post-hoc guard.
 # ===========================================================================
@@ -467,6 +691,151 @@ class FIX02_TourSlotNarrowing(unittest.TestCase):
         ]
         self.assertTrue(_looks_like_tour_slot_reply(convo, "wednesday works for us."))
 
+    def test_requested_tour_slot_declarative_confirmation_is_retained(self):
+        message = "The requested tour slot works."
+        convo = [
+            {"direction": "outbound", "content": "Can you confirm the requested tour slot?"},
+            {"direction": "inbound", "content": message},
+        ]
+
+        self.assertTrue(_looks_like_tour_slot_reply(convo, message.lower()))
+        self.assertIn("tour_requested", _types(augment({"events": []}, convo)))
+
+    def test_unrelated_clock_time_does_not_become_tour_slot_reply(self):
+        convo = [
+            {"direction": "outbound", "content": "Can you confirm a tour date and requested arrival time?"},
+            {"direction": "inbound", "content": "I will send the rent schedule at 2 PM."},
+        ]
+        self.assertFalse(
+            _looks_like_tour_slot_reply(convo, "i will send the rent schedule at 2 pm.")
+        )
+        out = augment({"events": []}, convo)
+        self.assertNotIn("tour_requested", _types(out))
+
+    def test_bare_time_remains_a_valid_reply_in_real_tour_context(self):
+        convo = [
+            {"direction": "outbound", "content": "Would Tuesday at 10 AM or 2 PM work for a tour?"},
+            {"direction": "inbound", "content": "2 PM."},
+        ]
+        self.assertTrue(_looks_like_tour_slot_reply(convo, "2 pm."))
+
+    def test_first_person_availability_remains_valid_in_real_tour_context(self):
+        convo = [
+            {"direction": "outbound", "content": "Would Tuesday at 10 AM or 2 PM work for a tour?"},
+            {"direction": "inbound", "content": "I'm available at 2 PM."},
+        ]
+        self.assertTrue(_looks_like_tour_slot_reply(convo, "i'm available at 2 pm."))
+
+    def test_non_tour_subjects_do_not_use_tour_reply_keywords(self):
+        messages = (
+            "The lease commencement date works for us Tuesday.",
+            "I confirmed the rent schedule at 2 PM.",
+            "I could do the rent schedule tomorrow.",
+            "I am available at 2 PM for a pricing call.",
+            "The rent schedule is attached. Tuesday works for us.",
+            "The pricing call moved. I'm available at 2 PM.",
+            "The lease terms are attached. Sounds good.",
+            "I cannot show the financial model at that time.",
+            "I can't show you the rent schedule Tuesday.",
+            "I am not able to show you the lease terms Tuesday.",
+            "The pricing meeting is confirmed for Tuesday at 2 PM.",
+            "Our call is confirmed for Tuesday at 2 PM.",
+            "I can't show you the floor plan until Tuesday.",
+            "I cannot show the cash-flow projections Tuesday.",
+            "I cannot show the floor plan Tuesday; could we do Wednesday?",
+            "The pricing call moved Tuesday; could we do Wednesday?",
+            "The pricing call moved. Could we do Wednesday at 2 PM instead?",
+            "I reviewed the property tax model. I can show it Tuesday.",
+            "The floor plan covers the property. I can show it Tuesday.",
+            "This one is a property tax model. I can show it Tuesday.",
+            "I reviewed the tenant vacating schedule. I can show it Tuesday.",
+            "We discussed the tenant move out timeline. I can show it Tuesday.",
+            "You are welcome to visit the property page Tuesday.",
+            "I can let your client into the property model Tuesday.",
+            "We can accommodate a visit to discuss pricing Tuesday.",
+            "I can provide access to the floor plan Tuesday.",
+            "The rent review at that time is confirmed.",
+            "The pricing call at that slot works for us.",
+            "The financial model at that time is unavailable.",
+            "The floor plan at that slot is confirmed.",
+            "The lease schedule at that time doesn't work.",
+            "Rent is confirmed at that time.",
+            "Pricing does not work at that slot.",
+            "Model review is unavailable at that time.",
+            "Floor plan is confirmed at that slot.",
+            "Lease terms work for us at that time.",
+            "The tour report at that time is confirmed.",
+            "We reviewed when the tenant vacates. I can show it Tuesday.",
+            "We discussed when the tenant moves out. I can show it Tuesday.",
+            "The schedule notes when the tenant vacates. I can show it Tuesday.",
+            "The timeline records when the tenant moves out. I can show it Tuesday.",
+            "We discussed the tour schedule for when the tenant moves out. I can show it Tuesday.",
+            "The tour timeline notes when the tenant vacates. I can show it Tuesday.",
+            "The pricing call is at 2 PM. That time works.",
+            "The rent review is scheduled for Tuesday. That time is confirmed.",
+            "The pricing call is confirmed. That no longer works.",
+            "The lease meeting is at 10 AM. That slot is unavailable.",
+            "I can provide access to the tenant schedule after the tenant moves out. I can show it Tuesday.",
+            "I can let them review the floor plan after the tenant moves out. I can show it Tuesday.",
+            "I can visit the pricing model once the tenant vacates. I can show it Tuesday.",
+            "I can show you the property Tuesday online.",
+            "I can show you the property Tuesday in the financial model.",
+            "Would your client like to see the property on the listing page?",
+            "Let me know if your client wants to schedule a tour Tuesday via Zoom.",
+            "Let me know if your client wants to schedule a tour Tuesday online.",
+            "Let me know if your client wants to schedule a tour Tuesday in the financial model.",
+            "You are welcome to visit the property Tuesday to review the lease.",
+            "I can let your client into the property Tuesday for the pricing call.",
+            "We can accommodate a visit Tuesday to discuss pricing.",
+            "I can provide access at 2 PM to the floor plan.",
+            "The tour report is available Tuesday.",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                convo = [
+                    {
+                        "direction": "outbound",
+                        "content": "Can you confirm a tour date and requested arrival time?",
+                    },
+                    {"direction": "inbound", "content": message},
+                ]
+                self.assertFalse(_looks_like_tour_slot_reply(convo, message.lower()))
+                out = augment({"events": []}, convo)
+                self.assertNotIn("tour_requested", _types(out))
+
+    def test_day_only_and_timed_reschedules_are_tour_slot_replies(self):
+        for message in (
+            "I cannot show Tuesday; could we do Wednesday?",
+            "I cannot show Tuesday; could we do Wednesday at 2 PM?",
+            "The rent schedule is attached. That time no longer works; could we do Wednesday at 2 PM for the tour?",
+        ):
+            with self.subTest(message=message):
+                convo = [
+                    {
+                        "direction": "outbound",
+                        "content": "Can you confirm a tour date and requested arrival time?",
+                    },
+                    {"direction": "inbound", "content": message},
+                ]
+                self.assertTrue(_looks_like_tour_slot_reply(convo, message.lower()))
+                out = augment({"events": []}, convo)
+                tours = [event for event in out["events"] if event.get("type") == "tour_requested"]
+                self.assertEqual(1, len(tours))
+                self.assertEqual("tour_slot_reply", tours[0].get("reason"))
+
+                repaired = augment({
+                    "events": [{
+                        "type": "tour_requested",
+                        "reason": "tour_unavailable",
+                        "question": message,
+                    }],
+                }, convo)
+                repaired_tours = [
+                    event for event in repaired["events"]
+                    if event.get("type") == "tour_requested"
+                ]
+                self.assertEqual("tour_slot_reply", repaired_tours[0].get("reason"))
+
 
 # ===========================================================================
 # FIX-05 — repair a model-emitted tour_requested carrying a wrong reason (M18).
@@ -567,6 +936,14 @@ class FIX08_PromptBuilder(unittest.TestCase):
         prompt = self._capture_prompt(convo)
         self.assertIn("never invent", prompt)                 # M22/M23 off-enum reasons
         self.assertIn("gate/visitor list", prompt)            # M14 confidential scope
+
+    def test_tour_prompt_rejects_courtesy_and_requires_exact_evidence(self):
+        prompt = self._capture_prompt([
+            {"direction": "inbound", "content": "Please let me know if you need a tour."}
+        ])
+        self.assertIn("generic courtesy sign-off", prompt)
+        self.assertIn("exact broker-authored sentence", prompt)
+        self.assertIn("copied verbatim without paraphrasing", prompt)
 
     def test_fix13_neutral_greeting_when_mapped_name_disagrees(self):
         # M30: mapped contact 'Jordan Lee' but sender is Patricia Wong.

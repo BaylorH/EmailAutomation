@@ -181,6 +181,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         send_reply_mock=None,
         complete_threads_mock=None,
         mark_client_completed_mock=None,
+        missing_required_fields=None,
     ):
         client_id = "client-1"
         msg = self._common_graph_message(
@@ -243,6 +244,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 return False
             return event_key in thread_ref._data.get("handledEvents", {})
 
+        build_event_key = MagicMock(side_effect=processing.build_event_key)
+        is_event_handled = MagicMock(side_effect=fake_is_event_handled)
+        mark_event_handled = MagicMock(side_effect=fake_mark_event_handled)
+
         def fake_update_thread_status(_user_id, _thread_id, status, reason):
             status_updates.append({"status": status, "reason": reason})
             return True
@@ -304,9 +309,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "propose_sheet_updates", return_value=proposal),
             patch.object(processing, "_sheets_client", return_value=MagicMock()),
             patch.object(processing, "_get_first_tab_title", return_value="Sheet1"),
-            patch.object(processing, "is_event_handled", side_effect=fake_is_event_handled),
+            patch.object(processing, "build_event_key", new=build_event_key),
+            patch.object(processing, "is_event_handled", new=is_event_handled),
             patch.object(processing, "write_notification", side_effect=fake_write_notification),
-            patch.object(processing, "mark_event_handled", side_effect=fake_mark_event_handled),
+            patch.object(processing, "mark_event_handled", new=mark_event_handled),
             patch.object(processing, "_is_row_below_nonviable", return_value=row_below_nonviable),
             patch.object(processing, "ensure_nonviable_divider", new=ensure_divider),
             patch.object(processing, "move_row_below_divider", side_effect=move_row),
@@ -321,7 +327,11 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "complete_threads_for_row", new=complete_threads),
             patch.object(processing, "_clear_thread_action_notifications"),
             patch.object(processing, "_maybe_mark_client_completed", side_effect=mark_client_completed),
-            patch.object(processing, "check_missing_required_fields", return_value=[]),
+            patch.object(
+                processing,
+                "check_missing_required_fields",
+                return_value=list(missing_required_fields or []),
+            ),
         ]
 
         for patcher in patches:
@@ -339,6 +349,9 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         return {
             "notifications": notifications,
             "handledEvents": handled_events,
+            "buildEventKey": build_event_key,
+            "isEventHandled": is_event_handled,
+            "markEventHandled": mark_event_handled,
             "statusUpdates": status_updates,
             "moveRow": move_row,
             "ensureDivider": ensure_divider,
@@ -668,51 +681,537 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             result["statusUpdates"],
         )
 
-    def test_non_allowlisted_user_tour_offer_creates_human_review_action(self):
-        body = "Hi Baylor,\n\nThe space is available. Let me know if you would like to schedule a tour.\n\nBest,\nBP21"
-        thread_id = "thread-normal-tour-offer"
+    def test_passive_tour_courtesy_does_not_poison_later_real_tour_request(self):
+        thread_id = "thread-tour-courtesy-then-real-request"
         thread_ref = FakeDocumentRef({
             "clientId": "client-1",
             "email": ["bp21harrison@gmail.com"],
             "status": processing.THREAD_STATUS["active"],
             "rowNumber": 3,
         })
-        proposal = {
-            "updates": [],
-            "events": [
-                {
-                    "type": "tour_requested",
-                    "question": "Let me know if you would like to schedule a tour.",
-                    "suggestedEmail": "Hi Ryan,\n\nCan we tour Tuesday morning?",
-                }
-            ],
-            "response_email": None,
-        }
 
-        result = self._run_tour_invite_reply_processing(
+        courtesy_result = self._run_tour_invite_reply_processing(
             user_id="regular-user",
             thread_id=thread_id,
-            body=body,
-            proposal=proposal,
+            body="Please let me know if you need a tour.",
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": "Need a tour?",
+                    "suggestedEmail": "",
+                }],
+                "response_email": None,
+            },
             thread_ref=thread_ref,
+            msg_id="msg-tour-courtesy",
+            internet_message_id="<tour-courtesy@mock.test>",
+            persist_handled_events=True,
+            missing_required_fields=["Ops Ex / SF"],
         )
 
-        self.assertEqual(1, len(result["notifications"]))
+        self.assertEqual([], courtesy_result["notifications"])
+        self.assertFalse(any(
+            update["status"] == processing.THREAD_STATUS["paused"]
+            or update["reason"] == "tour_requested"
+            for update in courtesy_result["statusUpdates"]
+        ))
+        self.assertEqual({}, thread_ref._data.get("handledEvents", {}))
+        courtesy_result["buildEventKey"].assert_not_called()
+        courtesy_result["isEventHandled"].assert_not_called()
+        courtesy_result["markEventHandled"].assert_not_called()
+        courtesy_result["sendReply"].assert_called_once()
+        self.assertIn("Ops Ex / SF", courtesy_result["sendReply"].call_args.args[2])
+        courtesy_result["completeThreads"].assert_not_called()
+        courtesy_result["markClientCompleted"].assert_not_called()
+        self.assertEqual(processing.THREAD_STATUS["active"], thread_ref._data["status"])
+        self.assertFalse(any(
+            update["status"] == processing.THREAD_STATUS["completed"]
+            for update in courtesy_result["statusUpdates"]
+        ))
+
+        real_result = self._run_tour_invite_reply_processing(
+            user_id="regular-user",
+            thread_id=thread_id,
+            body="Let me know if your client wants to schedule a tour Tuesday at 2 PM.",
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": "Let me know if your client wants to schedule a tour Tuesday at 2 PM.",
+                    "suggestedEmail": "Tuesday at 2 PM works for us.",
+                }],
+                "response_email": None,
+            },
+            thread_ref=thread_ref,
+            msg_id="msg-real-tour-request",
+            internet_message_id="<real-tour-request@mock.test>",
+            persist_handled_events=True,
+        )
+
+        self.assertEqual(1, len(real_result["notifications"]))
         self.assertEqual(
             "tour_requested",
-            result["notifications"][0]["kwargs"]["meta"]["reason"],
+            real_result["notifications"][0]["kwargs"]["meta"]["reason"],
         )
-        result["sendReply"].assert_not_called()
+        real_result["sendReply"].assert_not_called()
         self.assertTrue(
-            any(update["reason"] == "tour_requested" for update in result["statusUpdates"])
+            any(update["reason"] == "tour_requested" for update in real_result["statusUpdates"])
         )
         self.assertTrue(
             any(
                 handled["eventKey"] == "tour_requested"
-                and handled["notifId"] == result["notifications"][0]["id"]
-                for handled in result["handledEvents"]
+                and handled["notifId"] == real_result["notifications"][0]["id"]
+                for handled in real_result["handledEvents"]
             )
         )
+
+    def test_subject_bound_tour_clauses_control_process_outcome(self):
+        offer_thread = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "2:00 PM",
+                "departureTime": "2:30 PM",
+                "status": "sent",
+            },
+        })
+        offer_body = "Can I show you the property Tuesday? The rent schedule is confirmed."
+        offer_result = self._run_tour_invite_reply_processing(
+            thread_id="thread-tour-offer-rent-confirmed",
+            body=offer_body,
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": offer_body,
+                    "suggestedEmail": "",
+                }],
+                "response_email": None,
+            },
+            thread_ref=offer_thread,
+            missing_required_fields=["Ops Ex / SF"],
+        )
+
+        self.assertEqual(1, len(offer_result["notifications"]))
+        offer_meta = offer_result["notifications"][0]["kwargs"]["meta"]
+        self.assertEqual("tour_requested", offer_meta["reason"])
+        self.assertEqual(
+            "tour_offer_or_request",
+            offer_meta["tourReplyClassification"]["outcome"],
+        )
+        offer_result["completeThreads"].assert_not_called()
+        self.assertEqual(1, len(offer_result["handledEvents"]))
+
+        confirmation_thread = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "2:00 PM",
+                "departureTime": "2:30 PM",
+                "status": "sent",
+            },
+        })
+        confirmation_body = "Tour confirmed for Tuesday at 2 PM. The rent schedule doesn't work."
+        confirmation_result = self._run_tour_invite_reply_processing(
+            thread_id="thread-tour-confirmed-rent-declined",
+            body=confirmation_body,
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": confirmation_body,
+                    "suggestedEmail": "",
+                }],
+                "response_email": None,
+            },
+            thread_ref=confirmation_thread,
+        )
+
+        self.assertEqual("confirmed", confirmation_thread._data["tourInvite.status"])
+        self.assertEqual("confirmed", confirmation_thread._data["tourStatus"])
+        confirmation_result["completeThreads"].assert_called_once()
+        self.assertFalse(any(
+            notification["kwargs"]["meta"]["reason"] == "tour_reschedule_requested"
+            for notification in confirmation_result["notifications"]
+        ))
+
+    def test_offer_questions_do_not_complete_established_tour_invite(self):
+        messages = (
+            "Happy to show you the space, when works for you?",
+            "Happy to show you the property if Tuesday works for you.",
+            "Happy to show you the property whenever works for you.",
+        )
+        for index, body in enumerate(messages):
+            with self.subTest(body=body):
+                thread_ref = FakeDocumentRef({
+                    "clientId": "client-1",
+                    "email": ["bp21harrison@gmail.com"],
+                    "status": processing.THREAD_STATUS["active"],
+                    "rowNumber": 3,
+                    "source": "dashboard_tour_planner",
+                    "actionType": "tour_invite",
+                    "tourInvite": {
+                        "tourDate": "2026-06-23",
+                        "arrivalTime": "2:00 PM",
+                        "departureTime": "2:30 PM",
+                        "status": "sent",
+                    },
+                })
+                result = self._run_tour_invite_reply_processing(
+                    thread_id=f"thread-tour-offer-question-{index}",
+                    body=body,
+                    proposal={
+                        "updates": [],
+                        "events": [{
+                            "type": "tour_requested",
+                            "question": body,
+                            "suggestedEmail": "",
+                        }],
+                        "response_email": None,
+                    },
+                    thread_ref=thread_ref,
+                    missing_required_fields=["Ops Ex / SF"],
+                )
+
+                self.assertEqual(1, len(result["notifications"]))
+                meta = result["notifications"][0]["kwargs"]["meta"]
+                self.assertEqual("tour_requested", meta["reason"])
+                self.assertEqual(
+                    "tour_offer_or_request",
+                    meta["tourReplyClassification"]["outcome"],
+                )
+                self.assertEqual(1, len(result["handledEvents"]))
+                result["completeThreads"].assert_not_called()
+                self.assertNotEqual("confirmed", thread_ref._data.get("tourStatus"))
+
+    def test_fresh_bare_time_model_reason_does_not_pause_normal_campaign(self):
+        body = "2 PM."
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "actionType": "campaign_creation",
+        })
+        result = self._run_tour_invite_reply_processing(
+            thread_id="thread-fresh-bare-time-no-tour-context",
+            body=body,
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "reason": "tour_slot_reply",
+                    "question": body,
+                    "suggestedEmail": "",
+                }],
+                "response_email": None,
+            },
+            thread_ref=thread_ref,
+            missing_required_fields=["Ops Ex / SF"],
+        )
+
+        self.assertEqual([], result["notifications"])
+        self.assertEqual([], result["handledEvents"])
+        self.assertFalse(any(
+            update["status"] == processing.THREAD_STATUS["paused"]
+            for update in result["statusUpdates"]
+        ))
+        result["completeThreads"].assert_not_called()
+
+    def test_non_tour_subjects_do_not_mutate_established_tour_process(self):
+        messages = (
+            "The pricing meeting is confirmed for Tuesday at 2 PM.",
+            "Our call is confirmed for Tuesday at 2 PM.",
+            "I can't show you the floor plan until Tuesday.",
+            "I cannot show the cash-flow projections Tuesday.",
+            "I cannot show the floor plan Tuesday; could we do Wednesday?",
+            "The pricing call moved Tuesday; could we do Wednesday?",
+            "The pricing call moved. Could we do Wednesday at 2 PM instead?",
+            "I reviewed the property tax model. I can show it Tuesday.",
+            "The floor plan covers the property. I can show it Tuesday.",
+            "This one is a property tax model. I can show it Tuesday.",
+            "I reviewed the tenant vacating schedule. I can show it Tuesday.",
+            "We discussed the tenant move out timeline. I can show it Tuesday.",
+            "You are welcome to visit the property page Tuesday.",
+            "I can let your client into the property model Tuesday.",
+            "We can accommodate a visit to discuss pricing Tuesday.",
+            "I can provide access to the floor plan Tuesday.",
+            "The rent review at that time is confirmed.",
+            "The pricing call at that slot works for us.",
+            "The financial model at that time is unavailable.",
+            "The floor plan at that slot is confirmed.",
+            "The lease schedule at that time doesn't work.",
+            "Rent is confirmed at that time.",
+            "Pricing does not work at that slot.",
+            "Model review is unavailable at that time.",
+            "Floor plan is confirmed at that slot.",
+            "Lease terms work for us at that time.",
+            "The tour report at that time is confirmed.",
+            "We reviewed when the tenant vacates. I can show it Tuesday.",
+            "We discussed when the tenant moves out. I can show it Tuesday.",
+            "The schedule notes when the tenant vacates. I can show it Tuesday.",
+            "The timeline records when the tenant moves out. I can show it Tuesday.",
+            "We discussed the tour schedule for when the tenant moves out. I can show it Tuesday.",
+            "The tour timeline notes when the tenant vacates. I can show it Tuesday.",
+            "The pricing call is at 2 PM. That time works.",
+            "The rent review is scheduled for Tuesday. That time is confirmed.",
+            "The pricing call is confirmed. That no longer works.",
+            "The lease meeting is at 10 AM. That slot is unavailable.",
+            "I can provide access to the tenant schedule after the tenant moves out. I can show it Tuesday.",
+            "I can let them review the floor plan after the tenant moves out. I can show it Tuesday.",
+            "I can visit the pricing model once the tenant vacates. I can show it Tuesday.",
+            "I can show you the property Tuesday online.",
+            "I can show you the property Tuesday in the financial model.",
+            "Would your client like to see the property on the listing page?",
+            "Let me know if your client wants to schedule a tour Tuesday via Zoom.",
+            "Let me know if your client wants to schedule a tour Tuesday online.",
+            "Let me know if your client wants to schedule a tour Tuesday in the financial model.",
+            "You are welcome to visit the property Tuesday to review the lease.",
+            "I can let your client into the property Tuesday for the pricing call.",
+            "We can accommodate a visit Tuesday to discuss pricing.",
+            "I can provide access at 2 PM to the floor plan.",
+            "The tour report is available Tuesday.",
+        )
+        for index, body in enumerate(messages):
+            with self.subTest(body=body):
+                thread_ref = FakeDocumentRef({
+                    "clientId": "client-1",
+                    "email": ["bp21harrison@gmail.com"],
+                    "status": processing.THREAD_STATUS["active"],
+                    "rowNumber": 3,
+                    "source": "dashboard_tour_planner",
+                    "actionType": "tour_invite",
+                    "tourInvite": {
+                        "tourDate": "2026-06-23",
+                        "arrivalTime": "2:00 PM",
+                        "departureTime": "2:30 PM",
+                        "status": "sent",
+                    },
+                })
+                result = self._run_tour_invite_reply_processing(
+                    thread_id=f"thread-non-tour-subject-{index}",
+                    body=body,
+                    proposal={
+                        "updates": [],
+                        "events": [{
+                            "type": "tour_requested",
+                            "question": body,
+                            "suggestedEmail": "",
+                        }],
+                        "response_email": None,
+                    },
+                    thread_ref=thread_ref,
+                    missing_required_fields=["Ops Ex / SF"],
+                )
+
+                self.assertEqual([], result["notifications"])
+                self.assertEqual([], result["handledEvents"])
+                self.assertFalse(any(
+                    update["status"] == processing.THREAD_STATUS["paused"]
+                    for update in result["statusUpdates"]
+                ))
+                result["completeThreads"].assert_not_called()
+                self.assertEqual("sent", thread_ref._data["tourInvite"]["status"])
+
+    def test_physical_antecedents_and_mixed_virtual_offers_pause_once(self):
+        messages = (
+            "The property is available, and I can show it Tuesday.",
+            "The suite is ready. I can show it Tuesday.",
+            "The building is open and I can walk through it Tuesday.",
+            "Would your client like a tour?",
+            "Do you want a tour?",
+            "Does your client want a tour?",
+            "The property is available. You can see it Tuesday.",
+            "This one is a warehouse. You can see it Tuesday.",
+            "You are welcome to visit the property Tuesday.",
+            "I can let your client into the property Tuesday.",
+            "We can accommodate a visit Tuesday.",
+            "I can provide access Tuesday.",
+            "I can provide access at 2 PM.",
+            "You are welcome to visit the property Tuesday with your client.",
+            "We can accommodate a visit Tuesday at the property.",
+            "I can provide access at 2 PM to the suite.",
+            "The current tenant will vacate next month. We can show it Tuesday.",
+            "The tenant moves out Friday. You can walk through it Tuesday.",
+            "Virtual tours are available online or I can show the property Tuesday.",
+            "Virtual tours are available online — I can show the property Tuesday.",
+            "Let me know if your client wants to schedule a tour Tuesday at 2 PM.",
+        )
+        for index, body in enumerate(messages):
+            with self.subTest(body=body):
+                thread_ref = FakeDocumentRef({
+                    "clientId": "client-1",
+                    "email": ["bp21harrison@gmail.com"],
+                    "status": processing.THREAD_STATUS["active"],
+                    "rowNumber": 3,
+                })
+                result = self._run_tour_invite_reply_processing(
+                    thread_id=f"thread-physical-tour-offer-{index}",
+                    body=body,
+                    proposal={
+                        "updates": [],
+                        "events": [{
+                            "type": "tour_requested",
+                            "question": body,
+                            "suggestedEmail": "Please share a time that works.",
+                        }],
+                        "response_email": None,
+                    },
+                    thread_ref=thread_ref,
+                    missing_required_fields=["Ops Ex / SF"],
+                )
+
+                self.assertEqual(1, len(result["notifications"]))
+                self.assertEqual("tour_requested", result["notifications"][0]["kwargs"]["meta"]["reason"])
+                self.assertEqual(1, len(result["handledEvents"]))
+                self.assertEqual(1, len([
+                    update for update in result["statusUpdates"]
+                    if update["status"] == processing.THREAD_STATUS["paused"]
+                    and update["reason"] == "tour_requested"
+                ]))
+                result["completeThreads"].assert_not_called()
+
+    def test_cannot_show_then_proposed_day_reschedules_process(self):
+        cases = (
+            ("I cannot show Tuesday; could we do Wednesday?", "Wednesday"),
+            ("I cannot show Tuesday; could we do Wednesday at 2 PM?", "Wednesday at 2 PM"),
+            (
+                "The rent schedule is attached. That time no longer works; "
+                "could we do Wednesday at 2 PM for the tour?",
+                "Wednesday at 2 PM",
+            ),
+        )
+        for index, (body, expected_alternate) in enumerate(cases):
+            with self.subTest(body=body):
+                thread_ref = FakeDocumentRef({
+                    "clientId": "client-1",
+                    "email": ["bp21harrison@gmail.com"],
+                    "status": processing.THREAD_STATUS["active"],
+                    "rowNumber": 3,
+                    "source": "dashboard_tour_planner",
+                    "actionType": "tour_invite",
+                    "tourInvite": {
+                        "tourDate": "2026-06-23",
+                        "arrivalTime": "2:00 PM",
+                        "departureTime": "2:30 PM",
+                        "status": "sent",
+                    },
+                })
+                result = self._run_tour_invite_reply_processing(
+                    thread_id=f"thread-tour-day-reschedule-{index}",
+                    body=body,
+                    proposal={
+                        "updates": [],
+                        "events": [{
+                            "type": "tour_requested",
+                            "question": body,
+                            "suggestedEmail": "",
+                        }],
+                        "response_email": None,
+                    },
+                    thread_ref=thread_ref,
+                )
+
+                self.assertEqual(1, len(result["notifications"]))
+                meta = result["notifications"][0]["kwargs"]["meta"]
+                self.assertEqual("tour_reschedule_requested", meta["reason"])
+                self.assertEqual("alternate_requested", meta["tourReplyClassification"]["outcome"])
+                self.assertIn(expected_alternate, meta["tourReplyClassification"]["alternateTimes"])
+                self.assertEqual("alternate_requested", thread_ref._data["tourInvite.status"])
+                self.assertEqual(1, len(result["handledEvents"]))
+                result["sendReply"].assert_not_called()
+
+    def test_negative_tour_slot_without_alternate_pauses_as_declined(self):
+        body = "That no longer works."
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "2:00 PM",
+                "departureTime": "2:30 PM",
+                "status": "sent",
+            },
+        })
+        result = self._run_tour_invite_reply_processing(
+            thread_id="thread-tour-slot-declined-no-alternate",
+            body=body,
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": body,
+                    "suggestedEmail": "",
+                }],
+                "response_email": None,
+            },
+            thread_ref=thread_ref,
+        )
+
+        self.assertEqual(1, len(result["notifications"]))
+        meta = result["notifications"][0]["kwargs"]["meta"]
+        self.assertEqual("tour_slot_declined", meta["reason"])
+        self.assertEqual("declined", meta["tourReplyClassification"]["outcome"])
+        self.assertEqual("declined", thread_ref._data["tourInvite.status"])
+        self.assertEqual(1, len(result["handledEvents"]))
+        result["completeThreads"].assert_not_called()
+        result["sendReply"].assert_not_called()
+
+    def test_requested_tour_slot_works_confirms_and_closes_without_draft(self):
+        body = "The requested tour slot works."
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "2:00 PM",
+                "departureTime": "2:30 PM",
+                "status": "sent",
+            },
+        })
+        result = self._run_tour_invite_reply_processing(
+            thread_id="thread-requested-tour-slot-confirmed",
+            body=body,
+            proposal={
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "question": body,
+                    "suggestedEmail": "",
+                }],
+                "response_email": None,
+            },
+            thread_ref=thread_ref,
+        )
+
+        self.assertEqual([], result["notifications"])
+        self.assertEqual("confirmed", thread_ref._data["tourInvite.status"])
+        self.assertEqual("confirmed", thread_ref._data["tourStatus"])
+        self.assertEqual(1, len(result["handledEvents"]))
+        self.assertTrue(result["handledEvents"][0]["eventKey"].startswith(
+            "tour_requested:confirmed:"
+        ))
+        result["completeThreads"].assert_called_once()
+        result["sendReply"].assert_not_called()
 
     def test_reviewed_tour_invite_confirmation_survives_persisted_offer_dedupe(self):
         thread_id = "thread-tour-sequence-confirmed"
@@ -760,7 +1259,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         })
         confirmation_result = self._run_tour_invite_reply_processing(
             thread_id=thread_id,
-            body="Tuesday at 10:15 AM works for us. Confirmed.",
+            body=(
+                "Tuesday at 10:15 AM works for us. Confirmed. "
+                "Let me know if you need directions for the tour."
+            ),
             proposal={
                 "updates": [],
                 "events": [{

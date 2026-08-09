@@ -29,7 +29,14 @@ from .column_config import (
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
 from .property_images import STREET_SUFFIX_TOKENS
-from .tour_scheduling import looks_like_tour_only_unavailable
+from .tour_scheduling import (
+    TOUR_INTENT_COURTESY,
+    classify_tour_intent,
+    extract_proposed_tour_options,
+    looks_like_tour_scheduling_reply,
+    looks_like_tour_only_unavailable,
+    subject_bound_tour_segments,
+)
 from .outbound_safety import find_unresolved_placeholders
 
 logger = logging.getLogger(__name__)
@@ -451,30 +458,7 @@ def _looks_like_tour_slot_reply(conversation: List[dict], latest_text: str) -> b
     )
     if not tour_context:
         return False
-
-    # Strong, unambiguous scheduling-reply signals (self-sufficient).
-    strong_reply_signal = re.search(
-        r"\b(?:that\s+time|that\s+slot|the\s+slot|requested\s+time|confirmed|"
-        r"does\s+not\s+work|doesn[’']t\s+work|can't\s+do|cannot\s+do|won[’']t\s+work|"
-        r"could\s+do|available\s+(?:at|around|after|before)|works\s+better|"
-        r"reschedule|see\s+you|no\s+longer\s+available)\b",
-        latest,
-    )
-    time_signal = re.search(r"\b(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)|morning|afternoon|noon)\b", latest)
-    day_signal = re.search(
-        r"\b(?:mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun)(?:day|nesday|rsday|urday)?\b"
-        r"|\b(?:today|tomorrow|tonight|next\s+week|this\s+week)\b",
-        latest,
-    )
-    # Bare "works" / "instead" is only a scheduling reply when a concrete
-    # time or day anchors it — otherwise the idiom "the works" or "works for the
-    # client" falsely stripped a correct non-viable classification (A′ misread M04).
-    weak_reply_signal = re.search(r"\b(?:works?|instead)\b", latest)
-    return bool(
-        strong_reply_signal
-        or time_signal
-        or (weak_reply_signal and (time_signal or day_signal))
-    )
+    return looks_like_tour_scheduling_reply(latest_text)
 
 
 def _has_tour_scheduling_context(conversation: List[dict]) -> bool:
@@ -926,7 +910,16 @@ def _apply_event_retention_guards(
             if opt_name and identities and opt_name not in identities:
                 continue
 
-        # (e) new_property whose own notes self-contradict the referral
+        # (e) Courtesy is the only proven-negative tour intent. Preserve
+        # UNKNOWN model events for downstream, conversation-aware processing;
+        # that layer still fails closed when no subject-bound clause exists.
+        if (
+            etype == "tour_requested"
+            and classify_tour_intent(newest_text) == TOUR_INTENT_COURTESY
+        ):
+            continue
+
+        # (f) new_property whose own notes self-contradict the referral
         if etype == "new_property" and _NEW_PROP_CONTRADICTION_RE.search(str(event.get("notes") or "")):
             continue
 
@@ -1501,7 +1494,12 @@ def _augment_events_with_deterministic_signals(
     # so the auto-reply is treated as ignore/continue, model-independently.
     if _looks_like_out_of_office(latest_text_raw):
         proposal["events"] = [
-            e for e in events if (e or {}).get("type") != "wrong_contact"
+            e for e in events
+            if (e or {}).get("type") != "wrong_contact"
+            and not (
+                (e or {}).get("type") == "tour_requested"
+                and classify_tour_intent(latest_text_raw) == TOUR_INTENT_COURTESY
+            )
         ]
         return proposal
 
@@ -1639,35 +1637,51 @@ def _augment_events_with_deterministic_signals(
         proposal["response_email"] = None
         return proposal
 
+    # FIX-02: never delete an LLM property_unavailable carrying a substantive
+    # (requirements-fit) reason — a tour-only idiom must not erase a correct
+    # non-viable classification.
+    def _is_substantive_pu(event: dict) -> bool:
+        return (
+            (event or {}).get("type") == "property_unavailable"
+            and str((event or {}).get("reason") or "").strip() == "requirements_mismatch"
+        )
+
     tour_reply_reason = None
-    if looks_like_tour_only_unavailable(latest_text_raw):
-        if _has_tour_scheduling_context(conversation) or _looks_like_tour_slot_reply(conversation, latest_text):
+    tour_reply_text = " ".join(subject_bound_tour_segments(latest_text_raw))
+    proposed_tour_options = extract_proposed_tour_options(tour_reply_text)
+    tour_only_unavailable = looks_like_tour_only_unavailable(tour_reply_text)
+    if tour_only_unavailable and not proposed_tour_options:
+        if (
+            _has_tour_scheduling_context(conversation)
+            and _looks_like_tour_slot_reply(conversation, latest_text)
+        ):
             tour_reply_reason = "tour_unavailable"
+        else:
+            # A tour restriction must never stop the property. Initial outreach
+            # merely asking whether tours exist is not an active scheduling
+            # lifecycle, so scrub a model over-fire without injecting a tour event.
+            proposal["events"] = [
+                event for event in events
+                if (event or {}).get("type") != "property_unavailable"
+                or _is_substantive_pu(event)
+            ]
+            return proposal
     elif _looks_like_tour_slot_reply(conversation, latest_text):
         tour_reply_reason = "tour_slot_reply"
 
     if tour_reply_reason:
-        # FIX-02: never delete an LLM property_unavailable carrying a substantive
-        # (requirements-fit) reason — the tour-slot idiom must not erase a correct
-        # non-viable classification.
-        def _is_substantive_pu(event: dict) -> bool:
-            return (
-                (event or {}).get("type") == "property_unavailable"
-                and str((event or {}).get("reason") or "").strip() == "requirements_mismatch"
-            )
-
         existing_tour = [e for e in events if (e or {}).get("type") == "tour_requested"]
         proposal["events"] = [
             event for event in events
             if (event or {}).get("type") != "property_unavailable" or _is_substantive_pu(event)
         ]
         if existing_tour:
-            # FIX-05: repair a model-emitted tour_requested carrying a wrong reason
-            # instead of only appending-when-absent (A′ misread M18).
-            if tour_reply_reason == "tour_unavailable":
-                for event in proposal["events"]:
-                    if (event or {}).get("type") == "tour_requested":
-                        event["reason"] = "tour_unavailable"
+            # FIX-05: the deterministic subject-bound lifecycle verdict is
+            # authoritative for both an unavailable tour and a proposed
+            # alternate; repair any model-emitted stale/wrong reason in place.
+            for event in proposal["events"]:
+                if (event or {}).get("type") == "tour_requested":
+                    event["reason"] = tour_reply_reason
         else:
             proposal["events"].append({
                 "type": "tour_requested",
@@ -6234,6 +6248,8 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 - "tour_requested": Emit when broker offers or requests a property tour/showing. This is DIFFERENT from needs_user_input.
   • Look for: "schedule a tour", "would you like to see it", "happy to show you", "can arrange a tour",
     "want to come by", "stop by and take a look", "walk through the property", "showing available"
+  • A generic courtesy sign-off such as "let me know if you need/want a tour" or "feel free to let me know if you want to see it" is NOT an actionable tour request unless the broker also gives concrete timing or directly asks/offers to schedule. Do not emit an event for the generic sign-off alone.
+  • For a real tour event, copy the exact triggering broker-authored sentence into question. Never paraphrase or strengthen the broker's wording.
   • DO NOT emit when the broker merely sends specs, says a property is available, attaches a flyer, or when quoted
     history/outbound text mentions "tour availability" as one of the requested fields.
   • DO NOT infer a tour offer from "available immediately", "available SF", "tourable", or "attached is the flyer"
@@ -6635,8 +6651,8 @@ OUTPUT ONLY valid JSON in this exact format:
       "contactName": "<for new_property: full name of the new contact if mentioned, e.g., 'Joe Smith' from 'email Joe Smith at joe@email.com'. Use first name only if that's all available>",
       "link": "<for new_property: include URL if mentioned>",
       "notes": "<for new_property: additional context about the property>",
-      "reason": "<for needs_user_input: client_question | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company>",
-      "question": "<for needs_user_input: the specific question/request that needs user attention>",
+      "reason": "<for needs_user_input: client_question | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company> OR <for tour_requested: tour_offer | tour_slot_reply | tour_unavailable>",
+      "question": "<for needs_user_input: the specific question/request that needs user attention; for tour_requested: the exact broker-authored sentence that triggered the event, copied verbatim without paraphrasing>",
       "suggestedContact": "<for wrong_contact: name of correct person to contact>",
       "suggestedEmail": "<for wrong_contact: email of correct person if provided>",
       "suggestedPhone": "<for wrong_contact: phone of correct person if provided>",

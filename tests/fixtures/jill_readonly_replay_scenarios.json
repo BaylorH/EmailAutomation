@@ -96,13 +96,11 @@
           "value": "No three-phase power"
         }
       ],
-      "expectedEvents": [
-        "tour_requested"
-      ],
+      "expectedEvents": [],
       "operatorChecks": [
         "PDF/flyer evidence remains attached to this row.",
         "Power gap is visible in results and map detail panel.",
-        "Tour offer pauses for user approval."
+        "Generic let-me-know tour courtesy does not pause or create an action."
       ]
     },
     {

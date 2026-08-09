@@ -525,6 +525,413 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertFalse(processing._tour_event_needs_operator_action(event, message))
         self.assertEqual([], classification["alternateTimes"])
 
+    def test_model_question_cannot_upgrade_passive_broker_tour_courtesy(self):
+        message = "Please let me know if you need a tour."
+        event = {
+            "type": "tour_requested",
+            "question": "Would you like to schedule a tour Tuesday at 2 PM?",
+            "notes": "Broker offered a concrete Tuesday tour slot.",
+            "suggestedEmail": "Tuesday at 2 PM works for us.",
+        }
+
+        classification = processing._classify_tour_invite_reply(
+            message,
+            event=event,
+            thread_data={"actionType": "campaign_creation"},
+        )
+
+        self.assertEqual("not_tour", classification["outcome"])
+        self.assertFalse(classification["needsOperatorAction"])
+
+    def test_nonphysical_show_meet_and_virtual_language_are_not_tour_actions(self):
+        messages = (
+            "The flyer is showing the available suites.",
+            "I can meet the asking rate.",
+            "Can we see whether the numbers work?",
+            "Virtual tours are available at https://example.com/virtual.",
+            "A 360 tour is available in the flyer.",
+            "Would you like to see the space in the attached photos?",
+            "Are there any dates that work for the lease commencement?",
+            "Pick a time for the pricing call.",
+            "I can show you the rent schedule Tuesday.",
+            "Ownership offered several lease dates.",
+            "The financial model is ready. I can show it to you Tuesday.",
+            "I can walk through the lease terms Tuesday.",
+            "I cannot show the financial model at that time.",
+            "I can't show you the rent schedule Tuesday.",
+            "I am not able to show you the lease terms Tuesday.",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={
+                        "type": "tour_requested",
+                        "question": "Would you like to schedule a tour Tuesday at 2 PM?",
+                    },
+                    thread_data={"actionType": "campaign_creation"},
+                )
+                self.assertEqual("not_tour", classification["outcome"])
+                self.assertFalse(classification["needsOperatorAction"])
+
+    def test_non_tour_reply_subjects_cannot_confirm_or_update_tour_invite(self):
+        messages = (
+            "The lease commencement date works for us Tuesday.",
+            "I confirmed the rent schedule at 2 PM.",
+            "I could do the rent schedule tomorrow.",
+            "I am available at 2 PM for a pricing call.",
+            "The rent schedule is attached. Tuesday works for us.",
+            "The pricing call moved. I'm available at 2 PM.",
+            "The lease terms are attached. Sounds good.",
+            "I cannot show the financial model at that time.",
+            "I can't show you the rent schedule Tuesday.",
+            "I am not able to show you the lease terms Tuesday.",
+            "The pricing meeting is confirmed for Tuesday at 2 PM.",
+            "Our call is confirmed for Tuesday at 2 PM.",
+            "I can't show you the floor plan until Tuesday.",
+            "I cannot show the cash-flow projections Tuesday.",
+            "I cannot show the floor plan Tuesday; could we do Wednesday?",
+            "The pricing call moved Tuesday; could we do Wednesday?",
+            "The pricing call moved. Could we do Wednesday at 2 PM instead?",
+            "I reviewed the property tax model. I can show it Tuesday.",
+            "The floor plan covers the property. I can show it Tuesday.",
+            "This one is a property tax model. I can show it Tuesday.",
+            "I reviewed the tenant vacating schedule. I can show it Tuesday.",
+            "We discussed the tenant move out timeline. I can show it Tuesday.",
+            "You are welcome to visit the property page Tuesday.",
+            "I can let your client into the property model Tuesday.",
+            "We can accommodate a visit to discuss pricing Tuesday.",
+            "I can provide access to the floor plan Tuesday.",
+            "The rent review at that time is confirmed.",
+            "The pricing call at that slot works for us.",
+            "The financial model at that time is unavailable.",
+            "The floor plan at that slot is confirmed.",
+            "The lease schedule at that time doesn't work.",
+            "Rent is confirmed at that time.",
+            "Pricing does not work at that slot.",
+            "Model review is unavailable at that time.",
+            "Floor plan is confirmed at that slot.",
+            "Lease terms work for us at that time.",
+            "The tour report at that time is confirmed.",
+            "We reviewed when the tenant vacates. I can show it Tuesday.",
+            "We discussed when the tenant moves out. I can show it Tuesday.",
+            "The schedule notes when the tenant vacates. I can show it Tuesday.",
+            "The timeline records when the tenant moves out. I can show it Tuesday.",
+            "We discussed the tour schedule for when the tenant moves out. I can show it Tuesday.",
+            "The tour timeline notes when the tenant vacates. I can show it Tuesday.",
+            "The pricing call is at 2 PM. That time works.",
+            "The rent review is scheduled for Tuesday. That time is confirmed.",
+            "The pricing call is confirmed. That no longer works.",
+            "The lease meeting is at 10 AM. That slot is unavailable.",
+            "I can provide access to the tenant schedule after the tenant moves out. I can show it Tuesday.",
+            "I can let them review the floor plan after the tenant moves out. I can show it Tuesday.",
+            "I can visit the pricing model once the tenant vacates. I can show it Tuesday.",
+            "I can show you the property Tuesday online.",
+            "I can show you the property Tuesday in the financial model.",
+            "Would your client like to see the property on the listing page?",
+            "Let me know if your client wants to schedule a tour Tuesday via Zoom.",
+            "Let me know if your client wants to schedule a tour Tuesday online.",
+            "Let me know if your client wants to schedule a tour Tuesday in the financial model.",
+            "You are welcome to visit the property Tuesday to review the lease.",
+            "I can let your client into the property Tuesday for the pricing call.",
+            "We can accommodate a visit Tuesday to discuss pricing.",
+            "I can provide access at 2 PM to the floor plan.",
+            "The tour report is available Tuesday.",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={"type": "tour_requested", "question": message},
+                    thread_data={
+                        "source": "dashboard_tour_planner",
+                        "actionType": "tour_invite",
+                        "tourInvite": {
+                            "tourDate": "2026-08-11",
+                            "arrivalTime": "2:00 PM",
+                            "departureTime": "2:30 PM",
+                        },
+                    },
+                )
+                self.assertEqual("not_tour", classification["outcome"])
+                self.assertFalse(classification["needsOperatorAction"])
+                self.assertFalse(classification["canCloseThread"])
+
+    def test_only_tour_bound_clauses_can_drive_invite_outcome(self):
+        cases = (
+            (
+                "Can I show you the property Tuesday? The rent schedule is confirmed.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Tour confirmed for Tuesday at 2 PM. The rent schedule doesn't work.",
+                "confirmed",
+            ),
+            (
+                "Happy to show you the space, when works for you?",
+                "tour_offer_or_request",
+            ),
+            (
+                "Happy to show you the property if Tuesday works for you.",
+                "tour_offer_or_request",
+            ),
+            (
+                "Happy to show you the property whenever works for you.",
+                "tour_offer_or_request",
+            ),
+            ("The Tuesday slot works for us.", "confirmed"),
+            ("The 2 PM slot is confirmed.", "confirmed"),
+            ("The requested tour slot works.", "confirmed"),
+            (
+                "Let me know if your client wants to schedule a tour Tuesday at 2 PM.",
+                "tour_offer_or_request",
+            ),
+        )
+        for message, expected_outcome in cases:
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={"type": "tour_requested", "question": message},
+                    thread_data={
+                        "source": "dashboard_tour_planner",
+                        "actionType": "tour_invite",
+                        "tourInvite": {
+                            "tourDate": "2026-08-11",
+                            "arrivalTime": "2:00 PM",
+                            "departureTime": "2:30 PM",
+                        },
+                    },
+                )
+
+                self.assertEqual(expected_outcome, classification["outcome"])
+
+    def test_physical_antecedents_direct_questions_and_mixed_virtual_copy_are_actionable(self):
+        messages = (
+            "The property is available, and I can show it Tuesday.",
+            "The suite is ready. I can show it Tuesday.",
+            "The building is open and I can walk through it Tuesday.",
+            "Would your client like a tour?",
+            "Do you want a tour?",
+            "Does your client want a tour?",
+            "Come see the property Tuesday.",
+            "The property is available. You can see it Tuesday.",
+            "This one is a warehouse. You can see it Tuesday.",
+            "You are welcome to visit the property Tuesday.",
+            "I can let your client into the property Tuesday.",
+            "We can accommodate a visit Tuesday.",
+            "I can provide access Tuesday.",
+            "I can provide access at 2 PM.",
+            "You are welcome to visit the property Tuesday with your client.",
+            "We can accommodate a visit Tuesday at the property.",
+            "I can provide access at 2 PM to the suite.",
+            "The current tenant will vacate next month. We can show it Tuesday.",
+            "The tenant moves out Friday. You can walk through it Tuesday.",
+            "Virtual tours are available online or I can show the property Tuesday.",
+            "Virtual tours are available online — I can show the property Tuesday.",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={"type": "tour_requested", "question": message},
+                    thread_data={"actionType": "campaign_creation"},
+                )
+
+                self.assertEqual("tour_offer_or_request", classification["outcome"])
+                self.assertTrue(classification["needsOperatorAction"])
+                self.assertFalse(classification["canCloseThread"])
+
+        virtual_only = processing._classify_tour_invite_reply(
+            "Virtual tours are available online.",
+            event={"type": "tour_requested", "question": "Virtual tours are available online."},
+            thread_data={"actionType": "campaign_creation"},
+        )
+        self.assertEqual("not_tour", virtual_only["outcome"])
+
+    def test_precomputed_tour_classification_is_authoritative_for_operator_action(self):
+        message = "Can I show you the property Tuesday? The rent schedule is confirmed."
+        event = {
+            "type": "tour_requested",
+            "question": message,
+            "suggestedEmail": "",
+        }
+        thread_data = {
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-08-11",
+                "arrivalTime": "2:00 PM",
+                "departureTime": "2:30 PM",
+            },
+        }
+        classification = processing._classify_tour_invite_reply(
+            message,
+            event=event,
+            thread_data=thread_data,
+        )
+
+        self.assertEqual("tour_offer_or_request", classification["outcome"])
+        self.assertTrue(classification["needsOperatorAction"])
+        self.assertTrue(processing._tour_event_needs_operator_action(
+            event,
+            message,
+            thread_data,
+            classification=classification,
+        ))
+
+    def test_fresh_bare_time_model_reason_cannot_create_tour_context(self):
+        event = {
+            "type": "tour_requested",
+            "reason": "tour_slot_reply",
+            "question": "2 PM.",
+        }
+
+        fresh = processing._classify_tour_invite_reply(
+            "2 PM.",
+            event=event,
+            thread_data={"actionType": "campaign_creation"},
+        )
+        metadata_only = processing._classify_tour_invite_reply(
+            "",
+            event=event,
+            thread_data={"actionType": "campaign_creation"},
+        )
+
+        self.assertEqual("not_tour", fresh["outcome"])
+        self.assertFalse(fresh["needsOperatorAction"])
+        self.assertEqual("tour_offer_or_request", metadata_only["outcome"])
+        self.assertTrue(metadata_only["needsOperatorAction"])
+
+    def test_negative_slot_without_alternate_is_declined(self):
+        message = "That no longer works."
+        classification = processing._classify_tour_invite_reply(
+            message,
+            event={"type": "tour_requested", "question": message},
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {
+                    "tourDate": "2026-08-11",
+                    "arrivalTime": "2:00 PM",
+                    "departureTime": "2:30 PM",
+                },
+            },
+        )
+
+        self.assertEqual("declined", classification["outcome"])
+        self.assertTrue(classification["needsOperatorAction"])
+        self.assertFalse(classification["canCloseThread"])
+
+    def test_day_only_and_timed_cannot_show_replies_preserve_proposed_alternate(self):
+        cases = (
+            ("I cannot show Tuesday; could we do Wednesday?", "Wednesday"),
+            ("I cannot show Tuesday; could we do Wednesday at 2 PM?", "Wednesday at 2 PM"),
+            (
+                "The rent schedule is attached. That time no longer works; "
+                "could we do Wednesday at 2 PM for the tour?",
+                "Wednesday at 2 PM",
+            ),
+        )
+        for message, expected_alternate in cases:
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={"type": "tour_requested", "question": message},
+                    thread_data={
+                        "source": "dashboard_tour_planner",
+                        "actionType": "tour_invite",
+                        "tourInvite": {
+                            "tourDate": "2026-08-11",
+                            "arrivalTime": "2:00 PM",
+                            "departureTime": "2:30 PM",
+                        },
+                    },
+                )
+
+                self.assertEqual("alternate_requested", classification["outcome"])
+                self.assertIn(expected_alternate, classification["alternateTimes"])
+                self.assertNotEqual("tour_unavailable", classification["outcome"])
+
+    def test_subject_bound_tour_positive_controls_remain_stable(self):
+        cases = (
+            ("Tour confirmed for Tuesday at 2 PM.", "confirmed"),
+            ("That time doesn't work; could we do 3 PM instead?", "alternate_requested"),
+            ("No tours till further notice.", "tour_unavailable"),
+            ("I'm available at 2 PM.", "tour_offer_or_request"),
+        )
+        for message, expected_outcome in cases:
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={"type": "tour_requested", "question": message},
+                    thread_data={
+                        "source": "dashboard_tour_planner",
+                        "actionType": "tour_invite",
+                        "tourInvite": {
+                            "tourDate": "2026-08-11",
+                            "arrivalTime": "2:00 PM",
+                            "departureTime": "2:30 PM",
+                        },
+                    },
+                )
+                self.assertEqual(expected_outcome, classification["outcome"])
+
+    def test_tour_classifier_uses_event_metadata_only_when_broker_text_is_absent(self):
+        classification = processing._classify_tour_invite_reply(
+            "",
+            event={
+                "type": "tour_requested",
+                "question": "Can your client tour Tuesday at 2 PM?",
+            },
+            thread_data={"actionType": "campaign_creation"},
+        )
+
+        self.assertEqual("tour_offer_or_request", classification["outcome"])
+        self.assertTrue(classification["needsOperatorAction"])
+
+    def test_confirmed_tour_with_courtesy_directions_still_closes_invite(self):
+        classification = processing._classify_tour_invite_reply(
+            "Tuesday at 2 PM is confirmed. Let me know if you need directions for the tour.",
+            event={
+                "type": "tour_requested",
+                "question": "Tuesday at 2 PM is confirmed.",
+            },
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {
+                    "tourDate": "2026-08-11",
+                    "arrivalTime": "2:00 PM",
+                    "departureTime": "2:30 PM",
+                },
+            },
+        )
+
+        self.assertEqual("confirmed", classification["outcome"])
+        self.assertFalse(classification["needsOperatorAction"])
+        self.assertTrue(classification["canCloseThread"])
+
+    def test_short_confirmations_remain_valid_in_established_tour_context(self):
+        for message in ("Sounds good.", "We're confirmed.", "See you then."):
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={"type": "tour_requested", "question": message},
+                    thread_data={
+                        "source": "dashboard_tour_planner",
+                        "actionType": "tour_invite",
+                        "tourInvite": {
+                            "tourDate": "2026-08-11",
+                            "arrivalTime": "2:00 PM",
+                            "departureTime": "2:30 PM",
+                        },
+                    },
+                )
+
+                self.assertEqual("confirmed", classification["outcome"])
+                self.assertFalse(classification["needsOperatorAction"])
+                self.assertTrue(classification["canCloseThread"])
+
     def test_broker_tours_are_available_next_week_requires_operator_action(self):
         message = (
             "Hi Baylor,\n\n"

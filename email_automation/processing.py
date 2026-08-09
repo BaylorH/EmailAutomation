@@ -56,12 +56,19 @@ from .notification_payloads import (
     should_skip_original_reply_for_new_property_referral,
 )
 from .tour_scheduling import (
+    TOUR_INTENT_ACTIONABLE,
+    TOUR_INTENT_COURTESY,
     build_tour_unavailable_reply,
     build_schedule_aware_tour_reply,
+    classify_tour_intent,
     evaluate_alternate_tour_time,
+    extract_proposed_tour_options,
     format_tour_date_label,
+    looks_like_concrete_tour_logistics,
+    looks_like_explicit_tour_offer_or_request,
     looks_like_tour_only_unavailable,
     parse_tour_time_minutes,
+    subject_bound_tour_segments,
     tour_date_from_thread_data,
 )
 from .outbound_safety import validate_outbound_body
@@ -3407,26 +3414,7 @@ def _is_no_new_reply_text(text: str = "") -> bool:
 
 
 def _looks_like_explicit_tour_offer_or_request(text: str = "") -> bool:
-    latest = (text or "").lower()
-    if not latest:
-        return False
-
-    tour_noun = (
-        r"(?:tour|showing|walk[-\s]?through|walkthrough|"
-        r"show\s+(?:you|your\s+client)|see\s+(?:it|the\s+space|the\s+property)|"
-        r"come\s+by|stop\s+by|take\s+a\s+look)"
-    )
-    patterns = [
-        rf"\b(?:schedule|arrange|set(?:\s+up)?|book|coordinate)\s+(?:a\s+)?{tour_noun}\b",
-        rf"\b(?:would\s+you\s+like|do\s+you\s+want|want)\s+to\s+(?:schedule\s+)?{tour_noun}\b",
-        r"\b(?:offered|sent|provided|gave)\s+(?:available\s+)?(?:tour\s+)?(?:times|windows|slots|availability)\b",
-        rf"\b(?:happy|glad|able|available)\s+to\s+(?:show|tour|walk)\b",
-        rf"\b(?:can|could)\s+(?:show|tour|walk|meet)\b",
-        rf"\b(?:can|could)\s+(?:you|your\s+client|we)\s+(?:tour|come\s+by|stop\s+by|see)\b",
-        rf"\b(?:tour|showing|walk[-\s]?through|walkthrough)\s+(?:is\s+)?(?:available|offered)\b",
-        r"\b(?:tours?|showings?|walk[-\s]?throughs?|walkthroughs?)\s+(?:are|is)\s+(?:available|offered)\b",
-    ]
-    return any(re.search(pattern, latest) for pattern in patterns)
+    return looks_like_explicit_tour_offer_or_request(text)
 
 
 def _classify_tour_invite_reply(
@@ -3440,17 +3428,34 @@ def _classify_tour_invite_reply(
 ) -> Dict[str, Any]:
     event = event or {}
     thread_data = thread_data or {}
-    raw_text = " ".join([
-        str(message_text or ""),
-        str(event.get("question") or ""),
-        str(event.get("notes") or ""),
-    ]).strip()
-    clean_text = _clean_tour_signal_text(raw_text)
-    text = clean_text.lower()
-    tour_invite_context = _is_tour_invite_thread(thread_data) or event.get("reason") == "tour_slot_reply"
+    broker_text = _clean_tour_signal_text(message_text)
+    has_fresh_broker_text = bool(
+        broker_text and not _is_no_new_reply_text(broker_text)
+    )
+    if has_fresh_broker_text:
+        # Model-authored question/notes must never upgrade the broker's actual
+        # words into an action. Metadata is a fallback only for legacy callers
+        # that genuinely have no broker-authored body.
+        clean_text = broker_text
+    else:
+        clean_text = _clean_tour_signal_text(
+            event.get("question") or "",
+            event.get("notes") or "",
+        )
+    tour_invite_context = bool(
+        _is_tour_invite_thread(thread_data)
+        or (
+            not has_fresh_broker_text
+            and event.get("reason") == "tour_slot_reply"
+        )
+    )
     tour_date = tour_date_from_thread_data(thread_data)
+    tour_intent = classify_tour_intent(clean_text)
+    tour_segments = subject_bound_tour_segments(clean_text)
+    tour_text = " ".join(tour_segments)
+    text = tour_text.lower()
 
-    if not tour_invite_context and not _looks_like_explicit_tour_offer_or_request(clean_text):
+    if not tour_invite_context and tour_intent != TOUR_INTENT_ACTIONABLE:
         return {
             "outcome": "not_tour",
             "needsOperatorAction": False,
@@ -3471,19 +3476,61 @@ def _classify_tour_invite_reply(
         r"no\s+tour|not\s+touring|cancel(?:led)?\s+the\s+tour)\b",
         text,
     ))
-    tour_unavailable_signal = looks_like_tour_only_unavailable(clean_text)
-    confirmation_signal = bool(re.search(
-        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+(?:us|me|my\s+team|our\s+team|the\s+team|[\w#&'./-]+)|"
+    tour_unavailable_signal = looks_like_tour_only_unavailable(tour_text)
+    confirmation_pattern = re.compile(
+        r"\b(?:that\s+(?:time|slot)\s+works?|"
+        r"(?:the\s+)?(?:requested|scheduled)\s+(?:tour\s+)?"
+        r"(?:time|slot|window|appointment)\s+works?|"
+        r"works\s+for\s+(?:us|me|my\s+team|our\s+team|the\s+team|"
+        r"(?!(?:you|your)\b)[\w#&'./-]+)|"
         r"confirmed\b(?!\s+(?:stop|stops|tour|tours|slot|slots|showing|showings|appointment|appointments|"
         r"meeting|meetings|property|properties|visit|visits))|confirming|"
         r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
-        text,
-    ))
+        re.IGNORECASE,
+    )
+    confirmation_signal = any(
+        "?" not in segment and confirmation_pattern.search(segment)
+        for segment in tour_segments
+    )
     slot_scoped_decline_signal = bool(re.search(
         r"\b(?:that|requested|scheduled)\s+(?:time|slot)\b|\bat\s+that\s+time\b",
         text,
-    ))
-    alternate_times = _extract_tour_reply_time_mentions(clean_text)
+    )) or bool(declined_signal and looks_like_concrete_tour_logistics(tour_text))
+    proposed_options = extract_proposed_tour_options(tour_text)
+    alternate_times = proposed_options or _extract_tour_reply_time_mentions(tour_text)
+
+    if (
+        tour_invite_context
+        and tour_intent != TOUR_INTENT_ACTIONABLE
+        and not tour_segments
+    ):
+        return {
+            "outcome": "not_tour",
+            "needsOperatorAction": False,
+            "canCloseThread": False,
+            "alternateTimes": [],
+            "details": "Broker reply was about a non-tour subject.",
+            "suggestedEmail": "",
+        }
+
+    if (
+        tour_invite_context
+        and tour_intent == TOUR_INTENT_COURTESY
+        and not (
+            tour_unavailable_signal
+            or declined_signal
+            or negative_time_signal
+            or confirmation_signal
+        )
+    ):
+        return {
+            "outcome": "not_tour",
+            "needsOperatorAction": False,
+            "canCloseThread": False,
+            "alternateTimes": [],
+            "details": "Broker did not explicitly offer or request a tour.",
+            "suggestedEmail": "",
+        }
 
     if tour_invite_context and tour_unavailable_signal and not alternate_times and not slot_scoped_decline_signal:
         suggested_email = build_tour_unavailable_reply(
@@ -3502,7 +3549,7 @@ def _classify_tour_invite_reply(
             "suggestedEmail": suggested_email,
         }
 
-    if tour_invite_context and declined_signal and not alternate_times:
+    if tour_invite_context and (declined_signal or negative_time_signal) and not alternate_times:
         return {
             "outcome": "declined",
             "needsOperatorAction": True,
@@ -3513,8 +3560,12 @@ def _classify_tour_invite_reply(
             "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email, tour_date=tour_date),
         }
 
-    if tour_invite_context and (negative_time_signal or "inste" in text) and alternate_times:
-        alternate_times = _reorder_alternate_tour_times(alternate_times, clean_text, thread_data)
+    if (
+        tour_invite_context
+        and (negative_time_signal or declined_signal or proposed_options or "inste" in text)
+        and alternate_times
+    ):
+        alternate_times = _reorder_alternate_tour_times(alternate_times, tour_text, thread_data)
         suggested_email = _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times, tour_date=tour_date)
         if schedule_decision:
             suggested_email = build_schedule_aware_tour_reply(
@@ -3619,38 +3670,15 @@ def _tour_event_needs_operator_action(
     event: Dict[str, Any],
     message_text: str = "",
     thread_data: Optional[Dict[str, Any]] = None,
+    *,
+    classification: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    classification = _classify_tour_invite_reply(
+    authoritative = classification or _classify_tour_invite_reply(
         message_text,
         event=event,
         thread_data=thread_data,
     )
-    if classification.get("outcome") == "not_tour":
-        return False
-    if classification.get("outcome") == "confirmed":
-        return False
-
-    suggested = event.get("suggestedEmail")
-    if isinstance(suggested, dict):
-        suggested_body = suggested.get("body") or ""
-    else:
-        suggested_body = suggested or ""
-    if str(suggested_body).strip():
-        return True
-
-    question = str(event.get("question") or "").strip().lower()
-    if not question:
-        return True
-
-    confirmation_pattern = (
-        r"\b(?:is|are|for)\s+confirmed\b|"
-        r"\bconfirmed\s+(?:for|at|on)\b|"
-        r"\b(?:tour|showing|appointment)\s+(?:is|has been)\s+confirmed\b"
-    )
-    if re.search(confirmation_pattern, question):
-        return False
-
-    return True
+    return bool(authoritative.get("needsOperatorAction"))
 
 
 def _sanitize_dashboard_suggested_email_body(body: Any) -> str:
@@ -6087,10 +6115,18 @@ def process_inbox_message(
                         contact_name=contact_name,
                         recipient_email=to_addr_lower,
                     )
+                    # A model over-fire is not a durable business event. Exit
+                    # before building or consulting the generic per-thread key,
+                    # otherwise courtesy boilerplate can hide a later genuine
+                    # tour request on this same conversation.
+                    if tour_reply_classification.get("outcome") == "not_tour":
+                        print("🏠 Ignoring non-actionable tour model event before dedupe")
+                        continue
                     tour_needs_operator_action = _tour_event_needs_operator_action(
                         clean_tour_event,
                         tour_message_text,
                         thread_data,
+                        classification=tour_reply_classification,
                     )
                     # A tour handoff or a confirmed invite is always no-send.
                     # Set this before dedupe and before every fallible durable
