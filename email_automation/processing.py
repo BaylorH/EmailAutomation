@@ -2379,6 +2379,166 @@ _GENERIC_PROPERTY_NAME_TOKENS = {
     "our", "your", "its", "new", "existing", "industrial", "commercial",
     "commerce", "business", "logistics", "distribution", "office", "warehouse",
 }
+_GENERIC_ROW_ALIAS_TOKENS = _GENERIC_PROPERTY_NAME_TOKENS | {
+    "building", "campus", "center", "centre", "complex", "facility", "park",
+    "plaza", "property", "space", "suite", "unit",
+}
+def _normalize_server_owned_row_alias(value: Any) -> str:
+    """Return a conservative comparable-property name or fail closed."""
+    if not isinstance(value, str) or len(value) > 160:
+        return ""
+    tokens = re.findall(r"[a-z0-9]+", value.lower())
+    if not 2 <= len(tokens) <= 12 or not any(
+        re.search(r"[a-z]", token) and token not in _GENERIC_ROW_ALIAS_TOKENS
+        for token in tokens
+    ):
+        return ""
+    return " ".join(tokens)
+
+
+def _server_owned_row_aliases(
+    rowvals: Optional[List[Any]],
+    header: Optional[List[str]],
+    column_config: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Read only validated row aliases owned by the current Sheet row."""
+    if (
+        not isinstance(rowvals, (list, tuple))
+        or not isinstance(header, (list, tuple))
+        or any(not isinstance(name, str) for name in header)
+    ):
+        return []
+
+    configured_header = ""
+    if column_config is not None:
+        mappings = column_config.get("mappings") if isinstance(column_config, dict) else None
+        if not isinstance(mappings, dict):
+            return []
+        configured_header = mappings.get("property_name")
+        if configured_header is not None and (
+            not isinstance(configured_header, str) or not configured_header.strip()
+        ):
+            return []
+
+    candidates = [configured_header] if configured_header else ["property name", "building name"]
+    normalized_headers = [name.strip().lower() for name in header]
+    for candidate in candidates:
+        matches = [
+            index
+            for index, name in enumerate(normalized_headers)
+            if name == candidate.strip().lower()
+        ]
+        if len(matches) > 1:
+            return []
+        if not matches or matches[0] >= len(rowvals):
+            continue
+        alias = _normalize_server_owned_row_alias(rowvals[matches[0]])
+        return [alias] if alias else []
+    return []
+
+
+def _server_owned_row_alias_spans(
+    source_text: str,
+    row_aliases: Optional[List[str]],
+) -> List[tuple]:
+    source_text = source_text or ""
+    spans = []
+    for raw_alias in (row_aliases or []):
+        alias = _normalize_server_owned_row_alias(raw_alias)
+        if not alias:
+            continue
+        pattern = re.compile(
+            r"(?:^(?:(?:a|an|both|the)\s+)?|"
+            r"[,;:.!?()]\s*(?:(?:a|an|both|the)\s+)?|"
+            r"\b(?:at|for|in|of|on|regarding)\s+(?:(?:a|an|both|the)\s+)?)"
+            r"(?P<alias>"
+            + r"[^a-z0-9]+".join(re.escape(token) for token in alias.split())
+            + r")(?=$|\s*(?:['’]s\b|[,.;:!?)]|(?:is|are|was|were|has|have|had|"
+            r"remains?|remained|became|becomes|went|will|would|can|could|does|did|"
+            r"[a-z]+n['’]t)\b))",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(source_text):
+            spans.append(match.span("alias"))
+    return sorted(set(spans))
+
+
+def _source_mentions_server_owned_row_alias(
+    source_text: str,
+    row_aliases: Optional[List[str]],
+) -> bool:
+    return bool(_server_owned_row_alias_spans(source_text, row_aliases))
+
+
+def _row_alias_terminal_link_is_current(link_text: str) -> bool:
+    link = re.sub(
+        r"^\s*,?\s*(?:it|this|that|the\s+(?:building|property|space))\s+",
+        "",
+        link_text or "",
+        flags=re.IGNORECASE,
+    )
+    return bool(
+        _is_bounded_coordinated_viability_link(link)
+        and not _viability_lexical_negator_count(link)
+    )
+
+
+def _row_alias_terminal_decision(
+    message_text: str,
+    row_anchor: str,
+    row_aliases: Optional[List[str]],
+    unavailable_keywords: List[str],
+) -> Optional[bool]:
+    """Authorize only an exact row alias and terminal in one unambiguous clause."""
+    if not row_aliases:
+        return None
+    terminal_patterns = [pattern for _reason, pattern in _UNAVAILABLE_PATTERNS] + [
+        r"\b" + r"\s+".join(re.escape(word) for word in keyword.split()) + r"\b"
+        for keyword in unavailable_keywords if keyword
+    ]
+    saw_alias = False
+    saw_terminal = False
+    for clause in _terminal_binding_clauses(message_text):
+        alias_spans = _server_owned_row_alias_spans(clause, row_aliases)
+        clause_tokens = re.findall(r"[a-z0-9]+", (clause or "").lower())
+        clause_bigrams = set(zip(clause_tokens, clause_tokens[1:]))
+        ambiguous_alias = not alias_spans and any(
+            tuple(alias.split()[index:index + 2]) in clause_bigrams
+            for alias in row_aliases
+            for index in range(len(alias.split()) - 1)
+        )
+        saw_alias = saw_alias or bool(alias_spans) or ambiguous_alias
+        terminal = _clause_has_terminal_property_evidence(clause, unavailable_keywords)
+        saw_terminal = saw_terminal or terminal
+        current_viability = any(
+            not _viability_prefix_is_lexically_negated(clause[:match.start()])
+            for match in _VIABILITY_RE.finditer(clause)
+        )
+        owns_terminal = any(
+            _row_alias_terminal_link_is_current(clause[alias_end:match.start()])
+            for _alias_start, alias_end in alias_spans
+            for pattern in terminal_patterns
+            for match in re.finditer(pattern, clause, re.IGNORECASE)
+            if match.start() >= alias_end
+        )
+        competing_binding = any(
+            kind == "competing"
+            and all(not (a < end and start < b) for a, b in alias_spans)
+            for start, end, kind in _explicit_property_bindings(clause, row_anchor)
+        )
+        if not owns_terminal or current_viability:
+            continue
+        if (
+            looks_like_tour_only_unavailable(clause)
+            or _clause_has_ancillary_terminal_evidence(clause)
+            or _clause_has_ancillary_requirements_mismatch(clause)
+            or competing_binding
+        ):
+            continue
+        return True
+    if saw_alias or not saw_terminal:
+        return False
+    return None
 
 
 def _explicit_property_bindings(clause: str, row_anchor: str) -> List[tuple]:
@@ -2910,6 +3070,7 @@ def _property_unavailable_event_applies_to_row(
     event: Dict[str, Any],
     *,
     row_anchor: str = "",
+    row_aliases: Optional[List[str]] = None,
     message_text: str = "",
     unavailable_keywords: Optional[List[str]] = None,
 ) -> bool:
@@ -2945,7 +3106,17 @@ def _property_unavailable_event_applies_to_row(
         return False
 
     event_property = _format_event_property(event)
-    if event_property:
+    event_property_is_row_alias = bool(
+        event_property
+        and _source_mentions_server_owned_row_alias(event_property, row_aliases)
+    )
+    alias_decision = _row_alias_terminal_decision(
+        message_text,
+        row_anchor,
+        row_aliases,
+        keywords,
+    )
+    if event_property and not event_property_is_row_alias:
         event_norm = _normalize_replacement_match_text(event_property)
         row_primary = row_norm.split(",", 1)[0].strip()
         event_primary = event_norm.split(",", 1)[0].strip()
@@ -2960,7 +3131,7 @@ def _property_unavailable_event_applies_to_row(
         )
 
     if not row_norm or not message_norm:
-        return True
+        return alias_decision is True if event_property_is_row_alias else True
 
     terminal_bindings = []
     ancillary_terminal_seen = False
@@ -2992,6 +3163,10 @@ def _property_unavailable_event_applies_to_row(
 
     if "target" in terminal_bindings:
         return True
+    if event_property_is_row_alias:
+        return alias_decision is True
+    if alias_decision is not None:
+        return alias_decision
     if "competing" in terminal_bindings:
         # Bare language alongside an explicitly competing terminal statement is
         # not enough to terminalize the target. A genuinely bare current-context
@@ -3871,6 +4046,7 @@ def _pending_nonviable_followup_patch(
     events: List[Dict[str, Any]],
     *,
     row_anchor: str,
+    row_aliases: Optional[List[str]] = None,
     message_text: str,
 ) -> Optional[Dict[str, Any]]:
     """Stop follow-up eligibility before retryable sheet work begins."""
@@ -3880,6 +4056,7 @@ def _pending_nonviable_followup_patch(
         if not _property_unavailable_event_applies_to_row(
             event,
             row_anchor=row_anchor,
+            row_aliases=row_aliases,
             message_text=message_text,
             unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
         ):
@@ -6019,6 +6196,19 @@ def process_inbox_message(
             # Process events from the proposal
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
+            row_aliases = _server_owned_row_aliases(
+                rowvals,
+                header,
+                column_config,
+            )
+            # The proposal was derived from fresh broker-authored text. Reuse
+            # that same authority boundary for every nonviable decision so a
+            # quoted prior terminal statement cannot move the current row.
+            nonviable_message_text = (
+                _text_for_ai
+                if isinstance(_text_for_ai, str) and _text_for_ai.strip()
+                else _full_text
+            )
 
             events = _order_events_for_processing(_proposal_events(proposal))
             current_pdf_manifest, new_property_pdf_groups = _partition_property_attachments(
@@ -6043,7 +6233,8 @@ def process_inbox_message(
                 and _property_unavailable_event_applies_to_row(
                     e,
                     row_anchor=row_anchor,
-                    message_text=_full_text,
+                    row_aliases=row_aliases,
+                    message_text=nonviable_message_text,
                     unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
                 )
                 for e in events
@@ -6051,7 +6242,8 @@ def process_inbox_message(
             pending_nonviable_patch = _pending_nonviable_followup_patch(
                 events,
                 row_anchor=row_anchor,
-                message_text=_full_text,
+                row_aliases=row_aliases,
+                message_text=nonviable_message_text,
             )
             if pending_nonviable_patch:
                 staged_thread_count = _stage_row_thread_roots_for_terminal_transition(
@@ -6472,14 +6664,17 @@ def process_inbox_message(
                     if not _property_unavailable_event_applies_to_row(
                         event,
                         row_anchor=row_anchor,
-                        message_text=_full_text,
+                        row_aliases=row_aliases,
+                        message_text=nonviable_message_text,
                         unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
                     ):
                         print(
                             "ℹ️ Skipping property_unavailable event because it does not match "
                             f"current row anchor: {row_anchor or 'unknown row'}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                        # An ungrounded model over-fire is not a durable business
+                        # event. Stamping the generic key here would suppress a
+                        # later fresh target-grounded unavailable reply.
                         continue
 
                     terminal_reason = _nonviable_status_reason(event)

@@ -221,6 +221,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         thread_docs=None,
         row_anchor="912-930 Gemini St",
         rownum=3,
+        property_name=None,
         contact_name="Ryan",
         from_email="bp21harrison@gmail.com",
         row_below_nonviable=False,
@@ -263,6 +264,9 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "10.00",
             "3.31",
         ]
+        if property_name is not None:
+            header.insert(2, "Property Name")
+            rowvals.insert(2, property_name)
         client_ref = FakeDocumentRef({"criteria": "Industrial search"})
         full_body_response = MagicMock()
         full_body_response.json.return_value = {
@@ -638,6 +642,280 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
             "client-1",
         )
+
+    def test_property_unavailable_named_by_current_row_property_name_moves_row(self):
+        body = (
+            "Hi Avery, Olive Commerce Park is no longer available; "
+            "the owner signed another tenant yesterday. Best, Jordan"
+        )
+        thread_id = "thread-current-property-name-unavailable"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Avery Cole",
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 4,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{
+                "type": "property_unavailable",
+                "reason": "no_longer_available",
+                "address": "",
+                "city": "",
+            }],
+            "response_email": "Thank you. Do you have another comparable property?",
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+            row_anchor="10675 W Olive Ave",
+            rownum=4,
+            property_name="Olive Commerce Park",
+            contact_name="Avery Cole",
+        )
+
+        result["moveRow"].assert_called_once()
+        result["stopThreads"].assert_called_once_with(
+            "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+            11,
+            client_id="client-1",
+            reason="no_longer_available",
+        )
+        self.assertEqual("stopped", result["threadRef"]._data["followUpStatus"])
+        self.assertEqual("no_longer_available", result["threadRef"]._data["nonViableReason"])
+        self.assertEqual(1, len(result["notifications"]))
+        self.assertEqual(
+            "property_unavailable",
+            result["notifications"][0]["kwargs"]["kind"],
+        )
+        self.assertTrue(
+            any(
+                handled["eventKey"].startswith("property_unavailable")
+                and handled["notifId"] is not None
+                for handled in result["handledEvents"]
+            )
+        )
+
+    def test_quoted_property_name_unavailability_does_not_move_fresh_viable_row(self):
+        fresh_messages = (
+            "Thanks, I attached the current specs.",
+            "Oak Commerce Center is no longer available.",
+        )
+        for index, fresh_message in enumerate(fresh_messages):
+            with self.subTest(fresh_message=fresh_message):
+                body = (
+                    f"{fresh_message}\n\n"
+                    "On Fri, Aug 7, 2026 at 1:00 PM Avery wrote:\n"
+                    "Olive Commerce Park is no longer available."
+                )
+                thread_id = f"thread-quoted-property-name-unavailable-{index}"
+                thread_ref = FakeDocumentRef({
+                    "clientId": "client-1",
+                    "email": ["bp21harrison@gmail.com"],
+                    "status": processing.THREAD_STATUS["active"],
+                    "rowNumber": 4,
+                })
+                proposal = {
+                    "updates": [],
+                    "events": [{
+                        "type": "property_unavailable",
+                        "reason": "no_longer_available",
+                        "address": "",
+                        "city": "",
+                    }],
+                    "skip_response": True,
+                    "response_email": None,
+                }
+
+                result = self._run_tour_invite_reply_processing(
+                    thread_id=thread_id,
+                    body=body,
+                    proposal=proposal,
+                    thread_ref=thread_ref,
+                    row_anchor="10675 W Olive Ave",
+                    rownum=4,
+                    property_name="Olive Commerce Park",
+                )
+
+                result["moveRow"].assert_not_called()
+                result["stopThreads"].assert_not_called()
+                self.assertNotEqual("stopped", thread_ref._data.get("followUpStatus"))
+                self.assertFalse(any(
+                    handled["eventKey"].startswith("property_unavailable")
+                    for handled in result["handledEvents"]
+                ))
+
+    def test_rejected_competitor_event_does_not_poison_later_target_event(self):
+        thread_id = "thread-competitor-then-target-unavailable"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 4,
+        })
+        event = {
+            "type": "property_unavailable",
+            "reason": "no_longer_available",
+            "address": "",
+            "city": "",
+        }
+
+        rejected = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=(
+                "Oak Commerce Center is no longer available, but specs for "
+                "Olive Commerce Park are attached."
+            ),
+            proposal={
+                "updates": [],
+                "events": [event],
+                "skip_response": True,
+                "response_email": None,
+            },
+            thread_ref=thread_ref,
+            row_anchor="10675 W Olive Ave",
+            rownum=4,
+            property_name="Olive Commerce Park",
+            persist_handled_events=True,
+            msg_id="msg-competitor-unavailable",
+            internet_message_id="<competitor-unavailable@mock.test>",
+        )
+
+        rejected["moveRow"].assert_not_called()
+        self.assertFalse(any(
+            event_key.startswith("property_unavailable")
+            for event_key in thread_ref._data.get("handledEvents", {})
+        ))
+
+        accepted = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="Olive Commerce Park is no longer available.",
+            proposal={
+                "updates": [],
+                "events": [event],
+                "skip_response": True,
+                "response_email": None,
+            },
+            thread_ref=thread_ref,
+            row_anchor="10675 W Olive Ave",
+            rownum=4,
+            property_name="Olive Commerce Park",
+            persist_handled_events=True,
+            msg_id="msg-target-unavailable",
+            internet_message_id="<target-unavailable@mock.test>",
+        )
+
+        accepted["moveRow"].assert_called_once()
+        self.assertTrue(any(
+            event_key.startswith("property_unavailable")
+            and handled["notificationId"] is not None
+            for event_key, handled in thread_ref._data.get("handledEvents", {}).items()
+        ))
+
+    def test_property_name_unavailable_has_one_terminal_reply_and_no_generic_completion(self):
+        body = (
+            "Hi Avery, Olive Commerce Park is no longer available; "
+            "the owner signed another tenant yesterday. Best, Jordan"
+        )
+        thread_id = "thread-property-name-terminal-response"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Avery Cole",
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 4,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{
+                "type": "property_unavailable",
+                "reason": "no_longer_available",
+                "address": "",
+                "city": "",
+            }],
+            "response_email": "Thank you. Do you have another comparable property?",
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+            row_anchor="10675 W Olive Ave",
+            rownum=4,
+            property_name="Olive Commerce Park",
+            contact_name="Avery Cole",
+        )
+
+        result["sendReply"].assert_called_once()
+        result["completeThreads"].assert_not_called()
+        self.assertEqual(
+            ["property_unavailable"],
+            [notification["kwargs"]["kind"] for notification in result["notifications"]],
+        )
+        self.assertNotIn(
+            {"status": processing.THREAD_STATUS["completed"], "reason": "all_fields_gathered"},
+            result["statusUpdates"],
+        )
+        self.assertTrue(
+            any(
+                handled["eventKey"].startswith("property_unavailable")
+                and handled["notifId"] is not None
+                for handled in result["handledEvents"]
+            )
+        )
+
+    def test_negated_or_superseded_property_name_unavailable_does_not_move_row(self):
+        messages = (
+            "Olive Commerce Park is not leased.",
+            "Olive Commerce Park is not unavailable.",
+            "Olive Commerce Park was no longer available, but is now still available.",
+            "Olive Commerce Park is not leased; it remains available.",
+            "Olive Commerce Park is not not leased.",
+        )
+        for index, body in enumerate(messages):
+            with self.subTest(body=body):
+                thread_ref = FakeDocumentRef({
+                    "clientId": "client-1",
+                    "email": ["bp21harrison@gmail.com"],
+                    "status": processing.THREAD_STATUS["active"],
+                    "rowNumber": 4,
+                })
+                result = self._run_tour_invite_reply_processing(
+                    thread_id=f"thread-negated-property-name-unavailable-{index}",
+                    body=body,
+                    proposal={
+                        "updates": [],
+                        "events": [{
+                            "type": "property_unavailable",
+                            "reason": "no_longer_available",
+                            "address": "",
+                            "city": "",
+                        }],
+                        "skip_response": True,
+                        "response_email": None,
+                    },
+                    thread_ref=thread_ref,
+                    row_anchor="10675 W Olive Ave",
+                    rownum=4,
+                    property_name="Olive Commerce Park",
+                    msg_id=f"msg-negated-property-name-unavailable-{index}",
+                    internet_message_id=f"<negated-property-name-{index}@mock.test>",
+                )
+
+                result["moveRow"].assert_not_called()
+                result["stopThreads"].assert_not_called()
+                result["sendReply"].assert_not_called()
+                self.assertNotEqual("stopped", thread_ref._data.get("followUpStatus"))
+                self.assertNotIn("nonViableReason", thread_ref._data)
+                self.assertFalse(any(
+                    handled["eventKey"].startswith("property_unavailable")
+                    for handled in result["handledEvents"]
+                ))
 
     def test_close_conversation_sends_terminal_reply_before_campaign_completion(self):
         body = (
