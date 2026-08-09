@@ -48,6 +48,7 @@ from .campaign_safety import (
     CAMPAIGN_AUTOMATION_ALLOW,
     CAMPAIGN_AUTOMATION_BLOCKED,
     CampaignAutomationDecision,
+    classify_client_automation_state,
     get_client_automation_decision,
     get_client_automation_pause,
 )
@@ -976,10 +977,14 @@ def _dead_letter_unsafe_outbound_body_if_needed(
     doc_ref,
     data: dict,
     body: str,
+    *,
+    allow_scheduling_language: bool = False,
 ) -> bool:
     validation = validate_outbound_body(
         body,
-        allow_scheduling_language=_is_tour_invite_outbox(data),
+        allow_scheduling_language=(
+            allow_scheduling_language or _is_tour_invite_outbox(data)
+        ),
     )
     if validation.is_safe:
         return False
@@ -1013,6 +1018,29 @@ def _dead_letter_unresolved_name_placeholder_if_needed(
 # Thread statuses that may still receive dashboard replies. Anything else
 # (stopped/completed/closed/unknown) is terminal for the send pipeline.
 OPEN_THREAD_STATUSES = {"active", "paused"}
+
+DASHBOARD_INLINE_REPLY_SOURCE = "dashboard_inline_reply"
+DASHBOARD_REPLY_ACTION_TYPE = "reply"
+DASHBOARD_TOUR_ACTION_REASON = "tour_requested"
+DASHBOARD_TOUR_RESOLUTION_KIND = "core_campaign_tour_action_reply"
+DASHBOARD_TOUR_PENDING_STATUS = "sent_pending_finalization"
+DASHBOARD_TOUR_BINDING_FIELDS = (
+    "clientId",
+    "notificationClientId",
+    "notificationId",
+    "threadId",
+    "replyToMessageId",
+    "recipient",
+    "outboxId",
+)
+TERMINAL_TOUR_STATUSES = {
+    "confirmed",
+    "declined",
+    "tour_slot_declined",
+    "alternate_requested",
+    "tour_unavailable",
+    "completed",
+}
 
 
 def _validate_outbox_thread_reply_target(user_id: str, data: dict) -> Dict[str, Any]:
@@ -1083,6 +1111,410 @@ def _validate_outbox_thread_reply_target(user_id: str, data: dict) -> Dict[str, 
         return {"ok": False, "reason": "reply_target_not_in_thread", "thread": None}
 
     return {"ok": True, "reason": None, "thread": thread, "status": status}
+
+
+def _dashboard_tour_action_binding(
+    data: Optional[Dict[str, Any]],
+    outbox_id: str = "",
+) -> Dict[str, str]:
+    data = data or {}
+    assigned = data.get("assignedEmails") or []
+    recipients = [
+        _normalize_email(value)
+        for value in assigned
+        if isinstance(value, str) and _normalize_email(value)
+    ] if isinstance(assigned, (list, tuple)) else []
+    client_id = str(data.get("clientId") or "").strip()
+    return {
+        "clientId": client_id,
+        "notificationClientId": str(
+            data.get("notificationClientId") or client_id
+        ).strip(),
+        "notificationId": str(data.get("notificationId") or "").strip(),
+        "threadId": str(data.get("threadId") or "").strip(),
+        "replyToMessageId": str(data.get("replyToMessageId") or "").strip(),
+        "recipient": recipients[0] if len(recipients) == 1 else "",
+        "outboxId": str(outbox_id or "").strip(),
+    }
+
+
+def _is_dashboard_inline_action_reply(data: Optional[Dict[str, Any]]) -> bool:
+    """Identify the deployed inline-action reply shape without trusting its reason."""
+    data = data or {}
+    return bool(
+        str(data.get("source") or "").strip() == DASHBOARD_INLINE_REPLY_SOURCE
+        and str(data.get("actionType") or "").strip() == DASHBOARD_REPLY_ACTION_TYPE
+        and data.get("resumeThreadOnSend") is True
+        and data.get("deleteNotificationOnSend") is True
+    )
+
+
+def _dashboard_tour_resolution_refs(user_id: str, binding: Dict[str, str]):
+    """Return refs for the server-owned notification resolution boundary."""
+    from .clients import _fs
+
+    user_ref = _fs.collection("users").document(user_id)
+    client_ref = user_ref.collection("clients").document(binding["notificationClientId"])
+    return {
+        "fs": _fs,
+        "client": client_ref,
+        "notification": client_ref.collection("notifications").document(binding["notificationId"]),
+        "resolution": user_ref.collection("actionResolutions").document(binding["notificationId"]),
+        "thread": user_ref.collection("threads").document(binding["threadId"]),
+    }
+
+
+def _reserve_dashboard_tour_action_resolution(
+    user_id: str,
+    doc_ref,
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Server-validate and uniquely reserve one dashboard tour action reply.
+
+    The frontend owns every outbox field, including ``actionReason``.  The live
+    notification, thread, and client are therefore re-read in one transaction.
+    A durable resolution document keyed by notificationId prevents two outbox
+    documents from sending the same logical action.
+    """
+    if not _is_dashboard_inline_action_reply(data):
+        return {"status": "not_applicable"}
+
+    binding = _dashboard_tour_action_binding(
+        data,
+        getattr(doc_ref, "id", ""),
+    )
+    if not all(binding.values()):
+        return {"status": "invalid", "reason": "dashboard_action_binding_incomplete"}
+    refs = _dashboard_tour_resolution_refs(user_id, binding)
+    attempted_at = datetime.now(timezone.utc)
+
+    @firestore.transactional
+    def reserve(transaction):
+        # Firestore transactions require all reads before any writes.
+        outbox_snapshot = doc_ref.get(transaction=transaction)
+        resolution_snapshot = refs["resolution"].get(transaction=transaction)
+        notification_snapshot = refs["notification"].get(transaction=transaction)
+        thread_snapshot = refs["thread"].get(transaction=transaction)
+        client_snapshot = refs["client"].get(transaction=transaction)
+
+        if not getattr(outbox_snapshot, "exists", False):
+            return {"status": "gone"}
+        current_outbox = outbox_snapshot.to_dict() or {}
+        if _is_cancelled_outbox_item(current_outbox):
+            return {"status": "cancelled", "data": current_outbox}
+        if str(current_outbox.get("processingBy") or "") != WORKER_ID:
+            return {"status": "claim_lost"}
+        current_binding = _dashboard_tour_action_binding(
+            current_outbox,
+            getattr(doc_ref, "id", ""),
+        )
+        if not _is_dashboard_inline_action_reply(current_outbox) or current_binding != binding:
+            return {"status": "invalid", "reason": "outbox_binding_changed"}
+
+        if binding["notificationClientId"] != binding["clientId"]:
+            return {"status": "invalid", "reason": "notification_client_mismatch"}
+        if not getattr(client_snapshot, "exists", False):
+            return {"status": "invalid", "reason": "client_not_found"}
+        client = client_snapshot.to_dict() or {}
+        if not classify_client_automation_state(
+            client,
+            source="clients",
+        ).allows_autonomous_work:
+            return {"status": "invalid", "reason": "client_no_longer_active"}
+        if not getattr(thread_snapshot, "exists", False):
+            return {"status": "invalid", "reason": "thread_not_found"}
+
+        thread = thread_snapshot.to_dict() or {}
+        thread_client_id = str(thread.get("clientId") or "").strip()
+        thread_status = str(thread.get("status") or "active").strip().lower()
+        if thread_client_id != binding["clientId"]:
+            return {"status": "invalid", "reason": "thread_client_mismatch"}
+        if thread_status not in OPEN_THREAD_STATUSES:
+            return {
+                "status": "invalid",
+                "reason": f"thread_no_longer_open (status={thread_status})",
+            }
+
+        if not getattr(notification_snapshot, "exists", False):
+            # A durable prior resolution is authoritative after notification
+            # cleanup; otherwise the client-supplied action cannot be trusted.
+            if not getattr(resolution_snapshot, "exists", False):
+                return {"status": "invalid", "reason": "notification_not_found"}
+            notification = {}
+        else:
+            notification = notification_snapshot.to_dict() or {}
+            notification_kind = str(
+                notification.get("kind") or notification.get("type") or ""
+            ).strip()
+            notification_thread_id = str(notification.get("threadId") or "").strip()
+            if notification_kind != "action_needed":
+                return {"status": "invalid", "reason": "notification_not_action_needed"}
+            if notification_thread_id != binding["threadId"]:
+                return {"status": "invalid", "reason": "notification_thread_mismatch"}
+            if _normalize_email(notification.get("email")) != binding["recipient"]:
+                return {"status": "invalid", "reason": "notification_recipient_mismatch"}
+            if str(
+                (notification.get("meta") or {}).get("replyToMessageId") or ""
+            ).strip() != binding["replyToMessageId"]:
+                return {"status": "invalid", "reason": "notification_reply_target_mismatch"}
+
+        server_reason = str(
+            ((notification.get("meta") or {}).get("reason")) or ""
+        ).strip()
+        if server_reason and server_reason != DASHBOARD_TOUR_ACTION_REASON:
+            return {"status": "generic", "reason": server_reason}
+        if not server_reason and not getattr(resolution_snapshot, "exists", False):
+            return {"status": "generic", "reason": "notification_without_tour_reason"}
+
+        existing = (
+            resolution_snapshot.to_dict() or {}
+            if getattr(resolution_snapshot, "exists", False)
+            else {}
+        )
+        if existing:
+            if not (
+                existing.get("kind") == DASHBOARD_TOUR_RESOLUTION_KIND
+                and all(
+                    str(existing.get(field) or "") == binding[field]
+                    for field in DASHBOARD_TOUR_BINDING_FIELDS[:-1]
+                )
+            ):
+                return {"status": "invalid", "reason": "resolution_binding_mismatch"}
+            owner_outbox_id = str(existing.get("outboxId") or "")
+            if owner_outbox_id != binding["outboxId"]:
+                return {
+                    "status": "duplicate",
+                    "reason": "notification_already_reserved",
+                    "ownerOutboxId": owner_outbox_id,
+                }
+            if str(existing.get("status") or "") == "sent":
+                return {"status": "already_resolved", "resolution": existing}
+
+        marker = {
+            "kind": DASHBOARD_TOUR_RESOLUTION_KIND,
+            **binding,
+            "status": str(existing.get("status") or "sending"),
+            "attemptedAt": existing.get("attemptedAt") or attempted_at,
+        }
+        if existing:
+            transaction.set(doc_ref, {
+                "requiresSentItemsPreflight": True,
+                "tourActionResolution": marker,
+            }, merge=True)
+            return {"status": "reserved", "recovery": True, "marker": marker}
+
+        resolution_payload = {
+            **marker,
+            "verifiedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        transaction.create(refs["resolution"], resolution_payload)
+        transaction.set(doc_ref, {
+            "status": "sending",
+            "requiresSentItemsPreflight": True,
+            "lastSendAttemptAt": attempted_at,
+            "tourActionResolution": marker,
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+        return {"status": "reserved", "recovery": False, "marker": marker}
+
+    return reserve(refs["fs"].transaction())
+
+
+def _pending_tour_send_result(data: Dict[str, Any]) -> Dict[str, Any]:
+    pending = data.get("pendingSendResult") or {}
+    return {
+        key: value for key, value in dict(pending).items()
+        if value not in (None, {}, [])
+    }
+
+
+def _is_dashboard_tour_pending_finalization(data: Optional[Dict[str, Any]]) -> bool:
+    data = data or {}
+    marker = data.get("tourActionResolution") or {}
+    return bool(
+        str(data.get("status") or "") == DASHBOARD_TOUR_PENDING_STATUS
+        and data.get("alreadySent") is True
+        and marker.get("kind") == DASHBOARD_TOUR_RESOLUTION_KIND
+        and marker.get("notificationId") == data.get("notificationId")
+    )
+
+
+def _persist_dashboard_tour_sent_pending_finalization(
+    doc_ref,
+    data: Dict[str, Any],
+    send_result: Dict[str, Any],
+    error: Exception,
+) -> None:
+    """Persist Graph success so every later pass is finalize-only."""
+    marker = dict(data.get("tourActionResolution") or {})
+    marker["status"] = DASHBOARD_TOUR_PENDING_STATUS
+    pending_send_result = {
+        key: value for key, value in (send_result or {}).items()
+        if value not in (None, {}, [])
+    }
+    doc_ref.set({
+        "status": DASHBOARD_TOUR_PENDING_STATUS,
+        "alreadySent": True,
+        "requiresSentItemsPreflight": True,
+        "pendingSendResult": pending_send_result,
+        "sentRecipients": pending_send_result.get("sent") or data.get("sentRecipients") or [],
+        "tourActionResolution": marker,
+        "lastError": f"Post-send tour action finalization failed: {error}"[:1500],
+        "processingBy": None,
+        "processingAt": None,
+        "updatedAt": SERVER_TIMESTAMP,
+    }, merge=True)
+
+
+def _finalize_dashboard_tour_action_resolution(
+    user_id: str,
+    doc_ref,
+    data: Dict[str, Any],
+    send_result: Optional[Dict[str, Any]],
+) -> None:
+    """Atomically resolve a verified tour action and persist lifecycle context."""
+    from .notifications import _decrement_notification_rollups
+
+    binding = _dashboard_tour_action_binding(
+        data,
+        getattr(doc_ref, "id", ""),
+    )
+    refs = _dashboard_tour_resolution_refs(user_id, binding)
+    identity = _send_identity_payload(send_result, data.get("assignedEmails") or [])
+    action_audit_id = str(data.get("actionAuditId") or "").strip()
+    audit_ref = (
+        refs["fs"].collection("users").document(user_id)
+        .collection("actionAudit").document(action_audit_id)
+        if action_audit_id else None
+    )
+
+    @firestore.transactional
+    def finalize(transaction):
+        # Read the whole server-owned binding before any write.
+        resolution_snapshot = refs["resolution"].get(transaction=transaction)
+        notification_snapshot = refs["notification"].get(transaction=transaction)
+        thread_snapshot = refs["thread"].get(transaction=transaction)
+        client_snapshot = refs["client"].get(transaction=transaction)
+
+        if not getattr(resolution_snapshot, "exists", False):
+            raise ValueError("tour_action_resolution_not_found")
+        resolution = resolution_snapshot.to_dict() or {}
+        if not (
+            resolution.get("kind") == DASHBOARD_TOUR_RESOLUTION_KIND
+            and all(
+                str(resolution.get(field) or "") == value
+                for field, value in binding.items()
+            )
+        ):
+            raise ValueError("tour_action_resolution_binding_mismatch")
+
+        thread = (
+            thread_snapshot.to_dict() or {}
+            if getattr(thread_snapshot, "exists", False)
+            else {}
+        )
+        thread_client_id = str(thread.get("clientId") or "").strip()
+        if thread_client_id and thread_client_id != binding["clientId"]:
+            raise ValueError("tour_action_thread_client_mismatch")
+
+        notification = (
+            notification_snapshot.to_dict() or {}
+            if getattr(notification_snapshot, "exists", False)
+            else {}
+        )
+        if notification:
+            if str(notification.get("threadId") or "").strip() != binding["threadId"]:
+                raise ValueError("tour_action_notification_thread_mismatch")
+            if str((notification.get("meta") or {}).get("reason") or "").strip() != DASHBOARD_TOUR_ACTION_REASON:
+                raise ValueError("tour_action_notification_reason_mismatch")
+            if _normalize_email(notification.get("email")) != binding["recipient"]:
+                raise ValueError("tour_action_notification_recipient_mismatch")
+            if str(
+                (notification.get("meta") or {}).get("replyToMessageId") or ""
+            ).strip() != binding["replyToMessageId"]:
+                raise ValueError("tour_action_notification_reply_target_mismatch")
+
+        thread_status = str(thread.get("status") or "active").strip().lower()
+        tour_status = str(thread.get("tourStatus") or "").strip().lower()
+        invite_status = str(
+            (thread.get("tourInvite") or {}).get("status") or ""
+        ).strip().lower()
+        client_exists = bool(getattr(client_snapshot, "exists", False))
+        client_data = client_snapshot.to_dict() or {} if client_exists else {}
+        client_allows_work = bool(
+            client_exists
+            and classify_client_automation_state(
+                client_data,
+                source="clients",
+            ).allows_autonomous_work
+        )
+        if (
+            getattr(thread_snapshot, "exists", False)
+            and client_allows_work
+            and thread_status in OPEN_THREAD_STATUSES
+            and tour_status not in TERMINAL_TOUR_STATUSES
+            and invite_status not in TERMINAL_TOUR_STATUSES
+        ):
+            existing_invite = dict(thread.get("tourInvite") or {})
+            invite_payload = {
+                **existing_invite,
+                "status": "sent",
+                "origin": "core_campaign_handoff",
+                "originActionReason": DASHBOARD_TOUR_ACTION_REASON,
+                "notificationId": binding["notificationId"],
+                "actionAuditId": data.get("actionAuditId"),
+                "outboxId": binding["outboxId"],
+                "sentAt": SERVER_TIMESTAMP,
+                "sentMessageId": identity.get("sentMessageId"),
+                "internetMessageId": identity.get("internetMessageId"),
+                "sentThreadId": identity.get("sentThreadId"),
+                "conversationId": identity.get("conversationId"),
+                "sourceMessageId": data.get("replyToMessageId"),
+            }
+            transaction.set(refs["thread"], {
+                "status": "active",
+                "followUpStatus": "waiting",
+                "lastOperatorReplySentAt": SERVER_TIMESTAMP,
+                "tourStatus": "awaiting_confirmation",
+                "tourInvite": {
+                    key: value for key, value in invite_payload.items()
+                    if value is not None
+                },
+                "updatedAt": SERVER_TIMESTAMP,
+            }, merge=True)
+
+        sent_payload = {
+            "status": "sent",
+            "sentAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+            **identity,
+        }
+        if data.get("postSendWarning"):
+            sent_payload["postSendWarning"] = data.get("postSendWarning")
+        transaction.set(refs["resolution"], sent_payload, merge=True)
+
+        if audit_ref is not None:
+            transaction.set(audit_ref, {
+                **sent_payload,
+                "outboxId": binding["outboxId"],
+                "clientId": binding["clientId"],
+                "notificationId": binding["notificationId"],
+                "threadId": binding["threadId"],
+            }, merge=True)
+
+        if notification:
+            kind = notification.get("kind") or notification.get("type")
+            if client_exists:
+                transaction.set(
+                    refs["client"],
+                    _decrement_notification_rollups(client_data, kind),
+                    merge=True,
+                )
+            transaction.delete(refs["notification"])
+        transaction.delete(doc_ref)
+
+    finalize(refs["fs"].transaction())
 
 
 def _mark_tour_invite_thread_sent(
@@ -2310,11 +2742,31 @@ def _finalize_successful_outbox_item(
     row_number: Optional[int] = None,
     client_id: Optional[str] = None,
     send_result: Optional[Dict[str, Any]] = None,
+    dashboard_tour_resolution: Optional[Dict[str, Any]] = None,
 ):
     """Delete sent outbox and apply post-send dashboard state only after send success."""
     from .clients import _fs
 
     client_id = client_id or (data.get("clientId") or "").strip()
+
+    if dashboard_tour_resolution:
+        _finalize_dashboard_tour_action_resolution(
+            user_id,
+            doc_ref,
+            data,
+            send_result,
+        )
+        if row_number and client_id:
+            try:
+                sheet_id = _get_sheet_id_or_fail(user_id, client_id)
+                highlight_row(sheet_id, row_number)
+            except Exception as e:
+                print(f"  ⚠️ Could not highlight row {row_number}: {e}")
+        print(
+            f"   ✅ Resolved dashboard tour action {data.get('notificationId')} "
+            "with durable invite context"
+        )
+        return
 
     doc_ref.delete()
 
@@ -3222,6 +3674,18 @@ def send_outboxes(
     email_groups = defaultdict(list)
     for d in docs:
         data = d.to_dict() or {}
+        if _is_dashboard_tour_pending_finalization(data):
+            _send_single_outbox_item(
+                user_id,
+                headers,
+                {"doc": d, "data": data},
+                user_signature,
+                signature_mode,
+                user_email,
+                headers_provider=headers_provider,
+                operation_states=operation_states,
+            )
+            continue
         if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
             continue
         emails = data.get("assignedEmails") or []
@@ -4126,9 +4590,50 @@ def _send_single_outbox_item(
     d = item['doc']
     data = item['data']
 
+    # Graph already accepted this tour-action reply.  This state is finalize-
+    # only: claims, retries, and scheduler re-entry must never call Graph again.
+    if _is_dashboard_tour_pending_finalization(data):
+        if not _claim_outbox_item(d.reference, data, user_id=user_id):
+            print(f"   ⏭️ Skipping {d.id} - already being finalized by another worker")
+            return
+        fresh_data = _get_current_outbox_data(d.reference)
+        if fresh_data is None:
+            return
+        if fresh_data:
+            data = fresh_data
+        pending_send_result = _pending_tour_send_result(data)
+        try:
+            _finalize_successful_outbox_item(
+                user_id,
+                d.reference,
+                data,
+                row_number=data.get("rowNumber"),
+                client_id=(data.get("clientId") or "").strip(),
+                send_result=pending_send_result,
+                dashboard_tour_resolution=data.get("tourActionResolution") or {},
+            )
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state("healthy", doc_id=d.id),
+            )
+        except Exception as exc:
+            _persist_dashboard_tour_sent_pending_finalization(
+                d.reference,
+                data,
+                pending_send_result,
+                exc,
+            )
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state("error", doc_id=d.id, error=exc),
+            )
+            print(f"   ⚠️ Dashboard tour action {d.id} remains pending finalization: {exc}")
+        return
+
     # RAIL 3 (kill switch): gate the outbox driver before claiming or sending.
     # Fail closed — anything but "live" leaves the item queued and untouched
     # (no claim, no delete, no Graph call) so it resumes cleanly once re-enabled.
+    # Finalize-only items above are state repair, not outbound communication.
     outbound_mode = resolve_outbound_mode()
     if outbound_mode != OUTBOUND_MODE_LIVE:
         _kill_switch_suppressed(
@@ -4262,6 +4767,7 @@ def _send_single_outbox_item(
         "threadIds": {},
         "conversationIds": {},
     }
+    dashboard_tour_resolution: Optional[Dict[str, Any]] = None
 
     # Get follow-up config if present
     followup_config = data.get("followUpConfig")
@@ -4298,9 +4804,85 @@ def _send_single_outbox_item(
     if is_thread_reply:
         # For replies, use the script directly (already personalized by frontend)
         script_content = email_scripts[0] if email_scripts else ""
-        if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, script_content):
+        # Reject every non-scheduling safety violation before creating a durable
+        # action reservation. Scheduling copy gets a second, server-authenticated
+        # decision below; the frontend actionReason is never sufficient.
+        if not validate_outbound_body(
+            script_content,
+            allow_scheduling_language=True,
+        ).is_safe and _dead_letter_unsafe_outbound_body_if_needed(
+            user_id,
+            d.reference,
+            data,
+            script_content,
+        ):
             print(f"   🛑 Blocked unsafe dashboard reply body in outbox item {d.id}; manual review required")
             return
+
+        resolution_result = _reserve_dashboard_tour_action_resolution(
+            user_id,
+            d.reference,
+            data,
+        )
+        resolution_status = resolution_result.get("status")
+        if resolution_status == "gone":
+            return
+        if resolution_status == "cancelled":
+            _delete_cancelled_outbox_item_if_needed(
+                d.reference,
+                resolution_result.get("data") or data,
+                user_id=user_id,
+            )
+            return
+        if resolution_status == "claim_lost":
+            print(f"   ⏭️ Skipping {d.id} - dashboard action claim changed")
+            return
+        if resolution_status == "invalid":
+            reason = resolution_result.get("reason") or "dashboard_action_binding_invalid"
+            _move_to_dead_letter(
+                user_id,
+                d.reference,
+                data,
+                f"Dashboard action failed server validation: {reason}; "
+                "manual review required before sending",
+            )
+            print(f"   🛑 Blocked dashboard action reply {d.id}: {reason}")
+            return
+        if resolution_status in {"duplicate", "already_resolved"}:
+            _terminalize_outbox_action_audit(
+                user_id,
+                d.reference,
+                data,
+                "duplicate_skipped",
+                {
+                    "skippedAt": SERVER_TIMESTAMP,
+                    "skipReason": resolution_result.get("reason")
+                    or "notification_already_resolved",
+                },
+            )
+            d.reference.delete()
+            print(
+                f"   ⏭️ Skipped duplicate dashboard tour action {d.id} "
+                f"for notification {data.get('notificationId')}"
+            )
+            return
+        if resolution_status == "reserved":
+            dashboard_tour_resolution = resolution_result
+            data = {
+                **data,
+                "tourActionResolution": resolution_result.get("marker") or {},
+            }
+
+        if _dead_letter_unsafe_outbound_body_if_needed(
+            user_id,
+            d.reference,
+            data,
+            script_content,
+            allow_scheduling_language=bool(dashboard_tour_resolution),
+        ):
+            print(f"   🛑 Blocked unsafe dashboard reply body in outbox item {d.id}; manual review required")
+            return
+
         current_headers = _fresh_graph_headers(headers, headers_provider)
         reply_sender = _get_reply_message_sender(current_headers, reply_to_msg_id)
         use_graph_reply = _assigned_emails_match_reply_sender(emails, reply_sender)
@@ -4318,10 +4900,13 @@ def _send_single_outbox_item(
             )
             if prior_send.get("sent"):
                 _merge_send_identity(send_identity, prior_send)
-                all_errors[recipient] = (
-                    "Prior failed attempt appears already sent in Sent Items; "
-                    "operator reconciliation required"
-                )
+                if dashboard_tour_resolution:
+                    all_sent.extend(prior_send.get("sent") or [recipient])
+                else:
+                    all_errors[recipient] = (
+                        "Prior failed attempt appears already sent in Sent Items; "
+                        "operator reconciliation required"
+                    )
             elif prior_send.get("manualContinuation"):
                 _move_to_dead_letter(
                     user_id,
@@ -4338,6 +4923,15 @@ def _send_single_outbox_item(
                     f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
                 )
                 return
+            elif dashboard_tour_resolution and dashboard_tour_resolution.get("recovery"):
+                _move_to_dead_letter(
+                    user_id,
+                    d.reference,
+                    data,
+                    "A prior dashboard tour send attempt could not be matched in "
+                    "Sent Items; manual review required before any resend",
+                )
+                return
             else:
                 try:
                     res = _send_outbox_as_reply(
@@ -4345,7 +4939,11 @@ def _send_single_outbox_item(
                         thread_id, user_signature=user_signature,
                         signature_mode=signature_mode, user_email=user_email,
                         fallback_to_emails=emails,
-                        fallback_cc_emails=data.get("ccEmails") or data.get("ccRecipients") or [],
+                        fallback_cc_emails=(
+                            []
+                            if dashboard_tour_resolution
+                            else data.get("ccEmails") or data.get("ccRecipients") or []
+                        ),
                         client_id=clientId,
                     )
 
@@ -4370,16 +4968,37 @@ def _send_single_outbox_item(
                             send_identity["internetMessageIds"][recipient] = res.get("internetMessageId")
                         if res.get("conversationId"):
                             send_identity["conversationIds"][recipient] = res.get("conversationId")
-                        _save_outbox_reply_message(
-                            user_id, thread_id, res.get("toRecipients") or emails, subject_override,
-                            script_content, user_signature, signature_mode, user_email,
-                            cc_emails=res.get("ccRecipients") or [],
-                        )
+                        try:
+                            reply_indexed = _save_outbox_reply_message(
+                                user_id, thread_id, res.get("toRecipients") or emails, subject_override,
+                                script_content, user_signature, signature_mode, user_email,
+                                cc_emails=res.get("ccRecipients") or [],
+                            )
+                            if reply_indexed is False and dashboard_tour_resolution:
+                                raise RuntimeError("save_message returned False")
+                        except Exception as exc:
+                            if not dashboard_tour_resolution:
+                                raise
+                            data = {
+                                **data,
+                                "postSendWarning": (
+                                    f"Reply history indexing failed after Graph accepted send: {exc}"
+                                )[:1500],
+                            }
+                            print(
+                                "   ⚠️ Tour reply was accepted by Graph but reply history "
+                                f"indexing failed; lifecycle finalization will continue: {exc}"
+                            )
                         if not (res.get("sentMessageId") or res.get("internetMessageId")):
-                            all_errors[recipient] = (
+                            warning = (
                                 "Graph accepted reply but Sent Items identity lookup failed; "
                                 "operator reconciliation required"
                             )
+                            if dashboard_tour_resolution:
+                                data = {**data, "postSendWarning": warning}
+                                print(f"   ⚠️ {warning}; tour lifecycle finalization will continue")
+                            else:
+                                all_errors[recipient] = warning
                     else:
                         all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
 
@@ -4407,10 +5026,13 @@ def _send_single_outbox_item(
                     )
                     if prior_send.get("sent"):
                         _merge_send_identity(send_identity, prior_send)
-                        all_errors[recipient_email] = (
-                            "Prior failed attempt appears already sent in Sent Items; "
-                            "operator reconciliation required"
-                        )
+                        if dashboard_tour_resolution:
+                            all_sent.extend(prior_send.get("sent") or [recipient_email])
+                        else:
+                            all_errors[recipient_email] = (
+                                "Prior failed attempt appears already sent in Sent Items; "
+                                "operator reconciliation required"
+                            )
                         continue
                     if prior_send.get("manualContinuation"):
                         _move_to_dead_letter(
@@ -4426,6 +5048,15 @@ def _send_single_outbox_item(
                             d.reference,
                             data,
                             f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                        )
+                        return
+                    if dashboard_tour_resolution and dashboard_tour_resolution.get("recovery"):
+                        _move_to_dead_letter(
+                            user_id,
+                            d.reference,
+                            data,
+                            "A prior dashboard tour send attempt could not be matched "
+                            "in Sent Items; manual review required before any resend",
                         )
                         return
                     res = send_and_index_email(
@@ -4586,11 +5217,29 @@ def _send_single_outbox_item(
             email for email in (data.get("sentRecipients") or [])
             if isinstance(email, str)
         ] + all_sent)
-        _finalize_successful_outbox_item(
-            user_id, d.reference, data,
-            row_number=row_number, client_id=clientId,
-            send_result={**send_identity, "sent": final_sent},
-        )
+        final_send_result = {**send_identity, "sent": final_sent}
+        try:
+            _finalize_successful_outbox_item(
+                user_id, d.reference, data,
+                row_number=row_number, client_id=clientId,
+                send_result=final_send_result,
+                dashboard_tour_resolution=dashboard_tour_resolution,
+            )
+        except Exception as exc:
+            if not dashboard_tour_resolution:
+                raise
+            _persist_dashboard_tour_sent_pending_finalization(
+                d.reference,
+                data,
+                final_send_result,
+                exc,
+            )
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state("error", doc_id=d.id, error=exc),
+            )
+            print(f"   ⚠️ Dashboard tour action {d.id} sent but awaits finalization: {exc}")
+            return
         print(f"🗑️ Deleted outbox item {d.id}")
         _record_operation_state(
             operation_states, _outbox_send_operation_state("healthy", doc_id=d.id)

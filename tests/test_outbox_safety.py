@@ -1,6 +1,6 @@
 import unittest
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from contextlib import ExitStack
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -15,17 +15,28 @@ from email_automation.column_config import get_default_column_config
 
 
 class FakeDocRef:
-    def __init__(self, doc_id="outbox-1"):
+    def __init__(self, doc_id="outbox-1", data=None):
         self.id = doc_id
         self.deleted = False
         self.set_calls = []
         self.update_calls = []
+        self._data = data if data is not None else {}
+
+    def get(self, transaction=None):
+        return FakeSnapshot(dict(self._data), exists=not self.deleted)
 
     def delete(self):
         self.deleted = True
 
     def set(self, *args, **kwargs):
         self.set_calls.append((args, kwargs))
+        if args:
+            payload = dict(args[0] or {})
+            if kwargs.get("merge"):
+                self._data.update(payload)
+            else:
+                self._data.clear()
+                self._data.update(payload)
 
     def update(self, data):
         self.update_calls.append(data)
@@ -34,8 +45,8 @@ class FakeDocRef:
 class FakeDoc:
     def __init__(self, data, doc_id="outbox-1"):
         self.id = doc_id
-        self.reference = FakeDocRef(doc_id)
         self._data = data
+        self.reference = FakeDocRef(doc_id, dict(data))
 
     def to_dict(self):
         return self._data
@@ -54,21 +65,80 @@ class FakeFirestoreNode:
 
     def delete(self):
         self.root.deleted_paths.append(tuple(self.path))
+        key = "/".join(self.path[1::2])
+        self.root.snapshots[key] = FakeSnapshot({}, exists=False)
 
     def set(self, data, merge=False):
+        error = self.root.set_errors.get("/".join(self.path[1::2]))
+        if error:
+            raise error
         self.root.set_calls.append((tuple(self.path), data, merge))
+        key = "/".join(self.path[1::2])
+        current = self.root.snapshots.get(key, FakeSnapshot({}, exists=False))
+        current_data = dict(current.to_dict() or {}) if current.exists else {}
+        next_data = {**current_data, **data} if merge else dict(data)
+        self.root.snapshots[key] = FakeSnapshot(next_data)
 
     def add(self, data):
         self.root.add_calls.append((tuple(self.path), data))
         return FakeFirestoreNode(self.root, self.path + ["document", "auto-id"])
 
-    def get(self):
+    def order_by(self, _field):
+        return self
+
+    def stream(self):
+        key = "/".join(self.path[1::2])
+        if key.endswith("/outbox"):
+            return list(self.root.outbox_docs)
+        return []
+
+    def get(self, transaction=None):
         key = "/".join(self.path[1::2])
         if "/archivedClients/" in f"/{key}/":
             return FakeSnapshot({}, exists=False)
-        if "/clients/" in f"/{key}/":
+        key_parts = key.split("/")
+        if len(key_parts) == 2 and key_parts[0] == "users":
+            return self.root.snapshots.get(
+                key,
+                FakeSnapshot({"email": "baylor.freelance@outlook.com"}),
+            )
+        if len(key_parts) == 4 and key_parts[2] == "clients":
             return self.root.snapshots.get(key, FakeSnapshot({"status": "live"}))
         return self.root.snapshots.get(key, FakeSnapshot({}, exists=False))
+
+
+class FakeFirestoreTransaction:
+    def __init__(self):
+        self._max_attempts = 1
+        self._read_only = False
+        self._id = b"fake-transaction"
+
+    def _clean_up(self):
+        return None
+
+    def _begin(self, retry_id=None):
+        self._id = retry_id or b"fake-transaction"
+
+    def _commit(self):
+        return None
+
+    def _rollback(self):
+        return None
+
+    def set(self, ref, data, merge=False):
+        ref.set(data, merge=merge)
+
+    def create(self, ref, data):
+        snapshot = ref.get()
+        if getattr(snapshot, "exists", False):
+            raise AssertionError("document already exists")
+        ref.set(data, merge=False)
+
+    def update(self, ref, data):
+        ref.update(data)
+
+    def delete(self, ref):
+        ref.delete()
 
 
 class FakeFirestore:
@@ -76,11 +146,16 @@ class FakeFirestore:
         self.deleted_paths = []
         self.set_calls = []
         self.add_calls = []
+        self.set_errors = {}
+        self.outbox_docs = []
         # "users/uid-1/threads/thread-1" -> FakeSnapshot; consulted by node.get()
         self.snapshots = {}
 
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
+
+    def transaction(self):
+        return FakeFirestoreTransaction()
 
 
 def _seed_open_thread(fake_fs, user_id="uid-1", thread_id="thread-1",
@@ -96,6 +171,24 @@ def _seed_open_thread(fake_fs, user_id="uid-1", thread_id="thread-1",
     fake_fs.snapshots[
         f"users/{user_id}/threads/{thread_id}/messages/{message_id}"
     ] = FakeSnapshot({"direction": "inbound"})
+
+
+def _seed_tour_notification(fake_fs, *, user_id="uid-1", client_id="client-1",
+                            notification_id="notification-1", thread_id="thread-1",
+                            email="bp21harrison@gmail.com",
+                            reply_to_message_id="graph-message-1",
+                            reason="tour_requested"):
+    fake_fs.snapshots[
+        f"users/{user_id}/clients/{client_id}/notifications/{notification_id}"
+    ] = FakeSnapshot({
+        "kind": "action_needed",
+        "email": email,
+        "threadId": thread_id,
+        "meta": {
+            "reason": reason,
+            "replyToMessageId": reply_to_message_id,
+        },
+    })
 
 
 def _action_audit_payload(fake_fs, user_id, audit_id):
@@ -1456,6 +1549,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-dashboard-reply",
             "source": "dashboard_manual_reply",
             "followUpConfig": {"enabled": False},
+            "processingBy": email_module.WORKER_ID,
         }
         if overrides:
             data.update(overrides)
@@ -1530,6 +1624,1018 @@ class OutboxSafetyTests(unittest.TestCase):
         thread_payload = fake_fs.set_calls[-1][1]
         self.assertEqual("active", thread_payload["status"])
         self.assertEqual("waiting", thread_payload["followUpStatus"])
+
+    def test_dashboard_tour_action_reply_persists_invite_context_with_resume(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        })
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        fake_fs.snapshots["users/uid-1/threads/thread-1"] = FakeSnapshot({
+            "clientId": "client-1",
+            "status": "paused",
+            "rowNumber": 20,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+        })
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-tour-reply-1",
+                 "internetMessageId": "<graph-tour-reply-1@example.com>",
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }), \
+             patch.object(email_module, "_save_outbox_reply_message"), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        thread_path = (
+            "collection", "users", "document", "uid-1",
+            "collection", "threads", "document", "thread-1",
+        )
+        thread_payloads = [
+            payload for path, payload, _merge in fake_fs.set_calls
+            if path == thread_path
+        ]
+        self.assertEqual(1, len(thread_payloads))
+        self.assertEqual("active", thread_payloads[0]["status"])
+        self.assertEqual("waiting", thread_payloads[0]["followUpStatus"])
+        self.assertEqual("awaiting_confirmation", thread_payloads[0]["tourStatus"])
+        self.assertEqual("sent", thread_payloads[0]["tourInvite"]["status"])
+        self.assertEqual(
+            "graph-tour-reply-1",
+            thread_payloads[0]["tourInvite"]["sentMessageId"],
+        )
+        self.assertFalse(any(
+            key.startswith("tourInvite.") for key in thread_payloads[0]
+        ))
+        self.assertNotIn("source", thread_payloads[0])
+        self.assertNotIn("actionType", thread_payloads[0])
+        resolution = fake_fs.snapshots[
+            "users/uid-1/actionResolutions/notification-1"
+        ].to_dict()
+        self.assertEqual("sent", resolution["status"])
+        self.assertEqual("outbox-dashboard-reply", resolution["outboxId"])
+        audit = _action_audit_payload(
+            fake_fs,
+            "uid-1",
+            "audit-dashboard-reply",
+        )
+        self.assertEqual("sent", audit["status"])
+        self.assertEqual("graph-tour-reply-1", audit["sentMessageId"])
+
+    def test_server_verified_dashboard_tour_reply_allows_real_suggested_copy(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "script": (
+                "Hi Ryan,\n\n"
+                "Thank you for offering to show me the property. I'd like to schedule a tour.\n\n"
+                "Tuesday, August 11 at 2:00 PM would work on my end.\n\n"
+                "Could you please confirm what works best?\n\n"
+                "Thanks!"
+            ),
+        }, doc_id="outbox-real-tour-suggested-copy")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-real-tour-copy-1",
+                 "internetMessageId": "<graph-real-tour-copy-1@example.com>",
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }) as graph_send, \
+             patch.object(email_module, "_save_outbox_reply_message", return_value=True), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_send.assert_called_once()
+        self.assertEqual([], fake_fs.add_calls)
+        self.assertEqual(
+            "awaiting_confirmation",
+            fake_fs.snapshots["users/uid-1/threads/thread-1"].to_dict()["tourStatus"],
+        )
+
+    def test_tour_notification_cannot_authorize_forged_recipient(self):
+        doc = self._dashboard_manual_reply_doc({
+            "assignedEmails": ["forged@example.com"],
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "script": "I'd like to schedule the property tour Tuesday at 2 PM.",
+        }, doc_id="outbox-forged-tour-recipient")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="forged@example.com"), \
+             patch.object(email_module, "_send_outbox_as_reply") as graph_send:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_send.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual(1, len(fake_fs.add_calls))
+
+    def test_inline_action_with_multiple_recipients_fails_closed(self):
+        doc = self._dashboard_manual_reply_doc({
+            "assignedEmails": [
+                "bp21harrison@gmail.com",
+                "forged@example.com",
+            ],
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "script": "Thanks, we'll follow up shortly.",
+        }, doc_id="outbox-tour-multiple-recipients")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply") as graph_reply, \
+             patch.object(email_module, "send_and_index_email") as graph_new_send:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_reply.assert_not_called()
+        graph_new_send.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual(1, len(fake_fs.add_calls))
+
+    def test_inline_action_with_missing_binding_fails_closed(self):
+        doc = self._dashboard_manual_reply_doc({
+            "notificationId": "",
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "script": "Thanks, we'll follow up shortly.",
+        }, doc_id="outbox-tour-missing-notification")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply") as graph_reply, \
+             patch.object(email_module, "send_and_index_email") as graph_new_send:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_reply.assert_not_called()
+        graph_new_send.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual(1, len(fake_fs.add_calls))
+
+    def test_tour_notification_cannot_authorize_forged_source_message(self):
+        doc = self._dashboard_manual_reply_doc({
+            "replyToMessageId": "graph-message-2",
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "script": "I'd like to schedule the property tour Tuesday at 2 PM.",
+        }, doc_id="outbox-forged-tour-message")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs, message_id="graph-message-2")
+        _seed_tour_notification(fake_fs, reply_to_message_id="graph-message-1")
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply") as graph_send:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_send.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual(1, len(fake_fs.add_calls))
+
+    def test_client_tour_reason_cannot_upgrade_server_non_tour_notification(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "script": "I'd like to schedule the property tour Tuesday at 2 PM.",
+        }, doc_id="outbox-spoofed-tour-reason")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs, reason="call_requested")
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply") as graph_send:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_send.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual(1, len(fake_fs.add_calls))
+
+    def test_server_verified_tour_reply_drops_client_supplied_fallback_cc(self):
+        doc = self._dashboard_manual_reply_doc({
+            "ccEmails": ["forged-cc@example.com"],
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "script": "I'd like to schedule the property tour Tuesday at 2 PM.",
+        }, doc_id="outbox-forged-tour-cc")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-tour-no-forged-cc",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }) as graph_send, \
+             patch.object(email_module, "_save_outbox_reply_message", return_value=True), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_send.assert_called_once()
+        self.assertEqual([], graph_send.call_args.kwargs["fallback_cc_emails"])
+
+    def test_tour_reservation_observes_cancel_delete_and_claim_owner_races(self):
+        for race, expected_status in (
+            ("cancel", "cancelled"),
+            ("delete", "gone"),
+            ("claim_owner", "claim_lost"),
+        ):
+            with self.subTest(race=race):
+                doc = self._dashboard_manual_reply_doc({
+                    "actionReason": "tour_requested",
+                    "source": "dashboard_inline_reply",
+                    "actionType": "reply",
+                }, doc_id=f"outbox-tour-{race}-race")
+                stale_data = dict(doc.to_dict())
+                if race == "cancel":
+                    doc.reference._data.update({
+                        "cancelRequested": True,
+                        "status": "cancel_requested",
+                    })
+                elif race == "delete":
+                    doc.reference.delete()
+                else:
+                    doc.reference._data["processingBy"] = "other-worker"
+
+                fake_fs = FakeFirestore()
+                _seed_open_thread(fake_fs)
+                _seed_tour_notification(fake_fs)
+                with patch("email_automation.clients._fs", fake_fs):
+                    result = email_module._reserve_dashboard_tour_action_resolution(
+                        "uid-1",
+                        doc.reference,
+                        stale_data,
+                    )
+
+                self.assertEqual(expected_status, result["status"])
+                resolution = fake_fs.snapshots.get(
+                    "users/uid-1/actionResolutions/notification-1"
+                )
+                self.assertFalse(resolution and resolution.exists)
+
+    def test_dashboard_tour_reservation_rejects_terminal_client(self):
+        outbox_ref = FakeDocRef("outbox-tour-stopped-client")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        fake_fs.snapshots["users/uid-1/clients/client-1"] = FakeSnapshot({
+            "status": "stopped",
+            "automationPaused": True,
+        })
+        _seed_tour_notification(fake_fs)
+        data = {
+            **self._dashboard_manual_reply_doc().to_dict(),
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }
+        outbox_ref._data.update(data)
+
+        with patch("email_automation.clients._fs", fake_fs):
+            result = email_module._reserve_dashboard_tour_action_resolution(
+                "uid-1",
+                outbox_ref,
+                data,
+            )
+
+        self.assertEqual("invalid", result["status"])
+        self.assertEqual("client_no_longer_active", result["reason"])
+
+    def test_unverified_dashboard_tour_action_binding_fails_closed_before_send(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        })
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        fake_fs.snapshots[
+            "users/uid-1/clients/client-1/notifications/notification-1"
+        ] = FakeSnapshot({
+            "kind": "action_needed",
+            "threadId": "different-thread",
+            "meta": {"reason": "tour_requested"},
+        })
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-reply-message-1",
+                 "internetMessageId": "<graph-reply-message-1@example.com>",
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }) as send_reply, \
+             patch.object(email_module, "_save_outbox_reply_message"), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_reply.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual(1, len(fake_fs.add_calls))
+
+    def test_tour_context_write_failure_keeps_dashboard_action_retryable(self):
+        outbox_ref = FakeDocRef("outbox-tour-state-retry")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+        fake_fs.set_errors["users/uid-1/threads/thread-1"] = RuntimeError(
+            "tour context write unavailable"
+        )
+        data = {
+            **self._dashboard_manual_reply_doc().to_dict(),
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }
+        outbox_ref._data.update(data)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "delete_notification_and_decrement_counters") as delete_notification:
+            resolution = email_module._reserve_dashboard_tour_action_resolution(
+                "uid-1",
+                outbox_ref,
+                data,
+            )
+            with self.assertRaisesRegex(RuntimeError, "tour context write unavailable"):
+                email_module._finalize_successful_outbox_item(
+                    "uid-1",
+                    outbox_ref,
+                    data,
+                    send_result={
+                        "sent": ["bp21harrison@gmail.com"],
+                        "sentMessageIds": {
+                            "bp21harrison@gmail.com": "graph-tour-reply-1",
+                        },
+                    },
+                    dashboard_tour_resolution=resolution,
+                )
+
+        self.assertFalse(outbox_ref.deleted)
+        delete_notification.assert_not_called()
+
+    def test_dashboard_tour_action_retry_finalizes_without_second_graph_send(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }, doc_id="outbox-dashboard-tour-retry")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        fake_fs.snapshots["users/uid-1/threads/thread-1"] = FakeSnapshot({
+            "clientId": "client-1",
+            "status": "paused",
+            "rowNumber": 20,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+        })
+        _seed_tour_notification(fake_fs)
+        fake_fs.set_errors["users/uid-1/threads/thread-1"] = RuntimeError(
+            "tour context write unavailable"
+        )
+        fake_fs.outbox_docs = [doc]
+
+        def graph_send(*_args, **_kwargs):
+            attempt_payloads = [
+                args[0] for args, _kwargs in doc.reference.set_calls
+                if args
+            ]
+            self.assertTrue(any(
+                payload.get("requiresSentItemsPreflight") is True
+                for payload in attempt_payloads
+            ))
+            return {
+                "sent": True,
+                "error": None,
+                "sentMessageId": "graph-tour-retry-1",
+                "internetMessageId": "<graph-tour-retry-1@example.com>",
+                "conversationId": "conversation-1",
+                "toRecipients": ["bp21harrison@gmail.com"],
+                "ccRecipients": [],
+                "sentRecipients": ["bp21harrison@gmail.com"],
+            }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", side_effect=graph_send) as send_reply, \
+             patch.object(email_module, "_save_outbox_reply_message"), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters") as delete_notification, \
+             patch.object(email_module, "_resolve_daily_send_cap", return_value=1), \
+             patch.object(email_module, "_resolve_global_daily_send_cap", return_value=None), \
+             patch.object(email_module, "_read_daily_send_count", side_effect=[0, 1]) as read_send_count, \
+             patch.object(email_module, "_increment_daily_send_count"), \
+             patch.object(
+                 email_module,
+                 "resolve_outbound_mode",
+                 side_effect=[email_module.OUTBOUND_MODE_LIVE, email_module.OUTBOUND_MODE_PAUSED],
+             ):
+            email_module.send_outboxes(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+            )
+
+            pending_payloads = [
+                args[0] for args, _kwargs in doc.reference.set_calls
+                if args and args[0].get("status") == "sent_pending_finalization"
+            ]
+            self.assertEqual(1, len(pending_payloads))
+            self.assertTrue(pending_payloads[0]["alreadySent"])
+            self.assertTrue(pending_payloads[0]["requiresSentItemsPreflight"])
+            self.assertFalse(doc.reference.deleted)
+            delete_notification.assert_not_called()
+
+            doc._data.update(pending_payloads[0])
+            fake_fs.set_errors.clear()
+            failing_headers_provider = MagicMock(
+                side_effect=RuntimeError("token refresh unavailable")
+            )
+            email_module.send_outboxes(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                headers_provider=failing_headers_provider,
+            )
+
+        send_reply.assert_called_once()
+        failing_headers_provider.assert_not_called()
+        read_send_count.assert_called_once()
+        self.assertTrue(doc.reference.deleted)
+        delete_notification.assert_not_called()
+        self.assertIn(
+            (
+                "collection", "users", "document", "uid-1",
+                "collection", "clients", "document", "client-1",
+                "collection", "notifications", "document", "notification-1",
+            ),
+            fake_fs.deleted_paths,
+        )
+
+    def test_matching_non_tour_dashboard_action_remains_generic_reply(self):
+        outbox_ref = FakeDocRef("outbox-call-action")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        fake_fs.snapshots[
+            "users/uid-1/clients/client-1/notifications/notification-1"
+        ] = FakeSnapshot({
+            "kind": "action_needed",
+            "threadId": "thread-1",
+            "meta": {"reason": "call_requested"},
+        })
+        data = {
+            **self._dashboard_manual_reply_doc().to_dict(),
+            "actionReason": "call_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                data,
+                send_result={
+                    "sent": ["bp21harrison@gmail.com"],
+                    "sentMessageIds": {
+                        "bp21harrison@gmail.com": "graph-call-reply-1",
+                    },
+                },
+            )
+
+        thread_path = (
+            "collection", "users", "document", "uid-1",
+            "collection", "threads", "document", "thread-1",
+        )
+        thread_payloads = [
+            payload for path, payload, _merge in fake_fs.set_calls
+            if path == thread_path
+        ]
+        self.assertEqual(1, len(thread_payloads))
+        self.assertNotIn("tourStatus", thread_payloads[0])
+        self.assertNotIn("tourInvite", thread_payloads[0])
+
+    def test_grouped_campaign_tour_resolution_preserves_core_provenance(self):
+        outbox_ref = FakeDocRef("outbox-grouped-tour-action")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        grouped_thread = {
+            "clientId": "client-1",
+            "status": "paused",
+            "rowNumber": 20,
+            "source": "dashboard_campaign_launch",
+            "actionType": "campaign_launch",
+            "rows": [20, 21],
+        }
+        fake_fs.snapshots["users/uid-1/threads/thread-1"] = FakeSnapshot(grouped_thread)
+        _seed_tour_notification(fake_fs)
+        data = {
+            **self._dashboard_manual_reply_doc().to_dict(),
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }
+        outbox_ref._data.update(data)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            resolution = email_module._reserve_dashboard_tour_action_resolution(
+                "uid-1",
+                outbox_ref,
+                data,
+            )
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                data,
+                send_result={
+                    "sent": ["bp21harrison@gmail.com"],
+                    "sentMessageIds": {
+                        "bp21harrison@gmail.com": "graph-grouped-tour-reply-1",
+                    },
+                },
+                dashboard_tour_resolution=resolution,
+            )
+
+        thread_path = (
+            "collection", "users", "document", "uid-1",
+            "collection", "threads", "document", "thread-1",
+        )
+        thread_payloads = [
+            payload for path, payload, _merge in fake_fs.set_calls
+            if path == thread_path
+        ]
+        self.assertEqual("sent", thread_payloads[0]["tourInvite"]["status"])
+        self.assertNotIn("source", thread_payloads[0])
+        self.assertNotIn("actionType", thread_payloads[0])
+        self.assertEqual("dashboard_campaign_launch", grouped_thread["source"])
+        self.assertEqual("campaign_launch", grouped_thread["actionType"])
+
+    def test_server_tour_notification_bridges_legacy_reply_without_action_reason(self):
+        doc = self._dashboard_manual_reply_doc({
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }, doc_id="outbox-legacy-tour-action")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-legacy-tour-1",
+                 "internetMessageId": "<graph-legacy-tour-1@example.com>",
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }), \
+             patch.object(email_module, "_save_outbox_reply_message"), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        thread = fake_fs.snapshots["users/uid-1/threads/thread-1"].to_dict()
+        self.assertEqual("awaiting_confirmation", thread["tourStatus"])
+        self.assertEqual("sent", thread["tourInvite"]["status"])
+
+    def test_duplicate_dashboard_tour_outboxes_send_one_logical_reply(self):
+        first = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }, doc_id="outbox-tour-duplicate-a")
+        second = self._dashboard_manual_reply_doc({
+            "actionAuditId": "audit-tour-duplicate-b",
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }, doc_id="outbox-tour-duplicate-b")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+        graph_result = {
+            "sent": True,
+            "error": None,
+            "sentMessageId": "graph-tour-deduped-1",
+            "internetMessageId": "<graph-tour-deduped-1@example.com>",
+            "conversationId": "conversation-1",
+            "toRecipients": ["bp21harrison@gmail.com"],
+            "ccRecipients": [],
+            "sentRecipients": ["bp21harrison@gmail.com"],
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value=graph_result) as send_reply, \
+             patch.object(email_module, "_save_outbox_reply_message"), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            for doc in (first, second):
+                email_module._send_single_outbox_item(
+                    "uid-1",
+                    {"Authorization": "Bearer token"},
+                    {"doc": doc, "data": doc.to_dict()},
+                )
+
+        send_reply.assert_called_once()
+        self.assertTrue(first.reference.deleted)
+        self.assertTrue(second.reference.deleted)
+
+    def test_dashboard_tour_graph_success_survives_reply_index_warning(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }, doc_id="outbox-tour-index-warning")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-tour-index-warning-1",
+                 "internetMessageId": "<graph-tour-index-warning-1@example.com>",
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }) as graph_send, \
+             patch.object(email_module, "_save_outbox_reply_message", return_value=False), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_send.assert_called_once()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual([], fake_fs.add_calls)
+        thread = fake_fs.snapshots["users/uid-1/threads/thread-1"].to_dict()
+        self.assertEqual("awaiting_confirmation", thread["tourStatus"])
+        self.assertEqual("sent", thread["tourInvite"]["status"])
+        resolution = fake_fs.snapshots[
+            "users/uid-1/actionResolutions/notification-1"
+        ].to_dict()
+        self.assertIn("Reply history indexing failed", resolution["postSendWarning"])
+
+    def test_dashboard_tour_graph_success_without_identity_still_persists_context(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }, doc_id="outbox-tour-identity-warning")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        _seed_tour_notification(fake_fs)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }) as graph_send, \
+             patch.object(email_module, "_save_outbox_reply_message"), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        graph_send.assert_called_once()
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual([], fake_fs.add_calls)
+        thread = fake_fs.snapshots["users/uid-1/threads/thread-1"].to_dict()
+        self.assertEqual("awaiting_confirmation", thread["tourStatus"])
+        self.assertEqual("sent", thread["tourInvite"]["status"])
+
+    def test_dashboard_tour_send_terminal_race_never_resurrects_thread(self):
+        doc = self._dashboard_manual_reply_doc({
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }, doc_id="outbox-tour-terminal-race")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        thread_key = "users/uid-1/threads/thread-1"
+        fake_fs.snapshots[thread_key] = FakeSnapshot({
+            "clientId": "client-1",
+            "status": "paused",
+            "rowNumber": 20,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+        })
+        _seed_tour_notification(fake_fs)
+
+        def graph_send(*_args, **_kwargs):
+            fake_fs.snapshots[thread_key] = FakeSnapshot({
+                "clientId": "client-1",
+                "status": "completed",
+                "followUpStatus": "stopped",
+                "statusReason": "manual_completion",
+                "rowNumber": 20,
+                "source": "dashboard_new_campaign",
+                "actionType": "campaign_creation",
+                "tourStatus": "confirmed",
+            })
+            return {
+                "sent": True,
+                "error": None,
+                "sentMessageId": "graph-tour-terminal-race-1",
+                "internetMessageId": "<graph-tour-terminal-race-1@example.com>",
+                "conversationId": "conversation-1",
+                "toRecipients": ["bp21harrison@gmail.com"],
+                "ccRecipients": [],
+                "sentRecipients": ["bp21harrison@gmail.com"],
+            }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", side_effect=graph_send), \
+             patch.object(email_module, "_save_outbox_reply_message"), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        thread = fake_fs.snapshots[thread_key].to_dict()
+        self.assertEqual("completed", thread["status"])
+        self.assertEqual("stopped", thread["followUpStatus"])
+        self.assertEqual("confirmed", thread["tourStatus"])
+        self.assertEqual("manual_completion", thread["statusReason"])
+
+    def test_dashboard_tour_send_stopped_client_race_never_resumes_thread(self):
+        outbox_ref = FakeDocRef("outbox-tour-stopped-client-race")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        client_key = "users/uid-1/clients/client-1"
+        thread_key = "users/uid-1/threads/thread-1"
+        fake_fs.snapshots[client_key] = FakeSnapshot({"status": "live"})
+        _seed_tour_notification(fake_fs)
+        data = {
+            **self._dashboard_manual_reply_doc().to_dict(),
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }
+        outbox_ref._data.update(data)
+
+        with patch("email_automation.clients._fs", fake_fs):
+            resolution = email_module._reserve_dashboard_tour_action_resolution(
+                "uid-1",
+                outbox_ref,
+                data,
+            )
+            self.assertEqual("reserved", resolution["status"])
+            fake_fs.snapshots[client_key] = FakeSnapshot({
+                "status": "stopped",
+                "automationPaused": True,
+            })
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {**data, "tourActionResolution": resolution["marker"]},
+                send_result={
+                    "sent": ["bp21harrison@gmail.com"],
+                    "sentMessageIds": {
+                        "bp21harrison@gmail.com": "graph-stopped-client-race-1",
+                    },
+                },
+                dashboard_tour_resolution=resolution,
+            )
+
+        thread = fake_fs.snapshots[thread_key].to_dict()
+        self.assertEqual("paused", thread["status"])
+        self.assertNotIn("tourStatus", thread)
+        client = fake_fs.snapshots[client_key].to_dict()
+        self.assertEqual("stopped", client["status"])
+        self.assertTrue(client["automationPaused"])
+
+    def test_dashboard_tour_send_deleted_client_race_never_recreates_client(self):
+        outbox_ref = FakeDocRef("outbox-tour-deleted-client-race")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        client_key = "users/uid-1/clients/client-1"
+        thread_key = "users/uid-1/threads/thread-1"
+        fake_fs.snapshots[client_key] = FakeSnapshot({"status": "live"})
+        _seed_tour_notification(fake_fs)
+        data = {
+            **self._dashboard_manual_reply_doc().to_dict(),
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }
+        outbox_ref._data.update(data)
+
+        with patch("email_automation.clients._fs", fake_fs):
+            resolution = email_module._reserve_dashboard_tour_action_resolution(
+                "uid-1",
+                outbox_ref,
+                data,
+            )
+            self.assertEqual("reserved", resolution["status"])
+            fake_fs.snapshots[client_key] = FakeSnapshot({}, exists=False)
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {**data, "tourActionResolution": resolution["marker"]},
+                send_result={
+                    "sent": ["bp21harrison@gmail.com"],
+                    "sentMessageIds": {
+                        "bp21harrison@gmail.com": "graph-deleted-client-race-1",
+                    },
+                },
+                dashboard_tour_resolution=resolution,
+            )
+
+        thread = fake_fs.snapshots[thread_key].to_dict()
+        self.assertEqual("paused", thread["status"])
+        self.assertNotIn("tourStatus", thread)
+        self.assertFalse(fake_fs.snapshots[client_key].exists)
+
+    def test_dashboard_tour_send_preserves_nested_terminal_invite_race(self):
+        outbox_ref = FakeDocRef("outbox-tour-nested-terminal-race")
+        fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
+        thread_key = "users/uid-1/threads/thread-1"
+        _seed_tour_notification(fake_fs)
+        data = {
+            **self._dashboard_manual_reply_doc().to_dict(),
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+        }
+        outbox_ref._data.update(data)
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"):
+            resolution = email_module._reserve_dashboard_tour_action_resolution(
+                "uid-1",
+                outbox_ref,
+                data,
+            )
+            fake_fs.snapshots[thread_key] = FakeSnapshot({
+                "clientId": "client-1",
+                "status": "paused",
+                "followUpStatus": "paused",
+                "rowNumber": 20,
+                "source": "dashboard_new_campaign",
+                "actionType": "campaign_creation",
+                "tourInvite": {"status": "confirmed", "confirmedAt": "later"},
+            })
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                data,
+                send_result={
+                    "sent": ["bp21harrison@gmail.com"],
+                    "sentMessageIds": {
+                        "bp21harrison@gmail.com": "graph-nested-terminal-race-1",
+                    },
+                },
+                dashboard_tour_resolution=resolution,
+            )
+
+        thread = fake_fs.snapshots[thread_key].to_dict()
+        self.assertEqual("paused", thread["status"])
+        self.assertEqual("paused", thread["followUpStatus"])
+        self.assertNotIn("tourStatus", thread)
+        self.assertEqual("confirmed", thread["tourInvite"]["status"])
+        self.assertEqual("later", thread["tourInvite"]["confirmedAt"])
+
+    def test_core_dashboard_tour_bridge_does_not_expand_planner_predicate(self):
+        self.assertFalse(email_module._is_tour_invite_outbox({
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "actionReason": "tour_requested",
+        }))
+        self.assertTrue(email_module._is_tour_invite_outbox({
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+        }))
 
     def test_dashboard_manual_reply_preserves_reviewed_reply_all_ccs_in_audit_and_history(self):
         doc = self._dashboard_manual_reply_doc({

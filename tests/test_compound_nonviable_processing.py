@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 with patch("google.cloud.firestore.Client", return_value=MagicMock()):
-    from email_automation import ai_processing, campaign_safety, processing
+    from email_automation import ai_processing, campaign_safety, email as email_module, processing
 
 
 class FakeSnapshot:
@@ -22,8 +22,9 @@ class FakeDocumentRef:
         self._data = data or {}
         self._exists = exists
         self._update_error = update_error
+        self._collections = {}
 
-    def get(self):
+    def get(self, transaction=None):
         return FakeSnapshot(self._data, self._exists)
 
     def set(self, data, merge=False):
@@ -31,11 +32,21 @@ class FakeDocumentRef:
             self._data.update(data)
         else:
             self._data = dict(data)
+        self._exists = True
 
     def update(self, data):
         if self._update_error:
             raise self._update_error
         self._data.update(data)
+
+    def delete(self):
+        self._exists = False
+
+    def collection(self, name):
+        return self._collections.get(
+            name,
+            FakeCollection(FakeDocumentRef({}, exists=False)),
+        )
 
 
 class FakeQuerySnapshot(FakeSnapshot):
@@ -66,6 +77,11 @@ class FakeUserRef:
             return FakeCollection(self.thread_ref, docs=self.thread_docs)
         if name == "clients":
             return FakeCollection(self.client_ref)
+        if name == "actionResolutions":
+            return self.client_ref._collections.get(
+                "actionResolutions",
+                FakeCollection(FakeDocumentRef({}, exists=False)),
+            )
         return FakeCollection(FakeDocumentRef({}, exists=False))
 
 
@@ -102,6 +118,39 @@ class FakeWriteBatch:
             document_ref.update(data)
 
 
+class FakeTransaction:
+    def __init__(self):
+        self._max_attempts = 1
+        self._read_only = False
+        self._id = b"fake-transaction"
+
+    def _clean_up(self):
+        return None
+
+    def _begin(self, retry_id=None):
+        self._id = retry_id or b"fake-transaction"
+
+    def _commit(self):
+        return None
+
+    def _rollback(self):
+        return None
+
+    def set(self, ref, data, merge=False):
+        ref.set(data, merge=merge)
+
+    def create(self, ref, data):
+        if ref.get().exists:
+            raise AssertionError("document already exists")
+        ref.set(data)
+
+    def update(self, ref, data):
+        ref.update(data)
+
+    def delete(self, ref):
+        ref.delete()
+
+
 class FakeFirestore:
     def __init__(self, thread_ref, client_ref, thread_docs=None):
         self.thread_ref = thread_ref
@@ -124,6 +173,9 @@ class FakeFirestore:
 
     def batch(self):
         return FakeWriteBatch()
+
+    def transaction(self):
+        return FakeTransaction()
 
 
 class CompoundNonviableProcessingTests(unittest.TestCase):
@@ -1458,6 +1510,154 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         self.assertTrue(any(
             key.startswith("tour_requested:confirmed:")
             for key in thread_ref._data["handledEvents"]
+        ))
+
+    def test_dashboard_tour_action_handoff_closes_exact_final_confirmation(self):
+        thread_id = "thread-production-dashboard-tour-handoff"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["paused"],
+            "followUpStatus": "paused",
+            "rowNumber": 3,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "handledEvents": {
+                "tour_requested": {
+                    "detectedInMessageId": "msg-full-date-offer",
+                    "notificationId": "notification-tour-1",
+                },
+            },
+        })
+        notification_ref = FakeDocumentRef({
+            "kind": "action_needed",
+            "email": "bp21harrison@gmail.com",
+            "threadId": thread_id,
+            "meta": {
+                "reason": "tour_requested",
+                "replyToMessageId": "msg-full-date-offer",
+            },
+        })
+        client_ref = FakeDocumentRef({"status": "live"})
+        client_ref._collections["notifications"] = FakeCollection(
+            notification_ref,
+            docs={"notification-tour-1": notification_ref},
+        )
+        action_resolution_ref = FakeDocumentRef({}, exists=False)
+        client_ref._collections["actionResolutions"] = FakeCollection(
+            action_resolution_ref,
+            docs={"notification-tour-1": action_resolution_ref},
+        )
+        outbox_ref = FakeDocumentRef()
+        outbox_ref.id = "outbox-dashboard-tour-reply"
+        user_id = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
+        outbox_data = {
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "clientId": "client-1",
+            "notificationClientId": "client-1",
+            "notificationId": "notification-tour-1",
+            "deleteNotificationOnSend": True,
+            "resumeThreadOnSend": True,
+            "threadId": thread_id,
+            "replyToMessageId": "msg-full-date-offer",
+            "actionAuditId": "audit-dashboard-tour-reply",
+            "actionReason": "tour_requested",
+            "source": "dashboard_inline_reply",
+            "actionType": "reply",
+            "processingBy": email_module.WORKER_ID,
+        }
+        outbox_ref._data.update(outbox_data)
+        fake_fs = FakeFirestore(
+            thread_ref,
+            client_ref,
+            thread_docs={thread_id: thread_ref},
+        )
+
+        with patch(
+            "email_automation.clients._fs",
+            fake_fs,
+        ), patch.object(
+            email_module,
+            "delete_notification_and_decrement_counters",
+        ), patch.object(
+            email_module,
+            "_get_sheet_id_or_fail",
+            return_value="sheet-1",
+        ), patch.object(email_module, "highlight_row"):
+            resolution = email_module._reserve_dashboard_tour_action_resolution(
+                user_id,
+                outbox_ref,
+                outbox_data,
+            )
+            self.assertEqual("reserved", resolution["status"])
+            email_module._finalize_successful_outbox_item(
+                user_id,
+                outbox_ref,
+                outbox_data,
+                row_number=3,
+                client_id="client-1",
+                send_result={
+                    "sent": ["bp21harrison@gmail.com"],
+                    "sentMessageIds": {
+                        "bp21harrison@gmail.com": "graph-dashboard-tour-reply",
+                    },
+                    "internetMessageIds": {
+                        "bp21harrison@gmail.com": "<graph-dashboard-tour-reply@example.com>",
+                    },
+                    "conversationIds": {
+                        "bp21harrison@gmail.com": "conv-dashboard-tour",
+                    },
+                },
+                dashboard_tour_resolution=resolution,
+            )
+
+        final_body = (
+            "Tuesday, August 11 at 2:00 PM works. I'll meet you at the front "
+            "entrance. Confirmed. Let me know if you need directions for the tour."
+        )
+        final_proposal = ai_processing._augment_events_with_deterministic_signals(
+            {
+                "updates": [],
+                "events": [{
+                    "type": "tour_requested",
+                    "reason": "tour_slot_reply",
+                    "question": final_body,
+                    "suggestedEmail": "",
+                }],
+                "response_email": None,
+            },
+            [{"direction": "inbound", "content": final_body}],
+            target_anchor="912-930 Gemini St",
+        )
+        result = self._run_tour_invite_reply_processing(
+            user_id=user_id,
+            thread_id=thread_id,
+            body=final_body,
+            proposal=final_proposal,
+            thread_ref=thread_ref,
+            msg_id="msg-exact-final-tour-confirmation",
+            internet_message_id="<exact-final-tour-confirmation@mock.test>",
+            persist_handled_events=True,
+            missing_required_fields=[],
+        )
+
+        self.assertEqual([], result["notifications"])
+        result["sendReply"].assert_not_called()
+        result["completeThreads"].assert_called_once_with(
+            user_id,
+            3,
+            client_id="client-1",
+            reason="tour_confirmed",
+        )
+        self.assertTrue(any(
+            update["status"] == processing.THREAD_STATUS["completed"]
+            and update["reason"] == "tour_confirmed"
+            for update in result["statusUpdates"]
+        ))
+        self.assertEqual("confirmed", thread_ref._data["tourStatus"])
+        self.assertEqual(1, len(result["handledEvents"]))
+        self.assertTrue(result["handledEvents"][0]["eventKey"].startswith(
+            "tour_requested:confirmed:"
         ))
 
     def test_reviewed_tour_invite_reschedule_survives_persisted_offer_dedupe(self):
