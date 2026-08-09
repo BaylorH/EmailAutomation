@@ -3624,6 +3624,333 @@ class DailySendCapTests(unittest.TestCase):
             }, doc_id="outbox-2"),
         ]
 
+    def _same_recipient_docs(self, count):
+        return [
+            FakeDoc({
+                "assignedEmails": ["broker@example.invalid"],
+                "script": f"Hi Broker, property {index}",
+                "clientId": "client-1",
+                "subject": f"{100 + index} Cap Way",
+                "rowNumber": 3 + index,
+            }, doc_id=f"outbox-batch-{index}")
+            for index in range(count)
+        ]
+
+    def _direct_multi_recipient_doc(self):
+        return FakeDoc({
+            "assignedEmails": [
+                "first-broker@example.invalid",
+                "second-broker@example.invalid",
+            ],
+            "script": "Hi Broker, can you share the property details?",
+            "scriptSelectionMode": "exact",
+            "clientId": "client-1",
+            "subject": "100 Direct Cap Way",
+            "rowNumber": 3,
+        }, doc_id="outbox-direct-multi-recipient")
+
+    def _combined_docs(self, count=3):
+        docs = self._same_recipient_docs(count)
+        for doc in docs:
+            doc._data["sendMode"] = "combined"
+        return docs
+
+    def _run_provider_send_cap_case(self, docs, *, scope, current, cap=20):
+        day_key = email_module._send_counter_day_key()
+        health_sink = []
+        fake_fs = FakeFirestoreWithOutbox(
+            docs,
+            counter_store={day_key: current} if scope == "user" else {},
+            health_sink=health_sink,
+        )
+        env = {
+            "SITESIFT_DAILY_SEND_CAP": str(cap) if scope == "user" else "0",
+            "SITESIFT_GLOBAL_DAILY_SEND_CAP": str(cap) if scope == "global" else "0",
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, env))
+            stack.enter_context(patch("email_automation.clients._fs", fake_fs))
+            if scope == "global":
+                stack.enter_context(patch.object(
+                    email_module,
+                    "_read_global_send_count",
+                    return_value=current,
+                ))
+            single_send = stack.enter_context(
+                patch.object(email_module, "_send_single_outbox_item")
+            )
+            separate_send = stack.enter_context(
+                patch.object(email_module, "_send_multi_property_email")
+            )
+            combined_send = stack.enter_context(
+                patch.object(email_module, "_send_combined_property_email")
+            )
+            increment_user = stack.enter_context(
+                patch.object(email_module, "_increment_daily_send_count")
+            )
+            increment_global = stack.enter_context(
+                patch.object(email_module, "_increment_global_send_count")
+            )
+            stack.enter_context(patch.object(email_module.time, "sleep", return_value=None))
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        return {
+            "day_key": day_key,
+            "fake_fs": fake_fs,
+            "health_sink": health_sink,
+            "single_send": single_send,
+            "separate_send": separate_send,
+            "combined_send": combined_send,
+            "increment_user": increment_user,
+            "increment_global": increment_global,
+        }
+
+    def test_direct_multi_recipient_overflow_blocks_user_and_global_caps(self):
+        for scope in ("user", "global"):
+            with self.subTest(scope=scope):
+                doc = self._direct_multi_recipient_doc()
+                result = self._run_provider_send_cap_case(
+                    [doc],
+                    scope=scope,
+                    current=19,
+                )
+
+                result["single_send"].assert_not_called()
+                result["increment_user"].assert_not_called()
+                result["increment_global"].assert_not_called()
+                self.assertFalse(doc.reference.deleted)
+                self.assertEqual(len(result["health_sink"]), 1)
+                self.assertEqual(
+                    result["health_sink"][0][0]["sendCap"]["reason"],
+                    email_module.DAILY_CAP_REACHED_REASON,
+                )
+
+    def test_direct_multi_recipient_exact_fill_counts_two_provider_sends(self):
+        for scope in ("user", "global"):
+            with self.subTest(scope=scope):
+                result = self._run_provider_send_cap_case(
+                    [self._direct_multi_recipient_doc()],
+                    scope=scope,
+                    current=18,
+                )
+
+                result["single_send"].assert_called_once()
+                expected_increment = (
+                    result["increment_user"]
+                    if scope == "user"
+                    else result["increment_global"]
+                )
+                expected_args = (
+                    (result["fake_fs"], "uid-1", result["day_key"], 2)
+                    if scope == "user"
+                    else (result["fake_fs"], result["day_key"], 2)
+                )
+                expected_increment.assert_called_once_with(*expected_args)
+                self.assertEqual(result["health_sink"], [])
+
+    def test_combined_mode_exact_fill_counts_one_provider_send(self):
+        for scope in ("user", "global"):
+            with self.subTest(scope=scope):
+                result = self._run_provider_send_cap_case(
+                    self._combined_docs(),
+                    scope=scope,
+                    current=19,
+                )
+
+                result["combined_send"].assert_called_once()
+                result["separate_send"].assert_not_called()
+                expected_increment = (
+                    result["increment_user"]
+                    if scope == "user"
+                    else result["increment_global"]
+                )
+                expected_args = (
+                    (result["fake_fs"], "uid-1", result["day_key"], 1)
+                    if scope == "user"
+                    else (result["fake_fs"], result["day_key"], 1)
+                )
+                expected_increment.assert_called_once_with(*expected_args)
+                self.assertEqual(result["health_sink"], [])
+
+    def test_combined_mode_overflow_blocks_user_and_global_caps(self):
+        for scope in ("user", "global"):
+            with self.subTest(scope=scope):
+                docs = self._combined_docs()
+                result = self._run_provider_send_cap_case(
+                    docs,
+                    scope=scope,
+                    current=20,
+                )
+
+                result["combined_send"].assert_not_called()
+                result["increment_user"].assert_not_called()
+                result["increment_global"].assert_not_called()
+                self.assertTrue(all(not doc.reference.deleted for doc in docs))
+                self.assertEqual(len(result["health_sink"]), 1)
+                self.assertEqual(
+                    result["health_sink"][0][0]["sendCap"]["reason"],
+                    email_module.DAILY_CAP_REACHED_REASON,
+                )
+
+    def test_user_cap_blocks_group_when_batch_would_exceed_remaining_capacity(self):
+        docs = self._same_recipient_docs(10)
+        day_key = email_module._send_counter_day_key()
+        health_sink = []
+        fake_fs = FakeFirestoreWithOutbox(
+            docs,
+            counter_store={day_key: 18},
+            health_sink=health_sink,
+        )
+
+        with patch.dict(os.environ, {
+            "SITESIFT_DAILY_SEND_CAP": "20",
+            "SITESIFT_GLOBAL_DAILY_SEND_CAP": "0",
+        }), patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_multi_property_email") as grouped_send, \
+             patch.object(email_module, "_send_single_outbox_item") as single_send, \
+             patch.object(email_module, "_increment_daily_send_count") as increment, \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        grouped_send.assert_not_called()
+        single_send.assert_not_called()
+        increment.assert_not_called()
+        self.assertTrue(all(not doc.reference.deleted for doc in docs))
+        self.assertEqual(fake_fs.counter_store[day_key], 18)
+        self.assertEqual(len(health_sink), 1)
+        self.assertEqual(health_sink[0][0]["sendCap"]["status"], "warning")
+        self.assertEqual(
+            health_sink[0][0]["sendCap"]["reason"],
+            email_module.DAILY_CAP_REACHED_REASON,
+        )
+        self.assertEqual(health_sink[0][0]["sendCap"]["count"], 18)
+
+    def test_user_cap_allows_group_that_exactly_fills_remaining_capacity(self):
+        docs = self._same_recipient_docs(2)
+        day_key = email_module._send_counter_day_key()
+        health_sink = []
+        fake_fs = FakeFirestoreWithOutbox(
+            docs,
+            counter_store={day_key: 18},
+            health_sink=health_sink,
+        )
+
+        with patch.dict(os.environ, {
+            "SITESIFT_DAILY_SEND_CAP": "20",
+            "SITESIFT_GLOBAL_DAILY_SEND_CAP": "0",
+        }), patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_multi_property_email") as grouped_send, \
+             patch.object(email_module, "_increment_daily_send_count") as increment, \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        grouped_send.assert_called_once()
+        increment.assert_called_once_with(fake_fs, "uid-1", day_key, 2)
+        self.assertEqual(health_sink, [])
+
+    def test_global_cap_blocks_group_when_batch_would_exceed_remaining_capacity(self):
+        docs = self._same_recipient_docs(3)
+        day_key = email_module._send_counter_day_key()
+        health_sink = []
+        fake_fs = FakeFirestoreWithOutbox(docs, health_sink=health_sink)
+
+        with patch.dict(os.environ, {
+            "SITESIFT_DAILY_SEND_CAP": "0",
+            "SITESIFT_GLOBAL_DAILY_SEND_CAP": "20",
+        }), patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_read_global_send_count", return_value=18), \
+             patch.object(email_module, "_send_multi_property_email") as grouped_send, \
+             patch.object(email_module, "_send_single_outbox_item") as single_send, \
+             patch.object(email_module, "_increment_global_send_count") as increment, \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        grouped_send.assert_not_called()
+        single_send.assert_not_called()
+        increment.assert_not_called()
+        self.assertTrue(all(not doc.reference.deleted for doc in docs))
+        self.assertEqual(len(health_sink), 1)
+        self.assertEqual(health_sink[0][0]["sendCap"]["status"], "warning")
+        self.assertEqual(
+            health_sink[0][0]["sendCap"]["reason"],
+            email_module.DAILY_CAP_REACHED_REASON,
+        )
+        self.assertEqual(health_sink[0][0]["sendCap"]["count"], 18)
+        self.assertEqual(health_sink[0][0]["sendCap"]["scope"], "global")
+
+    def test_global_cap_allows_group_that_exactly_fills_remaining_capacity(self):
+        docs = self._same_recipient_docs(2)
+        day_key = email_module._send_counter_day_key()
+        health_sink = []
+        fake_fs = FakeFirestoreWithOutbox(docs, health_sink=health_sink)
+
+        with patch.dict(os.environ, {
+            "SITESIFT_DAILY_SEND_CAP": "0",
+            "SITESIFT_GLOBAL_DAILY_SEND_CAP": "20",
+        }), patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_read_global_send_count", return_value=18), \
+             patch.object(email_module, "_send_multi_property_email") as grouped_send, \
+             patch.object(email_module, "_increment_global_send_count") as increment, \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        grouped_send.assert_called_once()
+        increment.assert_called_once_with(fake_fs, day_key, 2)
+        self.assertEqual(health_sink, [])
+
+    def test_pending_finalization_repairs_at_cap_without_graph_or_counter_access(self):
+        day_key = email_module._send_counter_day_key()
+        doc = FakeDoc({
+            "assignedEmails": ["broker@example.invalid"],
+            "clientId": "client-1",
+            "rowNumber": 3,
+            "notificationId": "notification-1",
+            "status": email_module.DASHBOARD_TOUR_PENDING_STATUS,
+            "alreadySent": True,
+            "pendingSendResult": {
+                "sent": ["broker@example.invalid"],
+                "sentMessageIds": {"broker@example.invalid": "graph-message-1"},
+            },
+            "tourActionResolution": {
+                "kind": email_module.DASHBOARD_TOUR_RESOLUTION_KIND,
+                "notificationId": "notification-1",
+            },
+        }, doc_id="outbox-pending-finalization")
+        fake_fs = FakeFirestoreWithOutbox(
+            [doc],
+            counter_store={day_key: 20},
+        )
+
+        def finalize(_uid, doc_ref, *_args, **_kwargs):
+            doc_ref.delete()
+
+        with patch.dict(os.environ, {
+            "SITESIFT_DAILY_SEND_CAP": "20",
+            "SITESIFT_GLOBAL_DAILY_SEND_CAP": "20",
+        }), patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_current_outbox_data", return_value=doc.to_dict()), \
+             patch.object(email_module, "_finalize_successful_outbox_item", side_effect=finalize) as finalizer, \
+             patch.object(email_module, "_read_daily_send_count") as read_user_count, \
+             patch.object(email_module, "_read_global_send_count") as read_global_count, \
+             patch.object(email_module, "_increment_daily_send_count") as increment_user, \
+             patch.object(email_module, "_increment_global_send_count") as increment_global, \
+             patch.object(email_module, "resolve_outbound_mode") as outbound_mode, \
+             patch.object(email_module, "_send_outbox_as_reply") as graph_reply, \
+             patch.object(email_module, "send_and_index_email") as graph_send:
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        finalizer.assert_called_once()
+        self.assertTrue(doc.reference.deleted)
+        read_user_count.assert_not_called()
+        read_global_count.assert_not_called()
+        increment_user.assert_not_called()
+        increment_global.assert_not_called()
+        outbound_mode.assert_not_called()
+        graph_reply.assert_not_called()
+        graph_send.assert_not_called()
+
     def test_send_is_suppressed_and_queue_retained_when_daily_cap_reached(self):
         """The cap+1 send must be blocked and the outbox retained, not drained."""
         docs = self._two_recipient_docs()

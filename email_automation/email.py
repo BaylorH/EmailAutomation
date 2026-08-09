@@ -2692,6 +2692,23 @@ def _must_process_outbox_item_individually(data: Dict[str, Any]) -> bool:
     )
 
 
+def _outbox_group_provider_send_plan(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the existing dispatch mode and its planned provider-send count."""
+    if len(items) > 1:
+        send_mode = (items[0].get("data") or {}).get("sendMode") or "separate"
+        return {
+            "mode": send_mode,
+            "send_count": 1 if send_mode == "combined" else len(items),
+        }
+
+    data = (items[0].get("data") or {}) if items else {}
+    assigned_emails = data.get("assignedEmails") or []
+    return {
+        "mode": "single",
+        "send_count": len(assigned_emails),
+    }
+
+
 def _order_outbox_docs(docs: List[Any]) -> List[Any]:
     """Deterministically order same-timestamp campaign launches by sheet row."""
     def sort_key(doc):
@@ -3745,7 +3762,8 @@ def send_outboxes(
         # workers / processes) is bounded, not just a single drain. If the
         # counter cannot be read we STOP draining and retain the queue — a
         # transient store blip must never open the floodgates (fail-closed).
-        send_count = len(valid_items)
+        send_plan = _outbox_group_provider_send_plan(valid_items)
+        send_count = send_plan["send_count"]
         if daily_cap is not None:
             try:
                 current = _read_daily_send_count(_fs, user_id, cap_day_key)
@@ -3760,10 +3778,11 @@ def send_outboxes(
                     cap=daily_cap, count=None, day_key=cap_day_key,
                 )
                 return operation_states
-            if current >= daily_cap:
+            if current + send_count > daily_cap:
                 print(
-                    f"🛑 Daily send cap reached for {user_id} "
-                    f"({current}/{daily_cap}) — retaining outbox for next cycle."
+                    f"🛑 Daily send cap would be exceeded for {user_id} "
+                    f"({current} + {send_count} > {daily_cap}) — "
+                    "retaining outbox for next cycle."
                 )
                 _record_send_cap_health(
                     _fs, user_id, status="warning",
@@ -3786,10 +3805,11 @@ def send_outboxes(
                     cap=global_cap, count=None, day_key=cap_day_key, scope="global",
                 )
                 return operation_states
-            if current_global >= global_cap:
+            if current_global + send_count > global_cap:
                 print(
-                    "🛑 Global daily send cap reached "
-                    f"({current_global}/{global_cap}) — retaining outbox for next cycle."
+                    "🛑 Global daily send cap would be exceeded "
+                    f"({current_global} + {send_count} > {global_cap}) — "
+                    "retaining outbox for next cycle."
                 )
                 _record_send_cap_health(
                     _fs, user_id, status="warning",
@@ -3805,7 +3825,7 @@ def send_outboxes(
             # or 'combined' (one email covering ALL of this broker's properties).
             # Absent / any non-'combined' value → separate, so queued items and
             # older frontends stay byte-identical to today's behavior.
-            send_mode = (valid_items[0].get('data') or {}).get('sendMode') or 'separate'
+            send_mode = send_plan["mode"]
             if send_mode == 'combined':
                 print(f"🔗 Detected {len(valid_items)} properties for same broker (COMBINED mode): {recipient_email}")
                 _send_combined_property_email(
