@@ -3172,6 +3172,12 @@ _RENT_NUMERIC_VALUE_RE = re.compile(
     r"(?:(?:/|per\s+)?\s*(?:sf|psf|sq\.?\s*ft|square\s+foot)|a\s+foot)",
     re.IGNORECASE,
 )
+_AMBIGUOUS_FACT_CUE_RE = re.compile(
+    r"\b(?:old|outdated|obsolete|superseded|former|prior|previous|historical|"
+    r"corrected?|correction|revised|updated|instead)\b|"
+    r"\b(?:was|were)\b[^\d$]{0,32}\$?\d[\s\S]{0,160}\bnow\b[^\d$]{0,32}\$?\d|"
+    r"\b(?:isn't|wasn't|aren't|weren't|not)\b\s*(?:(?:about|approximately|roughly|"
+    r"around|exactly|actually|currently)\s+)?\$?\d", re.IGNORECASE)
 
 
 def _normalized_numeric_value(value: Any) -> Optional[Decimal]:
@@ -4571,7 +4577,11 @@ def _augment_proposal_with_deterministic_extractions(
     rent_col = mappings.get("rent_sf_yr") or _find_header_name(header, "Rent/SF /Yr")
     opex_col = mappings.get("ops_ex_sf") or _find_header_name(header, "Ops Ex /SF")
     total_sf_col = mappings.get("total_sf") or _find_header_name(header, "Total SF")
+    event_types = {
+        (event or {}).get("type") for event in (proposal.get("events") or [])
+    }
 
+    has_ambiguous_fact_cue = bool(_AMBIGUOUS_FACT_CUE_RE.search(fresh_text))
     fresh_rent = _extract_rent_sf_yr_from_text(fresh_text)
     trusted_pdf_rents = []
     competing_pdf_rents = set()
@@ -4584,7 +4594,9 @@ def _augment_proposal_with_deterministic_extractions(
         if not pdf_rent:
             continue
         normalized_pdf_rent = _normalized_rent_value(pdf_rent)
-        if _attachment_can_supply_target_rent(pdf_source, target_anchor, fresh_text):
+        if not has_ambiguous_fact_cue and _attachment_can_supply_target_rent(
+            pdf_source, target_anchor, fresh_text
+        ):
             trusted_pdf_rents.append(pdf_rent)
         elif (
             _attachment_property_verdict(pdf_source, target_anchor) in {"competing", "mixed"}
@@ -4601,7 +4613,7 @@ def _augment_proposal_with_deterministic_extractions(
         ))
         pdf_total_sf = _extract_total_sf_from_text((pdf or {}).get("text") or "")
         normalized_pdf_total_sf = _normalized_numeric_value(pdf_total_sf)
-        if pdf_total_sf and _attachment_can_supply_target_facts(
+        if not has_ambiguous_fact_cue and pdf_total_sf and _attachment_can_supply_target_facts(
             pdf_source, target_anchor, fresh_text
         ):
             trusted_pdf_total_sfs.append(pdf_total_sf)
@@ -4615,6 +4627,7 @@ def _augment_proposal_with_deterministic_extractions(
     # terminal/new-property proposal must not carry an unsafe current-row write.
     existing_rent = _proposal_update_for_column(proposal, rent_col) if rent_col else None
     if existing_rent:
+        model_owned_rent = bool(str(existing_rent.get("value") or "").strip()) and not event_types & {"new_property", "property_unavailable"}
         proposed_rent = _normalized_rent_value(existing_rent.get("value"))
         trusted_rents = {
             normalized
@@ -4632,7 +4645,7 @@ def _augment_proposal_with_deterministic_extractions(
             for value in (raw_value, annualized_value)
         }
         if (
-            (trusted_rents and proposed_rent not in trusted_rents)
+            (not model_owned_rent and trusted_rents and proposed_rent not in trusted_rents)
             or (
                 proposed_rent in competing_pdf_rents
                 and proposed_rent not in trusted_rents
@@ -4661,6 +4674,7 @@ def _augment_proposal_with_deterministic_extractions(
         _proposal_update_for_column(proposal, total_sf_col) if total_sf_col else None
     )
     if existing_total_sf:
+        model_owned_total_sf = bool(str(existing_total_sf.get("value") or "").strip()) and not event_types & {"new_property", "property_unavailable"}
         proposed_total_sf = _normalized_numeric_value(existing_total_sf.get("value"))
         normalized_total_sf = _normalized_numeric_value(total_sf_value)
         trusted_total_sfs = {
@@ -4674,7 +4688,7 @@ def _augment_proposal_with_deterministic_extractions(
             )
             if normalized is not None
         }
-        if trusted_total_sfs and proposed_total_sf not in trusted_total_sfs:
+        if not model_owned_total_sf and trusted_total_sfs and proposed_total_sf not in trusted_total_sfs:
             _remove_proposal_update(proposal, total_sf_col)
         elif (
             proposed_total_sf in competing_pdf_total_sfs
@@ -4684,6 +4698,7 @@ def _augment_proposal_with_deterministic_extractions(
         elif (
             proposed_total_sf in _component_sf_values(fresh_text)
             and proposed_total_sf != normalized_total_sf
+            and (not model_owned_total_sf or normalized_total_sf is None)
         ):
             _remove_proposal_update(proposal, total_sf_col)
 
@@ -4696,9 +4711,6 @@ def _augment_proposal_with_deterministic_extractions(
 
     # LIVE break (900 Alt Suggest St): when the reply kills the current row or
     # pitches an alternate property, do not mine fallback specs into this row.
-    event_types = {
-        (event or {}).get("type") for event in (proposal.get("events") or [])
-    }
     if event_types & {"new_property", "property_unavailable"}:
         return proposal
 
@@ -4714,13 +4726,22 @@ def _augment_proposal_with_deterministic_extractions(
         update = {"column": col_name, "value": value, "confidence": 0.92, "reason": reason}
         existing = _proposal_update_for_column(proposal, col_name)
         if existing:
+            rent_header = _find_header_name(header, rent_col)
+            protected = col_name in {rent_header, _find_header_name(header, total_sf_col)}
+            normalize = _normalized_rent_value if col_name == rent_header else _normalized_numeric_value
+            if protected and normalize(existing.get("value")) != normalize(value) and not (
+                col_name == rent_header
+                and normalize(existing.get("value")) is not None
+                and normalize(value) == normalize(existing.get("value")) * 12
+            ):
+                return
             if str(existing.get("value") or "").strip() != value:
                 existing.clear()
                 existing.update(update)
             return
         proposal.setdefault("updates", []).append(update)
 
-    rent_value = fresh_rent
+    rent_value = None if has_ambiguous_fact_cue else fresh_rent
     if not rent_value and trusted_pdf_rents:
         # FIX-16 (M35, HEAD): the accept-new-property path passes rent only inside
         # the PDF manifest text (the inbound body is a synthetic stub), so scan the
@@ -4739,7 +4760,7 @@ def _augment_proposal_with_deterministic_extractions(
     )
     _fill(
         total_sf_col,
-        total_sf_value,
+        None if has_ambiguous_fact_cue else total_sf_value,
         "Deterministic fallback parsed total square footage from the latest broker message.",
     )
     _fill(
