@@ -362,6 +362,8 @@ def _queue_response_retry_or_reconciliation(
     client_id: Optional[str] = None,
     *,
     source_context: str = "autoResponse",
+    terminal_reason: Optional[str] = None,
+    terminal_row_number: Optional[int] = None,
 ) -> str:
     """Queue a retry only when Graph did not already accept the reply."""
     send_outcome = _get_reply_send_outcome()
@@ -380,6 +382,9 @@ def _queue_response_retry_or_reconciliation(
         print("⏭️ Reply recipient opted out; no retry was queued")
         return "recipient_suppressed"
     if sent_but_unindexed:
+        _restore_deferred_terminal_reply(user_id, thread_id,
+            {"status": "completed", "reason": terminal_reason, "rowNumber": terminal_row_number} if terminal_reason else None,
+            client_id)
         record_sent_unindexed_response(
             user_id,
             thread_id,
@@ -404,6 +409,8 @@ def _queue_response_retry_or_reconciliation(
         subject=send_outcome.subject,
         conversation_id=send_outcome.conversation_id,
         last_send_attempt_at=send_outcome.send_attempt_at,
+        terminal_reason=terminal_reason,
+        terminal_row_number=terminal_row_number,
     )
     return "queued_retry"
 
@@ -417,8 +424,12 @@ def _handle_auto_response_send_failure(
     client_id: Optional[str] = None,
     *,
     failure_label: str = "automatic response",
+    terminal_reason: Optional[str] = None,
+    terminal_row_number: Optional[int] = None,
 ) -> bool:
     print(f"❌ Failed to send {failure_label}")
+    if terminal_reason and str(_get_reply_send_outcome().outcome or "").startswith("blocked_daily_"):
+        update_thread_status(user_id, thread_id, THREAD_STATUS["active"], "daily_send_cap_deferred")
     outcome = _queue_response_retry_or_reconciliation(
         user_id,
         thread_id,
@@ -426,9 +437,33 @@ def _handle_auto_response_send_failure(
         recipient,
         response_body,
         client_id,
+        terminal_reason=terminal_reason,
+        terminal_row_number=terminal_row_number,
     )
     return outcome in {"sent_unindexed", "recipient_suppressed"}
 
+
+def _complete_client_after_deferred_reply(user_id: str, client_id: str) -> bool:
+    """Complete only after a closing reply reaches a terminal send outcome."""
+    outcome = _get_reply_send_outcome()
+    if outcome.campaign_suppression_kind == "terminal" or str(outcome.outcome or "").startswith("blocked_daily_"):
+        print("⏹️ Closing reply remains unresolved; completion update skipped")
+        return False
+    return _maybe_mark_client_completed(user_id, client_id)
+
+
+def _restore_deferred_terminal_reply(user_id: str, thread_id: str, disposition: Optional[Dict[str, Any]], client_id: Optional[str]) -> None:
+    """Restore terminal state only after the deferred closing reply is delivered."""
+    if not disposition:
+        return
+    (_fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
+        "status": disposition.get("status") or THREAD_STATUS["completed"], "statusReason": disposition.get("reason") or "all_fields_gathered",
+        "statusUpdatedAt": SERVER_TIMESTAMP, "updatedAt": SERVER_TIMESTAMP,
+        "followUpStatus": "stopped", "followUpConfig.processingBy": None,
+        "followUpConfig.processingAt": None,
+    }))
+    _clear_thread_action_notifications(user_id, client_id, thread_id, strict=True)
+    complete_threads_for_row(user_id, disposition["rowNumber"], client_id=client_id, reason=disposition["reason"], strict=True)
 
 def _parse_graph_datetime(value: str) -> Optional[datetime]:
     if not value:
@@ -1816,6 +1851,7 @@ def _clear_thread_action_notifications(
     thread_id: str,
     *,
     notifications_ref=None,
+    strict: bool = False,
 ) -> int:
     if not client_id or not thread_id:
         return 0
@@ -1846,6 +1882,8 @@ def _clear_thread_action_notifications(
         return deleted
     except Exception as e:
         print(f"⚠️ Could not clear stale action notifications for completed thread: {e}")
+        if strict:
+            raise
         return 0
 
 
@@ -4884,9 +4922,11 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
         from .clients import _fs
         from .email import (
+            _check_single_provider_send_cap,
             _delete_graph_reply_draft,
             _filter_reply_all_draft_recipients,
             _hydrate_reply_all_draft_recipients,
+            _refund_single_provider_send,
             _reviewed_recipient_reply_all_fallback,
             _source_message_reply_all_fallback,
         )
@@ -5081,19 +5121,51 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             return False
 
+        cap_context = _check_single_provider_send_cap(_fs, user_id)
+        if not cap_context["allowed"]:
+            _set_reply_send_outcome(
+                error=cap_context["error"],
+                outcome=f"blocked_{cap_context['reason']}",
+                campaign_suppression_kind="maintenance",
+            )
+            print(f"   🛑 Blocked automatic reply: {cap_context['error']}")
+            if not _delete_graph_reply_draft(headers, reply_draft_id, base=base):
+                _set_reply_send_outcome(error=f"{cap_context['error']}; cap-blocked draft cleanup failed")
+            return False
+
         reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
         _set_reply_send_outcome(send_attempt_at=reply_sent_after)
-        resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-            max_retries=1,
-            operation="graph_send",
+        try:
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
+                max_retries=1,
+                operation="graph_send",
+            )
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is None:
+                raise
+            resp = exc.response
+        status_code = getattr(resp, "status_code", None)
+        reply_sent_successfully = (
+            isinstance(status_code, int) and 200 <= status_code < 300
         )
-        reply_sent_successfully = resp and resp.status_code in [200, 202]
         if reply_sent_successfully:
             print(f"   ✅ Sent reply via createReplyAll draft")
 
         if not reply_sent_successfully:
-            failure_reason = f"Reply-all draft send failed: {resp.status_code if resp else 'no response'}"
+            definite_rejection = (
+                isinstance(status_code, int)
+                and 400 <= status_code < 500
+                and status_code not in {408, 409, 425, 429}
+            )
+            refund_error = (
+                _refund_single_provider_send(_fs, user_id, cap_context)
+                if definite_rejection
+                else None
+            )
+            failure_reason = f"Reply-all draft send failed: {status_code or 'no response'}"
+            if refund_error:
+                failure_reason = f"{failure_reason}; {refund_error}"
             _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
             print(f"   ❌ {failure_reason}")
             return False
@@ -6032,6 +6104,7 @@ def process_inbox_message(
         new_property_pending_created = False
         new_row_number = None              # track the newly created row number
         defer_client_completion_for_closing_reply = False
+        deferred_terminal_reason = None
 
         # NEW: Handle PDF attachments with enhanced extraction for current message only
         pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
@@ -7063,6 +7136,7 @@ def process_inbox_message(
 
                         # Update thread status to completed using the status system
                         update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], close_reason)
+                        deferred_terminal_reason = close_reason
                         complete_threads_for_row(
                             user_id,
                             rownum,
@@ -7794,18 +7868,15 @@ To complete the property details, could you please provide:
                             else:
                                 response_sent = _handle_auto_response_send_failure(
                                     user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
-                                    failure_label="closing email"
+                                    failure_label="closing email", terminal_reason=deferred_terminal_reason or "all_fields_gathered",
+                                    terminal_row_number=rownum,
                                 )
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")
             finally:
                 if defer_client_completion_for_closing_reply:
-                    send_outcome = _get_reply_send_outcome()
-                    if send_outcome.campaign_suppression_kind == "terminal":
-                        print("⏹️ Campaign became terminal before closing reply; completion update skipped")
-                    else:
-                        _maybe_mark_client_completed(user_id, client_id)
+                    _complete_client_after_deferred_reply(user_id, client_id)
         
         else:
             print("ℹ️ No proposal generated; nothing to apply.")

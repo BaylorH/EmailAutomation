@@ -158,6 +158,8 @@ def queue_pending_response(
     subject: Optional[str] = None,
     conversation_id: Optional[str] = None,
     last_send_attempt_at: Optional[Any] = None,
+    terminal_reason: Optional[str] = None,
+    terminal_row_number: Optional[int] = None,
 ) -> str:
     """
     Queue a failed response for later retry.
@@ -185,6 +187,8 @@ def queue_pending_response(
         doc_data["conversationId"] = conversation_id
     if last_send_attempt_at:
         doc_data["lastSendAttemptAt"] = last_send_attempt_at
+    if terminal_reason:
+        doc_data["terminalDisposition"] = {"status": "completed", "reason": terminal_reason, "rowNumber": terminal_row_number}
 
     # Use thread_id as doc ID to prevent duplicates
     doc_ref = pending_ref.document(thread_id)
@@ -309,10 +313,18 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
         recipient = data.get("recipient")
         response_body = data.get("responseBody")
         attempts = data.get("attempts", 0)
+        terminal_disposition = data.get("terminalDisposition")
 
         print(f"  → Retrying response to {recipient} (attempt {attempts + 1}/{MAX_RESPONSE_ATTEMPTS})")
 
         try:
+            if terminal_disposition and data.get("deliveryConfirmed"):
+                processing_module._restore_deferred_terminal_reply(
+                    user_id, thread_id, terminal_disposition, data.get("clientId"))
+                doc.reference.delete()
+                if data.get("clientId"):
+                    processing_module._maybe_mark_client_completed(user_id, data["clientId"])
+                continue
             campaign_decision = get_client_automation_decision(
                 user_id,
                 data.get("clientId"),
@@ -363,6 +375,9 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
                     print("    ⚠️ Sent Items retry guard failed closed; moved pending response to manual review")
                     continue
                 if sent_match:
+                    if terminal_disposition:
+                        doc.reference.update({"deliveryConfirmed": True, "updatedAt": SERVER_TIMESTAMP})
+                    processing_module._restore_deferred_terminal_reply(user_id, thread_id, terminal_disposition, data.get("clientId"))
                     record_sent_unindexed_response(
                         user_id,
                         thread_id,
@@ -415,6 +430,9 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
 
             if sent:
                 print(f"    ✅ Successfully sent pending response!")
+                if terminal_disposition:
+                    doc.reference.update({"deliveryConfirmed": True, "updatedAt": SERVER_TIMESTAMP})
+                processing_module._restore_deferred_terminal_reply(user_id, thread_id, terminal_disposition, data.get("clientId"))
                 doc.reference.delete()
                 client_id = data.get("clientId")
                 if client_id:
@@ -452,6 +470,9 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
                     )
                     continue
                 if sent_but_unindexed:
+                    if terminal_disposition:
+                        doc.reference.update({"deliveryConfirmed": True, "updatedAt": SERVER_TIMESTAMP})
+                    processing_module._restore_deferred_terminal_reply(user_id, thread_id, terminal_disposition, data.get("clientId"))
                     record_sent_unindexed_response(
                         user_id,
                         thread_id,

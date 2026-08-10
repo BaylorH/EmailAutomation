@@ -200,7 +200,11 @@ class ProcessingReplySafetyTests(unittest.TestCase):
             "bodyPreview": "Hi Avery",
         }
 
-        with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1"}), \
+        with patch.dict(os.environ, {
+                 "SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1",
+                 "SITESIFT_DAILY_SEND_CAP": "0",
+                 "SITESIFT_GLOBAL_DAILY_SEND_CAP": "0",
+             }), \
              patch.object(processing, "get_client_automation_decision", return_value=CampaignAutomationDecision(
                  state="allow", reason="", client_data={"status": "live"},
                  metadata={"terminal": False, "stopKind": "none"},

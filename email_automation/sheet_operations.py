@@ -112,6 +112,7 @@ def complete_threads_for_row(
     row_number: int,
     client_id: Optional[str] = None,
     reason: str = "row_completed",
+    strict: bool = False,
 ) -> int:
     """
     Complete active thread roots anchored to one campaign row.
@@ -154,10 +155,19 @@ def complete_threads_for_row(
 
         if updated_count > 0:
             print(f"✅ Completed {updated_count} active thread root(s) anchored to row {row_number}")
+        if strict:
+            for thread in threads_ref.stream():
+                data = thread.to_dict() or {}
+                if client_id and data.get("clientId") != client_id:
+                    continue
+                if data.get("rowNumber") == row_number and str(data.get("status") or "active").strip().lower() == "active":
+                    raise RuntimeError(f"Active thread remains for completed row {row_number}")
         return updated_count
 
     except Exception as e:
         print(f"⚠️ Failed to complete threads for row {row_number}: {e}")
+        if strict:
+            raise
         return 0
 
 

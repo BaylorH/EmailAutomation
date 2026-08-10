@@ -309,6 +309,79 @@ def _record_send_cap_health(
         print(f"   ⚠️ Could not record send-cap health ({reason}): {exc}")
 
 
+def _check_single_provider_send_cap(fs, user_id: str) -> Dict[str, Any]:
+    """Atomically reserve one send from every enabled daily cap ledger.
+    Live auto/outbox queue is 1/1; BACKLOG: migrate outbox if concurrency widens."""
+    day_key = _send_counter_day_key()
+    daily_cap = _resolve_daily_send_cap()
+    global_cap = _resolve_global_daily_send_cap()
+    scopes = []
+    if daily_cap is not None:
+        scopes.append(("user", daily_cap, fs.collection("users").document(user_id)
+                       .collection(SEND_COUNTERS_COLLECTION).document(day_key)))
+    if global_cap is not None:
+        scopes.append(("global", global_cap, fs.collection(SEND_COUNTERS_COLLECTION).document(
+            f"{GLOBAL_SEND_COUNTER_PREFIX}-{day_key}")))
+    context = {"allowed": True, "day_key": day_key, "reserved": False, "scopes": scopes}
+    if not scopes:
+        return context
+
+    @firestore.transactional
+    def reserve(transaction):
+        counts = [_snapshot_count(ref.get(transaction=transaction)) for _, _, ref in scopes]
+        for (scope, cap, _ref), count in zip(scopes, counts):
+            if count + 1 > cap:
+                return scope, cap, count
+        for _scope, _cap, ref in scopes:
+            transaction.set(ref, {"count": Increment(1), "day": day_key,
+                                  "updatedAt": SERVER_TIMESTAMP}, merge=True)
+        return None
+
+    try:
+        blocked = reserve(fs.transaction())
+    except Exception as exc:  # noqa: BLE001 - unavailable reservation fails closed
+        context.update({"allowed": False, "reason": DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+                        "error": f"atomic daily send reservation unavailable: {exc}"})
+        _record_send_cap_health(
+            fs, user_id, status="error", reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+            cap=min(cap for _, cap, _ in scopes), count=None,
+            day_key=day_key, scope="user+global")
+        return context
+    if blocked:
+        scope, cap, count = blocked
+        context.update({"allowed": False, "reason": DAILY_CAP_REACHED_REASON,
+                        "error": f"{scope} daily send cap would be exceeded ({count} + 1 > {cap})"})
+        _record_send_cap_health(
+            fs, user_id, status="warning", reason=DAILY_CAP_REACHED_REASON,
+            cap=cap, count=count, day_key=day_key, scope=scope)
+        return context
+    context["reserved"] = True
+    return context
+
+
+def _refund_single_provider_send(fs, user_id: str, reservation: Dict[str, Any]) -> Optional[str]:
+    """Atomically refund a reservation after a definite provider rejection."""
+    scopes = reservation.get("scopes") or []
+    if not reservation.get("reserved") or not scopes:
+        return None
+
+    @firestore.transactional
+    def refund(transaction):
+        for _scope, _cap, ref in scopes:
+            transaction.set(ref, {"count": Increment(-1), "day": reservation["day_key"],
+                                  "updatedAt": SERVER_TIMESTAMP}, merge=True)
+
+    try:
+        refund(fs.transaction())
+    except Exception as exc:  # noqa: BLE001 - retaining quota is fail-safe
+        _record_send_cap_health(
+            fs, user_id, status="error", reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+            cap=min(cap for _, cap, _ in scopes), count=None,
+            day_key=reservation["day_key"], scope="user+global")
+        return f"Atomic daily send reservation refund failed: {exc}"
+    return None
+
+
 def _fresh_graph_headers(
     headers: Dict[str, str],
     headers_provider: Optional[Callable[[], Dict[str, str]]] = None,
