@@ -272,6 +272,20 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
   release-safety baseline command recorded by the system audit packet. If that
   packet does not expose an executable command, stop and add the exact list to
   this plan before claiming the gate.
+- [ ] The packet does not expose an executable command. Use this pinned
+  37-test contract baseline with the same no-live prefix:
+
+  ```bash
+  python3 -B -m unittest -v \
+    tests.test_release_feature_registry \
+    tests.test_system_audit_packet \
+    tests.test_graph_send_inventory \
+    tests.test_production_v1_fixture_map \
+    tests.test_backend_modules_are_tracked \
+    tests.test_feature_registry_owner_modules_exist
+  ```
+
+  Expected baseline on this branch: `Ran 37 tests ... OK`.
 - [ ] Run:
 
   ```bash
