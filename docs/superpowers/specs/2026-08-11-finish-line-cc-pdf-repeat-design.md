@@ -63,8 +63,11 @@ The deployed `_response_mentions_missing_fields()` accepts an LLM reply when it
 mentions any missing field. It therefore accepts a draft that asks for one
 missing field and one already-known field.
 
-Add a deterministic extractor for configured Ask fields mentioned inside
-request clauses. The response is eligible only when:
+Add a deterministic extractor for every configured requestable Ask field
+(`ask_required` and `ask_optional`) mentioned inside request clauses. The
+authoritative `missing_fields` set remains the post-write required Ask set, so
+an optional-field request is rejected unless that field is deliberately part of
+that required missing set. The response is eligible only when:
 
 - at least one configured Ask field is explicitly requested;
 - every requested field is in the authoritative post-write `missing_fields`;
@@ -116,8 +119,9 @@ Generate a native-text, three-page PDF:
   facts and a portfolio total.
 
 The PDF must extract through the normal local text path. A deterministic test
-must render it to PNG for visual QA and extract it back before it is used by the
-pipeline test. No real address, recipient, or mailbox may be committed.
+must render the same bytes into three nonempty PNGs and extract them back before
+those bytes are used by the pipeline test. A separate Poppler render supplies
+human visual QA. No real address, recipient, or mailbox may be committed.
 
 ### 5. Live acceptance order
 

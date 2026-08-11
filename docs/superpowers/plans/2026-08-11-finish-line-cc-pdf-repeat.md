@@ -55,23 +55,31 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
   assertion failures:
 
   ```bash
-  python3 -m unittest -v \
+  env -u GOOGLE_APPLICATION_CREDENTIALS PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test python3 -B -m unittest -v \
     tests.test_column_mode_contract.BrokerReplyColumnModeValidationTests
   ```
 
-- [ ] Add a pure helper in `column_config.py` that returns the configured Ask
-  field headers requested in explicit request clauses. Reuse the existing
+- [ ] Add a pure helper in `column_config.py` that returns every configured
+  requestable Ask field (`ask_required` and `ask_optional`) requested in
+  explicit request clauses. Reuse the existing
   request-intent regex, word-boundary matcher, canonical configured header,
   canonical aliases, and custom Ask header/paraphrase terms.
 - [ ] Fail closed on malformed `column_config`.
-- [ ] Change `_response_mentions_missing_fields()` to require:
+- [ ] Treat the post-write required `missing_fields` list as authoritative. An
+  optional-field request is therefore invalid unless that field is deliberately
+  included in this required missing set. Change
+  `_response_mentions_missing_fields()` to require:
   `requested_fields` is nonempty and `requested_fields <= missing_fields`, after
   the existing nonrequestable-field guard.
 - [ ] Keep the existing exact-missing deterministic fallback unchanged.
 - [ ] Run GREEN, then the neighboring completion and column-contract suites:
 
   ```bash
-  python3 -m unittest -v \
+  env -u GOOGLE_APPLICATION_CREDENTIALS PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test python3 -B -m unittest -v \
     tests.test_column_mode_contract \
     tests.test_processing_completion_guards
   ```
@@ -101,8 +109,16 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
 - [ ] Capture the expected failures:
 
   ```bash
-  python3 -m unittest -v tests.test_messaging_conversation_payload
+  env -u GOOGLE_APPLICATION_CREDENTIALS PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test python3 -B -m unittest -v \
+    tests.test_messaging_conversation_payload
   ```
+
+- [ ] Add RED seam tests proving `process_inbox_message()` forwards the locally
+  resolved mailbox identity into `propose_sheet_updates()`, including the path
+  where the optional function argument started unset, and proving
+  `propose_sheet_updates()` forwards it into `build_conversation_payload()`.
 
 - [ ] Add a pure direction-aware timestamp selector: durable indexed direction
   first; outbound uses sent time; inbound uses received time; missing preferred
@@ -110,15 +126,18 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
 - [ ] Add a pure Graph direction resolver: compare normalized `from` to the
   authenticated mailbox identity when both dates exist; retain the safe
   one-date rules and default ambiguous unknowns to inbound.
-- [ ] Thread optional `authenticated_mailbox_email` from
-  `process_inbox_message()` through `propose_sheet_updates()` into
+- [ ] Thread the locally resolved mailbox identity (`my_email`, not merely the
+  original optional argument) from `process_inbox_message()` through
+  `propose_sheet_updates()` into
   `build_conversation_payload()`. Do not add another `/me` request.
 - [ ] Use the shared timestamp selector for Firestore sorting, merged sorting,
   and payload timestamps so all three views agree.
 - [ ] Run GREEN and the message-order/dedupe/replay neighbors:
 
   ```bash
-  python3 -m unittest -v \
+  env -u GOOGLE_APPLICATION_CREDENTIALS PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test python3 -B -m unittest -v \
     tests.test_messaging_conversation_payload \
     tests.test_message_history_dedupe \
     tests.test_operator_message_replay
@@ -142,16 +161,21 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
 - [ ] Generate a native-text three-page in-memory PDF with fictional addresses:
   target availability/no target figures on page 1; conflicting complete Suite A
   and Suite B figures plus a portfolio total on pages 2-3.
-- [ ] Pass the actual bytes through `process_pdf_for_ai()` and assert local text
-  extraction includes all three pages and classifies the source as `mixed`.
+- [ ] Deterministically render the exact bytes to three nonempty PNG byte arrays,
+  then pass those same PDF bytes through `process_pdf_for_ai()` and assert local
+  text extraction includes all three pages and classifies the source as `mixed`.
 - [ ] Add a pipeline RED using the real extracted manifest. Assert:
   no scalar `apply_proposal_to_sheet`, no flyer/floorplan/property-image writes,
-  no AI_META or Sheet change-log writes, no new row, and no send; exactly one
-  paused `needs_user_input:multi_property_attachment` action remains.
+  no AI_META, no `applied` or asset/property-image row-level change-log writes,
+  no new row, and no send; exactly one proposal audit, one paused
+  `needs_user_input:multi_property_attachment` action, and preserved
+  message/thread attachment provenance remain.
 - [ ] Capture the expected RED failures:
 
   ```bash
-  python3 -m unittest -v \
+  env -u GOOGLE_APPLICATION_CREDENTIALS PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test python3 -B -m unittest -v \
     tests.test_mixed_pdf_asset_quarantine \
     tests.test_jill_live_campaign_regressions.JillLiveCampaignRegressionTests.test_competing_multi_property_brochure_escalates_instead_of_writing_current_row
   ```
@@ -163,7 +187,9 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
 - [ ] Run GREEN and neighboring PDF/property-image/link suites:
 
   ```bash
-  python3 -m unittest -v \
+  env -u GOOGLE_APPLICATION_CREDENTIALS PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test python3 -B -m unittest -v \
     tests.test_mixed_pdf_asset_quarantine \
     tests.test_jill_live_campaign_regressions \
     tests.test_pdf_link_changelog \
@@ -193,12 +219,59 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
 
 **Files:** repository-wide verification only; no production writes.
 
-- [ ] Run all focused suites from Tasks 1-3 fresh.
-- [ ] Run the exact existing 133-test CC/reply-all set documented in the design
-  finding; do not claim CC live proof from deterministic tests.
-- [ ] Run correction/current-value, lifecycle, scheduler, inbox authority,
-  source-envelope, reply safety/indexing, sent-mail guard, and release-safety
-  suites selected by the system audit packet.
+- [ ] Prefix local commands with the no-live emulator environment recorded
+  below so imports never request ADC or reach production:
+
+  ```bash
+  env -u GOOGLE_APPLICATION_CREDENTIALS \
+    PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true \
+    FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test \
+    python3 -B -m unittest -v <modules-or-classes>
+  ```
+
+- [ ] Run all focused suites from Tasks 1-3 fresh with that prefix.
+- [ ] Run the exact existing 133-test CC/reply-all module list below; do not
+  claim CC live proof from deterministic tests:
+
+  ```bash
+  env -u GOOGLE_APPLICATION_CREDENTIALS \
+    PYTHONDONTWRITEBYTECODE=1 \
+    E2E_TEST_MODE=true \
+    FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
+    GOOGLE_CLOUD_PROJECT=sitesift-unit-test \
+    python3 -B -m unittest \
+    tests.test_broker_language_reply_all_cc_context \
+    tests.test_crossfeature_reply_all_privacy_boundary \
+    tests.test_combo_reply_all_with_redirect_and_blocked_contact \
+    tests.test_graph_retry_policy \
+    tests.test_processing_reply_indexing \
+    tests.test_source_message_envelope \
+    tests.test_outbox_reply_recipient_routing \
+    tests.test_processing_reply_identity \
+    tests.test_rubric_core_inbox_matching_happy_path \
+    tests.test_rubric_core_inbox_matching_wrong_recipient \
+    tests.test_rubric_core_inbox_matching_duplicate_retry \
+    tests.test_ai_meta_row_identity \
+    tests.test_sheet_row_anchor_safety \
+    tests.test_current_value_precedence \
+    tests.test_terminal_thread_processing \
+    tests.test_split_thread_terminal_state
+  ```
+
+  Expected deployed baseline: `Ran 133 tests ... OK`.
+- [ ] Run these release-sized neighbors explicitly with the same prefix:
+  `tests.test_jill_live_campaign_regressions`,
+  `tests.test_compound_nonviable_processing`,
+  `tests.test_processing_reply_safety`,
+  `tests.test_processing_reply_indexing`,
+  `tests.test_source_message_envelope`,
+  `tests.test_message_history_dedupe`,
+  `tests.test_operator_message_replay`, and every module in the committed
+  release-safety baseline command recorded by the system audit packet. If that
+  packet does not expose an executable command, stop and add the exact list to
+  this plan before claiming the gate.
 - [ ] Run:
 
   ```bash
@@ -258,8 +331,9 @@ stop on any audience, row, send-count, lifecycle, queue, or residue mismatch.
   design: SF/adversarial repeat; Rent+call pause; Dashboard continuation; SF
   correction; Rent correction; reconfirmation while withholding OpEx; final
   OpEx/reconfirmation and one close.
-- [ ] At every automatic turn, inspect the new body and require requested fields
-  to equal the authoritative missing set—never merely overlap it.
+- [ ] At every automatic turn, inspect the new body and require its requested
+  configured Ask fields to be a nonempty subset of the authoritative required
+  missing set—never merely overlap it or include a known/optional field.
 - [ ] Require the call turn to pause with zero automatic send and the monitored
   continuation to resume safely.
 - [ ] Before final proposal, prove more than ten pre-close messages exist; after
