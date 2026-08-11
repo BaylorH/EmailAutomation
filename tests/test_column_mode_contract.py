@@ -571,6 +571,324 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                     )
                 )
 
+    def test_trailing_and_hopped_requests_bind_to_prior_field(self):
+        rent_bodies = (
+            "asking rent: $12/SF. Can you confirm that?",
+            "The asking rent is $12/SF. Can you confirm that again?",
+            "The asking rent is $12/SF please confirm.",
+            "The asking rent is $12/SF. Is that correct?",
+        )
+
+        for body in rent_bodies:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    {"rent/sf /yr"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+        flyer_bodies = (
+            "The flyer is available. Please send it.",
+            "Flyer: available please send.",
+        )
+        for body in flyer_bodies:
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+    def test_fieldless_request_verbs_and_anaphors_bind_bounded_context(self):
+        for verb in ("confirm", "verify", "check"):
+            body = f"The asking rent is $12/SF. Please {verb} it."
+            with self.subTest(verb=verb):
+                self.assertEqual(
+                    {"rent/sf /yr"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+
+        for verb in ("send", "share", "provide", "attach", "forward"):
+            body = f"The flyer is available. Please {verb} it."
+            with self.subTest(verb=verb):
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+        for anaphor in ("these", "both", "those values"):
+            body = (
+                "The asking rent is $12/SF and operating expenses are $3/SF; "
+                f"can you confirm {anaphor}?"
+            )
+            with self.subTest(anaphor=anaphor):
+                self.assertEqual(
+                    {"rent/sf /yr", "ops ex /sf"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+
+        nearest_body = (
+            "The asking rent is $12/SF and operating expenses are $3/SF; "
+            "can you confirm that?"
+        )
+        self.assertEqual(
+            {"ops ex /sf"},
+            set(column_config.get_requested_ask_fields(nearest_body, self.config)),
+        )
+        self.assertEqual(
+            [],
+            column_config.get_requested_ask_fields(
+                "The asking rent is $12/SF. The property is available. "
+                "Please confirm it.",
+                self.config,
+            ),
+        )
+
+    def test_forward_request_leadin_overrides_factual_looking_bullets(self):
+        rent_body = (
+            "Could you confirm the following?\n"
+            "- Asking rent: $12/SF\n"
+            "- Operating expenses"
+        )
+        self.assertEqual(
+            {"rent/sf /yr", "ops ex /sf"},
+            set(column_config.get_requested_ask_fields(rent_body, self.config)),
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                rent_body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+        flyer_body = (
+            "Could you confirm the following?\n"
+            "- Flyer: available\n"
+            "- Operating expenses"
+        )
+        self.assertTrue(
+            processing._response_requests_nonrequestable_fields(
+                flyer_body,
+                self.config,
+            )
+        )
+
+        all_factual_body = (
+            "Could you confirm the following?\n"
+            "- Asking rent: $12/SF\n"
+            "- Flyer: available"
+        )
+        self.assertTrue(
+            processing._response_requests_nonrequestable_fields(
+                all_factual_body,
+                self.config,
+            )
+        )
+
+    def test_plural_request_crosses_consecutive_colon_value_pairs(self):
+        bodies = (
+            (
+                "Asking rent: $12/SF\n"
+                "Operating expenses: $3/SF\n"
+                "Can you confirm both values?"
+            ),
+            (
+                "Asking rent: $12/SF; operating expenses: $3/SF; "
+                "Are these correct?"
+            ),
+        )
+
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    {"rent/sf /yr", "ops ex /sf"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+        remote_body = (
+            "Asking rent: $12/SF.\n\n"
+            "Operating expenses: $3/SF;\n"
+            "Can you confirm both values?"
+        )
+        self.assertEqual(
+            {"ops ex /sf"},
+            set(column_config.get_requested_ask_fields(remote_body, self.config)),
+        )
+
+    def test_excluded_extractable_canonical_uses_every_alias_as_nonrequestable(self):
+        self.config["extractionFields"].remove("docks")
+        self.config["requiredFields"].remove("docks")
+        self.assertIsNone(column_config.get_column_config_error(self.config))
+        dock_field = column_config.CANONICAL_FIELDS["docks"]
+        aliases = list(dict.fromkeys((
+            self.config["mappings"]["docks"],
+            dock_field["label"],
+            *dock_field["default_aliases"],
+            *dock_field["ai_synonyms"],
+        )))
+
+        for alias in aliases:
+            body = f"Could you confirm {alias}?"
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    [],
+                    column_config.get_requested_ask_fields(body, self.config),
+                )
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+    def test_field_reference_separators_and_simple_inflections_are_equivalent(self):
+        separators = (
+            " ",
+            "\n",
+            "-",
+            "\u00ad",
+            "\u2010",
+            "\u2011",
+            "\u2013",
+            "\u2014",
+            ".",
+            "/",
+            "_",
+        )
+        for separator in separators:
+            body = (
+                f"Could you confirm operating{separator}expenses and the asking rent?"
+            )
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    {"ops ex /sf", "rent/sf /yr"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Rent/SF /Yr"],
+                        self.config,
+                    )
+                )
+
+        for body, expected_fields in (
+            (
+                "Could you confirm operating expense and the asking rent?",
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            (
+                "Could you confirm sq. ft. and the asking rent?",
+                {"total sf", "rent/sf /yr"},
+            ),
+            (
+                "Could you confirm operating expenses and square foot?",
+                {"ops ex /sf", "total sf"},
+            ),
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    expected_fields,
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+
+        self.config["customFields"]["Loading Capacity"] = {
+            "mode": "ask_required",
+            "description": "Required loading capacity",
+        }
+        self.assertEqual(
+            {"Loading Capacity"},
+            set(column_config.get_requested_ask_fields(
+                "Could you confirm loading capacities?",
+                self.config,
+            )),
+        )
+
+    def test_longer_nonrequestable_alias_dominates_contained_ask_alias(self):
+        for separator in ("\u2013", "\u2014", ".", "/", "_"):
+            body = f"Could you confirm gross{separator}rent?"
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    [],
+                    column_config.get_requested_ask_fields(body, self.config),
+                )
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+    def test_terse_acknowledgements_and_facts_remain_benign(self):
+        for body in (
+            "Asking rent confirmed.",
+            "Only the asking rent is $12/SF.",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    [],
+                    column_config.get_requested_ask_fields(body, self.config),
+                )
+
+        for body in (
+            "Here's the flyer.",
+            "Only the flyer is attached.",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+        for body in (
+            "The asking rent is $12/SF. Correct.",
+            "The asking rent is $12/SF. Right.",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    [],
+                    column_config.get_requested_ask_fields(body, self.config),
+                )
+
+        self.assertEqual(
+            [],
+            column_config.get_requested_ask_fields(
+                "Please note:\n- Asking rent: $12/SF",
+                self.config,
+            ),
+        )
+
+        for body in (
+            "The flyer is available. Correct.",
+            "The flyer is available. Right.",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
     def test_semicolon_acknowledgement_only_requests_missing_field(self):
         body = (
             "Thanks for confirming the asking rent; could you confirm operating expenses?"

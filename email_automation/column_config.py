@@ -559,6 +559,26 @@ def get_column_config_error(column_config: Any) -> Optional[str]:
     return None
 
 
+def _canonical_field_reference_terms(
+    canonical: str,
+    configured_header: Optional[str],
+) -> List[str]:
+    """Return the configured name and supported aliases for one canonical field."""
+    field = CANONICAL_FIELDS.get(canonical, {})
+    terms = [
+        configured_header,
+        field.get("label"),
+        *field.get("default_aliases", []),
+        *field.get("legacy_aliases", []),
+        *field.get("ai_synonyms", []),
+    ]
+    return list(dict.fromkeys(
+        term.strip().lower()
+        for term in terms
+        if isinstance(term, str) and term.strip()
+    ))
+
+
 def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[str]]:
     """Return aliases grouped by each configured Note, Skip, or formula field."""
     mappings = column_config["mappings"]
@@ -578,18 +598,10 @@ def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[
 
     groups = []
     for canonical in non_requestable:
-        field = CANONICAL_FIELDS.get(canonical, {})
-        terms = [mappings.get(canonical), field.get("label")]
-        if canonical in (
-            set(column_config["neverRequest"])
-            | set(column_config["formulaFields"])
-            | {"listing_comments", "client_comments"}
-        ):
-            terms.extend(field.get("default_aliases", []))
-            terms.extend(field.get("legacy_aliases", []))
-        normalized = list(dict.fromkeys(
-            term.strip().lower() for term in terms if isinstance(term, str) and term.strip()
-        ))
+        normalized = _canonical_field_reference_terms(
+            canonical,
+            mappings.get(canonical),
+        )
         if normalized:
             groups.append(normalized)
 
@@ -677,9 +689,11 @@ _FIELD_REQUEST_SF_UNIT_PREFIX_RE = re.compile(
     r"(?:/|\bper\s+)\s*$",
     re.IGNORECASE,
 )
+_FIELD_REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z0-9$]+")
 _FIELD_TERM_SEPARATOR_PATTERN = (
     r"(?:"
-    r"[^\S\r\n]*(?:-|\u00ad|\u2010|\u2011)[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?"
+    r"[^\S\r\n]*[-\u00ad\u2010\u2011\u2013\u2014./_'\u2019]+"
+    r"[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?"
     r"|[^\S\r\n]*\r?\n[^\S\r\n]*"
     r"|[^\S\r\n]+"
     r")"
@@ -708,7 +722,7 @@ _FIELD_CLEAR_ACKNOWLEDGEMENT_RE = re.compile(
 _FIELD_CLEAR_INFORMATIONAL_RE = re.compile(
     r"(?:"
     r"\b(?:happy|glad)\s+to\s+(?:send|share|provide|forward)\b"
-    r"|\bhere\s+(?:is|are)\b"
+    r"|\bhere(?:\s+(?:is|are)|['\u2019]s)\b"
     r"|^\s*(?:i|we)\s+know\b"
     r"|^\s*(?:i|we)\s+could\s+(?:get|send|share|provide|forward)\b"
     r"|^\s*it\s+would\s+be\s+possible\s+to\s+"
@@ -718,8 +732,8 @@ _FIELD_CLEAR_INFORMATIONAL_RE = re.compile(
     re.IGNORECASE,
 )
 _FIELD_CLEAR_ACKNOWLEDGEMENT_SUFFIX_RE = re.compile(
-    r"^\s+(?:is|are|was|were|has|have|had)\s+(?:already\s+)?"
-    r"(?:been\s+)?"
+    r"^\s+(?:(?:is|are|was|were|has|have|had)\s+(?:already\s+)?"
+    r"(?:been\s+)?)?"
     r"(?:confirmed|provided|received|sent|included|attached|shared|forwarded|supplied)\b",
     re.IGNORECASE,
 )
@@ -752,17 +766,41 @@ _FIELD_DIRECT_MARKER_BRIDGE_RE = re.compile(
 _FIELD_REQUEST_EXCEPTION_RE = re.compile(r"\b(?:just|only)\b", re.IGNORECASE)
 _FIELD_ANAPHORIC_REQUEST_RE = re.compile(
     r"\s*(?:"
-    r"(?:(?:can|could|would|will|may)\s+(?:you|we)\s+(?:please\s+)?"
-    r"|please\s+)"
-    r"(?:confirm|verify|check)(?:\s+(?P<anaphor>that|it|this|those|them))?"
-    r"|(?P<tag>correct|right)"
+    r"(?:(?:(?:can|could|would|will|may)\s+(?:you|we)\s+(?:please\s+)?"
+    r"|please\s+)?"
+    r"(?:confirm|verify|check|send|share|provide|attach|forward)"
+    r"(?:\s+(?P<anaphor>"
+    r"that|it|this|them|these(?:\s+values)?|those(?:\s+values)?|both(?:\s+values)?"
+    r"))?(?:\s+again)?)"
+    r"|(?:is|are)\s+(?P<tag_anaphor>that|it|this|these|those)\s+"
+    r"(?P<tag>correct|right)"
+    r"|(?P<bare_tag>correct|right)"
     r")"
     r"\s*",
     re.IGNORECASE,
 )
-_FIELD_FACTUAL_VALUE_CONTEXT_RE = re.compile(
-    r"\s*(?:[$€£]?\s*\d|yes\b|no\b|none\b|unknown\b|available\b|unavailable\b)",
+_FIELD_TRAILING_REQUEST_RE = re.compile(
+    r"(?:"
+    r"\b(?:(?:can|could|would|will|may)\s+(?:you|we)\s+(?:please\s+)?"
+    r"|please\s+)"
+    r"(?:confirm|verify|check|send|share|provide|attach|forward)"
+    r"(?:\s+(?:"
+    r"that|it|this|them|these(?:\s+values)?|those(?:\s+values)?|both(?:\s+values)?"
+    r"))?(?:\s+again)?"
+    r"|\b(?:is|are)\s+(?:that|it|this|these|those)\s+(?:correct|right)"
+    r")\s*$",
     re.IGNORECASE,
+)
+_FIELD_FACTUAL_VALUE_CONTEXT_RE = re.compile(
+    r"\s*(?:"
+    r"[$€£]?\s*\d[\d,.]*"
+    r"(?:\s*(?:/|\bper\s+)\s*(?:sf|sq\.?\s*ft\.?|yr|year|mo|month))*"
+    r"|yes\b|no\b|none\b|unknown\b|available\b|unavailable\b"
+    r")",
+    re.IGNORECASE,
+)
+_FIELD_VALUE_SEQUENCE_SEPARATOR_RE = re.compile(
+    r"[^\S\r\n]*(?:;[^\S\r\n]*(?:\r?\n)?|\r?\n)[^\S\r\n]*"
 )
 
 _FIELD_MENTION_REQUEST = "request"
@@ -803,20 +841,39 @@ def _column_field_term_matches(
     normalized = (term or "").strip()
     if not normalized:
         return []
-    parts = [
-        part
-        for part in re.split(r"[\s\u00ad\u2010\u2011-]+", normalized)
-        if part
-    ]
+    parts = _FIELD_REFERENCE_TOKEN_RE.findall(normalized)
     if not parts:
         return []
-    pattern = _FIELD_TERM_SEPARATOR_PATTERN.join(re.escape(part) for part in parts)
+    token_patterns = [re.escape(part) for part in parts]
+    last_token = parts[-1]
+    if len(parts) > 1 and len(last_token) > 3 and last_token.isalpha():
+        last_token_lower = last_token.lower()
+        if last_token_lower in {"foot", "feet"}:
+            token_patterns[-1] = r"(?:foot|feet)"
+        elif last_token_lower.endswith("ies"):
+            token_patterns[-1] = (
+                rf"(?:{re.escape(last_token[:-3])}y|{re.escape(last_token)})"
+            )
+        elif re.search(r"[^aeiou]y$", last_token_lower):
+            token_patterns[-1] = rf"{re.escape(last_token[:-1])}(?:y|ies)"
+        elif last_token_lower.endswith("s"):
+            if not last_token_lower.endswith("ss"):
+                token_patterns[-1] = rf"{re.escape(last_token[:-1])}s?"
+        else:
+            token_patterns[-1] = rf"{re.escape(last_token)}s?"
+    pattern = _FIELD_TERM_SEPARATOR_PATTERN.join(token_patterns)
     matches = list(re.finditer(
         rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])",
         text or "",
         re.IGNORECASE,
     ))
-    if not disambiguate_sf or normalized.lower() != "sf":
+    normalized_reference = " ".join(parts).lower()
+    if not disambiguate_sf or normalized_reference not in {
+        "sf",
+        "sq ft",
+        "square foot",
+        "square feet",
+    }:
         return matches
     return [
         match
@@ -893,6 +950,28 @@ def _context_index_for_mention(
     return None
 
 
+def _context_contains_field_mention(
+    context_index: int,
+    mentions: List[tuple],
+    contexts: List[tuple],
+) -> bool:
+    context_start, context_end, _is_question = contexts[context_index]
+    return any(
+        context_start <= mention_start and mention_end <= context_end
+        for mention_start, mention_end, _group_index in mentions
+    )
+
+
+def _anaphoric_request_is_plural(match: Any) -> bool:
+    anaphor = (
+        match.group("anaphor")
+        or match.group("tag_anaphor")
+        or ""
+    ).lower()
+    anaphor_head = anaphor.split(maxsplit=1)[0] if anaphor else ""
+    return anaphor_head in {"these", "those", "them", "both"}
+
+
 def _has_immediately_following_anaphoric_request(
     text: str,
     mention: tuple,
@@ -900,12 +979,12 @@ def _has_immediately_following_anaphoric_request(
     contexts: List[tuple],
     context_index: int,
 ) -> bool:
-    mention_start, mention_end, _group_index = mention
-    context_start, context_end, _is_question = contexts[context_index]
+    _mention_start, mention_end, _group_index = mention
+    _context_start, context_end, _is_question = contexts[context_index]
     if context_index + 1 >= len(contexts):
         return False
 
-    next_start, next_end, _next_is_question = contexts[context_index + 1]
+    next_start, next_end, next_is_question = contexts[context_index + 1]
     if any(
         next_start <= other_start and other_end <= next_end
         for other_start, other_end, _other_group in mentions
@@ -914,15 +993,208 @@ def _has_immediately_following_anaphoric_request(
     anaphoric_request = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
         text[next_start:next_end]
     )
+    request_context_index = context_index + 1
+    request_is_question = next_is_question
+    if anaphoric_request is None and re.fullmatch(
+        r"\s*:\s*",
+        text[context_end:next_start],
+    ):
+        factual_value = _FIELD_FACTUAL_VALUE_CONTEXT_RE.match(
+            text[next_start:next_end]
+        )
+        if factual_value is not None:
+            anaphoric_request = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
+                text[next_start + factual_value.end():next_end]
+            )
+            if (
+                anaphoric_request is None
+                and not text[next_start + factual_value.end():next_end].strip()
+                and context_index + 2 < len(contexts)
+            ):
+                hop_start, hop_end, _hop_is_question = contexts[context_index + 2]
+                if not any(
+                    hop_start <= other_start and other_end <= hop_end
+                    for other_start, other_end, _other_group in mentions
+                ):
+                    anaphoric_request = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
+                        text[hop_start:hop_end]
+                    )
+                    request_context_index = context_index + 2
+                    request_is_question = _hop_is_question
     if anaphoric_request is None:
         return False
+    if anaphoric_request.group("bare_tag") and not request_is_question:
+        return False
+    if request_context_index + 1 < len(contexts):
+        request_end = contexts[request_context_index][1]
+        following_start, following_end, _following_is_question = contexts[
+            request_context_index + 1
+        ]
+        introduces_later_field = (
+            ":" in text[request_end:following_start]
+            and any(
+                following_start <= other_start and other_end <= following_end
+                for other_start, other_end, _other_group in mentions
+            )
+        )
+        if introduces_later_field:
+            return False
     has_later_field = any(
         other_start >= mention_end and other_start < context_end
         for other_start, _other_end, _other_group in mentions
     )
-    anaphor = anaphoric_request.group("anaphor")
-    is_plural = anaphor is not None and anaphor.lower() in {"those", "them"}
-    return is_plural or not has_later_field
+    return _anaphoric_request_is_plural(anaphoric_request) or not has_later_field
+
+
+def _colon_factual_value_context_index(
+    text: str,
+    mentions: List[tuple],
+    contexts: List[tuple],
+    field_context_index: int,
+) -> Optional[int]:
+    if field_context_index + 1 >= len(contexts):
+        return None
+    field_end = contexts[field_context_index][1]
+    value_start, value_end, _value_is_question = contexts[field_context_index + 1]
+    if not re.fullmatch(r"\s*:\s*", text[field_end:value_start]):
+        return None
+    if _context_contains_field_mention(
+        field_context_index + 1,
+        mentions,
+        contexts,
+    ):
+        return None
+    if not _FIELD_FACTUAL_VALUE_CONTEXT_RE.fullmatch(text[value_start:value_end]):
+        return None
+    return field_context_index + 1
+
+
+def _has_following_plural_request_across_value_pairs(
+    text: str,
+    mentions: List[tuple],
+    contexts: List[tuple],
+    context_index: int,
+) -> bool:
+    value_context_index = _colon_factual_value_context_index(
+        text,
+        mentions,
+        contexts,
+        context_index,
+    )
+    if value_context_index is None:
+        return False
+
+    request_context_index = value_context_index + 1
+    crossed_other_field = False
+    while request_context_index < len(contexts):
+        request_start, request_end, request_is_question = contexts[
+            request_context_index
+        ]
+        value_end = contexts[value_context_index][1]
+        if not _FIELD_VALUE_SEQUENCE_SEPARATOR_RE.fullmatch(
+            text[value_end:request_start]
+        ):
+            return False
+        request_match = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
+            text[request_start:request_end]
+        )
+        if request_match is not None:
+            if request_match.group("bare_tag") and not request_is_question:
+                return False
+            return (
+                crossed_other_field
+                and _anaphoric_request_is_plural(request_match)
+            )
+        if not _context_contains_field_mention(
+            request_context_index,
+            mentions,
+            contexts,
+        ):
+            return False
+        value_context_index = _colon_factual_value_context_index(
+            text,
+            mentions,
+            contexts,
+            request_context_index,
+        )
+        if value_context_index is None:
+            return False
+        crossed_other_field = True
+        request_context_index = value_context_index + 1
+    return False
+
+
+def _has_immediately_preceding_request_leadin(
+    text: str,
+    mentions: List[tuple],
+    contexts: List[tuple],
+    context_index: int,
+) -> bool:
+    field_context_index = context_index
+    while field_context_index > 0:
+        previous_index = field_context_index - 1
+        previous_start, previous_end, _previous_is_question = contexts[
+            previous_index
+        ]
+        field_start = contexts[field_context_index][0]
+        separator = text[previous_end:field_start]
+        if _context_contains_field_mention(previous_index, mentions, contexts):
+            if not _FIELD_VALUE_SEQUENCE_SEPARATOR_RE.fullmatch(separator):
+                return False
+            field_context_index = previous_index
+            continue
+
+        previous_text = text[previous_start:previous_end]
+        request_text = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
+            lambda match: " " * (match.end() - match.start()),
+            previous_text,
+        )
+        request_match = _last_pattern_match(
+            _FIELD_REQUEST_INTENT_RE,
+            request_text,
+        )
+        clear_matches = [
+            match
+            for pattern in (
+                _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
+                _FIELD_CLEAR_INFORMATIONAL_RE,
+            )
+            for match in pattern.finditer(previous_text)
+        ]
+        request_is_inside_clear = (
+            request_match is not None
+            and any(
+                clear.start() <= request_match.start() < clear.end()
+                for clear in clear_matches
+            )
+        )
+        if (
+            request_match is not None
+            and not request_is_inside_clear
+            and ("\n" in separator or ":" in separator)
+        ):
+            return True
+
+        if previous_index == 0:
+            return False
+        prior_field_index = previous_index - 1
+        if (
+            not _context_contains_field_mention(
+                prior_field_index,
+                mentions,
+                contexts,
+            )
+            or _colon_factual_value_context_index(
+                text,
+                mentions,
+                contexts,
+                prior_field_index,
+            ) != previous_index
+            or not _FIELD_VALUE_SEQUENCE_SEPARATOR_RE.fullmatch(separator)
+        ):
+            return False
+        field_context_index = prior_field_index
+    return False
 
 
 def _has_immediately_following_factual_value(
@@ -984,18 +1256,13 @@ def _classify_field_mention(
         lambda match: " " * (match.end() - match.start()),
         prefix,
     )
-    request_matches = [
-        match
-        for match in (
-            _last_pattern_match(_FIELD_REQUEST_INTENT_RE, intent_prefix),
-            _last_pattern_match(_FIELD_REQUEST_EXCEPTION_RE, intent_prefix),
-        )
-        if match is not None
-    ]
-    last_request = max(
-        request_matches,
-        key=lambda match: match.start(),
-        default=None,
+    last_request = _last_pattern_match(
+        _FIELD_REQUEST_INTENT_RE,
+        intent_prefix,
+    )
+    last_request_exception = _last_pattern_match(
+        _FIELD_REQUEST_EXCEPTION_RE,
+        intent_prefix,
     )
 
     if is_question:
@@ -1007,9 +1274,25 @@ def _classify_field_mention(
     )
     if last_request is not None and not request_is_inside_clear:
         return _FIELD_MENTION_REQUEST
+    if _FIELD_TRAILING_REQUEST_RE.search(suffix):
+        return _FIELD_MENTION_REQUEST
     if _has_immediately_following_anaphoric_request(
         text,
         mention,
+        mentions,
+        contexts,
+        context_index,
+    ):
+        return _FIELD_MENTION_REQUEST
+    if _has_following_plural_request_across_value_pairs(
+        text,
+        mentions,
+        contexts,
+        context_index,
+    ):
+        return _FIELD_MENTION_REQUEST
+    if _has_immediately_preceding_request_leadin(
+        text,
         mentions,
         contexts,
         context_index,
@@ -1039,6 +1322,8 @@ def _classify_field_mention(
     )
     if not has_prior_field and _FIELD_CLEAR_FACTUAL_PREFIX_RE.search(prefix):
         return _FIELD_MENTION_BENIGN
+    if last_request_exception is not None:
+        return _FIELD_MENTION_REQUEST
     return _FIELD_MENTION_UNKNOWN
 
 
@@ -1061,18 +1346,10 @@ def _requestable_field_groups(column_config: dict) -> List[tuple]:
         ):
             continue
 
-        terms = [
+        groups.append((
             configured_header,
-            field.get("label"),
-            *field.get("default_aliases", []),
-            *field.get("legacy_aliases", []),
-            *field.get("ai_synonyms", []),
-        ]
-        groups.append((configured_header, list(dict.fromkeys(
-            term.strip().lower()
-            for term in terms
-            if isinstance(term, str) and term.strip()
-        ))))
+            _canonical_field_reference_terms(canonical, configured_header),
+        ))
 
     for header, config in column_config["customFields"].items():
         if config.get("mode") not in {"ask_required", "ask_optional"}:
