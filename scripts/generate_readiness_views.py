@@ -33,7 +33,7 @@ PROOF_LEVELS = {
 }
 EVIDENCE_RESULTS = {"pass", "partial", "fail"}
 QUALITY_STATES = {"proven_live", "source_only", "partial", "open", "ready_for_live"}
-QUALITY_PRIORITIES = {"P0", "P1", "P2"}
+QUALITY_SEVERITIES = {"P0", "P1", "P2"}
 
 _GATE_LABELS = {
     "login_view": "Login / view",
@@ -458,17 +458,21 @@ def validate_registry(
     for quality_id, quality in quality_by_id.items():
         if quality.get("state") not in QUALITY_STATES:
             raise RegistryError(f"{quality_id}: invalid state")
-        if quality.get("priority") not in QUALITY_PRIORITIES:
-            raise RegistryError(f"{quality_id}: invalid priority")
+        if quality.get("severity") not in QUALITY_SEVERITIES:
+            raise RegistryError(f"{quality_id}: invalid severity")
         _stable_id(quality.get("owner"), quality_id, "owner")
         _nonempty_string(quality.get("guardrail"), quality_id, "guardrail")
         _nonempty_string(quality.get("nextProof"), quality_id, "nextProof")
-        _validate_refs(
+        quality_features = _validate_refs(
             quality, quality_id, "featureIds", known_features, required=True
         )
-        _validate_refs(
+        quality_scenarios = _validate_refs(
             quality, quality_id, "scenarioIds", known_scenarios, required=True
         )
+        if not quality_features or not quality_scenarios:
+            raise RegistryError(
+                f"{quality_id}: featureIds and scenarioIds must be nonempty"
+            )
         quality_evidence = _validate_refs(
             quality, quality_id, "evidenceIds", evidence_ids, required=True
         )

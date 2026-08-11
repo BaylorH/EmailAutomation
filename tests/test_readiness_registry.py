@@ -182,7 +182,7 @@ class ReadinessRegistryTests(unittest.TestCase):
                 {
                     "id": "quality.canary_unrun",
                     "state": "ready_for_live",
-                    "priority": "P0",
+                    "severity": "P0",
                     "featureIds": ["feature.beta"],
                     "scenarioIds": ["scenario.feature"],
                     "evidenceIds": ["evidence.live"],
@@ -862,7 +862,7 @@ class ReadinessRegistryTests(unittest.TestCase):
             "scenarioIds",
             "evidenceIds",
             "blocksGates",
-            "priority",
+            "severity",
             "guardrail",
             "nextProof",
             "owner",
@@ -878,7 +878,7 @@ class ReadinessRegistryTests(unittest.TestCase):
             ("scenarioIds", None),
             ("evidenceIds", None),
             ("blocksGates", None),
-            ("priority", "P3"),
+            ("severity", "P3"),
             ("guardrail", ""),
             ("nextProof", ""),
             ("owner", ""),
@@ -887,6 +887,29 @@ class ReadinessRegistryTests(unittest.TestCase):
                 candidate = copy.deepcopy(self.registry)
                 candidate["qualityItems"][0][field] = invalid_value
                 self.assert_invalid(candidate, "quality.canary_unrun")
+
+    def test_quality_items_use_only_the_approved_severity_enum(self):
+        try:
+            self.validate()
+        except self.module.RegistryError as exc:
+            self.fail(f"approved severity must validate: {exc}")
+
+        legacy = copy.deepcopy(self.registry)
+        quality = legacy["qualityItems"][0]
+        quality["priority"] = quality.pop("severity")
+        self.assert_invalid(legacy, "quality.canary_unrun")
+
+    def test_quality_blockers_require_explicit_nonempty_scope(self):
+        for field in ("featureIds", "scenarioIds"):
+            for mutation in ("delete", "empty"):
+                with self.subTest(field=field, mutation=mutation):
+                    candidate = copy.deepcopy(self.registry)
+                    quality = candidate["qualityItems"][0]
+                    if mutation == "delete":
+                        quality.pop(field)
+                    else:
+                        quality[field] = []
+                    self.assert_invalid(candidate, "quality.canary_unrun")
 
     def test_parse_utc_is_strict_and_evidence_intervals_are_ordered(self):
         parsed = self.module.parse_utc("2026-08-11T00:00:00Z")

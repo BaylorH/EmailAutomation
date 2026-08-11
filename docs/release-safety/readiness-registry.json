@@ -256,7 +256,7 @@
     {
       "id": "returning-user-canary-unrun",
       "state": "ready_for_live",
-      "priority": "P0",
+      "severity": "P0",
       "featureIds": [
         "core.launch_draft",
         "core.name_resolution",
@@ -281,7 +281,7 @@
     {
       "id": "autonomous-followups-current-live-gap",
       "state": "ready_for_live",
-      "priority": "P0",
+      "severity": "P0",
       "featureIds": [
         "core.followups",
         "core.inbox_matching",
@@ -305,7 +305,7 @@
     {
       "id": "reply-all-cc-multiparty-live-gap",
       "state": "ready_for_live",
-      "priority": "P0",
+      "severity": "P0",
       "featureIds": [
         "core.followups",
         "core.inbox_auto_reply",
@@ -331,7 +331,7 @@
     {
       "id": "pdf-multi-suite-ambiguity",
       "state": "open",
-      "priority": "P1",
+      "severity": "P1",
       "featureIds": [
         "core.event_classifier",
         "core.inbox_matching",
@@ -357,7 +357,7 @@
     {
       "id": "hard-repeat-ask-rejection-gap",
       "state": "partial",
-      "priority": "P0",
+      "severity": "P0",
       "featureIds": [
         "core.event_classifier",
         "core.followups",
@@ -382,7 +382,7 @@
     {
       "id": "natural-voice-variety",
       "state": "open",
-      "priority": "P1",
+      "severity": "P1",
       "featureIds": [
         "core.followups",
         "core.inbox_auto_reply",
@@ -407,7 +407,7 @@
     {
       "id": "long-multiturn-ordering-gap",
       "state": "ready_for_live",
-      "priority": "P0",
+      "severity": "P0",
       "featureIds": [
         "core.event_classifier",
         "core.health_recovery",
@@ -436,7 +436,7 @@
     {
       "id": "account-b-historical-cleanup",
       "state": "open",
-      "priority": "P2",
+      "severity": "P2",
       "featureIds": [
         "core.health_recovery",
         "core.stop_cancel_dismiss"
