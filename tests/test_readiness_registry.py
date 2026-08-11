@@ -1,6 +1,8 @@
 import copy
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -44,8 +46,16 @@ class ReadinessRegistryTests(unittest.TestCase):
 
         self.feature_registry = {
             "features": [
-                {"id": "feature.alpha", "name": "Alpha"},
-                {"id": "feature.beta", "name": "Beta"},
+                {
+                    "id": "feature.beta",
+                    "name": "Beta",
+                    "lane": "production_v1_core",
+                },
+                {
+                    "id": "feature.alpha",
+                    "name": "Alpha",
+                    "lane": "production_v1_core",
+                },
             ]
         }
         self.gradebook = {
@@ -54,8 +64,13 @@ class ReadinessRegistryTests(unittest.TestCase):
         }
         self.fixture_map = {
             "featureFixtureMatrix": {
-                "feature.alpha": {"happy_path": {}},
-                "feature.beta": {"happy_path": {}},
+                "feature.alpha": {
+                    "happy_path": {"status": "covered"},
+                    "terminal_state": {"status": "needs_live_proof"},
+                },
+                "feature.beta": {
+                    "happy_path": {"status": "needs_fixture"},
+                },
             }
         }
         self.registry = {
@@ -75,18 +90,19 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "rollback": "Disable returning-user access.",
                 },
                 {
-                    "id": "supervised_canary",
+                    "id": "supervised_campaign_use",
                     "decision": "ready_for_canary",
                     "scope": "One monitored campaign.",
                     "allows": ["one_monitored_launch"],
-                    "forbids": ["scope_expansion"],
+                    "forbids": ["scope_expansion", "autonomous_followups"],
+                    "guardrails": ["Keep follow-ups off."],
                     "evidenceIds": ["evidence.live"],
                     "blockerIds": ["quality.canary_unrun"],
                     "nextAction": "Run the monitored canary.",
                     "rollback": "Pause the campaign and preserve evidence.",
                 },
                 {
-                    "id": "autonomous_use",
+                    "id": "autonomous_campaign_use",
                     "decision": "hold",
                     "scope": "Unattended campaigns.",
                     "allows": [],
@@ -137,7 +153,7 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "featureIds": ["feature.beta"],
                     "scenarioIds": ["scenario.feature"],
                     "evidenceIds": ["evidence.live"],
-                    "blocksGates": ["supervised_canary"],
+                    "blocksGates": ["supervised_campaign_use"],
                     "guardrail": "One monitored campaign only.",
                     "nextProof": "Run and read back the canary.",
                 }
@@ -191,6 +207,36 @@ class ReadinessRegistryTests(unittest.TestCase):
             failure["supersedes"] = supersedes
         registry["evidence"].append(failure)
 
+    def write_repository_inputs(self, registry=None):
+        release_safety = self.repo_root / "docs" / "release-safety"
+        release_safety.mkdir(parents=True, exist_ok=True)
+        documents = {
+            "readiness-registry.json": self.registry if registry is None else registry,
+            "feature-registry.json": self.feature_registry,
+            "feature-gradebook.json": self.gradebook,
+            "production-v1-fixture-map.json": self.fixture_map,
+        }
+        for filename, document in documents.items():
+            (release_safety / filename).write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n"
+            )
+
+    def install_cli_script(self):
+        script = self.repo_root / "scripts" / "generate_readiness_views.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(MODULE_PATH.read_text())
+        return script
+
+    def run_cli(self, *arguments):
+        script = self.repo_root / "scripts" / "generate_readiness_views.py"
+        return subprocess.run(
+            [sys.executable, str(script), *arguments],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_valid_registry_builds_frozen_indexes(self):
         validated = self.validate()
 
@@ -198,7 +244,7 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertEqual({"feature.alpha", "feature.beta"}, set(validated.feature_by_id))
         self.assertEqual(self.fixture_map["featureFixtureMatrix"], validated.fixture_matrix)
         self.assertEqual(
-            {"login_view", "supervised_canary", "autonomous_use"},
+            {"login_view", "supervised_campaign_use", "autonomous_campaign_use"},
             set(validated.gate_ids),
         )
         self.assertEqual({"evidence.login", "evidence.live"}, set(validated.evidence_by_id))
@@ -276,7 +322,7 @@ class ReadinessRegistryTests(unittest.TestCase):
     def test_evidence_and_blocker_references_must_resolve(self):
         cases = (
             ("evidenceIds", "evidence.unknown", "login_view"),
-            ("blockerIds", "quality.unknown", "supervised_canary"),
+            ("blockerIds", "quality.unknown", "supervised_campaign_use"),
         )
         for field, value, stable_id in cases:
             with self.subTest(field=field):
@@ -328,7 +374,7 @@ class ReadinessRegistryTests(unittest.TestCase):
 
         candidate = copy.deepcopy(self.registry)
         candidate["qualityItems"][0]["blocksGates"] = []
-        self.assert_invalid(candidate, "supervised_canary")
+        self.assert_invalid(candidate, "supervised_campaign_use")
 
         candidate = copy.deepcopy(self.registry)
         candidate["qualityItems"][0]["blocksGates"] = ["login_view"]
@@ -637,7 +683,7 @@ class ReadinessRegistryTests(unittest.TestCase):
             with self.subTest(field=field):
                 candidate = copy.deepcopy(self.registry)
                 candidate["rolloutGates"][1][field] = empty_value
-                self.assert_invalid(candidate, "supervised_canary")
+                self.assert_invalid(candidate, "supervised_campaign_use")
 
     def test_parse_utc_is_strict_and_evidence_intervals_are_ordered(self):
         parsed = self.module.parse_utc("2026-08-11T00:00:00Z")
@@ -677,10 +723,251 @@ class ReadinessRegistryTests(unittest.TestCase):
 
         self.assertEqual("go", before_expiry["login_view"])
         self.assertEqual("stale", after_expiry["login_view"])
-        self.assertEqual("ready_for_canary", after_expiry["supervised_canary"])
-        self.assertEqual("hold", after_expiry["autonomous_use"])
+        self.assertEqual(
+            "ready_for_canary", after_expiry["supervised_campaign_use"]
+        )
+        self.assertEqual("hold", after_expiry["autonomous_campaign_use"])
         self.assertEqual(authored, self.registry)
         self.assertEqual(authored, validated.registry)
+
+    def test_current_view_states_exact_capability_boundary(self):
+        self.assertTrue(
+            hasattr(self.module, "render_current_readiness"),
+            "Task 2 current-readiness renderer is not implemented",
+        )
+        rendered = self.module.render_current_readiness(
+            self.validate(), at=self.module.parse_utc("2026-08-11T00:00:00Z")
+        )
+
+        self.assertIn("Login / view | GO", rendered)
+        self.assertIn("Supervised campaign use | READY FOR CANARY", rendered)
+        self.assertIn("Autonomous campaign use | HOLD", rendered)
+        self.assertIn("follow-ups off", rendered)
+        self.assertIn("quality.canary_unrun", rendered)
+        self.assertIn("Run the monitored canary.", rendered)
+        self.assertIn("Pause the campaign and preserve evidence.", rendered)
+        self.assertIn("2026-08-10T23:00:00Z", rendered)
+        self.assertIn("expires 2026-08-11T01:00:00Z", rendered)
+
+    def test_current_view_marks_expired_go_evidence_stale(self):
+        rendered = self.module.render_current_readiness(
+            self.validate(), at=self.module.parse_utc("2026-08-11T01:00:01Z")
+        )
+
+        self.assertIn("Login / view | STALE", rendered)
+        self.assertNotIn("Login / view | GO", rendered)
+
+    def test_full_view_separates_mapped_fixtures_from_live_proof(self):
+        self.assertTrue(
+            hasattr(self.module, "render_full_quality_coverage"),
+            "Task 2 full-coverage renderer is not implemented",
+        )
+        rendered = self.module.render_full_quality_coverage(
+            self.validate(), at=self.module.parse_utc("2026-08-11T00:00:00Z")
+        )
+
+        self.assertIn("Mapped fixtures", rendered)
+        self.assertIn("Live/source evidence", rendered)
+        self.assertIn(
+            "Mapped fixtures are deterministic coverage, not proof of live production behavior.",
+            rendered,
+        )
+        self.assertNotIn("Mapped fixtures = proven live", rendered)
+        alpha_row = next(
+            line for line in rendered.splitlines() if line.startswith("| feature.alpha |")
+        )
+        beta_row = next(
+            line for line in rendered.splitlines() if line.startswith("| feature.beta |")
+        )
+        self.assertIn("| 1: happy_path |", alpha_row)
+        self.assertIn("| 0 |", beta_row)
+
+    def test_full_view_is_deterministic_core_only_and_sorted(self):
+        feature_registry = copy.deepcopy(self.feature_registry)
+        feature_registry["features"].append(
+            {"id": "feature.support", "name": "Support", "lane": "recovery_support"}
+        )
+        validated = self.validate(feature_registry=feature_registry)
+        authored = copy.deepcopy(validated.registry)
+        at = self.module.parse_utc("2026-08-11T00:00:00Z")
+
+        first = self.module.render_full_quality_coverage(validated, at=at)
+        second = self.module.render_full_quality_coverage(validated, at=at)
+
+        self.assertEqual(first, second)
+        self.assertTrue(first.endswith("\n"))
+        self.assertLess(first.index("| feature.alpha |"), first.index("| feature.beta |"))
+        self.assertNotIn("feature.support", first)
+        self.assertEqual(authored, validated.registry)
+
+    def test_full_view_uses_scoped_evidence_precedence(self):
+        feature_registry = copy.deepcopy(self.feature_registry)
+        fixture_map = copy.deepcopy(self.fixture_map)
+        for suffix in ("gamma", "delta", "epsilon"):
+            feature_registry["features"].append(
+                {
+                    "id": f"feature.{suffix}",
+                    "name": suffix.title(),
+                    "lane": "production_v1_core",
+                }
+            )
+            fixture_map["featureFixtureMatrix"][f"feature.{suffix}"] = {}
+
+        registry = copy.deepcopy(self.registry)
+        failed = copy.deepcopy(registry["evidence"][1])
+        failed.update(
+            {
+                "id": "evidence.beta.fail",
+                "result": "fail",
+                "claim": "The scoped beta check failed.",
+                "observedAt": "2026-08-10T22:30:00Z",
+            }
+        )
+        partial = copy.deepcopy(registry["evidence"][1])
+        partial.update(
+            {
+                "id": "evidence.gamma.partial",
+                "result": "partial",
+                "claim": "The scoped gamma check was partial.",
+                "featureIds": ["feature.gamma"],
+            }
+        )
+        source_only = copy.deepcopy(registry["evidence"][1])
+        source_only.update(
+            {
+                "id": "evidence.delta.source",
+                "proofLevel": "source_review",
+                "result": "pass",
+                "claim": "The scoped delta source review passed.",
+                "featureIds": ["feature.delta"],
+            }
+        )
+        source_only.pop("releaseRefs")
+        registry["evidence"].extend([failed, partial, source_only])
+        validated = self.validate(
+            registry=registry,
+            feature_registry=feature_registry,
+            fixture_map=fixture_map,
+        )
+
+        rendered = self.module.render_full_quality_coverage(
+            validated, at=self.module.parse_utc("2026-08-11T00:00:00Z")
+        )
+        rows = {
+            feature_id: next(
+                line
+                for line in rendered.splitlines()
+                if line.startswith(f"| {feature_id} |")
+            )
+            for feature_id in (
+                "feature.alpha",
+                "feature.beta",
+                "feature.gamma",
+                "feature.delta",
+                "feature.epsilon",
+            )
+        }
+
+        self.assertIn("| PASS —", rows["feature.alpha"])
+        self.assertIn("| FAIL —", rows["feature.beta"])
+        self.assertIn("evidence.beta.fail", rows["feature.beta"])
+        self.assertIn("scenario.feature", rows["feature.beta"])
+        self.assertNotIn("evidence.beta.fail", rows["feature.alpha"])
+        self.assertIn("| PARTIAL —", rows["feature.gamma"])
+        self.assertIn("| DETERMINISTIC / SOURCE ONLY —", rows["feature.delta"])
+        self.assertIn("| UNPROVEN |", rows["feature.epsilon"])
+
+    def test_full_view_sorts_multiple_quality_items_by_stable_id(self):
+        registry = copy.deepcopy(self.registry)
+        earlier = copy.deepcopy(registry["qualityItems"][0])
+        earlier.update(
+            {
+                "id": "quality.alpha-review",
+                "blocksGates": [],
+            }
+        )
+        registry["qualityItems"].append(earlier)
+
+        rendered = self.module.render_full_quality_coverage(
+            self.validate(registry=registry),
+            at=self.module.parse_utc("2026-08-11T00:00:00Z"),
+        )
+        beta_row = next(
+            line for line in rendered.splitlines() if line.startswith("| feature.beta |")
+        )
+
+        self.assertLess(
+            beta_row.index("quality.alpha-review"),
+            beta_row.index("quality.canary_unrun"),
+        )
+
+    def test_render_outputs_loads_temp_repository_without_writing(self):
+        self.write_repository_inputs()
+        at = self.module.parse_utc("2026-08-11T00:00:00Z")
+
+        outputs = self.module.render_outputs(self.repo_root, at=at)
+
+        relative_paths = {path.relative_to(self.repo_root.resolve()) for path in outputs}
+        self.assertEqual(
+            {
+                Path("docs/release-safety/current-user-readiness.md"),
+                Path("docs/release-safety/full-quality-coverage.md"),
+            },
+            relative_paths,
+        )
+        self.assertFalse(
+            (self.repo_root / "docs/release-safety/current-user-readiness.md").exists()
+        )
+        self.assertFalse(
+            (self.repo_root / "docs/release-safety/full-quality-coverage.md").exists()
+        )
+
+    def test_cli_default_writes_and_check_reports_drift_without_writing(self):
+        self.write_repository_inputs()
+        self.install_cli_script()
+        at_args = ("--at", "2026-08-11T00:00:00Z")
+
+        written = self.run_cli(*at_args)
+        self.assertEqual(0, written.returncode, written.stderr)
+        current_path = self.repo_root / "docs/release-safety/current-user-readiness.md"
+        full_path = self.repo_root / "docs/release-safety/full-quality-coverage.md"
+        self.assertTrue(current_path.is_file())
+        self.assertTrue(full_path.is_file())
+
+        clean_snapshot = {current_path: current_path.read_bytes(), full_path: full_path.read_bytes()}
+        clean_check = self.run_cli("--check", *at_args)
+        self.assertEqual(0, clean_check.returncode, clean_check.stderr)
+        self.assertEqual(clean_snapshot, {path: path.read_bytes() for path in clean_snapshot})
+
+        current_path.write_text("drift\n")
+        drift_snapshot = {current_path: current_path.read_bytes(), full_path: full_path.read_bytes()}
+        drift_check = self.run_cli("--check", *at_args)
+
+        self.assertEqual(2, drift_check.returncode)
+        output = drift_check.stdout + drift_check.stderr
+        self.assertIn("docs/release-safety/current-user-readiness.md", output)
+        self.assertNotIn(str(self.repo_root), output)
+        self.assertEqual(drift_snapshot, {path: path.read_bytes() for path in drift_snapshot})
+        self.assertEqual([], list(current_path.parent.glob(".*readiness*.tmp")))
+
+    def test_cli_validation_error_is_stable_and_writes_nothing(self):
+        registry = copy.deepcopy(self.registry)
+        registry["evidence"][0]["claim"] = "contact person@example.com"
+        self.write_repository_inputs(registry)
+        self.install_cli_script()
+
+        result = self.run_cli("--at", "2026-08-11T00:00:00Z")
+
+        self.assertEqual(2, result.returncode)
+        output = result.stdout + result.stderr
+        self.assertIn("evidence.login", output)
+        self.assertNotIn("person@example.com", output)
+        self.assertFalse(
+            (self.repo_root / "docs/release-safety/current-user-readiness.md").exists()
+        )
+        self.assertFalse(
+            (self.repo_root / "docs/release-safety/full-quality-coverage.md").exists()
+        )
 
 
 if __name__ == "__main__":
