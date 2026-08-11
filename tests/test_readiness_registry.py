@@ -103,6 +103,8 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "blockerIds": [],
                     "nextAction": None,
                     "rollback": "Disable returning-user access.",
+                    "asOf": "2026-08-11T00:00:00Z",
+                    "invalidatedBy": ["release_change"],
                 },
                 {
                     "id": "supervised_campaign_use",
@@ -115,6 +117,8 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "blockerIds": ["quality.canary_unrun"],
                     "nextAction": "Run the monitored canary.",
                     "rollback": "Pause the campaign and preserve evidence.",
+                    "asOf": "2026-08-11T00:00:00Z",
+                    "invalidatedBy": ["release_change"],
                 },
                 {
                     "id": "autonomous_campaign_use",
@@ -126,6 +130,8 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "blockerIds": [],
                     "nextAction": "Define separate autonomous proof.",
                     "rollback": "Keep autonomous use disabled.",
+                    "asOf": "2026-08-11T00:00:00Z",
+                    "invalidatedBy": ["release_change"],
                 },
             ],
             "evidence": [
@@ -171,6 +177,7 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "blocksGates": ["supervised_campaign_use"],
                     "guardrail": "One monitored campaign only.",
                     "nextProof": "Run and read back the canary.",
+                    "owner": "release-operator",
                 }
             ],
         }
@@ -712,6 +719,44 @@ class ReadinessRegistryTests(unittest.TestCase):
                 candidate["rolloutGates"][1][field] = empty_value
                 self.assert_invalid(candidate, "supervised_campaign_use")
 
+    def test_every_gate_requires_timestamped_invalidation_provenance(self):
+        for field, mutation in (
+            ("asOf", lambda gate: gate.pop("asOf")),
+            ("asOf", lambda gate: gate.__setitem__("asOf", "2026-08-11T00:00:00+00:00")),
+            ("invalidatedBy", lambda gate: gate.pop("invalidatedBy")),
+            ("invalidatedBy", lambda gate: gate.__setitem__("invalidatedBy", [])),
+            (
+                "invalidatedBy",
+                lambda gate: gate.__setitem__("invalidatedBy", ["unsafe/reference"]),
+            ),
+        ):
+            with self.subTest(field=field, mutation=mutation.__code__.co_firstlineno):
+                candidate = copy.deepcopy(self.registry)
+                mutation(candidate["rolloutGates"][0])
+                self.assert_invalid(candidate, "login_view")
+
+    def test_quality_items_require_owner_and_traceable_provenance(self):
+        for value in (None, ""):
+            with self.subTest(owner=value):
+                candidate = copy.deepcopy(self.registry)
+                if value is None:
+                    candidate["qualityItems"][0].pop("owner")
+                else:
+                    candidate["qualityItems"][0]["owner"] = value
+                self.assert_invalid(candidate, "quality.canary_unrun")
+
+        no_provenance = copy.deepcopy(self.registry)
+        no_provenance["qualityItems"][0]["evidenceIds"] = []
+        self.assert_invalid(no_provenance, "quality.canary_unrun")
+
+        legacy_provenance = copy.deepcopy(no_provenance)
+        legacy_provenance["qualityItems"][0]["legacyRefs"] = ["FDR-010"]
+        self.validate(registry=legacy_provenance)
+
+        unsafe_legacy_ref = copy.deepcopy(no_provenance)
+        unsafe_legacy_ref["qualityItems"][0]["legacyRefs"] = ["unsafe/reference"]
+        self.assert_invalid(unsafe_legacy_ref, "quality.canary_unrun")
+
     def test_parse_utc_is_strict_and_evidence_intervals_are_ordered(self):
         parsed = self.module.parse_utc("2026-08-11T00:00:00Z")
         self.assertEqual(timezone.utc, parsed.tzinfo)
@@ -775,6 +820,14 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertIn("Pause the campaign and preserve evidence.", rendered)
         self.assertIn("2026-08-10T23:00:00Z", rendered)
         self.assertIn("expires 2026-08-11T01:00:00Z", rendered)
+
+    def test_current_view_shows_gate_decision_provenance(self):
+        rendered = self.module.render_current_readiness(
+            self.validate(), at=self.module.parse_utc("2026-08-11T00:00:00Z")
+        )
+
+        self.assertEqual(3, rendered.count("- Decision as of: `2026-08-11T00:00:00Z`"))
+        self.assertEqual(3, rendered.count("- Invalidated by: `release_change`"))
 
     def test_current_view_marks_expired_go_evidence_stale(self):
         rendered = self.module.render_current_readiness(
@@ -1146,6 +1199,53 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             decisions,
         )
 
+    def test_committed_gates_have_exact_decision_provenance(self):
+        registry = self.load_registry()
+        provenance = {
+            gate["id"]: (gate.get("asOf"), gate.get("invalidatedBy"))
+            for gate in registry["rolloutGates"]
+        }
+
+        self.assertEqual(
+            {
+                "login_view": (
+                    "2026-08-11T01:52:18Z",
+                    [
+                        "backend_release_change",
+                        "production_revision_change",
+                        "runtime_allowlist_change",
+                        "campaign_control_change",
+                        "new_operational_residue",
+                        "evidence_expiry",
+                    ],
+                ),
+                "supervised_campaign_use": (
+                    "2026-08-11T01:52:18Z",
+                    [
+                        "backend_release_change",
+                        "production_revision_change",
+                        "runtime_allowlist_change",
+                        "campaign_control_change",
+                        "queue_or_send_cap_change",
+                        "new_operational_residue",
+                        "evidence_expiry",
+                    ],
+                ),
+                "autonomous_campaign_use": (
+                    "2026-08-11T01:52:18Z",
+                    [
+                        "backend_release_change",
+                        "production_revision_change",
+                        "runtime_allowlist_change",
+                        "campaign_control_change",
+                        "queue_or_send_cap_change",
+                        "new_failure_or_regression",
+                    ],
+                ),
+            },
+            provenance,
+        )
+
     def test_committed_evidence_stays_within_the_four_bounded_claims(self):
         registry = self.load_registry()
         evidence_scope = {
@@ -1229,6 +1329,34 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             },
             blocks,
         )
+
+    def test_committed_quality_items_have_owner_and_provenance(self):
+        registry = self.load_registry()
+        quality_by_id = {item["id"]: item for item in registry["qualityItems"]}
+        self.assertEqual(
+            {
+                "returning-user-canary-unrun": "release-operator",
+                "autonomous-followups-current-live-gap": "messaging-runtime",
+                "reply-all-cc-multiparty-live-gap": "reply-routing",
+                "pdf-multi-suite-ambiguity": "extraction",
+                "hard-repeat-ask-rejection-gap": "response-generation",
+                "natural-voice-variety": "quality-evaluation",
+                "long-multiturn-ordering-gap": "event-ordering",
+                "account-b-historical-cleanup": "operations",
+            },
+            {item_id: item.get("owner") for item_id, item in quality_by_id.items()},
+        )
+        legacy_backed = {
+            "reply-all-cc-multiparty-live-gap",
+            "pdf-multi-suite-ambiguity",
+            "natural-voice-variety",
+            "long-multiturn-ordering-gap",
+        }
+        for item_id, item in quality_by_id.items():
+            with self.subTest(item_id=item_id):
+                self.assertTrue(item.get("evidenceIds") or item.get("legacyRefs"))
+                if item_id in legacy_backed:
+                    self.assertEqual(["FDR-010", "FDR-011"], item.get("legacyRefs"))
 
     def test_full_view_contains_every_core_feature_without_claim_broadening(self):
         registry = self.load_registry()
