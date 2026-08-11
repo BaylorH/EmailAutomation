@@ -449,9 +449,21 @@ def validate_registry(
     for quality_id, quality in quality_by_id.items():
         if quality.get("state") not in QUALITY_STATES:
             raise RegistryError(f"{quality_id}: invalid state")
+        _stable_id(quality.get("owner"), quality_id, "owner")
         _validate_refs(quality, quality_id, "featureIds", known_features)
         _validate_refs(quality, quality_id, "scenarioIds", known_scenarios)
-        _validate_refs(quality, quality_id, "evidenceIds", evidence_ids)
+        quality_evidence = _validate_refs(
+            quality, quality_id, "evidenceIds", evidence_ids
+        )
+        legacy_refs = (
+            _string_list(quality.get("legacyRefs"), quality_id, "legacyRefs")
+            if "legacyRefs" in quality
+            else []
+        )
+        if not quality_evidence and not legacy_refs:
+            raise RegistryError(
+                f"{quality_id}: requires evidenceIds or sanitized legacyRefs"
+            )
         _validate_refs(quality, quality_id, "blocksGates", gate_ids, required=True)
         _scan_safe(quality, quality_id)
 
@@ -469,6 +481,12 @@ def validate_registry(
         gate_blockers[gate_id] = _validate_refs(
             gate, gate_id, "blockerIds", quality_ids, required=True
         )
+        _timestamp(gate.get("asOf"), gate_id, "asOf")
+        invalidated_by = _string_list(
+            gate.get("invalidatedBy"), gate_id, "invalidatedBy"
+        )
+        if not invalidated_by:
+            raise RegistryError(f"{gate_id}: invalidatedBy must be nonempty")
         _scan_safe(gate, gate_id)
         if decision == "ready_for_canary":
             _nonempty_string(gate.get("scope"), gate_id, "scope")
@@ -699,6 +717,8 @@ def render_current_readiness(
                 f"## {_gate_label(gate_id)} — {decisions[gate_id].replace('_', ' ').upper()}",
                 "",
                 f"- Scope: {_markdown_cell(gate.get('scope', 'Not specified'))}",
+                f"- Decision as of: `{gate['asOf']}`",
+                f"- Invalidated by: {_display_ids(gate['invalidatedBy'])}",
                 f"- Allowed: {_display_ids(gate.get('allows', []))}",
                 f"- Forbidden: {_display_ids(gate.get('forbids', []))}",
                 f"- Guardrails: {_display_texts(gate.get('guardrails', []))}",

@@ -15,6 +15,8 @@ As of `2026-08-11T07:00:00Z`.
 ## Login / view — GO
 
 - Scope: Returning users may sign in and inspect existing state.
+- Decision as of: `2026-08-11T01:52:18Z`
+- Invalidated by: `backend_release_change`, `production_revision_change`, `runtime_allowlist_change`, `campaign_control_change`, `new_operational_residue`, `evidence_expiry`
 - Allowed: `login`, `view_existing_state`
 - Forbidden: `campaign_launch`, `send`
 - Guardrails: Inspection does not authorize campaign activity.
@@ -27,6 +29,8 @@ As of `2026-08-11T07:00:00Z`.
 ## Supervised campaign use — READY FOR CANARY
 
 - Scope: One one-row, continuously monitored campaign with follow-ups off.
+- Decision as of: `2026-08-11T01:52:18Z`
+- Invalidated by: `backend_release_change`, `production_revision_change`, `runtime_allowlist_change`, `campaign_control_change`, `queue_or_send_cap_change`, `new_operational_residue`, `evidence_expiry`
 - Allowed: `one_row_monitored_campaign`
 - Forbidden: `autonomous_followups`, `complex_copied_party_threads`, `multirow_campaign`, `unattended_use`
 - Guardrails: Keep follow-ups off.; Use one row only.; Continuously observe launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue.
@@ -42,6 +46,8 @@ As of `2026-08-11T07:00:00Z`.
 ## Autonomous campaign use — HOLD
 
 - Scope: Unattended campaigns, autonomous follow-ups, and broader complex inputs.
+- Decision as of: `2026-08-11T01:52:18Z`
+- Invalidated by: `backend_release_change`, `production_revision_change`, `runtime_allowlist_change`, `campaign_control_change`, `queue_or_send_cap_change`, `new_failure_or_regression`
 - Allowed: None
 - Forbidden: `autonomous_followups`, `broad_user_rollout`, `complex_copied_party_threads`, `ambiguous_multi_suite_documents`, `unattended_campaigns`
 - Guardrails: Keep autonomous execution and follow-ups disabled.

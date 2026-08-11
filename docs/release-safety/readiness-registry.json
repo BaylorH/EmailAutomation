@@ -26,7 +26,16 @@
       ],
       "blockerIds": [],
       "nextAction": null,
-      "rollback": "Disable returning-user access if the containment readback regresses."
+      "rollback": "Disable returning-user access if the containment readback regresses.",
+      "asOf": "2026-08-11T01:52:18Z",
+      "invalidatedBy": [
+        "backend_release_change",
+        "production_revision_change",
+        "runtime_allowlist_change",
+        "campaign_control_change",
+        "new_operational_residue",
+        "evidence_expiry"
+      ]
     },
     {
       "id": "supervised_campaign_use",
@@ -56,7 +65,17 @@
         "returning-user-canary-unrun"
       ],
       "nextAction": "Manually launch one one-row monitored canary with follow-ups off, then read back the full scoped path.",
-      "rollback": "Pause the campaign immediately and preserve scoped evidence if any guardrail fails."
+      "rollback": "Pause the campaign immediately and preserve scoped evidence if any guardrail fails.",
+      "asOf": "2026-08-11T01:52:18Z",
+      "invalidatedBy": [
+        "backend_release_change",
+        "production_revision_change",
+        "runtime_allowlist_change",
+        "campaign_control_change",
+        "queue_or_send_cap_change",
+        "new_operational_residue",
+        "evidence_expiry"
+      ]
     },
     {
       "id": "autonomous_campaign_use",
@@ -88,7 +107,16 @@
         "long-multiturn-ordering-gap"
       ],
       "nextAction": "Complete the monitored returning-user canary, then run separate live proof for each autonomous blocker.",
-      "rollback": "Keep autonomous execution and follow-ups disabled."
+      "rollback": "Keep autonomous execution and follow-ups disabled.",
+      "asOf": "2026-08-11T01:52:18Z",
+      "invalidatedBy": [
+        "backend_release_change",
+        "production_revision_change",
+        "runtime_allowlist_change",
+        "campaign_control_change",
+        "queue_or_send_cap_change",
+        "new_failure_or_regression"
+      ]
     }
   ],
   "evidence": [
@@ -247,7 +275,8 @@
         "autonomous_campaign_use"
       ],
       "guardrail": "Keep productive use to one continuously monitored row with follow-ups off.",
-      "nextProof": "Run the returning-user canary and read back launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue."
+      "nextProof": "Run the returning-user canary and read back launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue.",
+      "owner": "release-operator"
     },
     {
       "id": "autonomous-followups-current-live-gap",
@@ -270,7 +299,8 @@
         "autonomous_campaign_use"
       ],
       "guardrail": "Keep follow-ups off.",
-      "nextProof": "Run release-matched live follow-up and continuation proof with idempotent send, counters, and scoped readback."
+      "nextProof": "Run release-matched live follow-up and continuation proof with idempotent send, counters, and scoped readback.",
+      "owner": "messaging-runtime"
     },
     {
       "id": "reply-all-cc-multiparty-live-gap",
@@ -287,11 +317,16 @@
         "reply_all_cc_context"
       ],
       "evidenceIds": [],
+      "legacyRefs": [
+        "FDR-010",
+        "FDR-011"
+      ],
       "blocksGates": [
         "autonomous_campaign_use"
       ],
       "guardrail": "Avoid complex copied-party threads in the supervised canary.",
-      "nextProof": "Run a monitored copied-party reply-all proof with participant preservation and same-thread readback."
+      "nextProof": "Run a monitored copied-party reply-all proof with participant preservation and same-thread readback.",
+      "owner": "reply-routing"
     },
     {
       "id": "pdf-multi-suite-ambiguity",
@@ -308,11 +343,16 @@
         "broker_available_partial_specs"
       ],
       "evidenceIds": [],
+      "legacyRefs": [
+        "FDR-010",
+        "FDR-011"
+      ],
       "blocksGates": [
         "autonomous_campaign_use"
       ],
       "guardrail": "Route ambiguous multi-suite attachments to manual review.",
-      "nextProof": "Pass deterministic ambiguity cases, then run one monitored live multi-suite attachment proof."
+      "nextProof": "Pass deterministic ambiguity cases, then run one monitored live multi-suite attachment proof.",
+      "owner": "extraction"
     },
     {
       "id": "hard-repeat-ask-rejection-gap",
@@ -336,7 +376,8 @@
         "autonomous_campaign_use"
       ],
       "guardrail": "Stop for manual review if an already supplied value is requested again.",
-      "nextProof": "Prove hard repeated-ask rejection across partial-spec and continuation cases, then confirm it live."
+      "nextProof": "Prove hard repeated-ask rejection across partial-spec and continuation cases, then confirm it live.",
+      "owner": "response-generation"
     },
     {
       "id": "natural-voice-variety",
@@ -354,9 +395,14 @@
         "manual_user_continuation"
       ],
       "evidenceIds": [],
+      "legacyRefs": [
+        "FDR-010",
+        "FDR-011"
+      ],
       "blocksGates": [],
       "guardrail": "Review supervised drafts before send.",
-      "nextProof": "Evaluate varied natural English across launch, follow-up, and continuation samples without treating polish as a canary blocker."
+      "nextProof": "Evaluate varied natural English across launch, follow-up, and continuation samples without treating polish as a canary blocker.",
+      "owner": "quality-evaluation"
     },
     {
       "id": "long-multiturn-ordering-gap",
@@ -376,11 +422,16 @@
         "retry_after_uncertain_send"
       ],
       "evidenceIds": [],
+      "legacyRefs": [
+        "FDR-010",
+        "FDR-011"
+      ],
       "blocksGates": [
         "autonomous_campaign_use"
       ],
       "guardrail": "Keep the supervised canary to a short exchange and stop on ordering ambiguity.",
-      "nextProof": "Run a release-matched long multi-turn proof with ordering, retry, extraction, and same-row readback."
+      "nextProof": "Run a release-matched long multi-turn proof with ordering, retry, extraction, and same-row readback.",
+      "owner": "event-ordering"
     },
     {
       "id": "account-b-historical-cleanup",
@@ -398,7 +449,8 @@
       ],
       "blocksGates": [],
       "guardrail": "Treat historical cleanup as post-return hygiene and keep affected state non-send-capable.",
-      "nextProof": "Complete the offline cleanup reconciliation and verify the contained readback without changing rollout clearance."
+      "nextProof": "Complete the offline cleanup reconciliation and verify the contained readback without changing rollout clearance.",
+      "owner": "operations"
     }
   ]
 }
