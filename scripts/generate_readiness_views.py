@@ -354,9 +354,10 @@ def validate_registry(
     fixture_matrix = _mapping(
         fixture_doc.get("featureFixtureMatrix"), "fixture-map", "featureFixtureMatrix"
     )
-    for feature_id in fixture_matrix:
+    for feature_id, fixture_row in fixture_matrix.items():
         _stable_id(feature_id, "fixture-map", "featureFixtureMatrix key")
         _scan_safe(feature_id, "fixture-map")
+        _mapping(fixture_row, feature_id, "fixture row")
     unknown_fixture_features = set(fixture_matrix) - known_features
     if unknown_fixture_features:
         unknown = sorted(unknown_fixture_features)[0]
@@ -827,7 +828,9 @@ def _load_json(path: Path, stable_name: str) -> Any:
         raise RegistryError(f"{stable_name}: invalid JSON source") from exc
 
 
-def render_outputs(repo_root: Path | str, *, at: datetime | str) -> dict[Path, str]:
+def render_outputs(
+    repo_root: Path | str, *, at: datetime | str | None = None
+) -> dict[Path, str]:
     """Load validated sources and return both deterministic Markdown payloads."""
 
     root = Path(repo_root).resolve()
@@ -842,7 +845,11 @@ def render_outputs(repo_root: Path | str, *, at: datetime | str) -> dict[Path, s
         fixture_map,
         repo_root=root,
     )
-    at_time = _at_time(at)
+    at_time = (
+        parse_utc(validated.registry["updatedAt"])
+        if at is None
+        else _at_time(at)
+    )
     return {
         root / _CURRENT_VIEW_PATH: render_current_readiness(validated, at=at_time),
         root / _FULL_VIEW_PATH: render_full_quality_coverage(validated, at=at_time),
@@ -890,7 +897,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo_root = Path(__file__).resolve().parents[1]
     try:
-        at = parse_utc(args.at) if args.at else datetime.now(timezone.utc).replace(microsecond=0)
+        at = parse_utc(args.at) if args.at else None
         outputs = render_outputs(repo_root, at=at)
         if args.check:
             mismatches = []
