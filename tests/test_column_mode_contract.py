@@ -140,6 +140,79 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             )
         )
 
+    def test_rejects_direct_structural_questions_for_known_ask_fields(self):
+        cases = (
+            (
+                "Could you confirm operating expenses? What is the asking rent?",
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            (
+                "Could you confirm operating expenses? How many docks are there?",
+                {"ops ex /sf", "docks"},
+            ),
+            (
+                "Could you confirm operating expenses? Do the premises have docks?",
+                {"ops ex /sf", "docks"},
+            ),
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        for body, expected_fields in cases:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    expected_fields,
+                    set(helper(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+    def test_declarative_dock_context_does_not_become_a_request(self):
+        bodies = (
+            "There are many docks at the premises. Could you confirm operating expenses?",
+            "The premises do have docks. Could you confirm operating expenses?",
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    {"ops ex /sf"},
+                    set(helper(body, self.config)),
+                )
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+    def test_decimal_rate_does_not_split_shared_request_clause(self):
+        body = (
+            "Could you confirm operating expenses at $3.25/SF and the asking rent?"
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"ops ex /sf", "rent/sf /yr"},
+            set(helper(body, self.config)),
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
     def test_rejects_semicolon_clauses_reasking_known_ask_field(self):
         body = "Could you confirm the asking rent; please provide operating expenses?"
 

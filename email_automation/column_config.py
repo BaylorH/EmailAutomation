@@ -645,14 +645,19 @@ _FIELD_REQUEST_INTENT_RE = re.compile(
     r"|^\s*would\s+it\s+be\s+possible\s+to\b"
     r"|^\s*i\s+would\s+appreciate\b"
     r"|^\s*(?:is|are|was|were)\b"
+    r"|^\s*what\s+(?:is|are|was|were)\b"
+    r"|^\s*how\s+many\b"
     r"|^\s*(?:do|does|did)\s+(?:you|we|they)\s+have\b"
+    r"|^\s*(?:do|does|did)\s+(?!not\b)"
+    r"(?:(?:the|this|that|these|those|your|our|their)\s+)?"
+    r"(?:[a-z][a-z'-]*\s+){1,3}have\b"
     r"|^\s*what\s+about\b"
     r"|\b(?:i\s+am|we\s+are|the\s+client\s+is|our\s+team\s+is)\s+interested\s+in\b"
     r")",
     re.IGNORECASE,
 )
 
-_FIELD_REQUEST_SENTENCE_SPLIT_RE = re.compile(r"[.!?]+")
+_FIELD_REQUEST_SENTENCE_SPLIT_RE = re.compile(r"(?<!\d)\.|\.(?!\d)|[!?]+")
 _FIELD_REQUEST_COORDINATION_SPLIT_RE = re.compile(r"[,;]+")
 _FIELD_REQUEST_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
 _FIELD_ACKNOWLEDGEMENT_PREFIX_RE = re.compile(
