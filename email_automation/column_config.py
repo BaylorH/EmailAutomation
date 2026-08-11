@@ -660,13 +660,6 @@ _FIELD_REQUEST_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_FIELD_REQUEST_SENTENCE_BOUNDARY_RE = re.compile(r"(?<!\d)\.|\.(?!\d)|[!?]+")
-_FIELD_REQUEST_COORDINATION_SPLIT_RE = re.compile(r"[,;]+")
-_FIELD_REQUEST_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
-_FIELD_ACKNOWLEDGEMENT_PREFIX_RE = re.compile(
-    r"^\s*please\s+note(?:\s+that)?\b[\s,:-]*",
-    re.IGNORECASE,
-)
 _FIELD_NEGATED_REQUEST_INTENT_RE = re.compile(
     r"\b(?:"
     r"no\s+need"
@@ -680,125 +673,196 @@ _FIELD_NEGATED_REQUEST_INTENT_RE = re.compile(
     r"(?:\s+to\s+(?:ask|request|confirm))?\b",
     re.IGNORECASE,
 )
-_FIELD_REQUEST_CONTINUATION_BLOCK_RE = re.compile(
-    r"(?:"
-    r"^\s*(?:and\s+)?(?:i|you|we|they|he|she|it|this|that|here|there)\b"
-    r"|\b(?:already|am|is|are|was|were|have|has|had|confirmed|provided|received|sent|included|attached|shared|forwarded|supplied)\b"
-    r")",
-    re.IGNORECASE,
-)
-_FIELD_REQUEST_LIST_LEAD_RE = re.compile(
-    r"\b(?:the\s+)?(?:following|below|details|information|items)\s*[?:]\s*$",
-    re.IGNORECASE,
-)
-_FIELD_REQUEST_CONJUNCTION_PREFIX_RE = re.compile(r"^\s*(?:and|or)\s+", re.IGNORECASE)
-_FIELD_REQUEST_SF_TERM_RE = re.compile(
-    r"(?<![A-Za-z0-9])sf(?![A-Za-z0-9])",
-    re.IGNORECASE,
-)
 _FIELD_REQUEST_SF_UNIT_PREFIX_RE = re.compile(
     r"(?:/|\bper\s+)\s*$",
     re.IGNORECASE,
 )
+_FIELD_MENTION_CONTEXT_BOUNDARY_RE = re.compile(
+    r"(?<!\d)\.|\.(?!\d)|[!?;]+|\r?\n+|\s+[\u2013\u2014]\s+|\s+-\s+|\bbut\b"
+    r"|(?:,\s*|\b(?:and|or)\s+)(?=(?:"
+    r"i|we|you|they|he|she|it|can|could|would|will|may|"
+    r"is|are|do|does|did|what|how|please|kindly|tell|let"
+    r")\b)",
+    re.IGNORECASE,
+)
+_FIELD_CLEAR_ACKNOWLEDGEMENT_RE = re.compile(
+    r"(?:"
+    r"\b(?:thanks|thank\s+you)\s+for\s+"
+    r"(?:confirming|providing|sending|sharing)\b"
+    r"|\bplease\s+note(?:\s+that)?\b"
+    r"|\b(?:i|we|you|they|he|she)\s+already\s+"
+    r"(?:have|had|received|confirmed|provided)\b"
+    r"|\balready\s+"
+    r"(?:confirmed|provided|received|sent|included|attached|shared|forwarded|supplied)\b"
+    r")",
+    re.IGNORECASE,
+)
+_FIELD_CLEAR_INFORMATIONAL_RE = re.compile(
+    r"(?:"
+    r"\b(?:happy|glad)\s+to\s+(?:send|share|provide|forward)\b"
+    r"|\bhere\s+(?:is|are)\b"
+    r"|^\s*(?:i|we)\s+know\b"
+    r"|^\s*(?:i|we)\s+could\s+(?:get|send|share|provide|forward)\b"
+    r"|^\s*it\s+would\s+be\s+possible\s+to\s+"
+    r"(?:send|share|provide|forward)\b"
+    r"|^\s*(?:i|we)\s+appreciate\b"
+    r")",
+    re.IGNORECASE,
+)
+_FIELD_CLEAR_ACKNOWLEDGEMENT_SUFFIX_RE = re.compile(
+    r"^\s+(?:is|are|was|were|has|have|had)\s+(?:already\s+)?"
+    r"(?:been\s+)?"
+    r"(?:confirmed|provided|received|sent|included|attached|shared|forwarded|supplied)\b",
+    re.IGNORECASE,
+)
+_FIELD_CLEAR_NEGATED_SUFFIX_RE = re.compile(
+    r"^\s+(?:(?:is|are|was|were)\s+not|(?:isn|aren|wasn|weren)['\u2019]t)\s+"
+    r"(?:needed|required|requested)\b",
+    re.IGNORECASE,
+)
+_FIELD_CLEAR_FACTUAL_PREFIX_RE = re.compile(
+    r"(?:"
+    r"^\s*there\s+(?:is|are|was|were)\b"
+    r"|^\s*(?:"
+    r"(?:(?:the|this|that|these|those|our|your|their)\s+)"
+    r"(?:[a-z][a-z'-]*\s+){1,3}"
+    r"|[a-z][a-z'-]*\s+"
+    r")(?:do|does|did)\s+have\s*$"
+    r")",
+    re.IGNORECASE,
+)
+_FIELD_CLEAR_FACTUAL_VALUE_SUFFIX_RE = re.compile(
+    r"^\s*(?::|(?:is|are|was|were|equals?|runs?)\b)\s*"
+    r"(?:[$€£]?\s*\d|yes\b|no\b|none\b|unknown\b|available\b|unavailable\b)",
+    re.IGNORECASE,
+)
 
 
-def _field_request_sentences(text: str) -> List[tuple]:
-    """Return sentence text with whether its decimal-safe terminator is a question."""
-    sentences = []
-    sentence_start = 0
-    for boundary in _FIELD_REQUEST_SENTENCE_BOUNDARY_RE.finditer(text):
-        sentence = text[sentence_start:boundary.start()].strip()
-        if sentence:
-            sentences.append((sentence, "?" in boundary.group(0)))
-        sentence_start = boundary.end()
+def _field_mention_contexts(text: str) -> List[tuple]:
+    """Return bounded field contexts and whether each ended as a question."""
+    contexts = []
+    context_start = 0
+    for boundary in _FIELD_MENTION_CONTEXT_BOUNDARY_RE.finditer(text):
+        context = text[context_start:boundary.start()].strip()
+        if context:
+            contexts.append((context, "?" in boundary.group(0)))
+        context_start = boundary.end()
 
-    trailing_sentence = text[sentence_start:].strip()
-    if trailing_sentence:
-        sentences.append((trailing_sentence, False))
-    return sentences
-
-
-def _explicit_field_request_clauses(response_body: str) -> List[str]:
-    """Return explicit request clauses, including bullets under a request lead-in."""
-    request_clauses = []
-    bullet_request_active = False
-
-    for line in (response_body or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        if bullet_request_active and _FIELD_REQUEST_BULLET_RE.match(stripped):
-            request_clauses.append(stripped)
-            continue
-
-        explicit_clauses = []
-        for sentence, is_question in _field_request_sentences(stripped):
-            request_active = False
-            for clause in _FIELD_REQUEST_COORDINATION_SPLIT_RE.split(sentence):
-                request_candidate = _FIELD_ACKNOWLEDGEMENT_PREFIX_RE.sub(
-                    "",
-                    clause.strip(),
-                )
-                if not request_candidate:
-                    continue
-
-                intent_candidate = _FIELD_REQUEST_CONJUNCTION_PREFIX_RE.sub(
-                    "",
-                    request_candidate,
-                )
-                has_negated_intent = bool(
-                    _FIELD_NEGATED_REQUEST_INTENT_RE.search(intent_candidate)
-                )
-                intent_candidate = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
-                    "",
-                    intent_candidate,
-                )
-                intent_match = _FIELD_REQUEST_INTENT_RE.search(intent_candidate)
-                if intent_match:
-                    explicit_clauses.append(
-                        intent_candidate[intent_match.start():].strip()
-                    )
-                    request_active = True
-                elif is_question and not has_negated_intent:
-                    explicit_clauses.append(intent_candidate)
-                    request_active = True
-                elif (
-                    request_active
-                    and not _FIELD_REQUEST_CONTINUATION_BLOCK_RE.search(request_candidate)
-                ):
-                    explicit_clauses.append(request_candidate)
-                else:
-                    request_active = False
-        request_clauses.extend(explicit_clauses)
-        bullet_request_active = bool(explicit_clauses) and (
-            stripped.endswith(":") or bool(_FIELD_REQUEST_LIST_LEAD_RE.search(stripped))
-        )
-
-    return request_clauses
+    trailing_context = text[context_start:].strip()
+    if trailing_context:
+        contexts.append((trailing_context, False))
+    return contexts
 
 
-def contains_column_field_term(text: str, term: str) -> bool:
-    """Match a configured field term as words, never inside another word."""
+def _column_field_term_matches(
+    text: str,
+    term: str,
+    *,
+    disambiguate_sf: bool = False,
+) -> List[Any]:
+    """Return word-bounded matches for a field term, excluding unit-only SF."""
     normalized = (term or "").strip()
     if not normalized:
-        return False
+        return []
     pattern = re.escape(normalized).replace(r"\ ", r"\s+")
-    return bool(re.search(
+    matches = list(re.finditer(
         rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])",
         text or "",
         re.IGNORECASE,
     ))
+    if not disambiguate_sf or normalized.lower() != "sf":
+        return matches
+    return [
+        match
+        for match in matches
+        if not _FIELD_REQUEST_SF_UNIT_PREFIX_RE.search((text or "")[:match.start()])
+    ]
 
 
-def _request_clause_contains_field_term(clause: str, term: str) -> bool:
-    if not contains_column_field_term(clause, term):
+def contains_column_field_term(text: str, term: str) -> bool:
+    """Match a configured field term as words, never inside another word."""
+    return bool(_column_field_term_matches(text, term))
+
+
+def _field_group_match_spans(text: str, terms: List[str]) -> List[tuple]:
+    """Return maximal, de-duplicated spans for aliases of one configured field."""
+    spans = {
+        (match.start(), match.end())
+        for term in terms
+        for match in _column_field_term_matches(text, term, disambiguate_sf=True)
+    }
+    maximal_spans = []
+    for start, end in sorted(spans, key=lambda span: (span[0] - span[1], span[0])):
+        if any(
+            kept_start <= start and end <= kept_end
+            for kept_start, kept_end in maximal_spans
+        ):
+            continue
+        maximal_spans.append((start, end))
+    return sorted(maximal_spans)
+
+
+def _last_match_start(pattern: re.Pattern, text: str) -> int:
+    return max((match.start() for match in pattern.finditer(text)), default=-1)
+
+
+def _field_mention_is_clear_nonrequest(
+    context: str,
+    mention_start: int,
+    mention_end: int,
+    is_question: bool,
+) -> bool:
+    """Return True only for clear field-local acknowledgement or factual context."""
+    prefix = context[:mention_start]
+    suffix = context[mention_end:]
+    last_negation = _last_match_start(_FIELD_NEGATED_REQUEST_INTENT_RE, prefix)
+    last_acknowledgement = _last_match_start(
+        _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
+        prefix,
+    )
+    last_informational = _last_match_start(_FIELD_CLEAR_INFORMATIONAL_RE, prefix)
+    intent_prefix = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
+        lambda match: " " * (match.end() - match.start()),
+        prefix,
+    )
+    last_affirmative_intent = _last_match_start(
+        _FIELD_REQUEST_INTENT_RE,
+        intent_prefix,
+    )
+
+    last_clear_nonrequest = max(
+        last_negation,
+        last_acknowledgement,
+        last_informational,
+    )
+    if last_affirmative_intent > last_clear_nonrequest:
         return False
-    if term.lower() != "sf":
+    if last_clear_nonrequest >= 0:
         return True
+    if is_question:
+        return False
+    if _FIELD_CLEAR_NEGATED_SUFFIX_RE.search(suffix):
+        return True
+    if _FIELD_CLEAR_ACKNOWLEDGEMENT_SUFFIX_RE.search(suffix):
+        return True
+    if _FIELD_CLEAR_FACTUAL_PREFIX_RE.search(prefix):
+        return True
+    return bool(_FIELD_CLEAR_FACTUAL_VALUE_SUFFIX_RE.search(suffix))
+
+
+def _field_group_has_request_like_mention(
+    mention_contexts: List[tuple],
+    terms: List[str],
+) -> bool:
     return any(
-        not _FIELD_REQUEST_SF_UNIT_PREFIX_RE.search(clause[:match.start()])
-        for match in _FIELD_REQUEST_SF_TERM_RE.finditer(clause)
+        not _field_mention_is_clear_nonrequest(
+            context,
+            mention_start,
+            mention_end,
+            is_question,
+        )
+        for context, is_question in mention_contexts
+        for mention_start, mention_end in _field_group_match_spans(context, terms)
     )
 
 
@@ -847,21 +911,18 @@ def get_requested_ask_fields(
         terms = [header.strip().lower(), *_custom_field_paraphrase_terms(header)]
         field_groups.append((header, list(dict.fromkeys(terms))))
 
-    request_clauses = _explicit_field_request_clauses(body)
     requested = []
     requested_headers = set()
-    for clause in request_clauses:
-        clause_matches = [
-            (header, _normalized_column_name(header), term)
-            for header, terms in field_groups
-            for term in terms
-            if _request_clause_contains_field_term(clause, term)
-        ]
-        for header, normalized_header, _term in clause_matches:
-            if normalized_header in requested_headers:
-                continue
-            requested.append(header)
-            requested_headers.add(normalized_header)
+    mention_contexts = _field_mention_contexts(body)
+    for header, terms in field_groups:
+        normalized_header = _normalized_column_name(header)
+        if normalized_header in requested_headers:
+            continue
+        is_requested = _field_group_has_request_like_mention(mention_contexts, terms)
+        if not is_requested:
+            continue
+        requested.append(header)
+        requested_headers.add(normalized_header)
 
     return requested
 
@@ -877,12 +938,10 @@ def response_requests_nonrequestable_fields(
     if get_column_config_error(column_config):
         return True
 
-    request_clauses = _explicit_field_request_clauses(body)
+    mention_contexts = _field_mention_contexts(body)
     return any(
-        contains_column_field_term(clause, term)
+        _field_group_has_request_like_mention(mention_contexts, terms)
         for terms in get_non_requestable_field_terms(column_config)
-        for term in terms
-        for clause in request_clauses
     )
 
 

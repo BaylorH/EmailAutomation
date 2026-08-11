@@ -200,6 +200,110 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                     )
                 )
 
+    def test_unclassified_known_ask_mentions_fail_closed(self):
+        cases = (
+            (
+                "Could you confirm operating expenses? What's the asking rent per sq. ft.?",
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            ("What's the asking rent\nfor this property?", {"rent/sf /yr"}),
+            (
+                "Could you confirm operating expenses? I'd also like the asking rent.",
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            ("I'd like the asking rent.", {"rent/sf /yr"}),
+            ("I'm curious about the asking rent.", {"rent/sf /yr"}),
+            ("Kindly confirm the asking rent.", {"rent/sf /yr"}),
+            ("Tell me the asking rent.", {"rent/sf /yr"}),
+            (
+                "Thanks for confirming operating expenses, and I'd like the asking rent.",
+                {"rent/sf /yr"},
+            ),
+            ("Tell me if the premises do have docks.", {"docks"}),
+            (
+                "Could you confirm operating expenses? We don't need the flyer — what's the asking rent?",
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        for body, expected_fields in cases:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    expected_fields,
+                    set(helper(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+        self.assertFalse(
+            processing._response_requests_nonrequestable_fields(
+                cases[-1][0],
+                self.config,
+            )
+        )
+
+    def test_semicolon_acknowledgement_only_requests_missing_field(self):
+        body = (
+            "Thanks for confirming the asking rent; could you confirm operating expenses?"
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"ops ex /sf"},
+            set(helper(body, self.config)),
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+    def test_clear_nonrequest_context_does_not_leak_across_comma_clause(self):
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        body = "Thanks for confirming operating expenses, I'd like the asking rent."
+        self.assertEqual({"rent/sf /yr"}, set(helper(body, self.config)))
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+        body = "We don't need the flyer, I'd like the asking rent."
+        self.assertEqual({"rent/sf /yr"}, set(helper(body, self.config)))
+        self.assertFalse(
+            processing._response_requests_nonrequestable_fields(body, self.config)
+        )
+
+    def test_factual_known_ask_value_does_not_become_a_request(self):
+        body = "The asking rent is $12/SF. Could you confirm operating expenses?"
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"ops ex /sf"},
+            set(helper(body, self.config)),
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
     def test_declarative_dock_context_does_not_become_a_request(self):
         bodies = (
             "There are many docks at the premises. Could you confirm operating expenses?",
@@ -574,6 +678,7 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             "May I get the flyer?",
             "Would it be possible to send the flyer?",
             "I would appreciate a flyer.",
+            "I'm curious about the flyer link.",
         ):
             with self.subTest(body=body):
                 self.assertTrue(
