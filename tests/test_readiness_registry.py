@@ -1,5 +1,7 @@
 import copy
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -10,6 +12,7 @@ import unittest
 from dataclasses import FrozenInstanceError
 from datetime import timezone
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -770,6 +773,32 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertIn("Login / view | STALE", rendered)
         self.assertNotIn("Login / view | GO", rendered)
 
+    def test_current_view_names_failure_that_regresses_supporting_pass(self):
+        base = self.validate()
+        candidate = copy.deepcopy(self.registry)
+        self.add_login_failure(candidate, observed_at="2026-08-10T23:30:00Z")
+        validated = self.module.ValidatedRegistry(
+            registry=candidate,
+            feature_by_id=base.feature_by_id,
+            fixture_matrix=base.fixture_matrix,
+            gate_ids=base.gate_ids,
+            evidence_by_id={item["id"]: item for item in candidate["evidence"]},
+            quality_by_id=base.quality_by_id,
+        )
+
+        rendered = self.module.render_current_readiness(
+            validated, at=self.module.parse_utc("2026-08-11T00:00:00Z")
+        )
+        evidence_line = next(
+            line for line in rendered.splitlines() if "`evidence.login` —" in line
+        )
+
+        self.assertIn("Login / view | STALE", rendered)
+        self.assertIn("pass / regressed;", evidence_line)
+        self.assertIn("invalidated by `evidence.login.regression`", evidence_line)
+        self.assertIn("same-release overlapping failure", evidence_line)
+        self.assertNotIn("pass / current;", evidence_line)
+
     def test_full_view_separates_mapped_fixtures_from_live_proof(self):
         self.assertTrue(
             hasattr(self.module, "render_full_quality_coverage"),
@@ -1015,6 +1044,50 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertFalse(
             (self.repo_root / "docs/release-safety/full-quality-coverage.md").exists()
         )
+
+    def test_cli_rolls_back_both_outputs_when_second_replace_fails(self):
+        release_safety = self.repo_root / "docs" / "release-safety"
+        first = release_safety / "current-user-readiness.md"
+        second = release_safety / "full-quality-coverage.md"
+        first.write_bytes(b"original current\n")
+        second.write_bytes(b"original full\n")
+        outputs = {first: "new current\n", second: "new full\n"}
+        real_replace = os.replace
+        injected = {"failed": False}
+
+        def fail_second_new_output(source, target):
+            source_path = Path(source)
+            target_path = Path(target)
+            if source_path.name.endswith(".tmp") and target_path == second:
+                injected["failed"] = True
+                raise OSError("injected failure at /Users/private/second-target")
+            return real_replace(source, target)
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.module, "render_outputs", return_value=outputs),
+            mock.patch.object(
+                self.module.os, "replace", side_effect=fail_second_new_output
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = self.module.main([])
+
+        self.assertTrue(injected["failed"])
+        self.assertEqual(2, exit_code)
+        self.assertEqual(b"original current\n", first.read_bytes())
+        self.assertEqual(b"original full\n", second.read_bytes())
+        message = stderr.getvalue()
+        self.assertIn("readiness_outputs", message)
+        self.assertNotIn("/Users/private", message)
+        self.assertNotIn("Traceback", message)
+        residue = [
+            path.name
+            for path in release_safety.iterdir()
+            if path.name.startswith(".current-user-readiness.md.")
+            or path.name.startswith(".full-quality-coverage.md.")
+        ]
+        self.assertEqual([], residue)
 
     def test_cli_validation_error_is_stable_and_writes_nothing(self):
         registry = copy.deepcopy(self.registry)

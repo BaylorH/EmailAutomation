@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -293,14 +294,36 @@ def _go_evidence_is_current(
     expires_raw = evidence.get("expiresAt")
     if expires_raw is not None and at >= parse_utc(expires_raw):
         return False
+    if _regressing_failures(
+        evidence,
+        evidence_by_id,
+        release_identity,
+        at=at,
+    ):
+        return False
+    return True
+
+
+def _regressing_failures(
+    evidence: Mapping[str, Any],
+    evidence_by_id: Mapping[str, Mapping[str, Any]],
+    release_identity: Mapping[str, Any],
+    *,
+    at: datetime,
+) -> list[Mapping[str, Any]]:
+    failures = []
+    observed_at = parse_utc(evidence["observedAt"])
     for candidate in evidence_by_id.values():
         if candidate["proofLevel"] == "historical" or candidate["result"] != "fail":
             continue
         failed_at = parse_utc(candidate["observedAt"])
         if observed_at <= failed_at <= at and _is_current_release(candidate, release_identity):
             if _scope_overlaps(evidence, candidate):
-                return False
-    return True
+                failures.append(candidate)
+    return sorted(
+        failures,
+        key=lambda candidate: (parse_utc(candidate["observedAt"]), candidate["id"]),
+    )
 
 
 def _validate_artifact(artifact: Any, evidence_id: str, repo_root: Path) -> None:
@@ -600,19 +623,34 @@ def _age_text(observed_at: datetime, at: datetime) -> str:
 
 def _gate_evidence_line(
     evidence: Mapping[str, Any],
+    evidence_by_id: Mapping[str, Mapping[str, Any]],
     release_identity: Mapping[str, Any],
     *,
     at: datetime,
 ) -> str:
     observed_at = parse_utc(evidence["observedAt"])
-    currency = "current" if _evidence_is_current(evidence, release_identity, at=at) else "stale"
+    current = _evidence_is_current(evidence, release_identity, at=at)
+    regressions = (
+        _regressing_failures(evidence, evidence_by_id, release_identity, at=at)
+        if current and evidence["result"] == "pass"
+        else []
+    )
+    if regressions:
+        currency = "regressed"
+        invalidators = ", ".join(f"`{item['id']}`" for item in regressions)
+        invalidation = (
+            f"; invalidated by {invalidators} (same-release overlapping failure)"
+        )
+    else:
+        currency = "current" if current else "stale"
+        invalidation = ""
     expiry = evidence.get("expiresAt")
     expiry_text = "no fixed expiry" if expiry is None else f"expires {expiry}"
     scenarios = _display_ids(evidence.get("scenarioIds", []))
     return (
         f"`{evidence['id']}` — {evidence['proofLevel']} / {evidence['result']} / "
         f"{currency}; scenarios {scenarios}; observed {evidence['observedAt']} "
-        f"({_age_text(observed_at, at)}); {expiry_text}."
+        f"({_age_text(observed_at, at)}); {expiry_text}{invalidation}."
     )
 
 
@@ -675,6 +713,7 @@ def render_current_readiness(
                     "  - "
                     + _gate_evidence_line(
                         validated.evidence_by_id[evidence_id],
+                        validated.evidence_by_id,
                         release_identity,
                         at=at_time,
                     )
@@ -858,6 +897,7 @@ def render_outputs(
 
 def _atomic_write_outputs(outputs: Mapping[Path, str]) -> None:
     staged: list[tuple[Path, Path]] = []
+    backups: dict[Path, Path | None] = {}
     try:
         for target, payload in sorted(outputs.items(), key=lambda item: str(item[0])):
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -873,12 +913,55 @@ def _atomic_write_outputs(outputs: Mapping[Path, str]) -> None:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-        for temp_path, target in staged:
-            os.replace(temp_path, target)
+        for _temp_path, target in staged:
+            if target.exists():
+                descriptor, backup_name = tempfile.mkstemp(
+                    dir=target.parent,
+                    prefix=f".{target.name}.",
+                    suffix=".bak",
+                )
+                os.close(descriptor)
+                backup_path = Path(backup_name)
+                backups[target] = backup_path
+                shutil.copy2(target, backup_path)
+            else:
+                backups[target] = None
+
+        changed: list[Path] = []
+        try:
+            for temp_path, target in staged:
+                os.replace(temp_path, target)
+                changed.append(target)
+        except OSError as exc:
+            rollback_failed = False
+            for target in reversed(changed):
+                backup_path = backups[target]
+                try:
+                    if backup_path is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup_path, target)
+                        backups[target] = None
+                except OSError:
+                    rollback_failed = True
+            if rollback_failed:
+                raise RegistryError("readiness_outputs: rollback failed") from exc
+            raise RegistryError("readiness_outputs: transactional write failed") from exc
+    except RegistryError:
+        raise
+    except OSError as exc:
+        raise RegistryError("readiness_outputs: transactional write failed") from exc
     finally:
         for temp_path, _target in staged:
             try:
                 temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        for backup_path in backups.values():
+            if backup_path is None:
+                continue
+            try:
+                backup_path.unlink()
             except FileNotFoundError:
                 pass
 
