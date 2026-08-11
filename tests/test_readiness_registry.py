@@ -1403,7 +1403,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             "authoritative for current capability clearance",
             "This packet remains the test-selection contract",
             "`login_view = go`",
-            "`supervised_campaign_use = ready_for_canary`",
+            "`supervised_campaign_use = go`",
             "`autonomous_campaign_use = hold`",
             "Historical language in this packet is not a blanket hold",
             "Mapped fixtures and P0/P1 labels do not automatically equal live proof or a rollout block.",
@@ -1421,7 +1421,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
         self.assertEqual(
             {
                 "login_view": "go",
-                "supervised_campaign_use": "ready_for_canary",
+                "supervised_campaign_use": "go",
                 "autonomous_campaign_use": "hold",
             },
             decisions,
@@ -1448,7 +1448,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                     ],
                 ),
                 "supervised_campaign_use": (
-                    "2026-08-11T01:52:18Z",
+                    "2026-08-11T17:28:58Z",
                     [
                         "backend_release_change",
                         "production_revision_change",
@@ -1460,7 +1460,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                     ],
                 ),
                 "autonomous_campaign_use": (
-                    "2026-08-11T01:52:18Z",
+                    "2026-08-11T17:28:58Z",
                     [
                         "backend_release_change",
                         "production_revision_change",
@@ -1474,7 +1474,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             provenance,
         )
 
-    def test_committed_evidence_stays_within_the_four_bounded_claims(self):
+    def test_committed_evidence_stays_within_the_five_bounded_claims(self):
         registry = self.load_registry()
         evidence_scope = {
             item["id"]: (set(item["featureIds"]), set(item["scenarioIds"]))
@@ -1513,11 +1513,94 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                     },
                     {"broker_property_unavailable"},
                 ),
+                "m27-returning-user-canary-live": (
+                    {
+                        "core.event_classifier",
+                        "core.inbox_auto_reply",
+                        "core.inbox_matching",
+                        "core.property_extraction",
+                        "core.sheet_update",
+                    },
+                    {
+                        "broker_available_full_specs",
+                        "broker_available_partial_specs",
+                    },
+                ),
             },
             evidence_scope,
         )
 
-    def test_one_row_canary_does_not_clear_followups_or_autonomous_use(self):
+    def test_returning_user_canary_promotes_only_supervised_use(self):
+        registry = self.load_registry()
+        gates = {gate["id"]: gate for gate in registry["rolloutGates"]}
+        quality = {item["id"]: item for item in registry["qualityItems"]}
+        evidence = {item["id"]: item for item in registry["evidence"]}
+
+        supervised = gates["supervised_campaign_use"]
+        self.assertEqual("go", supervised["decision"])
+        self.assertEqual([], supervised["blockerIds"])
+        self.assertIsNone(supervised["nextAction"])
+        self.assertIn("m27-returning-user-canary-live", supervised["evidenceIds"])
+        self.assertIn("autonomous_followups", supervised["forbids"])
+
+        autonomous = gates["autonomous_campaign_use"]
+        self.assertEqual("hold", autonomous["decision"])
+        self.assertNotIn("returning-user-canary-unrun", autonomous["blockerIds"])
+        self.assertIn("autonomous-followups-current-live-gap", autonomous["blockerIds"])
+        self.assertIn("reply-all-cc-multiparty-live-gap", autonomous["blockerIds"])
+        self.assertIn("pdf-multi-suite-ambiguity", autonomous["blockerIds"])
+        self.assertIn("long-multiturn-ordering-gap", autonomous["blockerIds"])
+
+        canary_gap = quality["returning-user-canary-unrun"]
+        self.assertEqual("proven_live", canary_gap["state"])
+        self.assertEqual([], canary_gap["blocksGates"])
+        self.assertEqual(
+            [
+                "m27-ten-row-launch-integrity-live",
+                "m27-returning-user-canary-live",
+            ],
+            canary_gap["evidenceIds"],
+        )
+
+        natural_voice = quality["natural-voice-variety"]
+        self.assertEqual("open", natural_voice["state"])
+        self.assertEqual([], natural_voice["blocksGates"])
+        self.assertIn("m27-returning-user-canary-live", natural_voice["evidenceIds"])
+
+        repeat_ask = quality["hard-repeat-ask-rejection-gap"]
+        self.assertEqual("partial", repeat_ask["state"])
+        self.assertIn("m27-returning-user-canary-live", repeat_ask["evidenceIds"])
+
+        canary = evidence["m27-returning-user-canary-live"]
+        self.assertEqual("2026-08-11T17:28:58Z", canary["observedAt"])
+        self.assertEqual(
+            "process-user-00092-som",
+            canary["releaseRefs"]["productionRevision"],
+        )
+        proof_text = " ".join(
+            [canary["claim"], *canary["readbacks"], *canary["limitations"]]
+        )
+        for required_text in (
+            "20/20",
+            "21,600",
+            "17.25",
+            "4.10",
+            "38,430.00",
+            "G8*(H8+I8)/12",
+            "47,900",
+            "15.35",
+            "3.85",
+            "76,640.00",
+            "G9*(H9+I9)/12",
+            "correction",
+            "operating expenses",
+            "natural voice",
+            "follow-ups",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, proof_text)
+
+    def test_supervised_go_does_not_clear_followups_or_autonomous_use(self):
         registry = self.load_registry()
         gates = {gate["id"]: gate for gate in registry["rolloutGates"]}
         supervised = gates["supervised_campaign_use"]
@@ -1541,10 +1624,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
 
         self.assertEqual(
             {
-                "returning-user-canary-unrun": {
-                    "supervised_campaign_use",
-                    "autonomous_campaign_use",
-                },
+                "returning-user-canary-unrun": set(),
                 "autonomous-followups-current-live-gap": {
                     "autonomous_campaign_use"
                 },
@@ -1614,7 +1694,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
         )
         self.assertIn("UNPROVEN", followups_row)
         self.assertNotIn("m27-ten-row-launch-integrity-live", followups_row)
-        self.assertEqual(4, len(registry["evidence"]))
+        self.assertEqual(5, len(registry["evidence"]))
 
     def test_committed_artifacts_are_sanitized(self):
         payloads = {
@@ -1654,7 +1734,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                 str(MODULE_PATH),
                 "--check",
                 "--at",
-                "2026-08-11T07:00:00Z",
+                "2026-08-11T17:28:58Z",
             ],
         )
         for command in commands:

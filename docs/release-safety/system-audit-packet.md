@@ -106,11 +106,11 @@ and evidence backlog. This packet remains the test-selection contract: it
 defines which product paths and evidence a change must exercise, but it does
 not override the current gate decisions.
 
-The initial recorded gate boundary is:
+The current recorded gate boundary is:
 
 - `login_view = go`: users may sign in and view the product.
-- `supervised_campaign_use = ready_for_canary`: permit only the bounded,
-  monitored canary described by the current readiness view.
+- `supervised_campaign_use = go`: permit only the bounded one-row, monitored,
+  follow-ups-off use described by the current readiness view.
 - `autonomous_campaign_use = hold`: do not permit autonomous campaign use.
 
 Historical language in this packet is not a blanket hold; use it as the safety

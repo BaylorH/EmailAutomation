@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-11T07:00:00Z",
+  "updatedAt": "2026-08-11T17:28:58Z",
   "releaseIdentity": {
     "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
     "productionRevision": "process-user-00092-som"
@@ -39,8 +39,8 @@
     },
     {
       "id": "supervised_campaign_use",
-      "decision": "ready_for_canary",
-      "scope": "One one-row, continuously monitored campaign with follow-ups off.",
+      "decision": "go",
+      "scope": "One continuously monitored campaign row at a time, with follow-ups off.",
       "allows": [
         "one_row_monitored_campaign"
       ],
@@ -59,14 +59,13 @@
         "returning-workspace-containment-readback",
         "m27-ten-row-launch-integrity-live",
         "m27-simple-extraction-close-live",
-        "m27-unavailable-terminalization-live"
+        "m27-unavailable-terminalization-live",
+        "m27-returning-user-canary-live"
       ],
-      "blockerIds": [
-        "returning-user-canary-unrun"
-      ],
-      "nextAction": "Manually launch one one-row monitored canary with follow-ups off, then read back the full scoped path.",
+      "blockerIds": [],
+      "nextAction": null,
       "rollback": "Pause the campaign immediately and preserve scoped evidence if any guardrail fails.",
-      "asOf": "2026-08-11T01:52:18Z",
+      "asOf": "2026-08-11T17:28:58Z",
       "invalidatedBy": [
         "backend_release_change",
         "production_revision_change",
@@ -96,19 +95,19 @@
         "returning-workspace-containment-readback",
         "m27-ten-row-launch-integrity-live",
         "m27-simple-extraction-close-live",
-        "m27-unavailable-terminalization-live"
+        "m27-unavailable-terminalization-live",
+        "m27-returning-user-canary-live"
       ],
       "blockerIds": [
-        "returning-user-canary-unrun",
         "autonomous-followups-current-live-gap",
         "reply-all-cc-multiparty-live-gap",
         "pdf-multi-suite-ambiguity",
         "hard-repeat-ask-rejection-gap",
         "long-multiturn-ordering-gap"
       ],
-      "nextAction": "Complete the monitored returning-user canary, then run separate live proof for each autonomous blocker.",
+      "nextAction": "Run separate live proof for each remaining autonomous blocker.",
       "rollback": "Keep autonomous execution and follow-ups disabled.",
-      "asOf": "2026-08-11T01:52:18Z",
+      "asOf": "2026-08-11T17:28:58Z",
       "invalidatedBy": [
         "backend_release_change",
         "production_revision_change",
@@ -250,12 +249,63 @@
         "followup_policy_change",
         "unavailable_or_lifecycle_path_change"
       ]
+    },
+    {
+      "id": "m27-returning-user-canary-live",
+      "proofLevel": "live_production",
+      "result": "pass",
+      "claim": "The monitored returning-user canary completed a full-spec close and a partial-then-correction flow with targeted missing-field handling, correction precedence, terminal closure, exact same-row updates, reconciled counters, and zero scoped residue.",
+      "featureIds": [
+        "core.event_classifier",
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.property_extraction",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs"
+      ],
+      "releaseRefs": {
+        "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
+        "productionRevision": "process-user-00092-som"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-11T17:28:58Z",
+      "expiresAt": null,
+      "readbacks": [
+        "Row 8 closed after one full-spec reply without another ask.",
+        "Row 9 remained active after partial facts and the automatic response requested only operating expenses.",
+        "Row 9 accepted the correction plus operating expenses, replaced the earlier Total SF value, preserved Rent/SF/Yr, and reached terminal closure without another ask.",
+        "Sheet Row 8 read back Total SF 21,600, Rent/SF/Yr 17.25, Ops Ex/SF 4.10, and same-row formula G8*(H8+I8)/12 with result 38,430.00.",
+        "Sheet Row 9 read back corrected Total SF 47,900, Rent/SF/Yr 15.35, Ops Ex/SF 3.85, and same-row formula G9*(H9+I9)/12 with result 76,640.00.",
+        "The dashboard showed both target rows completed at the end, and every other campaign row was unchanged.",
+        "Automatic-send and message-index counters reconciled at 20/20.",
+        "Action, pending, reconciliation, duplicate, error, dead-letter, claim, task, and scoped-residue readbacks were zero.",
+        "Campaign controls read back Closed/Closed with queued, blocked, pending, dead-letter, stopping, and stop-failed counts all zero.",
+        "Production revision process-user-00092-som reported 100 percent health with zero application errors and zero 5xx responses."
+      ],
+      "limitations": [
+        "The proof covered two controlled rows and three broker-side replies; it does not prove long conversations, ambiguous history, or every correction shape.",
+        "No copied-party CC thread, attachment or ambiguous multi-suite PDF, autoresponder, autonomous follow-ups, or unattended campaign was exercised.",
+        "No hard rejection case was induced; targeted missing-field handling and one correction were observed, so hard repeat-ask suppression remains partial.",
+        "Functional closure was safe, but natural voice is not cleared: one close contained jammed punctuation and stock follow-up phrasing, while the final close used a spaced hyphen and familiar stock phrasing.",
+        "The campaign launch itself remains supported by separate controlled launch evidence."
+      ],
+      "retestOn": [
+        "backend_release_change",
+        "production_revision_change",
+        "classifier_extraction_or_sheet_path_change",
+        "auto_reply_or_lifecycle_path_change",
+        "campaign_control_or_send_cap_change",
+        "new_failure_or_residue"
+      ]
     }
   ],
   "qualityItems": [
     {
       "id": "returning-user-canary-unrun",
-      "state": "ready_for_live",
+      "state": "proven_live",
       "severity": "P0",
       "featureIds": [
         "core.launch_draft",
@@ -268,14 +318,12 @@
         "launch_with_variable_mapping"
       ],
       "evidenceIds": [
-        "m27-ten-row-launch-integrity-live"
+        "m27-ten-row-launch-integrity-live",
+        "m27-returning-user-canary-live"
       ],
-      "blocksGates": [
-        "supervised_campaign_use",
-        "autonomous_campaign_use"
-      ],
-      "guardrail": "Keep productive use to one continuously monitored row with follow-ups off.",
-      "nextProof": "Run the returning-user canary and read back launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue.",
+      "blocksGates": [],
+      "guardrail": "Preserve the one-row monitored, follow-ups-off boundary unless a separate promotion expands it.",
+      "nextProof": "Re-run the bounded canary after an invalidation trigger before restoring supervised GO.",
       "owner": "release-operator"
     },
     {
@@ -370,7 +418,8 @@
         "manual_user_continuation"
       ],
       "evidenceIds": [
-        "m27-simple-extraction-close-live"
+        "m27-simple-extraction-close-live",
+        "m27-returning-user-canary-live"
       ],
       "blocksGates": [
         "autonomous_campaign_use"
@@ -394,14 +443,16 @@
         "launch_with_variable_mapping",
         "manual_user_continuation"
       ],
-      "evidenceIds": [],
+      "evidenceIds": [
+        "m27-returning-user-canary-live"
+      ],
       "legacyRefs": [
         "FDR-010",
         "FDR-011"
       ],
       "blocksGates": [],
-      "guardrail": "Review supervised drafts before send.",
-      "nextProof": "Evaluate varied natural English across launch, follow-up, and continuation samples without treating polish as a canary blocker.",
+      "guardrail": "Continuously monitor supervised replies and stop on incoherent or unsafe copy; polish defects remain nonblocking.",
+      "nextProof": "Evaluate varied natural English across launch, missing-field, correction-close, follow-up, and continuation samples without treating polish as a canary blocker.",
       "owner": "quality-evaluation"
     },
     {
