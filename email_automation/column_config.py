@@ -572,11 +572,26 @@ def _canonical_field_reference_terms(
         *field.get("legacy_aliases", []),
         *field.get("ai_synonyms", []),
     ]
-    return list(dict.fromkeys(
+    normalized_terms = list(dict.fromkeys(
         term.strip().lower()
         for term in terms
         if isinstance(term, str) and term.strip()
     ))
+    reference_terms = []
+    for term in normalized_terms:
+        reference_terms.append(term)
+        base_term = re.sub(
+            r"\s*(?:/|\bper\s+)(?:sf|sq\.?\s*ft\.?|yr|year|mo|month)\s*$",
+            "",
+            term,
+            flags=re.IGNORECASE,
+        ).strip()
+        if (
+            base_term != term
+            and len(re.findall(r"[A-Za-z0-9$]+", base_term)) >= 2
+        ):
+            reference_terms.append(base_term)
+    return list(dict.fromkeys(reference_terms))
 
 
 def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[str]]:
@@ -707,6 +722,10 @@ _FIELD_MENTION_CONTEXT_BOUNDARY_RE = re.compile(
     r")\b)",
     re.IGNORECASE,
 )
+_FIELD_URL_RE = re.compile(
+    r"\bhttps?://[^\s<>()]*[A-Za-z0-9/#]",
+    re.IGNORECASE,
+)
 _FIELD_CLEAR_ACKNOWLEDGEMENT_RE = re.compile(
     r"(?:"
     r"\b(?:thanks|thank\s+you)\s+for\s+"
@@ -764,33 +783,6 @@ _FIELD_DIRECT_MARKER_BRIDGE_RE = re.compile(
     re.IGNORECASE,
 )
 _FIELD_REQUEST_EXCEPTION_RE = re.compile(r"\b(?:just|only)\b", re.IGNORECASE)
-_FIELD_ANAPHORIC_REQUEST_RE = re.compile(
-    r"\s*(?:"
-    r"(?:(?:(?:can|could|would|will|may)\s+(?:you|we)\s+(?:please\s+)?"
-    r"|please\s+)?"
-    r"(?:confirm|verify|check|send|share|provide|attach|forward)"
-    r"(?:\s+(?P<anaphor>"
-    r"that|it|this|them|these(?:\s+values)?|those(?:\s+values)?|both(?:\s+values)?"
-    r"))?(?:\s+again)?)"
-    r"|(?:is|are)\s+(?P<tag_anaphor>that|it|this|these|those)\s+"
-    r"(?P<tag>correct|right)"
-    r"|(?P<bare_tag>correct|right)"
-    r")"
-    r"\s*",
-    re.IGNORECASE,
-)
-_FIELD_TRAILING_REQUEST_RE = re.compile(
-    r"(?:"
-    r"\b(?:(?:can|could|would|will|may)\s+(?:you|we)\s+(?:please\s+)?"
-    r"|please\s+)"
-    r"(?:confirm|verify|check|send|share|provide|attach|forward)"
-    r"(?:\s+(?:"
-    r"that|it|this|them|these(?:\s+values)?|those(?:\s+values)?|both(?:\s+values)?"
-    r"))?(?:\s+again)?"
-    r"|\b(?:is|are)\s+(?:that|it|this|these|those)\s+(?:correct|right)"
-    r")\s*$",
-    re.IGNORECASE,
-)
 _FIELD_FACTUAL_VALUE_CONTEXT_RE = re.compile(
     r"\s*(?:"
     r"[$€£]?\s*\d[\d,.]*"
@@ -799,9 +791,19 @@ _FIELD_FACTUAL_VALUE_CONTEXT_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-_FIELD_VALUE_SEQUENCE_SEPARATOR_RE = re.compile(
-    r"[^\S\r\n]*(?:;[^\S\r\n]*(?:\r?\n)?|\r?\n)[^\S\r\n]*"
+_FIELD_CONTEXT_DECLARATIVE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:the|this|that|these|those|it|i|we|you|they|he|she)\b"
+    r".*\b(?:is|are|was|were|has|have|had|do|does|did|looks?|seems?|appears?)\b"
+    r"|(?:that|it|this)['\u2019]s\b"
+    r")",
+    re.IGNORECASE,
 )
+_FIELD_CONTEXT_DEONTIC_RE = re.compile(
+    r"\b(?:have|has|had|am|is|are|was|were)\s+to\b",
+    re.IGNORECASE,
+)
+_FIELD_LIST_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
 
 _FIELD_MENTION_REQUEST = "request"
 _FIELD_MENTION_BENIGN = "benign"
@@ -812,10 +814,14 @@ def _field_mention_contexts(text: str, mention_spans: List[tuple]) -> List[tuple
     """Return intent contexts without splitting inside a discovered field span."""
     contexts = []
     context_start = 0
+    protected_spans = [
+        *mention_spans,
+        *((match.start(), match.end()) for match in _FIELD_URL_RE.finditer(text)),
+    ]
     for boundary in _FIELD_MENTION_CONTEXT_BOUNDARY_RE.finditer(text):
         if any(
             start < boundary.end() and boundary.start() < end
-            for start, end in mention_spans
+            for start, end in protected_spans
         ):
             continue
         if text[context_start:boundary.start()].strip():
@@ -844,24 +850,31 @@ def _column_field_term_matches(
     parts = _FIELD_REFERENCE_TOKEN_RE.findall(normalized)
     if not parts:
         return []
-    token_patterns = [re.escape(part) for part in parts]
-    last_token = parts[-1]
-    if len(parts) > 1 and len(last_token) > 3 and last_token.isalpha():
-        last_token_lower = last_token.lower()
-        if last_token_lower in {"foot", "feet"}:
-            token_patterns[-1] = r"(?:foot|feet)"
-        elif last_token_lower.endswith("ies"):
-            token_patterns[-1] = (
-                rf"(?:{re.escape(last_token[:-3])}y|{re.escape(last_token)})"
+    token_patterns = []
+    for part in parts:
+        token = part.lower()
+        if token in _CUSTOM_FIELD_GENERIC_TOKENS:
+            token_patterns.append(re.escape(token))
+        elif token in {"foot", "feet"}:
+            token_patterns.append(r"(?:foot|feet)")
+        elif len(token) > 4 and token.endswith("ies"):
+            token_patterns.append(
+                rf"(?:{re.escape(token[:-3])}y|{re.escape(token)})"
             )
-        elif re.search(r"[^aeiou]y$", last_token_lower):
-            token_patterns[-1] = rf"{re.escape(last_token[:-1])}(?:y|ies)"
-        elif last_token_lower.endswith("s"):
-            if not last_token_lower.endswith("ss"):
-                token_patterns[-1] = rf"{re.escape(last_token[:-1])}s?"
+        elif len(token) > 3 and re.search(r"[^aeiou]y$", token):
+            token_patterns.append(rf"{re.escape(token[:-1])}(?:y|ies)")
+        elif len(token) > 2 and token.endswith("s") and not token.endswith("ss"):
+            token_patterns.append(rf"{re.escape(token[:-1])}s?")
+        elif len(token) > 3 and token not in {"sq", "sf", "ft", "yr", "mo"}:
+            token_patterns.append(rf"{re.escape(token)}s?")
         else:
-            token_patterns[-1] = rf"{re.escape(last_token)}s?"
+            token_patterns.append(re.escape(token))
     pattern = _FIELD_TERM_SEPARATOR_PATTERN.join(token_patterns)
+    if (
+        len(parts) >= 2
+        and all(part.isalpha() and len(part) <= 3 for part in parts)
+    ):
+        pattern += r"(?:\.(?=[ \t]+(?-i:[a-z])))?"
     matches = list(re.finditer(
         rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])",
         text or "",
@@ -906,22 +919,34 @@ def _field_group_match_spans(text: str, terms: List[str]) -> List[tuple]:
 
 
 def _configured_field_mentions(text: str, field_groups: List[tuple]) -> List[tuple]:
-    """Find maximal configured-field spans across the complete response body."""
+    """Find configured fields, with Note/Skip/formula spans taking precedence."""
     raw_mentions = {
         (start, end, group_index)
         for group_index, (_kind, _header, terms) in enumerate(field_groups)
         for start, end in _field_group_match_spans(text, terms)
     }
+    nonrequestable_spans = [
+        (start, end)
+        for start, end, group_index in raw_mentions
+        if field_groups[group_index][0] == "nonrequestable"
+    ]
     mentions = []
     for start, end, group_index in sorted(
         raw_mentions,
         key=lambda mention: (mention[0] - mention[1], mention[0], mention[2]),
     ):
+        kind = field_groups[group_index][0]
+        if kind == "ask" and any(
+            start < nonrequestable_end and nonrequestable_start < end
+            for nonrequestable_start, nonrequestable_end in nonrequestable_spans
+        ):
+            continue
         if any(
             kept_start <= start
             and end <= kept_end
             and (kept_start, kept_end) != (start, end)
-            for kept_start, kept_end, _kept_group in mentions
+            and field_groups[kept_group][0] == kind
+            for kept_start, kept_end, kept_group in mentions
         ):
             continue
         mentions.append((start, end, group_index))
@@ -962,239 +987,346 @@ def _context_contains_field_mention(
     )
 
 
-def _anaphoric_request_is_plural(match: Any) -> bool:
-    anaphor = (
-        match.group("anaphor")
-        or match.group("tag_anaphor")
-        or ""
-    ).lower()
-    anaphor_head = anaphor.split(maxsplit=1)[0] if anaphor else ""
-    return anaphor_head in {"these", "those", "them", "both"}
-
-
-def _has_immediately_following_anaphoric_request(
-    text: str,
-    mention: tuple,
-    mentions: List[tuple],
-    contexts: List[tuple],
+def _field_groups_in_context(
     context_index: int,
-) -> bool:
-    _mention_start, mention_end, _group_index = mention
-    _context_start, context_end, _is_question = contexts[context_index]
-    if context_index + 1 >= len(contexts):
-        return False
-
-    next_start, next_end, next_is_question = contexts[context_index + 1]
-    if any(
-        next_start <= other_start and other_end <= next_end
-        for other_start, other_end, _other_group in mentions
-    ):
-        return False
-    anaphoric_request = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
-        text[next_start:next_end]
-    )
-    request_context_index = context_index + 1
-    request_is_question = next_is_question
-    if anaphoric_request is None and re.fullmatch(
-        r"\s*:\s*",
-        text[context_end:next_start],
-    ):
-        factual_value = _FIELD_FACTUAL_VALUE_CONTEXT_RE.match(
-            text[next_start:next_end]
-        )
-        if factual_value is not None:
-            anaphoric_request = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
-                text[next_start + factual_value.end():next_end]
-            )
-            if (
-                anaphoric_request is None
-                and not text[next_start + factual_value.end():next_end].strip()
-                and context_index + 2 < len(contexts)
-            ):
-                hop_start, hop_end, _hop_is_question = contexts[context_index + 2]
-                if not any(
-                    hop_start <= other_start and other_end <= hop_end
-                    for other_start, other_end, _other_group in mentions
-                ):
-                    anaphoric_request = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
-                        text[hop_start:hop_end]
-                    )
-                    request_context_index = context_index + 2
-                    request_is_question = _hop_is_question
-    if anaphoric_request is None:
-        return False
-    if anaphoric_request.group("bare_tag") and not request_is_question:
-        return False
-    if request_context_index + 1 < len(contexts):
-        request_end = contexts[request_context_index][1]
-        following_start, following_end, _following_is_question = contexts[
-            request_context_index + 1
-        ]
-        introduces_later_field = (
-            ":" in text[request_end:following_start]
-            and any(
-                following_start <= other_start and other_end <= following_end
-                for other_start, other_end, _other_group in mentions
-            )
-        )
-        if introduces_later_field:
-            return False
-    has_later_field = any(
-        other_start >= mention_end and other_start < context_end
-        for other_start, _other_end, _other_group in mentions
-    )
-    return _anaphoric_request_is_plural(anaphoric_request) or not has_later_field
-
-
-def _colon_factual_value_context_index(
-    text: str,
     mentions: List[tuple],
     contexts: List[tuple],
-    field_context_index: int,
+) -> set:
+    context_start, context_end, _is_question = contexts[context_index]
+    return {
+        group_index
+        for mention_start, mention_end, group_index in mentions
+        if context_start <= mention_start and mention_end <= context_end
+    }
+
+
+def _is_adjacent_context_separator(separator: str) -> bool:
+    normalized = (separator or "").replace("\r\n", "\n")
+    if re.search(r"\n[ \t]*\n", normalized):
+        return False
+    return bool(re.fullmatch(
+        r"(?:[ \t.!?;,:\-\u2013\u2014]*"
+        r"(?:\n[ \t]*)?|[ \t]*(?:and|or)[ \t]*)",
+        normalized,
+        re.IGNORECASE,
+    ))
+
+
+def _is_compound_context_separator(separator: str) -> bool:
+    normalized = (separator or "").replace("\r\n", "\n")
+    if re.search(r"\n[ \t]*\n", normalized) or "." in normalized:
+        return False
+    return bool(re.fullmatch(
+        r"[ \t,;:]*(?:(?:and|or)\b[ \t,;:]*)?(?:\n[ \t,;:]*)?",
+        normalized,
+        re.IGNORECASE,
+    ))
+
+
+def _context_is_factual_value(
+    text: str,
+    context_index: int,
+    mentions: List[tuple],
+    contexts: List[tuple],
+) -> bool:
+    if _context_contains_field_mention(context_index, mentions, contexts):
+        return False
+    context_start, context_end, is_question = contexts[context_index]
+    return (
+        not is_question
+        and _FIELD_FACTUAL_VALUE_CONTEXT_RE.fullmatch(
+            text[context_start:context_end]
+        ) is not None
+    )
+
+
+def _fieldless_context_is_proven_benign(
+    context_text: str,
+    is_question: bool,
+) -> bool:
+    if is_question:
+        return False
+    if re.fullmatch(r"\s*(?:correct|right)\s*", context_text, re.IGNORECASE):
+        return True
+    if _FIELD_URL_RE.fullmatch(context_text.strip()) is not None:
+        return True
+    if _FIELD_FACTUAL_VALUE_CONTEXT_RE.fullmatch(context_text) is not None:
+        return True
+    if any(pattern.search(context_text) for pattern in (
+        _FIELD_NEGATED_REQUEST_INTENT_RE,
+        _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
+        _FIELD_CLEAR_INFORMATIONAL_RE,
+    )):
+        return True
+    if _FIELD_CONTEXT_DEONTIC_RE.search(context_text) is not None:
+        return False
+    return _FIELD_CONTEXT_DECLARATIVE_RE.search(context_text) is not None
+
+
+def _fieldless_context_is_request_like(
+    context_text: str,
+    is_question: bool,
+) -> bool:
+    if is_question:
+        return True
+    please_matches = list(re.finditer(r"\bplease\b", context_text, re.IGNORECASE))
+    clear_matches = [
+        match
+        for pattern in (
+            _FIELD_NEGATED_REQUEST_INTENT_RE,
+            _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
+            _FIELD_CLEAR_INFORMATIONAL_RE,
+        )
+        for match in pattern.finditer(context_text)
+    ]
+    if any(
+        not any(clear.start() <= request.start() < clear.end() for clear in clear_matches)
+        for request in please_matches
+    ):
+        return True
+    if _fieldless_context_is_proven_benign(context_text, is_question):
+        return False
+    return bool(context_text.strip())
+
+
+def _field_context_before_factual_value(
+    text: str,
+    value_context_index: int,
+    mentions: List[tuple],
+    contexts: List[tuple],
 ) -> Optional[int]:
-    if field_context_index + 1 >= len(contexts):
+    if value_context_index <= 0 or not _context_is_factual_value(
+        text,
+        value_context_index,
+        mentions,
+        contexts,
+    ):
+        return None
+    field_context_index = value_context_index - 1
+    if not _context_contains_field_mention(
+        field_context_index,
+        mentions,
+        contexts,
+    ):
         return None
     field_end = contexts[field_context_index][1]
-    value_start, value_end, _value_is_question = contexts[field_context_index + 1]
+    value_start = contexts[value_context_index][0]
     if not re.fullmatch(r"\s*:\s*", text[field_end:value_start]):
         return None
-    if _context_contains_field_mention(
-        field_context_index + 1,
-        mentions,
-        contexts,
+    return field_context_index
+
+
+def _antecedent_field_group_indices(
+    text: str,
+    request_context_index: int,
+    mentions: List[tuple],
+    contexts: List[tuple],
+) -> set:
+    """Return the complete local field proposition governed by a follow-up."""
+    request_start, request_end, _is_question = contexts[request_context_index]
+    request_text = text[request_start:request_end]
+    anchor_field_index = None
+
+    if request_context_index > 0:
+        previous_index = request_context_index - 1
+        previous_end = contexts[previous_index][1]
+        if _is_adjacent_context_separator(text[previous_end:request_start]):
+            if _context_contains_field_mention(
+                previous_index,
+                mentions,
+                contexts,
+            ):
+                anchor_field_index = previous_index
+            else:
+                anchor_field_index = _field_context_before_factual_value(
+                    text,
+                    previous_index,
+                    mentions,
+                    contexts,
+                )
+
+    if (
+        anchor_field_index is None
+        and request_context_index > 0
+        and _FIELD_FACTUAL_VALUE_CONTEXT_RE.match(request_text) is not None
     ):
-        return None
-    if not _FIELD_FACTUAL_VALUE_CONTEXT_RE.fullmatch(text[value_start:value_end]):
-        return None
-    return field_context_index + 1
+        previous_index = request_context_index - 1
+        previous_end = contexts[previous_index][1]
+        if (
+            _context_contains_field_mention(previous_index, mentions, contexts)
+            and re.fullmatch(r"\s*:\s*", text[previous_end:request_start])
+        ):
+            anchor_field_index = previous_index
 
+    if anchor_field_index is None:
+        return set()
 
-def _has_following_plural_request_across_value_pairs(
-    text: str,
-    mentions: List[tuple],
-    contexts: List[tuple],
-    context_index: int,
-) -> bool:
-    value_context_index = _colon_factual_value_context_index(
-        text,
+    antecedent_groups = _field_groups_in_context(
+        anchor_field_index,
         mentions,
         contexts,
-        context_index,
     )
-    if value_context_index is None:
-        return False
+    cursor = anchor_field_index
+    while cursor > 0:
+        previous_index = cursor - 1
+        previous_end = contexts[previous_index][1]
+        cursor_start = contexts[cursor][0]
+        if not _is_compound_context_separator(text[previous_end:cursor_start]):
+            break
 
-    request_context_index = value_context_index + 1
-    crossed_other_field = False
-    while request_context_index < len(contexts):
-        request_start, request_end, request_is_question = contexts[
-            request_context_index
-        ]
-        value_end = contexts[value_context_index][1]
-        if not _FIELD_VALUE_SEQUENCE_SEPARATOR_RE.fullmatch(
-            text[value_end:request_start]
-        ):
-            return False
-        request_match = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
-            text[request_start:request_end]
-        )
-        if request_match is not None:
-            if request_match.group("bare_tag") and not request_is_question:
-                return False
-            return (
-                crossed_other_field
-                and _anaphoric_request_is_plural(request_match)
+        previous_field_index = None
+        if _context_contains_field_mention(previous_index, mentions, contexts):
+            previous_field_index = previous_index
+        else:
+            previous_field_index = _field_context_before_factual_value(
+                text,
+                previous_index,
+                mentions,
+                contexts,
             )
-        if not _context_contains_field_mention(
-            request_context_index,
+        if previous_field_index is None:
+            break
+        antecedent_groups.update(_field_groups_in_context(
+            previous_field_index,
             mentions,
             contexts,
-        ):
-            return False
-        value_context_index = _colon_factual_value_context_index(
-            text,
-            mentions,
-            contexts,
-            request_context_index,
-        )
-        if value_context_index is None:
-            return False
-        crossed_other_field = True
-        request_context_index = value_context_index + 1
-    return False
+        ))
+        cursor = previous_field_index
+    return antecedent_groups
 
 
-def _has_immediately_preceding_request_leadin(
+def _structural_followup_request_groups(
     text: str,
     mentions: List[tuple],
     contexts: List[tuple],
-    context_index: int,
-) -> bool:
-    field_context_index = context_index
-    while field_context_index > 0:
-        previous_index = field_context_index - 1
-        previous_start, previous_end, _previous_is_question = contexts[
-            previous_index
-        ]
-        field_start = contexts[field_context_index][0]
-        separator = text[previous_end:field_start]
-        if _context_contains_field_mention(previous_index, mentions, contexts):
-            if not _FIELD_VALUE_SEQUENCE_SEPARATOR_RE.fullmatch(separator):
-                return False
-            field_context_index = previous_index
+) -> set:
+    request_groups = set()
+    for context_index, (context_start, context_end, is_question) in enumerate(contexts):
+        if _context_contains_field_mention(context_index, mentions, contexts):
+            continue
+        context_text = text[context_start:context_end]
+        line_start = text.rfind("\n", 0, context_start) + 1
+        line_end = text.find("\n", context_end)
+        if line_end < 0:
+            line_end = len(text)
+        if _line_is_request_list_leadin(text[line_start:line_end]):
+            continue
+        if not _fieldless_context_is_request_like(context_text, is_question):
+            continue
+        request_groups.update(_antecedent_field_group_indices(
+            text,
+            context_index,
+            mentions,
+            contexts,
+        ))
+    return request_groups
+
+
+def _line_is_request_list_leadin(line: str) -> bool:
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    request_text = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
+        lambda match: " " * (match.end() - match.start()),
+        stripped,
+    )
+    request_match = _last_pattern_match(_FIELD_REQUEST_INTENT_RE, request_text)
+    if request_match is None:
+        return False
+    clear_matches = [
+        match
+        for pattern in (
+            _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
+            _FIELD_CLEAR_INFORMATIONAL_RE,
+        )
+        for match in pattern.finditer(stripped)
+    ]
+    if any(
+        clear.start() <= request_match.start() < clear.end()
+        for clear in clear_matches
+    ):
+        return False
+    return "following" in stripped.lower() or stripped.endswith(":")
+
+
+def _line_is_list_heading(line: str) -> bool:
+    stripped = (line or "").strip()
+    if not stripped or stripped.endswith(":"):
+        return bool(stripped)
+    if re.search(r"[.!?;]$", stripped):
+        return False
+    tokens = re.findall(r"[A-Za-z0-9]+", stripped)
+    if not 1 <= len(tokens) <= 6:
+        return False
+    return not any(
+        token.lower() in {
+            "is", "are", "was", "were", "has", "have", "had",
+            "do", "does", "did", "can", "could", "would", "will",
+        }
+        for token in tokens
+    )
+
+
+def _request_list_field_group_indices(
+    text: str,
+    mentions: List[tuple],
+) -> set:
+    """Propagate one explicit list lead-in through its bounded bullet block."""
+    request_groups = set()
+    pending = False
+    pending_blank_count = 0
+    active = False
+    offset = 0
+
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        line_start = offset
+        line_end = line_start + len(line)
+        offset += len(raw_line)
+        stripped = line.strip()
+        is_bullet = _FIELD_LIST_BULLET_RE.match(line) is not None
+
+        if active:
+            if is_bullet:
+                request_groups.update(
+                    group_index
+                    for mention_start, mention_end, group_index in mentions
+                    if mention_start < line_end and line_start < mention_end
+                )
+                continue
+            active = False
+            pending = False
+            if not stripped:
+                continue
+
+        if is_bullet:
+            if pending:
+                active = True
+                request_groups.update(
+                    group_index
+                    for mention_start, mention_end, group_index in mentions
+                    if mention_start < line_end and line_start < mention_end
+                )
+            pending = False
             continue
 
-        previous_text = text[previous_start:previous_end]
-        request_text = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
-            lambda match: " " * (match.end() - match.start()),
-            previous_text,
-        )
-        request_match = _last_pattern_match(
-            _FIELD_REQUEST_INTENT_RE,
-            request_text,
-        )
-        clear_matches = [
-            match
-            for pattern in (
-                _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
-                _FIELD_CLEAR_INFORMATIONAL_RE,
-            )
-            for match in pattern.finditer(previous_text)
-        ]
-        request_is_inside_clear = (
-            request_match is not None
-            and any(
-                clear.start() <= request_match.start() < clear.end()
-                for clear in clear_matches
-            )
-        )
-        if (
-            request_match is not None
-            and not request_is_inside_clear
-            and ("\n" in separator or ":" in separator)
-        ):
-            return True
+        if _line_is_request_list_leadin(line):
+            pending = True
+            pending_blank_count = 0
+            continue
 
-        if previous_index == 0:
-            return False
-        prior_field_index = previous_index - 1
-        if (
-            not _context_contains_field_mention(
-                prior_field_index,
-                mentions,
-                contexts,
-            )
-            or _colon_factual_value_context_index(
-                text,
-                mentions,
-                contexts,
-                prior_field_index,
-            ) != previous_index
-            or not _FIELD_VALUE_SEQUENCE_SEPARATOR_RE.fullmatch(separator)
-        ):
-            return False
-        field_context_index = prior_field_index
-    return False
+        if not pending:
+            continue
+        if not stripped:
+            pending_blank_count += 1
+            if pending_blank_count > 1:
+                pending = False
+            continue
+        if _line_is_list_heading(line):
+            continue
+        pending = False
+
+    return request_groups
 
 
 def _has_immediately_following_factual_value(
@@ -1274,29 +1406,11 @@ def _classify_field_mention(
     )
     if last_request is not None and not request_is_inside_clear:
         return _FIELD_MENTION_REQUEST
-    if _FIELD_TRAILING_REQUEST_RE.search(suffix):
-        return _FIELD_MENTION_REQUEST
-    if _has_immediately_following_anaphoric_request(
-        text,
-        mention,
-        mentions,
-        contexts,
-        context_index,
-    ):
-        return _FIELD_MENTION_REQUEST
-    if _has_following_plural_request_across_value_pairs(
-        text,
-        mentions,
-        contexts,
-        context_index,
-    ):
-        return _FIELD_MENTION_REQUEST
-    if _has_immediately_preceding_request_leadin(
-        text,
-        mentions,
-        contexts,
-        context_index,
-    ):
+    suffix_intent = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
+        lambda match: " " * (match.end() - match.start()),
+        suffix,
+    )
+    if re.search(r"\bplease\b", suffix_intent, re.IGNORECASE):
         return _FIELD_MENTION_REQUEST
     if last_direct_clear is not None:
         return _FIELD_MENTION_BENIGN
@@ -1388,6 +1502,15 @@ def _classify_configured_field_requests(
             contexts,
         ) != _FIELD_MENTION_BENIGN
     }
+    request_like_groups.update(_structural_followup_request_groups(
+        response_body,
+        mentions,
+        contexts,
+    ))
+    request_like_groups.update(_request_list_field_group_indices(
+        response_body,
+        mentions,
+    ))
 
     requested = []
     requested_headers = set()
