@@ -1,0 +1,404 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-08-11T01:52:18Z",
+  "releaseIdentity": {
+    "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
+    "productionRevision": "process-user-00092-som"
+  },
+  "rolloutGates": [
+    {
+      "id": "login_view",
+      "decision": "go",
+      "scope": "Returning users may sign in and inspect existing state.",
+      "allows": [
+        "login",
+        "view_existing_state"
+      ],
+      "forbids": [
+        "campaign_launch",
+        "send"
+      ],
+      "guardrails": [
+        "Inspection does not authorize campaign activity."
+      ],
+      "evidenceIds": [
+        "returning-workspace-containment-readback"
+      ],
+      "blockerIds": [],
+      "nextAction": null,
+      "rollback": "Disable returning-user access if the containment readback regresses."
+    },
+    {
+      "id": "supervised_campaign_use",
+      "decision": "ready_for_canary",
+      "scope": "One one-row, continuously monitored campaign with follow-ups off.",
+      "allows": [
+        "one_row_monitored_campaign"
+      ],
+      "forbids": [
+        "autonomous_followups",
+        "complex_copied_party_threads",
+        "multirow_campaign",
+        "unattended_use"
+      ],
+      "guardrails": [
+        "Keep follow-ups off.",
+        "Use one row only.",
+        "Continuously observe launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue."
+      ],
+      "evidenceIds": [
+        "returning-workspace-containment-readback",
+        "m27-ten-row-launch-integrity-live",
+        "m27-simple-extraction-close-live",
+        "m27-unavailable-terminalization-live"
+      ],
+      "blockerIds": [
+        "returning-user-canary-unrun"
+      ],
+      "nextAction": "Manually launch one one-row monitored canary with follow-ups off, then read back the full scoped path.",
+      "rollback": "Pause the campaign immediately and preserve scoped evidence if any guardrail fails."
+    },
+    {
+      "id": "autonomous_campaign_use",
+      "decision": "hold",
+      "scope": "Unattended campaigns, autonomous follow-ups, and broader complex inputs.",
+      "allows": [],
+      "forbids": [
+        "autonomous_followups",
+        "broad_user_rollout",
+        "complex_copied_party_threads",
+        "ambiguous_multi_suite_documents",
+        "unattended_campaigns"
+      ],
+      "guardrails": [
+        "Keep autonomous execution and follow-ups disabled."
+      ],
+      "evidenceIds": [
+        "returning-workspace-containment-readback",
+        "m27-ten-row-launch-integrity-live",
+        "m27-simple-extraction-close-live",
+        "m27-unavailable-terminalization-live"
+      ],
+      "blockerIds": [
+        "returning-user-canary-unrun",
+        "autonomous-followups-current-live-gap",
+        "reply-all-cc-multiparty-live-gap",
+        "pdf-multi-suite-ambiguity",
+        "hard-repeat-ask-rejection-gap",
+        "long-multiturn-ordering-gap"
+      ],
+      "nextAction": "Complete the monitored returning-user canary, then run separate live proof for each autonomous blocker.",
+      "rollback": "Keep autonomous execution and follow-ups disabled."
+    }
+  ],
+  "evidence": [
+    {
+      "id": "returning-workspace-containment-readback",
+      "proofLevel": "production_readback",
+      "result": "pass",
+      "claim": "The controlled returning workspace was contained for login and view inspection.",
+      "featureIds": [],
+      "scenarioIds": [],
+      "releaseRefs": {
+        "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
+        "productionRevision": "process-user-00092-som"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-11T01:52:18Z",
+      "expiresAt": "2026-08-12T01:52:18Z",
+      "readbacks": [
+        "Login and view access remained available in the controlled workspace.",
+        "No send-capable residue remained in the audited secondary workspace scope."
+      ],
+      "limitations": [
+        "No campaign launch or send was exercised by this readback."
+      ],
+      "retestOn": [
+        "backend_or_auth_change",
+        "containment_state_change",
+        "expiry"
+      ]
+    },
+    {
+      "id": "m27-ten-row-launch-integrity-live",
+      "proofLevel": "live_production",
+      "result": "pass",
+      "claim": "One controlled ten-row launch completed with unique initial sends and indexes, reconciled counters, queue drain, and zero scoped residue.",
+      "featureIds": [
+        "core.launch_draft",
+        "core.name_resolution",
+        "core.outbox_send",
+        "core.scheduler_scope",
+        "core.upload_mapping"
+      ],
+      "scenarioIds": [
+        "launch_with_variable_mapping"
+      ],
+      "releaseRefs": {
+        "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
+        "productionRevision": "process-user-00092-som"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-11T00:29:47Z",
+      "expiresAt": null,
+      "readbacks": [
+        "Ten unique initial sends and ten unique indexes were observed.",
+        "The scoped queue drained, counters reconciled, and zero scoped residue remained."
+      ],
+      "limitations": [
+        "This was one controlled launch and does not prove follow-ups, copied-party threads, complex extraction, or broad rollout."
+      ],
+      "retestOn": [
+        "backend_release_change",
+        "counter_or_queue_change",
+        "launch_or_send_path_change"
+      ]
+    },
+    {
+      "id": "m27-simple-extraction-close-live",
+      "proofLevel": "live_production",
+      "result": "pass",
+      "claim": "Five simple or correction extraction rows closed with same-row formulas and no repeated ask observed.",
+      "featureIds": [
+        "core.event_classifier",
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.property_extraction",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_available_full_specs"
+      ],
+      "releaseRefs": {
+        "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
+        "productionRevision": "process-user-00092-som"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-11T01:51:00Z",
+      "expiresAt": null,
+      "readbacks": [
+        "Five simple or correction rows closed with formulas on their original rows.",
+        "No repeated ask was observed in those five rows."
+      ],
+      "limitations": [
+        "The rows do not prove ambiguous multi-suite documents, hard repeat suppression, autoresponders, or long conversations."
+      ],
+      "retestOn": [
+        "backend_release_change",
+        "classifier_extraction_or_sheet_path_change",
+        "new_input_shape"
+      ]
+    },
+    {
+      "id": "m27-unavailable-terminalization-live",
+      "proofLevel": "live_production",
+      "result": "pass",
+      "claim": "Two unavailable rows reached terminal state with follow-ups stopped.",
+      "featureIds": [
+        "core.event_classifier",
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_property_unavailable"
+      ],
+      "releaseRefs": {
+        "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
+        "productionRevision": "process-user-00092-som"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-11T01:51:00Z",
+      "expiresAt": null,
+      "readbacks": [
+        "Two unavailable rows were terminalized.",
+        "Follow-ups were stopped for both rows."
+      ],
+      "limitations": [
+        "This does not prove autonomous follow-up scheduling or other terminal scenarios."
+      ],
+      "retestOn": [
+        "backend_release_change",
+        "followup_policy_change",
+        "unavailable_or_lifecycle_path_change"
+      ]
+    }
+  ],
+  "qualityItems": [
+    {
+      "id": "returning-user-canary-unrun",
+      "state": "ready_for_live",
+      "priority": "P0",
+      "featureIds": [
+        "core.launch_draft",
+        "core.name_resolution",
+        "core.outbox_send",
+        "core.scheduler_scope",
+        "core.upload_mapping"
+      ],
+      "scenarioIds": [
+        "launch_with_variable_mapping"
+      ],
+      "evidenceIds": [
+        "m27-ten-row-launch-integrity-live"
+      ],
+      "blocksGates": [
+        "supervised_campaign_use",
+        "autonomous_campaign_use"
+      ],
+      "guardrail": "Keep productive use to one continuously monitored row with follow-ups off.",
+      "nextProof": "Run the returning-user canary and read back launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue."
+    },
+    {
+      "id": "autonomous-followups-current-live-gap",
+      "state": "ready_for_live",
+      "priority": "P0",
+      "featureIds": [
+        "core.followups",
+        "core.inbox_matching",
+        "core.outbox_send",
+        "core.scheduler_scope"
+      ],
+      "scenarioIds": [
+        "followup_due",
+        "manual_user_continuation"
+      ],
+      "evidenceIds": [
+        "m27-unavailable-terminalization-live"
+      ],
+      "blocksGates": [
+        "autonomous_campaign_use"
+      ],
+      "guardrail": "Keep follow-ups off.",
+      "nextProof": "Run release-matched live follow-up and continuation proof with idempotent send, counters, and scoped readback."
+    },
+    {
+      "id": "reply-all-cc-multiparty-live-gap",
+      "state": "ready_for_live",
+      "priority": "P0",
+      "featureIds": [
+        "core.followups",
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.manual_reply",
+        "core.reply_all_cc"
+      ],
+      "scenarioIds": [
+        "reply_all_cc_context"
+      ],
+      "evidenceIds": [],
+      "blocksGates": [
+        "autonomous_campaign_use"
+      ],
+      "guardrail": "Avoid complex copied-party threads in the supervised canary.",
+      "nextProof": "Run a monitored copied-party reply-all proof with participant preservation and same-thread readback."
+    },
+    {
+      "id": "pdf-multi-suite-ambiguity",
+      "state": "open",
+      "priority": "P1",
+      "featureIds": [
+        "core.event_classifier",
+        "core.inbox_matching",
+        "core.property_extraction",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_attachment_or_link_only",
+        "broker_available_partial_specs"
+      ],
+      "evidenceIds": [],
+      "blocksGates": [
+        "autonomous_campaign_use"
+      ],
+      "guardrail": "Route ambiguous multi-suite attachments to manual review.",
+      "nextProof": "Pass deterministic ambiguity cases, then run one monitored live multi-suite attachment proof."
+    },
+    {
+      "id": "hard-repeat-ask-rejection-gap",
+      "state": "partial",
+      "priority": "P0",
+      "featureIds": [
+        "core.event_classifier",
+        "core.followups",
+        "core.inbox_auto_reply",
+        "core.property_extraction",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_available_partial_specs",
+        "manual_user_continuation"
+      ],
+      "evidenceIds": [
+        "m27-simple-extraction-close-live"
+      ],
+      "blocksGates": [
+        "autonomous_campaign_use"
+      ],
+      "guardrail": "Stop for manual review if an already supplied value is requested again.",
+      "nextProof": "Prove hard repeated-ask rejection across partial-spec and continuation cases, then confirm it live."
+    },
+    {
+      "id": "natural-voice-variety",
+      "state": "open",
+      "priority": "P1",
+      "featureIds": [
+        "core.followups",
+        "core.inbox_auto_reply",
+        "core.launch_draft",
+        "core.manual_reply"
+      ],
+      "scenarioIds": [
+        "followup_due",
+        "launch_with_variable_mapping",
+        "manual_user_continuation"
+      ],
+      "evidenceIds": [],
+      "blocksGates": [],
+      "guardrail": "Review supervised drafts before send.",
+      "nextProof": "Evaluate varied natural English across launch, follow-up, and continuation samples without treating polish as a canary blocker."
+    },
+    {
+      "id": "long-multiturn-ordering-gap",
+      "state": "ready_for_live",
+      "priority": "P0",
+      "featureIds": [
+        "core.event_classifier",
+        "core.health_recovery",
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.property_extraction",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_available_partial_specs",
+        "manual_user_continuation",
+        "retry_after_uncertain_send"
+      ],
+      "evidenceIds": [],
+      "blocksGates": [
+        "autonomous_campaign_use"
+      ],
+      "guardrail": "Keep the supervised canary to a short exchange and stop on ordering ambiguity.",
+      "nextProof": "Run a release-matched long multi-turn proof with ordering, retry, extraction, and same-row readback."
+    },
+    {
+      "id": "account-b-historical-cleanup",
+      "state": "open",
+      "priority": "P2",
+      "featureIds": [
+        "core.health_recovery",
+        "core.stop_cancel_dismiss"
+      ],
+      "scenarioIds": [
+        "dashboard_action_resolution"
+      ],
+      "evidenceIds": [
+        "returning-workspace-containment-readback"
+      ],
+      "blocksGates": [],
+      "guardrail": "Treat historical cleanup as post-return hygiene and keep affected state non-send-capable.",
+      "nextProof": "Complete the offline cleanup reconciliation and verify the contained readback without changing rollout clearance."
+    }
+  ]
+}
