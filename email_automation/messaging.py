@@ -307,6 +307,93 @@ def lookup_thread_by_conversation_id_exhaustive(user_id: str, conversation_id: s
         print(f"❌ Exhaustive conversation lookup failed: {e}")
         return None
 
+
+def _direction_aware_message_timestamp(data: Dict[str, Any]) -> Any:
+    """Select a message's authoritative chronology timestamp."""
+    direction = str(data.get("direction") or "").strip().lower()
+    preferred_fields = (
+        ("sentDateTime", "receivedDateTime")
+        if direction == "outbound"
+        else ("receivedDateTime", "sentDateTime")
+    )
+    for field in (*preferred_fields, "createdAt"):
+        value = data.get(field)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            return value
+    return None
+
+
+def _timestamp_sort_value(value: Any) -> float:
+    """Convert supported timestamp values to UTC epoch seconds for sorting."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return 0.0
+    elif hasattr(value, "timestamp"):
+        try:
+            return float(value.timestamp())
+        except (OSError, OverflowError, TypeError, ValueError):
+            return 0.0
+    else:
+        return 0.0
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc).timestamp()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return 0.0
+
+
+def _normalized_email_address(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().casefold()
+
+
+def _graph_message_from_address(message: Dict[str, Any]) -> str:
+    from_value = message.get("from") or {}
+    if not isinstance(from_value, dict):
+        return ""
+    email_address = from_value.get("emailAddress") or {}
+    if not isinstance(email_address, dict):
+        return ""
+    address = email_address.get("address")
+    return address if isinstance(address, str) else ""
+
+
+def _resolve_graph_message_direction(
+    message: Dict[str, Any],
+    authenticated_mailbox_email: Optional[str],
+) -> str:
+    """Resolve Graph direction conservatively without folder information."""
+    sent_at = message.get("sentDateTime")
+    received_at = message.get("receivedDateTime")
+    has_sent_at = sent_at is not None and (
+        not isinstance(sent_at, str) or bool(sent_at.strip())
+    )
+    has_received_at = received_at is not None and (
+        not isinstance(received_at, str) or bool(received_at.strip())
+    )
+
+    if has_sent_at and has_received_at:
+        from_email = _normalized_email_address(
+            _graph_message_from_address(message)
+        )
+        mailbox_email = _normalized_email_address(authenticated_mailbox_email)
+        if from_email and mailbox_email and from_email == mailbox_email:
+            return "outbound"
+        return "inbound"
+    if has_received_at:
+        return "inbound"
+    if has_sent_at:
+        return "outbound"
+    return "inbound"
+
+
 def _get_thread_messages_chronological(uid: str, thread_id: str) -> List[dict]:
     """Get all messages in thread in chronological order."""
     try:
@@ -322,23 +409,16 @@ def _get_thread_messages_chronological(uid: str, thread_id: str) -> List[dict]:
         message_data = []
         for msg in messages:
             data = msg.to_dict()
-            # Use sentDateTime for outbound, receivedDateTime for inbound
-            timestamp = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
-            if hasattr(timestamp, 'timestamp'):
-                timestamp = timestamp.timestamp()
-            elif isinstance(timestamp, str):
-                try:
-                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    timestamp = dt.timestamp()
-                except:
-                    timestamp = 0
-            else:
-                timestamp = 0
-                
-            message_data.append((timestamp, data, msg.id))
+            timestamp = _direction_aware_message_timestamp(data)
+            message_data.append(
+                (_timestamp_sort_value(timestamp), str(msg.id or ""), data, msg.id)
+            )
         
-        message_data.sort(key=lambda x: x[0])
-        return [{"data": data, "id": msg_id} for _, data, msg_id in message_data]
+        message_data.sort(key=lambda item: (item[0], item[1]))
+        return [
+            {"data": data, "id": msg_id}
+            for _, _, data, msg_id in message_data
+        ]
         
     except Exception as e:
         print(f"❌ Failed to get thread messages: {e}")
@@ -355,7 +435,13 @@ def _message_body_content_and_preview(data: dict) -> tuple[str, str]:
     return "", data.get("bodyPreview") or ""
 
 
-def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, headers: dict = None) -> List[dict]:
+def build_conversation_payload(
+    uid: str,
+    thread_id: str,
+    limit: int = 10,
+    headers: dict = None,
+    authenticated_mailbox_email: Optional[str] = None,
+) -> List[dict]:
     """
     Return last N messages in chronological order. Each item includes:
     direction, from, to, subject, timestamp, preview (short), content (full text, bounded)
@@ -406,23 +492,13 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
                                 matching_msgs = [m for m in graph_data.get("value", []) if m.get("conversationId") == conversation_id]
                                 for msg in matching_msgs:
                                     # Determine direction
-                                    from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "")
+                                    from_addr = _graph_message_from_address(msg)
                                     to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
                                     
-                                    # Determine direction: if receivedDateTime exists, it's inbound; if only sentDateTime, likely outbound
-                                    # Also check if message is in SentItems folder (we'd need to fetch that separately)
-                                    # For now, use heuristic: if receivedDateTime exists and no sentDateTime, it's inbound
-                                    # If sentDateTime exists but no receivedDateTime, it's outbound
-                                    sent_dt = msg.get("sentDateTime")
-                                    received_dt = msg.get("receivedDateTime")
-                                    
-                                    if received_dt and not sent_dt:
-                                        direction = "inbound"
-                                    elif sent_dt and not received_dt:
-                                        direction = "outbound"
-                                    else:
-                                        # Both exist or neither - default to inbound (most common case)
-                                        direction = "inbound"
+                                    direction = _resolve_graph_message_direction(
+                                        msg,
+                                        authenticated_mailbox_email,
+                                    )
                                     
                                     # Get body content
                                     body_obj = msg.get("body", {}) or {}
@@ -479,21 +555,17 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
         message_data = []
         for msg_info in messages_list:
             data = msg_info["data"]
-            ts = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
-            if hasattr(ts, 'timestamp'):
-                ts = ts.timestamp()
-            elif isinstance(ts, str):
-                try:
-                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                    ts = dt.timestamp()
-                except:
-                    ts = 0
-            else:
-                ts = 0
-            message_data.append((ts, msg_info))
+            ts = _direction_aware_message_timestamp(data)
+            message_data.append(
+                (
+                    _timestamp_sort_value(ts),
+                    str(msg_info.get("id") or ""),
+                    msg_info,
+                )
+            )
         
-        message_data.sort(key=lambda x: x[0])
-        sorted_messages = [msg_info for _, msg_info in message_data]
+        message_data.sort(key=lambda item: (item[0], item[1]))
+        sorted_messages = [msg_info for _, _, msg_info in message_data]
         
         # Take last N messages
         recent = sorted_messages[-limit:] if len(sorted_messages) > limit else sorted_messages
@@ -503,7 +575,7 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
         for msg_info in recent:
             data = msg_info["data"]
 
-            ts = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
+            ts = _direction_aware_message_timestamp(data)
             if hasattr(ts, "isoformat"):
                 ts = ts.isoformat()
             elif not isinstance(ts, str):

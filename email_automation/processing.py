@@ -5757,11 +5757,10 @@ def process_inbox_message(
 
     # SAFETY: Skip emails from ourselves (e.g., forwarded back via auto-forward rules)
     # This prevents our own outbound emails from being processed as broker replies
+    my_email = authenticated_mailbox_email
     try:
-        my_email = (
-            authenticated_mailbox_email
-            or _resolve_current_mailbox_email(headers)
-        )
+        if not my_email:
+            my_email = _resolve_current_mailbox_email(headers)
         authority_ineligibility_reason = _inbound_authority_ineligibility_reason(
             subject=subject,
             from_addr=from_addr,
@@ -6163,7 +6162,8 @@ def process_inbox_message(
         proposal = propose_sheet_updates(
             user_id, client_id, to_addr_lower, sheet_id, header, rownum, rowvals,
             thread_id, pdf_manifest=usable_pdf_manifest, url_texts=url_texts, contact_name=contact_name,
-            headers=headers, column_config=column_config, extraction_fields=extraction_fields
+            headers=headers, column_config=column_config, extraction_fields=extraction_fields,
+            authenticated_mailbox_email=my_email,
         )
 
         if proposal:

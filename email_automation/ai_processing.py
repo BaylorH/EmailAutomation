@@ -6140,7 +6140,8 @@ def propose_sheet_updates(uid: str,
                           conversation: List[dict] = None,   # Optional: pass conversation directly (for testing)
                           column_config: dict = None,        # Optional: dynamic column configuration
                           extraction_fields: List[str] = None,  # Optional: list of canonical field keys user wants extracted
-                          dry_run: bool = False) -> Optional[Dict]:
+                          dry_run: bool = False,
+                          authenticated_mailbox_email: str = None) -> Optional[Dict]:
     """
     Uses OpenAI Responses API to propose sheet updates.
     - Grounds on the current row's (address, city) as TARGET PROPERTY.
@@ -6161,7 +6162,13 @@ def propose_sheet_updates(uid: str,
         # If conversation is provided directly (e.g., from tests), use it; otherwise fetch from Firestore
         if conversation is None:
             # Pass headers to fetch from Graph API (includes manual emails we didn't index)
-            conversation = build_conversation_payload(uid, thread_id, limit=10, headers=headers)
+            conversation = build_conversation_payload(
+                uid,
+                thread_id,
+                limit=10,
+                headers=headers,
+                authenticated_mailbox_email=authenticated_mailbox_email,
+            )
 
         # ---- Rules sections ---------------------------------------------------
         # A campaign without a complete persisted contract must not reach the model.
