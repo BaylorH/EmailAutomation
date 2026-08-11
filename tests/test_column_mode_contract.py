@@ -7,6 +7,7 @@ os.environ.setdefault("E2E_TEST_MODE", "true")
 
 from email_automation import ai_processing, column_config, processing
 from email_automation.column_config import (
+    get_column_config_error,
     get_default_column_config,
     get_default_mode_for_canonical,
 )
@@ -163,6 +164,25 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                     )
                 )
 
+    def test_rejects_conjoined_is_request_for_known_field(self):
+        body = (
+            "Could you confirm operating expenses, and is the asking rent still $12?"
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"rent/sf /yr", "ops ex /sf"},
+            set(helper(body, self.config)),
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
     def test_rejects_bullet_list_reasking_known_ask_field(self):
         body = "Could you please provide:\n- asking rent\n- operating expenses"
 
@@ -234,6 +254,32 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             )
         )
 
+    def test_sf_alias_disambiguation_is_local_to_each_match(self):
+        body = "Could you confirm SF and Rent/SF /Yr?"
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"total sf", "rent/sf /yr"},
+            set(helper(body, self.config)),
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr"],
+                self.config,
+            )
+        )
+
+    def test_unconfigured_missing_field_is_not_promoted_to_requestable(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm Rail Access?",
+                ["Rail Access"],
+                get_default_column_config(),
+            )
+        )
+
     def test_optional_ask_must_be_deliberately_listed_as_missing(self):
         config = get_default_column_config()
         config["mappings"]["total_sf"] = "Available Size"
@@ -285,10 +331,12 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
 
     def test_formula_mode_drift_cannot_promote_formula_header_to_ask(self):
         config = get_default_column_config()
+        config["formulaFields"] = list(config["formulaFields"])
         config["formulaFields"].remove("gross_rent")
         config["extractionFields"].append("gross_rent")
         config["requiredFields"].append("gross_rent")
 
+        self.assertIsNotNone(get_column_config_error(config))
         self.assertFalse(
             processing._response_mentions_missing_fields(
                 "Could you confirm Gross Rent?",

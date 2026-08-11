@@ -3968,34 +3968,7 @@ def _response_mentions_missing_fields(
     if _response_requests_nonrequestable_fields(body, column_config):
         return False
 
-    request_config = column_config
-    if isinstance(column_config, dict):
-        configured_headers = {
-            _normalize_request_field_name(header)
-            for header in (
-                list((column_config.get("mappings") or {}).values())
-                + list((column_config.get("customFields") or {}).keys())
-            )
-            if isinstance(header, str) and header.strip()
-        }
-        unmapped_missing_fields = [
-            field
-            for field in missing_fields
-            if isinstance(field, str)
-            and field.strip()
-            and _normalize_request_field_name(field) not in configured_headers
-        ]
-        if unmapped_missing_fields:
-            request_config = dict(column_config)
-            custom_fields = dict(column_config.get("customFields") or {})
-            for field in unmapped_missing_fields:
-                custom_fields[field] = {
-                    "mode": "ask_required",
-                    "description": "Post-write required field",
-                }
-            request_config["customFields"] = custom_fields
-
-    requested_fields = get_requested_ask_fields(body, request_config)
+    requested_fields = get_requested_ask_fields(body, column_config)
     normalized_missing_fields = {
         _normalize_request_field_name(field)
         for field in missing_fields

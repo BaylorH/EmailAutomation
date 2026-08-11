@@ -34,11 +34,16 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
     def test_missing_field_response_must_reference_requested_detail(self):
         body = "Thanks for the info. Could you also confirm whether the building has rail access?"
+        config = get_default_column_config()
+        config["customFields"]["Rail Access"] = {
+            "mode": "ask_required",
+            "description": "Rail-service availability",
+        }
 
         self.assertTrue(processing._response_mentions_missing_fields(
             body,
             ["Rail Access"],
-            get_default_column_config(),
+            config,
         ))
 
     def test_all_info_close_event_requires_complete_required_fields(self):

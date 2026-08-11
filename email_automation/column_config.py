@@ -537,11 +537,18 @@ def get_column_config_error(column_config: Any) -> Optional[str]:
     formulas = set(column_config["formulaFields"])
     never_request = set(column_config["neverRequest"])
     mapped = set(mappings)
+    canonical_formulas = {
+        canonical
+        for canonical in mapped
+        if CANONICAL_FIELDS.get(canonical, {}).get("is_formula")
+    }
 
     if not required <= extraction:
         return "columnConfig.requiredFields must be included in extractionFields"
     if not never_request <= extraction:
         return "columnConfig.neverRequest must be included in extractionFields"
+    if not canonical_formulas <= formulas or (canonical_formulas & extraction):
+        return "columnConfig canonical formula fields must remain formula-only"
     if (required & never_request) or (required & formulas):
         return "columnConfig required fields cannot be Note or formula fields"
     if not (extraction | formulas) <= mapped:
@@ -661,7 +668,15 @@ _FIELD_REQUEST_LIST_LEAD_RE = re.compile(
     r"\b(?:the\s+)?(?:following|below|details|information|items)\s*[?:]\s*$",
     re.IGNORECASE,
 )
-_FIELD_REQUEST_SF_UNIT_RE = re.compile(r"(?:/|\bper\s+)sf\b", re.IGNORECASE)
+_FIELD_REQUEST_CONJUNCTION_PREFIX_RE = re.compile(r"^\s*(?:and|or)\s+", re.IGNORECASE)
+_FIELD_REQUEST_SF_TERM_RE = re.compile(
+    r"(?<![A-Za-z0-9])sf(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_FIELD_REQUEST_SF_UNIT_PREFIX_RE = re.compile(
+    r"(?:/|\bper\s+)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _explicit_field_request_clauses(response_body: str) -> List[str]:
@@ -689,10 +704,14 @@ def _explicit_field_request_clauses(response_body: str) -> List[str]:
                 if not request_candidate:
                     continue
 
-                intent_match = _FIELD_REQUEST_INTENT_RE.search(request_candidate)
+                intent_candidate = _FIELD_REQUEST_CONJUNCTION_PREFIX_RE.sub(
+                    "",
+                    request_candidate,
+                )
+                intent_match = _FIELD_REQUEST_INTENT_RE.search(intent_candidate)
                 if intent_match:
                     explicit_clauses.append(
-                        request_candidate[intent_match.start():].strip()
+                        intent_candidate[intent_match.start():].strip()
                     )
                     request_active = True
                 elif (
@@ -724,9 +743,14 @@ def contains_column_field_term(text: str, term: str) -> bool:
 
 
 def _request_clause_contains_field_term(clause: str, term: str) -> bool:
-    if term.lower() == "sf" and _FIELD_REQUEST_SF_UNIT_RE.search(clause):
+    if not contains_column_field_term(clause, term):
         return False
-    return contains_column_field_term(clause, term)
+    if term.lower() != "sf":
+        return True
+    return any(
+        not _FIELD_REQUEST_SF_UNIT_PREFIX_RE.search(clause[:match.start()])
+        for match in _FIELD_REQUEST_SF_TERM_RE.finditer(clause)
+    )
 
 
 def get_requested_ask_fields(
@@ -784,15 +808,8 @@ def get_requested_ask_fields(
             for term in terms
             if _request_clause_contains_field_term(clause, term)
         ]
-        for header, normalized_header, term in clause_matches:
+        for header, normalized_header, _term in clause_matches:
             if normalized_header in requested_headers:
-                continue
-            if any(
-                other_header != normalized_header
-                and len(other_term) > len(term)
-                and contains_column_field_term(other_term, term)
-                for _other, other_header, other_term in clause_matches
-            ):
                 continue
             requested.append(header)
             requested_headers.add(normalized_header)
