@@ -232,6 +232,23 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                     )
                 )
 
+    def test_negated_known_field_request_verb_does_not_become_a_request(self):
+        body = "We don't need the asking rent. Could you confirm operating expenses?"
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"ops ex /sf"},
+            set(helper(body, self.config)),
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
     def test_configured_rent_header_does_not_trigger_short_size_alias(self):
         body = "Could you confirm the Rent/SF /Yr?"
 
@@ -351,6 +368,7 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
         config["extractionFields"].append("mystery")
         config["requiredFields"].append("mystery")
 
+        self.assertIsNotNone(get_column_config_error(config))
         self.assertFalse(
             processing._response_mentions_missing_fields(
                 "Could you confirm Rail Access?",

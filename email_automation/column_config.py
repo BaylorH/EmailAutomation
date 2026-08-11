@@ -537,6 +537,8 @@ def get_column_config_error(column_config: Any) -> Optional[str]:
     formulas = set(column_config["formulaFields"])
     never_request = set(column_config["neverRequest"])
     mapped = set(mappings)
+    if mapped - set(CANONICAL_FIELDS):
+        return "columnConfig.mappings contains unknown canonical fields"
     canonical_formulas = {
         canonical
         for canonical in mapped
@@ -657,6 +659,15 @@ _FIELD_ACKNOWLEDGEMENT_PREFIX_RE = re.compile(
     r"^\s*please\s+note(?:\s+that)?\b[\s,:-]*",
     re.IGNORECASE,
 )
+_FIELD_NEGATED_REQUEST_INTENT_RE = re.compile(
+    r"\b(?:please\s+)?(?:"
+    r"do(?:es)?\s+not"
+    r"|don['\u2019]t"
+    r"|doesn['\u2019]t"
+    r"|not"
+    r")\s+(?:need|request|ask)\b",
+    re.IGNORECASE,
+)
 _FIELD_REQUEST_CONTINUATION_BLOCK_RE = re.compile(
     r"(?:"
     r"^\s*(?:and\s+)?(?:i|you|we|they|he|she|it|this|that|here|there)\b"
@@ -707,6 +718,10 @@ def _explicit_field_request_clauses(response_body: str) -> List[str]:
                 intent_candidate = _FIELD_REQUEST_CONJUNCTION_PREFIX_RE.sub(
                     "",
                     request_candidate,
+                )
+                intent_candidate = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
+                    "",
+                    intent_candidate,
                 )
                 intent_match = _FIELD_REQUEST_INTENT_RE.search(intent_candidate)
                 if intent_match:
