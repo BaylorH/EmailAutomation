@@ -46,6 +46,38 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             config,
         ))
 
+    def test_runtime_missing_field_selection_is_always_deterministic(self):
+        missing_fields = ["Ops Ex /SF", "Docks"]
+        llm_bodies = (
+            "Thanks for the update. Could you confirm Ops Ex /SF and Docks?",
+            "Please reconfirm asking rent, along with Ops Ex /SF and Docks.",
+            "Could you confirm the property address, Ops Ex /SF, and Docks?",
+        )
+        selected_bodies = []
+
+        with patch.object(processing, "_response_mentions_missing_fields") as mentions:
+            for llm_body in llm_bodies:
+                with self.subTest(llm_body=llm_body):
+                    selected = processing._select_automatic_response_body(
+                        "missing_fields",
+                        llm_body,
+                        get_default_column_config(),
+                        "Taylor",
+                        missing_fields=missing_fields,
+                    )
+                    selected_bodies.append(selected)
+            mentions.assert_not_called()
+
+        self.assertEqual(1, len(set(selected_bodies)))
+        selected = selected_bodies[0]
+        self.assertEqual(
+            missing_fields,
+            [line[2:] for line in selected.splitlines() if line.startswith("- ")],
+        )
+        self.assertNotIn("Thanks for the update.", selected)
+        self.assertNotIn("asking rent", selected.lower())
+        self.assertNotIn("property address", selected.lower())
+
     def test_all_info_close_event_requires_complete_required_fields(self):
         event = {"type": "close_conversation", "notes": "all_info_gathered"}
 

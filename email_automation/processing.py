@@ -3990,8 +3990,23 @@ def _select_automatic_response_body(
     llm_response_email: Optional[str],
     column_config: Optional[dict],
     contact_name: Optional[str],
+    *,
+    missing_fields: Optional[List[str]] = None,
 ) -> str:
-    """Use LLM copy only when it does not request configured Note/Skip fields."""
+    """Select deterministic scenario copy or an allowed LLM response."""
+    if scenario == "missing_fields":
+        if not missing_fields:
+            raise ValueError("missing_fields scenario requires authoritative fields")
+        greeting = _build_greeting(contact_name)
+        field_list = "\n".join(f"- {field}" for field in missing_fields)
+        return f"""{greeting}
+
+Thank you for the information!
+
+To complete the property details, could you please provide:
+
+{field_list}"""
+
     truth_locked_mismatch = scenario.startswith("requirements_mismatch")
     if (
         llm_response_email
@@ -7763,35 +7778,15 @@ Could you please provide your phone number so I can give you a call?"""
                         
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
-                            # Use LLM-generated response if available, otherwise use template
-                            if llm_response_email and _response_mentions_missing_fields(
+                            response_body = _select_automatic_response_body(
+                                "missing_fields",
                                 llm_response_email,
-                                missing_fields,
                                 column_config,
-                            ):
-                                response_body = llm_response_email
-                                # Safety check: Remove "Looking forward to your response" phrases
-                                if "Looking forward to your response" in response_body or "Looking forward to hearing from you" in response_body:
-                                    print(f"   ⚠️ LLM response contained 'Looking forward' phrase, removing it...")
-                                    response_body = response_body.replace("Looking forward to your response", "").replace("Looking forward to hearing from you", "")
-                                    # Clean up any double newlines
-                                    response_body = "\n".join(line for line in response_body.split("\n") if line.strip())
-                                    # Ensure it ends with a simple closing if needed
-                                    if response_body.strip() and not response_body.strip().endswith("Thanks") and not response_body.strip().endswith("Thanks."):
-                                        response_body = response_body.strip() + "\n\nThanks."
-                                print(f"🤖 Using LLM-generated response for missing fields scenario")
-                            else:
-                                if llm_response_email:
-                                    print("⚠️ Ignoring LLM response because it did not ask for the missing fields")
-                                greeting = _build_greeting(contact_name)
-                                field_list = "\n".join(f"- {field}" for field in missing_fields)
-                                response_body = f"""{greeting}
-
-Thank you for the information!
-
-To complete the property details, could you please provide:
-
-{field_list}"""
+                                contact_name,
+                                missing_fields=missing_fields,
+                            )
+                            if llm_response_email:
+                                print("ℹ️ Using deterministic authoritative missing-fields response")
                             
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:
