@@ -102,22 +102,30 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "id": "evidence.login",
                     "proofLevel": "production_readback",
                     "result": "pass",
+                    "claim": "Returning-user login and read-only inspection succeeded.",
                     "featureIds": ["feature.alpha"],
                     "scenarioIds": ["scenario.event"],
+                    "releaseRefs": {"backendRevision": "revision-001"},
                     "artifact": "docs/release-safety/evidence.md",
                     "observedAt": "2026-08-10T23:00:00Z",
                     "expiresAt": "2026-08-11T01:00:00Z",
+                    "readbacks": ["Authenticated session state was read back."],
+                    "limitations": ["No campaign mutation was exercised."],
                     "retestOn": ["runtime_change"],
                 },
                 {
                     "id": "evidence.live",
                     "proofLevel": "live_production",
                     "result": "pass",
+                    "claim": "The monitored behavioral proof passed.",
                     "featureIds": ["feature.beta"],
                     "scenarioIds": ["scenario.feature"],
+                    "releaseRefs": {"backendRevision": "revision-001"},
                     "artifact": "docs/release-safety/evidence.md",
                     "observedAt": "2026-08-10T22:00:00Z",
                     "expiresAt": None,
+                    "readbacks": ["Terminal state was read back."],
+                    "limitations": ["The proof covered one monitored run."],
                     "retestOn": ["release_change"],
                 },
             ],
@@ -155,6 +163,30 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertIn(stable_id, message)
         self.assertNotIn(repr(registry), message)
         return message
+
+    def add_login_failure(
+        self,
+        registry,
+        *,
+        observed_at="2026-08-10T23:30:00Z",
+        feature_ids=None,
+        scenario_ids=None,
+        release_revision="revision-001",
+    ):
+        failure = copy.deepcopy(registry["evidence"][0])
+        failure.update(
+            {
+                "id": "evidence.login.regression",
+                "result": "fail",
+                "claim": "A later current-release check failed.",
+                "observedAt": observed_at,
+                "expiresAt": None,
+                "featureIds": ["feature.alpha"] if feature_ids is None else feature_ids,
+                "scenarioIds": ["scenario.event"] if scenario_ids is None else scenario_ids,
+                "releaseRefs": {"backendRevision": release_revision},
+            }
+        )
+        registry["evidence"].append(failure)
 
     def test_valid_registry_builds_frozen_indexes(self):
         validated = self.validate()
@@ -222,7 +254,8 @@ class ReadinessRegistryTests(unittest.TestCase):
             with self.subTest(collection=collection, field=field):
                 candidate = copy.deepcopy(self.registry)
                 candidate[collection][0][field] = [value]
-                self.assert_invalid(candidate, stable_id)
+                message = self.assert_invalid(candidate, stable_id)
+                self.assertIn(value, message)
 
         bad_fixture_map = copy.deepcopy(self.fixture_map)
         bad_fixture_map["featureFixtureMatrix"]["feature.unknown"] = {}
@@ -247,11 +280,41 @@ class ReadinessRegistryTests(unittest.TestCase):
                 candidate = copy.deepcopy(self.registry)
                 gate_index = 0 if field == "evidenceIds" else 1
                 candidate["rolloutGates"][gate_index][field] = [value]
-                self.assert_invalid(candidate, stable_id)
+                message = self.assert_invalid(candidate, stable_id)
+                self.assertIn(value, message)
 
         candidate = copy.deepcopy(self.registry)
         candidate["qualityItems"][0]["evidenceIds"] = ["evidence.unknown"]
-        self.assert_invalid(candidate, "quality.canary_unrun")
+        message = self.assert_invalid(candidate, "quality.canary_unrun")
+        self.assertIn("evidence.unknown", message)
+
+    def test_stable_id_syntax_is_enforced_before_values_can_be_echoed(self):
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][0]["id"] = "unsafe/id"
+        candidate["rolloutGates"][0]["evidenceIds"] = ["unsafe/id"]
+        with self.assertRaises(self.module.RegistryError) as caught:
+            self.validate(registry=candidate)
+        self.assertIn("stable ID syntax", str(caught.exception))
+        self.assertNotIn("unsafe/id", str(caught.exception))
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["rolloutGates"][0]["evidenceIds"] = ["person@example.com"]
+        with self.assertRaises(self.module.RegistryError) as caught:
+            self.validate(registry=candidate)
+        self.assertIn("stable ID syntax", str(caught.exception))
+        self.assertNotIn("person@example.com", str(caught.exception))
+
+        for collection, field in (
+            ("evidence", "featureIds"),
+            ("qualityItems", "evidenceIds"),
+        ):
+            with self.subTest(collection=collection, field=field):
+                candidate = copy.deepcopy(self.registry)
+                candidate[collection][0][field] = ["person@example.com"]
+                with self.assertRaises(self.module.RegistryError) as caught:
+                    self.validate(registry=candidate)
+                self.assertIn("stable ID syntax", str(caught.exception))
+                self.assertNotIn("person@example.com", str(caught.exception))
 
     def test_quality_items_block_only_their_explicit_gates(self):
         nonblocking = copy.deepcopy(self.registry["qualityItems"][0])
@@ -329,6 +392,115 @@ class ReadinessRegistryTests(unittest.TestCase):
             candidate = copy.deepcopy(self.registry)
             mutation(candidate)
             self.assert_invalid(candidate, "login_view")
+
+    def test_every_evidence_item_requires_explicit_claim_scope_and_proof_details(self):
+        for field in (
+            "claim",
+            "featureIds",
+            "scenarioIds",
+            "readbacks",
+            "limitations",
+            "retestOn",
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(self.registry)
+                candidate["evidence"][0].pop(field)
+                self.assert_invalid(candidate, "evidence.login")
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][0]["claim"] = ""
+        self.assert_invalid(candidate, "evidence.login")
+
+    def test_live_evidence_requires_current_release_refs_and_nonempty_proof_details(self):
+        for evidence_index in (0, 1):
+            stable_id = self.registry["evidence"][evidence_index]["id"]
+            for field, empty_value in (
+                ("releaseRefs", {}),
+                ("readbacks", []),
+                ("limitations", []),
+                ("retestOn", []),
+            ):
+                with self.subTest(evidence=stable_id, field=field):
+                    candidate = copy.deepcopy(self.registry)
+                    candidate["evidence"][evidence_index][field] = empty_value
+                    self.assert_invalid(candidate, stable_id)
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][1]["releaseRefs"] = {"unknownRelease": "revision-001"}
+        self.assert_invalid(candidate, "evidence.live")
+
+    def test_control_plane_readback_may_use_explicit_empty_scope_but_live_evidence_may_not(self):
+        control_plane = copy.deepcopy(self.registry)
+        control_plane["evidence"][0]["featureIds"] = []
+        control_plane["evidence"][0]["scenarioIds"] = []
+        self.validate(registry=control_plane)
+
+        for field in ("featureIds", "scenarioIds"):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(self.registry)
+                candidate["evidence"][1][field] = []
+                self.assert_invalid(candidate, "evidence.live")
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][0]["featureIds"] = []
+        self.assert_invalid(candidate, "evidence.login")
+
+    def test_nonproduction_evidence_may_have_empty_proof_detail_lists(self):
+        candidate = copy.deepcopy(self.registry)
+        evidence = candidate["evidence"][1]
+        evidence["proofLevel"] = "deterministic_test"
+        evidence.pop("releaseRefs")
+        evidence["readbacks"] = []
+        evidence["limitations"] = []
+        evidence["retestOn"] = []
+
+        self.validate(registry=candidate)
+
+    def test_historical_or_old_release_evidence_cannot_support_go(self):
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][0]["proofLevel"] = "historical"
+        self.assert_invalid(candidate, "login_view")
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][0]["releaseRefs"] = {"backendRevision": "revision-000"}
+        self.assert_invalid(candidate, "login_view")
+
+    def test_newer_current_failure_with_overlapping_scope_invalidates_go(self):
+        candidate = copy.deepcopy(self.registry)
+        self.add_login_failure(candidate)
+
+        self.assert_invalid(candidate, "login_view")
+
+    def test_disjoint_or_old_release_failure_does_not_regress_go(self):
+        disjoint = copy.deepcopy(self.registry)
+        self.add_login_failure(
+            disjoint,
+            feature_ids=["feature.beta"],
+            scenario_ids=["scenario.feature"],
+        )
+        self.validate(registry=disjoint)
+
+        old_release = copy.deepcopy(self.registry)
+        self.add_login_failure(old_release, release_revision="revision-000")
+        self.validate(registry=old_release)
+
+    def test_effective_decision_stales_when_a_new_current_failure_becomes_observed(self):
+        candidate = copy.deepcopy(self.registry)
+        self.add_login_failure(candidate, observed_at="2026-08-11T00:30:00Z")
+        authored = copy.deepcopy(candidate)
+        validated = self.validate(registry=candidate)
+
+        before_failure = self.module.effective_gate_decisions(
+            validated, at=self.module.parse_utc("2026-08-11T00:29:59Z")
+        )
+        after_failure = self.module.effective_gate_decisions(
+            validated, at=self.module.parse_utc("2026-08-11T00:30:00Z")
+        )
+
+        self.assertEqual("go", before_failure["login_view"])
+        self.assertEqual("stale", after_failure["login_view"])
+        self.assertEqual(authored, candidate)
+        self.assertEqual(authored, validated.registry)
 
     def test_ready_for_canary_requires_explicit_operating_contract(self):
         for field, empty_value in (
