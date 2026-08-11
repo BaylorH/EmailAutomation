@@ -30,6 +30,7 @@ QUALITY_STATES = {"proven_live", "source_only", "partial", "open", "ready_for_li
 
 _UTC_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _EMAIL = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_STABLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _RAW_MESSAGE_FIELDS = {
     "bcc",
     "body",
@@ -96,12 +97,26 @@ def _nonempty_string(value: Any, owner: str, field: str) -> str:
     return value
 
 
+def _stable_id(value: Any, owner: str, field: str) -> str:
+    stable_id = _nonempty_string(value, owner, field)
+    if _STABLE_ID.fullmatch(stable_id) is None:
+        raise RegistryError(f"{owner}: {field} violates stable ID syntax")
+    return stable_id
+
+
 def _string_list(value: Any, owner: str, field: str) -> list[str]:
     values = _list(value, owner, field)
-    if any(not isinstance(item, str) or not item for item in values):
-        raise RegistryError(f"{owner}: {field} must contain stable string IDs")
+    for item in values:
+        _stable_id(item, owner, field)
     if len(values) != len(set(values)):
         raise RegistryError(f"{owner}: {field} contains duplicate IDs")
+    return values
+
+
+def _text_list(value: Any, owner: str, field: str) -> list[str]:
+    values = _list(value, owner, field)
+    if any(not isinstance(item, str) or not item.strip() for item in values):
+        raise RegistryError(f"{owner}: {field} must contain nonempty text")
     return values
 
 
@@ -144,7 +159,7 @@ def _index(items: Any, collection: str) -> dict[str, Mapping[str, Any]]:
     for index, raw_item in enumerate(_list(items, "registry", collection)):
         owner = f"{collection}[{index}]"
         item = _mapping(raw_item, owner, "item")
-        stable_id = _nonempty_string(item.get("id"), owner, "id")
+        stable_id = _stable_id(item.get("id"), owner, "id")
         _scan_safe(stable_id, owner)
         if stable_id in result:
             raise RegistryError(f"{stable_id}: duplicate stable ID")
@@ -168,9 +183,74 @@ def _validate_refs(
     if field not in item and not required:
         return []
     refs = _string_list(item.get(field), owner, field)
-    if any(ref not in known for ref in refs):
-        raise RegistryError(f"{owner}: {field} contains an unknown stable ID")
+    for ref in refs:
+        if ref not in known:
+            raise RegistryError(f"{owner}: {field} references unknown stable ID {ref}")
     return refs
+
+
+def _release_refs(
+    evidence: Mapping[str, Any],
+    evidence_id: str,
+    release_identity: Mapping[str, Any],
+    *,
+    required: bool,
+) -> Mapping[str, str]:
+    if "releaseRefs" not in evidence and not required:
+        return {}
+    refs = _mapping(evidence.get("releaseRefs"), evidence_id, "releaseRefs")
+    if required and not refs:
+        raise RegistryError(f"{evidence_id}: releaseRefs must be nonempty")
+    for key, value in refs.items():
+        safe_key = _stable_id(key, evidence_id, "releaseRefs key")
+        if safe_key not in release_identity:
+            raise RegistryError(f"{evidence_id}: releaseRefs references unknown key {safe_key}")
+        _nonempty_string(value, evidence_id, "releaseRefs value")
+    return refs
+
+
+def _is_current_release(
+    evidence: Mapping[str, Any], release_identity: Mapping[str, Any]
+) -> bool:
+    refs = evidence.get("releaseRefs")
+    return bool(refs) and all(release_identity.get(key) == value for key, value in refs.items())
+
+
+def _scope_overlaps(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left_features = set(left["featureIds"])
+    right_features = set(right["featureIds"])
+    left_scenarios = set(left["scenarioIds"])
+    right_scenarios = set(right["scenarioIds"])
+    if left_features & right_features or left_scenarios & right_scenarios:
+        return True
+    return not (left_features or right_features or left_scenarios or right_scenarios)
+
+
+def _go_evidence_is_current(
+    evidence: Mapping[str, Any],
+    evidence_by_id: Mapping[str, Mapping[str, Any]],
+    release_identity: Mapping[str, Any],
+    *,
+    at: datetime,
+) -> bool:
+    if evidence["proofLevel"] == "historical" or evidence["result"] != "pass":
+        return False
+    if not _is_current_release(evidence, release_identity):
+        return False
+    observed_at = parse_utc(evidence["observedAt"])
+    if observed_at > at:
+        return False
+    expires_raw = evidence.get("expiresAt")
+    if expires_raw is not None and at >= parse_utc(expires_raw):
+        return False
+    for candidate in evidence_by_id.values():
+        if candidate["proofLevel"] == "historical" or candidate["result"] != "fail":
+            continue
+        failed_at = parse_utc(candidate["observedAt"])
+        if observed_at < failed_at <= at and _is_current_release(candidate, release_identity):
+            if _scope_overlaps(evidence, candidate):
+                return False
+    return True
 
 
 def _validate_artifact(artifact: Any, evidence_id: str, repo_root: Path) -> None:
@@ -206,6 +286,9 @@ def validate_registry(
 
     updated_at = _timestamp(document.get("updatedAt"), "registry", "updatedAt")
     release_identity = _mapping(document.get("releaseIdentity"), "releaseIdentity", "value")
+    for key, value in release_identity.items():
+        _stable_id(key, "releaseIdentity", "key")
+        _nonempty_string(value, "releaseIdentity", "value")
     _scan_safe(release_identity, "releaseIdentity")
 
     feature_by_id = _feature_index(feature_registry)
@@ -221,6 +304,8 @@ def validate_registry(
     fixture_matrix = _mapping(
         fixture_doc.get("featureFixtureMatrix"), "fixture-map", "featureFixtureMatrix"
     )
+    for feature_id in fixture_matrix:
+        _stable_id(feature_id, "fixture-map", "featureFixtureMatrix key")
     unknown_fixture_features = set(fixture_matrix) - known_features
     if unknown_fixture_features:
         unknown = sorted(unknown_fixture_features)[0]
@@ -235,39 +320,68 @@ def validate_registry(
             if all_ids.count(stable_id) > 1:
                 raise RegistryError(f"{stable_id}: stable ID is reused across namespaces")
 
-    evidence_times: dict[str, tuple[datetime, datetime | None]] = {}
     for evidence_id, evidence in evidence_by_id.items():
-        _scan_safe(evidence, evidence_id)
         if evidence.get("proofLevel") not in PROOF_LEVELS:
             raise RegistryError(f"{evidence_id}: invalid proofLevel")
         if evidence.get("result") not in EVIDENCE_RESULTS:
             raise RegistryError(f"{evidence_id}: invalid result")
-        _validate_refs(evidence, evidence_id, "featureIds", known_features)
-        _validate_refs(evidence, evidence_id, "scenarioIds", known_scenarios)
+        _nonempty_string(evidence.get("claim"), evidence_id, "claim")
+        feature_refs = _validate_refs(
+            evidence, evidence_id, "featureIds", known_features, required=True
+        )
+        scenario_refs = _validate_refs(
+            evidence, evidence_id, "scenarioIds", known_scenarios, required=True
+        )
+        if not feature_refs or not scenario_refs:
+            is_control_plane = (
+                evidence["proofLevel"] == "production_readback"
+                and not feature_refs
+                and not scenario_refs
+            )
+            if not is_control_plane:
+                raise RegistryError(
+                    f"{evidence_id}: behavioral evidence requires featureIds and scenarioIds"
+                )
+        readbacks = _text_list(evidence.get("readbacks"), evidence_id, "readbacks")
+        limitations = _text_list(evidence.get("limitations"), evidence_id, "limitations")
+        retest_on = _text_list(evidence.get("retestOn"), evidence_id, "retestOn")
+        production_proof = evidence["proofLevel"] in {
+            "live_production",
+            "production_readback",
+        }
+        _release_refs(
+            evidence,
+            evidence_id,
+            release_identity,
+            required=production_proof,
+        )
+        _scan_safe(evidence, evidence_id)
+        if production_proof and not (readbacks and limitations and retest_on):
+            raise RegistryError(
+                f"{evidence_id}: production evidence requires nonempty proof details"
+            )
         observed_at = _timestamp(evidence.get("observedAt"), evidence_id, "observedAt")
         expires_raw = evidence.get("expiresAt")
         expires_at = None if expires_raw is None else _timestamp(expires_raw, evidence_id, "expiresAt")
         if expires_at is not None and expires_at <= observed_at:
             raise RegistryError(f"{evidence_id}: expiresAt must be after observedAt")
         _validate_artifact(evidence.get("artifact"), evidence_id, Path(repo_root).resolve())
-        evidence_times[evidence_id] = (observed_at, expires_at)
 
     gate_ids = set(gate_by_id)
     evidence_ids = set(evidence_by_id)
     quality_ids = set(quality_by_id)
     for quality_id, quality in quality_by_id.items():
-        _scan_safe(quality, quality_id)
         if quality.get("state") not in QUALITY_STATES:
             raise RegistryError(f"{quality_id}: invalid state")
         _validate_refs(quality, quality_id, "featureIds", known_features)
         _validate_refs(quality, quality_id, "scenarioIds", known_scenarios)
         _validate_refs(quality, quality_id, "evidenceIds", evidence_ids)
         _validate_refs(quality, quality_id, "blocksGates", gate_ids, required=True)
+        _scan_safe(quality, quality_id)
 
     gate_evidence: dict[str, list[str]] = {}
     gate_blockers: dict[str, list[str]] = {}
     for gate_id, gate in gate_by_id.items():
-        _scan_safe(gate, gate_id)
         decision = gate.get("decision")
         if decision not in GATE_DECISIONS:
             raise RegistryError(f"{gate_id}: invalid authored decision")
@@ -279,6 +393,7 @@ def validate_registry(
         gate_blockers[gate_id] = _validate_refs(
             gate, gate_id, "blockerIds", quality_ids, required=True
         )
+        _scan_safe(gate, gate_id)
         if decision == "ready_for_canary":
             _nonempty_string(gate.get("scope"), gate_id, "scope")
             if not _string_list(gate.get("forbids"), gate_id, "forbids"):
@@ -306,11 +421,15 @@ def validate_registry(
             raise RegistryError(f"{gate_id}: go requires passing evidence")
         for evidence_id in gate_evidence[gate_id]:
             evidence = evidence_by_id[evidence_id]
-            expires_at = evidence_times[evidence_id][1]
-            if evidence["result"] != "pass":
-                raise RegistryError(f"{gate_id}: go requires passing evidence")
-            if expires_at is not None and updated_at >= expires_at:
-                raise RegistryError(f"{gate_id}: go requires unexpired evidence")
+            if not _go_evidence_is_current(
+                evidence,
+                evidence_by_id,
+                release_identity,
+                at=updated_at,
+            ):
+                raise RegistryError(
+                    f"{gate_id}: go requires current nonhistorical unregressed evidence"
+                )
 
     return ValidatedRegistry(
         registry=document,
@@ -335,13 +454,18 @@ def effective_gate_decisions(
         raise RegistryError("at: expected an aware UTC date-time")
 
     decisions: dict[str, str] = {}
+    release_identity = validated.registry["releaseIdentity"]
     for gate in validated.registry["rolloutGates"]:
         gate_id = gate["id"]
         decision = gate["decision"]
         if decision == "go":
             for evidence_id in gate["evidenceIds"]:
-                expires_raw = validated.evidence_by_id[evidence_id].get("expiresAt")
-                if expires_raw is not None and at_time >= parse_utc(expires_raw):
+                if not _go_evidence_is_current(
+                    validated.evidence_by_id[evidence_id],
+                    validated.evidence_by_id,
+                    release_identity,
+                    at=at_time,
+                ):
                     decision = "stale"
                     break
         decisions[gate_id] = decision
