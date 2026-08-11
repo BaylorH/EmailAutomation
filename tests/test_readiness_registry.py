@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import FrozenInstanceError
 from datetime import timezone
@@ -310,6 +311,18 @@ class ReadinessRegistryTests(unittest.TestCase):
         bad_fixture_map["featureFixtureMatrix"]["feature.unknown"] = {}
         with self.assertRaisesRegex(self.module.RegistryError, "feature.unknown"):
             self.validate(fixture_map=bad_fixture_map)
+
+    def test_fixture_matrix_rows_must_be_mappings(self):
+        malformed = copy.deepcopy(self.fixture_map)
+        malformed["featureFixtureMatrix"]["feature.alpha"] = []
+
+        with self.assertRaises(self.module.RegistryError) as caught:
+            self.validate(fixture_map=malformed)
+
+        message = str(caught.exception)
+        self.assertIn("feature.alpha", message)
+        self.assertIn("fixture", message)
+        self.assertNotIn(repr(malformed), message)
 
     def test_scenario_union_accepts_event_and_feature_scenario_keys(self):
         self.validate()
@@ -922,7 +935,7 @@ class ReadinessRegistryTests(unittest.TestCase):
             (self.repo_root / "docs/release-safety/full-quality-coverage.md").exists()
         )
 
-    def test_cli_default_writes_and_check_reports_drift_without_writing(self):
+    def test_cli_explicit_at_writes_and_check_reports_drift_without_writing(self):
         self.write_repository_inputs()
         self.install_cli_script()
         at_args = ("--at", "2026-08-11T00:00:00Z")
@@ -949,6 +962,59 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertNotIn(str(self.repo_root), output)
         self.assertEqual(drift_snapshot, {path: path.read_bytes() for path in drift_snapshot})
         self.assertEqual([], list(current_path.parent.glob(".*readiness*.tmp")))
+
+    def test_cli_default_uses_registry_updated_at(self):
+        self.write_repository_inputs()
+        self.install_cli_script()
+
+        written = self.run_cli()
+
+        self.assertEqual(0, written.returncode, written.stderr)
+        for filename in (
+            "current-user-readiness.md",
+            "full-quality-coverage.md",
+        ):
+            rendered = (
+                self.repo_root / "docs" / "release-safety" / filename
+            ).read_text()
+            self.assertIn("As of `2026-08-11T00:00:00Z`.", rendered)
+
+    def test_cli_delayed_default_check_is_clean_and_writes_nothing(self):
+        self.write_repository_inputs()
+        self.install_cli_script()
+        written = self.run_cli()
+        self.assertEqual(0, written.returncode, written.stderr)
+        paths = (
+            self.repo_root / "docs/release-safety/current-user-readiness.md",
+            self.repo_root / "docs/release-safety/full-quality-coverage.md",
+        )
+        snapshot = {path: path.read_bytes() for path in paths}
+        time.sleep(1.1)
+
+        checked = self.run_cli("--check")
+
+        self.assertEqual(0, checked.returncode, checked.stderr)
+        self.assertEqual(snapshot, {path: path.read_bytes() for path in paths})
+
+    def test_cli_malformed_fixture_row_fails_safely_without_writing(self):
+        self.fixture_map["featureFixtureMatrix"]["feature.alpha"] = []
+        self.write_repository_inputs()
+        self.install_cli_script()
+
+        result = self.run_cli("--check")
+
+        self.assertEqual(2, result.returncode)
+        output = result.stdout + result.stderr
+        self.assertIn("feature.alpha", output)
+        self.assertIn("fixture", output)
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn(str(self.repo_root), output)
+        self.assertFalse(
+            (self.repo_root / "docs/release-safety/current-user-readiness.md").exists()
+        )
+        self.assertFalse(
+            (self.repo_root / "docs/release-safety/full-quality-coverage.md").exists()
+        )
 
     def test_cli_validation_error_is_stable_and_writes_nothing(self):
         registry = copy.deepcopy(self.registry)
