@@ -172,6 +172,7 @@ class ReadinessRegistryTests(unittest.TestCase):
         feature_ids=None,
         scenario_ids=None,
         release_revision="revision-001",
+        supersedes=None,
     ):
         failure = copy.deepcopy(registry["evidence"][0])
         failure.update(
@@ -186,6 +187,8 @@ class ReadinessRegistryTests(unittest.TestCase):
                 "releaseRefs": {"backendRevision": release_revision},
             }
         )
+        if supersedes is not None:
+            failure["supersedes"] = supersedes
         registry["evidence"].append(failure)
 
     def test_valid_registry_builds_frozen_indexes(self):
@@ -465,11 +468,56 @@ class ReadinessRegistryTests(unittest.TestCase):
         candidate["evidence"][0]["releaseRefs"] = {"backendRevision": "revision-000"}
         self.assert_invalid(candidate, "login_view")
 
-    def test_newer_current_failure_with_overlapping_scope_invalidates_go(self):
+    def test_same_feature_same_scenario_newer_current_failure_invalidates_go(self):
         candidate = copy.deepcopy(self.registry)
         self.add_login_failure(candidate)
 
         self.assert_invalid(candidate, "login_view")
+
+    def test_same_feature_different_scenario_failure_does_not_regress_go(self):
+        candidate = copy.deepcopy(self.registry)
+        self.add_login_failure(
+            candidate,
+            feature_ids=["feature.alpha"],
+            scenario_ids=["scenario.feature"],
+        )
+
+        try:
+            validated = self.validate(registry=candidate)
+        except self.module.RegistryError as exc:
+            self.fail(f"different scenarios must stay independent: {exc}")
+        decisions = self.module.effective_gate_decisions(
+            validated, at=self.module.parse_utc("2026-08-11T00:00:00Z")
+        )
+        self.assertEqual("go", decisions["login_view"])
+
+    def test_empty_scope_readbacks_regress_only_with_explicit_supersedes(self):
+        unrelated = copy.deepcopy(self.registry)
+        unrelated["evidence"][0]["featureIds"] = []
+        unrelated["evidence"][0]["scenarioIds"] = []
+        self.add_login_failure(unrelated, feature_ids=[], scenario_ids=[])
+        try:
+            self.validate(registry=unrelated)
+        except self.module.RegistryError as exc:
+            self.fail(f"unrelated control-plane readbacks must stay independent: {exc}")
+
+        superseding = copy.deepcopy(self.registry)
+        superseding["evidence"][0]["featureIds"] = []
+        superseding["evidence"][0]["scenarioIds"] = []
+        self.add_login_failure(
+            superseding,
+            feature_ids=[],
+            scenario_ids=[],
+            supersedes=["evidence.login"],
+        )
+        self.assert_invalid(superseding, "login_view")
+
+    def test_supersedes_references_must_resolve(self):
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][1]["supersedes"] = ["evidence.unknown"]
+
+        message = self.assert_invalid(candidate, "evidence.live")
+        self.assertIn("evidence.unknown", message)
 
     def test_disjoint_or_old_release_failure_does_not_regress_go(self):
         disjoint = copy.deepcopy(self.registry)

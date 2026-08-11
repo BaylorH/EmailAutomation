@@ -221,9 +221,23 @@ def _scope_overlaps(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     right_features = set(right["featureIds"])
     left_scenarios = set(left["scenarioIds"])
     right_scenarios = set(right["scenarioIds"])
-    if left_features & right_features or left_scenarios & right_scenarios:
-        return True
-    return not (left_features or right_features or left_scenarios or right_scenarios)
+    left_control = (
+        left["proofLevel"] == "production_readback"
+        and not left_features
+        and not left_scenarios
+    )
+    right_control = (
+        right["proofLevel"] == "production_readback"
+        and not right_features
+        and not right_scenarios
+    )
+    if left_control or right_control:
+        return (
+            left_control
+            and right_control
+            and left["id"] in right.get("supersedes", [])
+        )
+    return bool(left_features & right_features and left_scenarios & right_scenarios)
 
 
 def _go_evidence_is_current(
@@ -314,6 +328,7 @@ def validate_registry(
     gate_by_id = _index(document.get("rolloutGates"), "rolloutGates")
     evidence_by_id = _index(document.get("evidence"), "evidence")
     quality_by_id = _index(document.get("qualityItems"), "qualityItems")
+    evidence_ids = set(evidence_by_id)
     all_ids = [*gate_by_id, *evidence_by_id, *quality_by_id]
     if len(all_ids) != len(set(all_ids)):
         for stable_id in all_ids:
@@ -332,6 +347,7 @@ def validate_registry(
         scenario_refs = _validate_refs(
             evidence, evidence_id, "scenarioIds", known_scenarios, required=True
         )
+        _validate_refs(evidence, evidence_id, "supersedes", evidence_ids)
         if not feature_refs or not scenario_refs:
             is_control_plane = (
                 evidence["proofLevel"] == "production_readback"
@@ -368,7 +384,6 @@ def validate_registry(
         _validate_artifact(evidence.get("artifact"), evidence_id, Path(repo_root).resolve())
 
     gate_ids = set(gate_by_id)
-    evidence_ids = set(evidence_by_id)
     quality_ids = set(quality_by_id)
     for quality_id, quality in quality_by_id.items():
         if quality.get("state") not in QUALITY_STATES:
