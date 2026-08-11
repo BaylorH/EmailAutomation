@@ -643,6 +643,72 @@ _FIELD_REQUEST_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FIELD_REQUEST_SENTENCE_SPLIT_RE = re.compile(r"[.!?]+")
+_FIELD_REQUEST_COORDINATION_SPLIT_RE = re.compile(r"[,;]+")
+_FIELD_REQUEST_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
+_FIELD_ACKNOWLEDGEMENT_PREFIX_RE = re.compile(
+    r"^\s*please\s+note(?:\s+that)?\b[\s,:-]*",
+    re.IGNORECASE,
+)
+_FIELD_REQUEST_CONTINUATION_BLOCK_RE = re.compile(
+    r"(?:"
+    r"^\s*(?:and\s+)?(?:i|you|we|they|he|she|it|this|that|here|there)\b"
+    r"|\b(?:already|am|is|are|was|were|have|has|had|confirmed|provided|received|sent|included|attached|shared|forwarded|supplied)\b"
+    r")",
+    re.IGNORECASE,
+)
+_FIELD_REQUEST_LIST_LEAD_RE = re.compile(
+    r"\b(?:the\s+)?(?:following|below|details|information|items)\s*[?:]\s*$",
+    re.IGNORECASE,
+)
+_FIELD_REQUEST_SF_UNIT_RE = re.compile(r"(?:/|\bper\s+)sf\b", re.IGNORECASE)
+
+
+def _explicit_field_request_clauses(response_body: str) -> List[str]:
+    """Return explicit request clauses, including bullets under a request lead-in."""
+    request_clauses = []
+    bullet_request_active = False
+
+    for line in (response_body or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if bullet_request_active and _FIELD_REQUEST_BULLET_RE.match(stripped):
+            request_clauses.append(stripped)
+            continue
+
+        explicit_clauses = []
+        for sentence in _FIELD_REQUEST_SENTENCE_SPLIT_RE.split(stripped):
+            request_active = False
+            for clause in _FIELD_REQUEST_COORDINATION_SPLIT_RE.split(sentence):
+                request_candidate = _FIELD_ACKNOWLEDGEMENT_PREFIX_RE.sub(
+                    "",
+                    clause.strip(),
+                )
+                if not request_candidate:
+                    continue
+
+                intent_match = _FIELD_REQUEST_INTENT_RE.search(request_candidate)
+                if intent_match:
+                    explicit_clauses.append(
+                        request_candidate[intent_match.start():].strip()
+                    )
+                    request_active = True
+                elif (
+                    request_active
+                    and not _FIELD_REQUEST_CONTINUATION_BLOCK_RE.search(request_candidate)
+                ):
+                    explicit_clauses.append(request_candidate)
+                else:
+                    request_active = False
+        request_clauses.extend(explicit_clauses)
+        bullet_request_active = bool(explicit_clauses) and (
+            stripped.endswith(":") or bool(_FIELD_REQUEST_LIST_LEAD_RE.search(stripped))
+        )
+
+    return request_clauses
+
 
 def contains_column_field_term(text: str, term: str) -> bool:
     """Match a configured field term as words, never inside another word."""
@@ -657,6 +723,83 @@ def contains_column_field_term(text: str, term: str) -> bool:
     ))
 
 
+def _request_clause_contains_field_term(clause: str, term: str) -> bool:
+    if term.lower() == "sf" and _FIELD_REQUEST_SF_UNIT_RE.search(clause):
+        return False
+    return contains_column_field_term(clause, term)
+
+
+def get_requested_ask_fields(
+    response_body: str,
+    column_config: Optional[dict],
+) -> List[str]:
+    """Return configured Ask headers targeted by explicit request clauses."""
+    body = (response_body or "").strip()
+    if not body or get_column_config_error(column_config):
+        return []
+    mappings = column_config["mappings"]
+    extraction = set(column_config["extractionFields"])
+    nonrequestable = (
+        set(column_config["neverRequest"])
+        | set(column_config["formulaFields"])
+        | {"listing_comments", "client_comments"}
+    )
+    field_groups = []
+
+    for canonical, configured_header in mappings.items():
+        field = CANONICAL_FIELDS.get(canonical, {})
+        if (
+            canonical not in extraction
+            or canonical in nonrequestable
+            or not field.get("extractable")
+        ):
+            continue
+
+        terms = [
+            configured_header,
+            field.get("label"),
+            *field.get("default_aliases", []),
+            *field.get("legacy_aliases", []),
+            *field.get("ai_synonyms", []),
+        ]
+        field_groups.append((configured_header, list(dict.fromkeys(
+            term.strip().lower()
+            for term in terms
+            if isinstance(term, str) and term.strip()
+        ))))
+
+    for header, config in column_config["customFields"].items():
+        if config.get("mode") not in {"ask_required", "ask_optional"}:
+            continue
+        terms = [header.strip().lower(), *_custom_field_paraphrase_terms(header)]
+        field_groups.append((header, list(dict.fromkeys(terms))))
+
+    request_clauses = _explicit_field_request_clauses(body)
+    requested = []
+    requested_headers = set()
+    for clause in request_clauses:
+        clause_matches = [
+            (header, _normalized_column_name(header), term)
+            for header, terms in field_groups
+            for term in terms
+            if _request_clause_contains_field_term(clause, term)
+        ]
+        for header, normalized_header, term in clause_matches:
+            if normalized_header in requested_headers:
+                continue
+            if any(
+                other_header != normalized_header
+                and len(other_term) > len(term)
+                and contains_column_field_term(other_term, term)
+                for _other, other_header, other_term in clause_matches
+            ):
+                continue
+            requested.append(header)
+            requested_headers.add(normalized_header)
+
+    return requested
+
+
 def response_requests_nonrequestable_fields(
     response_body: str,
     column_config: Optional[dict],
@@ -668,11 +811,7 @@ def response_requests_nonrequestable_fields(
     if get_column_config_error(column_config):
         return True
 
-    request_clauses = [
-        clause
-        for clause in re.split(r"[\n.!?;,]+", body)
-        if _FIELD_REQUEST_INTENT_RE.search(clause)
-    ]
+    request_clauses = _explicit_field_request_clauses(body)
     return any(
         contains_column_field_term(clause, term)
         for terms in get_non_requestable_field_terms(column_config)

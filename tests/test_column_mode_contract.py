@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
-from email_automation import ai_processing, processing
+from email_automation import ai_processing, column_config, processing
 from email_automation.column_config import (
     get_default_column_config,
     get_default_mode_for_canonical,
@@ -101,6 +101,213 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                 body,
                 ["Rent/SF /Yr"],
                 self.config,
+            )
+        )
+
+    def test_requested_ask_fields_returns_every_explicit_question_target(self):
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"rent/sf /yr", "ops ex /sf"},
+            set(helper(
+                "Could you confirm both the asking rent and operating expenses?",
+                self.config,
+            )),
+        )
+
+    def test_requested_ask_fields_fails_closed_for_malformed_config(self):
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            [],
+            helper(
+                "Could you confirm both the asking rent and operating expenses?",
+                {"mappings": self.config["mappings"]},
+            ),
+        )
+
+    def test_rejects_question_reasking_known_ask_field_with_missing_field(self):
+        body = "Could you confirm both the asking rent and operating expenses?"
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+    def test_rejects_semicolon_clauses_reasking_known_ask_field(self):
+        body = "Could you confirm the asking rent; please provide operating expenses?"
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+    def test_rejects_shared_request_intent_when_known_field_comes_last(self):
+        for separator in (",", ";"):
+            body = f"Could you confirm operating expenses{separator} asking rent?"
+
+            with self.subTest(separator=separator):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+    def test_rejects_bullet_list_reasking_known_ask_field(self):
+        body = "Could you please provide:\n- asking rent\n- operating expenses"
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+    def test_rejects_question_leadin_bullets_reasking_known_ask_field(self):
+        body = "Could you provide the following?\n- operating expenses\n- asking rent"
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+        self.assertTrue(callable(helper))
+        self.assertEqual(
+            {"rent/sf /yr", "ops ex /sf"},
+            set(helper(body, self.config)),
+        )
+
+    def test_known_field_acknowledgement_does_not_become_a_request(self):
+        bodies = (
+            "Thanks for confirming the asking rent. Could you confirm operating expenses?",
+            "Thanks for confirming the asking rent; please provide operating expenses.",
+            "Thanks for confirming the asking rent.\nCould you please provide:\n- operating expenses",
+            "Please note that the asking rent is already confirmed. Could you confirm operating expenses?",
+            "Thanks for confirming the asking rent and could you confirm operating expenses?",
+            "We already have the asking rent we need. Could you confirm operating expenses?",
+        )
+
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+    def test_configured_rent_header_does_not_trigger_short_size_alias(self):
+        body = "Could you confirm the Rent/SF /Yr?"
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr"],
+                self.config,
+            )
+        )
+
+    def test_per_sf_unit_does_not_become_a_total_size_request(self):
+        body = "Could you confirm operating expenses per SF?"
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+    def test_optional_ask_must_be_deliberately_listed_as_missing(self):
+        config = get_default_column_config()
+        config["mappings"]["total_sf"] = "Available Size"
+        body = "Could you confirm the square footage and asking rent?"
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr"],
+                config,
+            )
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr", "Available Size"],
+                config,
+            )
+        )
+
+    def test_missing_field_subset_normalizes_configured_header_spacing(self):
+        config = get_default_column_config()
+        config["mappings"]["total_sf"] = "Available / Size"
+        body = "Could you confirm the square footage and asking rent?"
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr", "available/size"],
+                config,
+            )
+        )
+
+    def test_rejects_known_custom_required_ask_field_paraphrase(self):
+        config = get_default_column_config()
+        config["customFields"]["Loading Capacity Details"] = {
+            "mode": "ask_required",
+            "description": "Required loading-area capacity",
+        }
+        body = "Could you confirm the loading capacity and operating expenses?"
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                config,
+            )
+        )
+
+    def test_formula_mode_drift_cannot_promote_formula_header_to_ask(self):
+        config = get_default_column_config()
+        config["formulaFields"].remove("gross_rent")
+        config["extractionFields"].append("gross_rent")
+        config["requiredFields"].append("gross_rent")
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm Gross Rent?",
+                [config["mappings"]["gross_rent"]],
+                config,
+            )
+        )
+
+    def test_unknown_canonical_cannot_be_promoted_from_missing_fields(self):
+        config = get_default_column_config()
+        config["mappings"]["mystery"] = "Rail Access"
+        config["extractionFields"].append("mystery")
+        config["requiredFields"].append("mystery")
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm Rail Access?",
+                ["Rail Access"],
+                config,
             )
         )
 

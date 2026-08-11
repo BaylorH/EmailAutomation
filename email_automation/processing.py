@@ -88,10 +88,10 @@ from .sent_mail_guard import (
 )
 from .app_config import INBOX_SCAN_WINDOW_HOURS
 from .column_config import (
-    contains_column_field_term,
     find_client_comment_column_index,
     find_notes_comment_column_index,
     get_column_config_error,
+    get_requested_ask_fields,
     get_required_fields_for_close,
     is_asset_column_name,
     response_requests_nonrequestable_fields,
@@ -3944,15 +3944,16 @@ def _proposal_events(proposal: Dict[str, Any]) -> List[Dict[str, Any]]:
     return normalized_events
 
 
-def _contains_field_term(text: str, term: str) -> bool:
-    return contains_column_field_term(text, term)
-
-
 def _response_requests_nonrequestable_fields(
     response_body: str,
     column_config: Optional[dict],
 ) -> bool:
     return response_requests_nonrequestable_fields(response_body, column_config)
+
+
+def _normalize_request_field_name(field: str) -> str:
+    normalized = " ".join((field or "").strip().lower().split())
+    return re.sub(r"\s*/\s*", "/", normalized)
 
 
 def _response_mentions_missing_fields(
@@ -3961,30 +3962,53 @@ def _response_mentions_missing_fields(
     column_config: Optional[dict] = None,
 ) -> bool:
     """Accept only replies that request missing Ask fields and no Note/Skip fields."""
-    body = (response_body or "").lower()
+    body = (response_body or "").strip()
     if not body or not missing_fields:
         return False
     if _response_requests_nonrequestable_fields(body, column_config):
         return False
 
-    aliases = {
-        "rail access": ["rail"],
-        "docks": ["dock"],
-        "drive ins": ["drive", "grade"],
-        "drive-ins": ["drive", "grade"],
-        "ceiling ht": ["ceiling", "clear height"],
-        "power": ["power", "electrical", "amps", "voltage"],
-        "ops ex /sf": ["ops", "nnn", "cam", "operating"],
-        "flyer / link": ["flyer", "brochure", "marketing"],
-        "total sf": ["sf", "square footage", "size"],
-    }
+    request_config = column_config
+    if isinstance(column_config, dict):
+        configured_headers = {
+            _normalize_request_field_name(header)
+            for header in (
+                list((column_config.get("mappings") or {}).values())
+                + list((column_config.get("customFields") or {}).keys())
+            )
+            if isinstance(header, str) and header.strip()
+        }
+        unmapped_missing_fields = [
+            field
+            for field in missing_fields
+            if isinstance(field, str)
+            and field.strip()
+            and _normalize_request_field_name(field) not in configured_headers
+        ]
+        if unmapped_missing_fields:
+            request_config = dict(column_config)
+            custom_fields = dict(column_config.get("customFields") or {})
+            for field in unmapped_missing_fields:
+                custom_fields[field] = {
+                    "mode": "ask_required",
+                    "description": "Post-write required field",
+                }
+            request_config["customFields"] = custom_fields
 
-    for field in missing_fields:
-        key = (field or "").strip().lower()
-        candidates = aliases.get(key, [part for part in re.split(r"[^a-z0-9]+", key) if len(part) > 2])
-        if any(_contains_field_term(body, candidate) for candidate in candidates):
-            return True
-    return False
+    requested_fields = get_requested_ask_fields(body, request_config)
+    normalized_missing_fields = {
+        _normalize_request_field_name(field)
+        for field in missing_fields
+        if isinstance(field, str) and field.strip()
+    }
+    normalized_requested_fields = {
+        _normalize_request_field_name(field)
+        for field in requested_fields
+        if isinstance(field, str) and field.strip()
+    }
+    return bool(normalized_requested_fields) and (
+        normalized_requested_fields <= normalized_missing_fields
+    )
 
 
 def _select_automatic_response_body(
