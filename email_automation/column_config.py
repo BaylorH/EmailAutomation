@@ -660,12 +660,16 @@ _FIELD_ACKNOWLEDGEMENT_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _FIELD_NEGATED_REQUEST_INTENT_RE = re.compile(
-    r"\b(?:please\s+)?(?:"
+    r"\b(?:"
+    r"no\s+need"
+    r"|(?:please\s+)?(?:"
     r"do(?:es)?\s+not"
     r"|don['\u2019]t"
     r"|doesn['\u2019]t"
     r"|not"
-    r")\s+(?:need|request|ask)\b",
+    r")\s+(?:need|request|ask)"
+    r")"
+    r"(?:\s+to\s+(?:ask|request|confirm))?\b",
     re.IGNORECASE,
 )
 _FIELD_REQUEST_CONTINUATION_BLOCK_RE = re.compile(

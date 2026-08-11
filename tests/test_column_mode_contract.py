@@ -249,6 +249,28 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             )
         )
 
+    def test_negated_known_field_ask_clauses_do_not_become_requests(self):
+        bodies = (
+            "No need to confirm the asking rent. Could you confirm operating expenses?",
+            "We don't need to ask about the asking rent. Could you confirm operating expenses?",
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    {"ops ex /sf"},
+                    set(helper(body, self.config)),
+                )
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
     def test_configured_rent_header_does_not_trigger_short_size_alias(self):
         body = "Could you confirm the Rent/SF /Yr?"
 
