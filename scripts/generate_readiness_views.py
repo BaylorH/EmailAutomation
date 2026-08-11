@@ -33,6 +33,7 @@ PROOF_LEVELS = {
 }
 EVIDENCE_RESULTS = {"pass", "partial", "fail"}
 QUALITY_STATES = {"proven_live", "source_only", "partial", "open", "ready_for_live"}
+QUALITY_PRIORITIES = {"P0", "P1", "P2"}
 
 _GATE_LABELS = {
     "login_view": "Login / view",
@@ -457,11 +458,19 @@ def validate_registry(
     for quality_id, quality in quality_by_id.items():
         if quality.get("state") not in QUALITY_STATES:
             raise RegistryError(f"{quality_id}: invalid state")
+        if quality.get("priority") not in QUALITY_PRIORITIES:
+            raise RegistryError(f"{quality_id}: invalid priority")
         _stable_id(quality.get("owner"), quality_id, "owner")
-        _validate_refs(quality, quality_id, "featureIds", known_features)
-        _validate_refs(quality, quality_id, "scenarioIds", known_scenarios)
+        _nonempty_string(quality.get("guardrail"), quality_id, "guardrail")
+        _nonempty_string(quality.get("nextProof"), quality_id, "nextProof")
+        _validate_refs(
+            quality, quality_id, "featureIds", known_features, required=True
+        )
+        _validate_refs(
+            quality, quality_id, "scenarioIds", known_scenarios, required=True
+        )
         quality_evidence = _validate_refs(
-            quality, quality_id, "evidenceIds", evidence_ids
+            quality, quality_id, "evidenceIds", evidence_ids, required=True
         )
         legacy_refs = (
             _string_list(quality.get("legacyRefs"), quality_id, "legacyRefs")
@@ -481,6 +490,22 @@ def validate_registry(
         decision = gate.get("decision")
         if decision not in GATE_DECISIONS:
             raise RegistryError(f"{gate_id}: invalid authored decision")
+        _nonempty_string(gate.get("scope"), gate_id, "scope")
+        _text_list(gate.get("allows"), gate_id, "allows")
+        forbids = _text_list(gate.get("forbids"), gate_id, "forbids")
+        if not forbids:
+            raise RegistryError(f"{gate_id}: forbids must be nonempty")
+        guardrails = _text_list(gate.get("guardrails"), gate_id, "guardrails")
+        if not guardrails:
+            raise RegistryError(f"{gate_id}: guardrails must be nonempty")
+        _nonempty_string(gate.get("rollback"), gate_id, "rollback")
+        if "nextAction" not in gate:
+            raise RegistryError(f"{gate_id}: nextAction is required")
+        if decision == "go":
+            if gate["nextAction"] is not None:
+                _nonempty_string(gate["nextAction"], gate_id, "nextAction")
+        else:
+            _nonempty_string(gate.get("nextAction"), gate_id, "nextAction")
         _validate_refs(gate, gate_id, "featureIds", known_features)
         _validate_refs(gate, gate_id, "scenarioIds", known_scenarios)
         gate_evidence[gate_id] = _validate_refs(
@@ -497,13 +522,8 @@ def validate_registry(
             raise RegistryError(f"{gate_id}: invalidatedBy must be nonempty")
         _scan_safe(gate, gate_id)
         if decision == "ready_for_canary":
-            _nonempty_string(gate.get("scope"), gate_id, "scope")
-            if not _string_list(gate.get("forbids"), gate_id, "forbids"):
-                raise RegistryError(f"{gate_id}: forbids must be nonempty")
-            _nonempty_string(gate.get("nextAction"), gate_id, "nextAction")
             if not gate_blockers[gate_id]:
                 raise RegistryError(f"{gate_id}: blockerIds must be nonempty")
-            _nonempty_string(gate.get("rollback"), gate_id, "rollback")
 
     for quality_id, quality in quality_by_id.items():
         for gate_id in quality["blocksGates"]:
@@ -926,6 +946,7 @@ def render_outputs(
 def _atomic_write_outputs(outputs: Mapping[Path, str]) -> None:
     staged: list[tuple[Path, Path]] = []
     backups: dict[Path, Path | None] = {}
+    preserve_backups = False
     try:
         for target, payload in sorted(outputs.items(), key=lambda item: str(item[0])):
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -973,6 +994,7 @@ def _atomic_write_outputs(outputs: Mapping[Path, str]) -> None:
                 except OSError:
                     rollback_failed = True
             if rollback_failed:
+                preserve_backups = True
                 raise RegistryError("readiness_outputs: rollback failed") from exc
             raise RegistryError("readiness_outputs: transactional write failed") from exc
     except RegistryError:
@@ -985,13 +1007,14 @@ def _atomic_write_outputs(outputs: Mapping[Path, str]) -> None:
                 temp_path.unlink()
             except FileNotFoundError:
                 pass
-        for backup_path in backups.values():
-            if backup_path is None:
-                continue
-            try:
-                backup_path.unlink()
-            except FileNotFoundError:
-                pass
+        if not preserve_backups:
+            for backup_path in backups.values():
+                if backup_path is None:
+                    continue
+                try:
+                    backup_path.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 def _relative_path(path: Path, root: Path) -> str:

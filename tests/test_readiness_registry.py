@@ -103,6 +103,7 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "scope": "Returning users may sign in and inspect state.",
                     "allows": ["login", "view"],
                     "forbids": ["campaign_launch"],
+                    "guardrails": ["Keep access read-only."],
                     "evidenceIds": ["evidence.login"],
                     "blockerIds": [],
                     "nextAction": None,
@@ -130,6 +131,7 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "scope": "Unattended campaigns.",
                     "allows": [],
                     "forbids": ["autonomous_send"],
+                    "guardrails": ["Keep autonomous use disabled."],
                     "evidenceIds": ["evidence.live"],
                     "blockerIds": [],
                     "nextAction": "Define separate autonomous proof.",
@@ -766,6 +768,56 @@ class ReadinessRegistryTests(unittest.TestCase):
                 candidate["rolloutGates"][1][field] = empty_value
                 self.assert_invalid(candidate, "supervised_campaign_use")
 
+    def test_every_gate_requires_complete_authoritative_contract(self):
+        required_fields = (
+            "scope",
+            "allows",
+            "forbids",
+            "guardrails",
+            "rollback",
+            "asOf",
+            "nextAction",
+            "invalidatedBy",
+            "evidenceIds",
+            "blockerIds",
+        )
+        for gate_index, gate in enumerate(self.registry["rolloutGates"]):
+            gate_id = gate["id"]
+            for field in required_fields:
+                with self.subTest(gate=gate_id, missing=field):
+                    candidate = copy.deepcopy(self.registry)
+                    candidate["rolloutGates"][gate_index].pop(field)
+                    self.assert_invalid(candidate, gate_id)
+
+            for field, empty_value in (
+                ("scope", ""),
+                ("allows", None),
+                ("forbids", []),
+                ("guardrails", []),
+                ("rollback", ""),
+                ("asOf", ""),
+                ("invalidatedBy", []),
+                ("evidenceIds", None),
+                ("blockerIds", None),
+            ):
+                with self.subTest(gate=gate_id, empty=field):
+                    candidate = copy.deepcopy(self.registry)
+                    candidate["rolloutGates"][gate_index][field] = empty_value
+                    self.assert_invalid(candidate, gate_id)
+
+            if gate["decision"] == "go":
+                candidate = copy.deepcopy(self.registry)
+                candidate["rolloutGates"][gate_index]["nextAction"] = ""
+                self.assert_invalid(candidate, gate_id)
+            else:
+                for empty_value in (None, ""):
+                    with self.subTest(gate=gate_id, empty="nextAction"):
+                        candidate = copy.deepcopy(self.registry)
+                        candidate["rolloutGates"][gate_index][
+                            "nextAction"
+                        ] = empty_value
+                        self.assert_invalid(candidate, gate_id)
+
     def test_every_gate_requires_timestamped_invalidation_provenance(self):
         for field, mutation in (
             ("asOf", lambda gate: gate.pop("asOf")),
@@ -803,6 +855,38 @@ class ReadinessRegistryTests(unittest.TestCase):
         unsafe_legacy_ref = copy.deepcopy(no_provenance)
         unsafe_legacy_ref["qualityItems"][0]["legacyRefs"] = ["unsafe/reference"]
         self.assert_invalid(unsafe_legacy_ref, "quality.canary_unrun")
+
+    def test_every_quality_item_requires_complete_authoritative_contract(self):
+        required_fields = (
+            "featureIds",
+            "scenarioIds",
+            "evidenceIds",
+            "blocksGates",
+            "priority",
+            "guardrail",
+            "nextProof",
+            "owner",
+        )
+        for field in required_fields:
+            with self.subTest(missing=field):
+                candidate = copy.deepcopy(self.registry)
+                candidate["qualityItems"][0].pop(field)
+                self.assert_invalid(candidate, "quality.canary_unrun")
+
+        for field, invalid_value in (
+            ("featureIds", None),
+            ("scenarioIds", None),
+            ("evidenceIds", None),
+            ("blocksGates", None),
+            ("priority", "P3"),
+            ("guardrail", ""),
+            ("nextProof", ""),
+            ("owner", ""),
+        ):
+            with self.subTest(invalid=field):
+                candidate = copy.deepcopy(self.registry)
+                candidate["qualityItems"][0][field] = invalid_value
+                self.assert_invalid(candidate, "quality.canary_unrun")
 
     def test_parse_utc_is_strict_and_evidence_intervals_are_ordered(self):
         parsed = self.module.parse_utc("2026-08-11T00:00:00Z")
@@ -1199,6 +1283,54 @@ class ReadinessRegistryTests(unittest.TestCase):
             or path.name.startswith(".full-quality-coverage.md.")
         ]
         self.assertEqual([], residue)
+
+    def test_cli_preserves_recovery_backups_when_replace_and_rollback_fail(self):
+        release_safety = self.repo_root / "docs" / "release-safety"
+        first = release_safety / "current-user-readiness.md"
+        second = release_safety / "full-quality-coverage.md"
+        originals = {b"original current\n", b"original full\n"}
+        first.write_bytes(b"original current\n")
+        second.write_bytes(b"original full\n")
+        outputs = {first: "new current\n", second: "new full\n"}
+        real_replace = os.replace
+        injected = {"replace": False, "rollback": False}
+
+        def fail_second_output_and_first_rollback(source, target):
+            source_path = Path(source)
+            target_path = Path(target)
+            if source_path.name.endswith(".tmp") and target_path == second:
+                injected["replace"] = True
+                raise OSError("injected replace failure at /Users/private/second")
+            if source_path.name.endswith(".bak") and target_path == first:
+                injected["rollback"] = True
+                raise OSError("injected rollback failure at /Users/private/first")
+            return real_replace(source, target)
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.module, "render_outputs", return_value=outputs),
+            mock.patch.object(
+                self.module.os,
+                "replace",
+                side_effect=fail_second_output_and_first_rollback,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = self.module.main([])
+
+        self.assertEqual({"replace": True, "rollback": True}, injected)
+        self.assertEqual(2, exit_code)
+        backups = sorted(release_safety.glob(".*.bak"))
+        self.assertTrue(backups, "rollback failure must preserve recovery backups")
+        surviving_bytes = {first.read_bytes(), second.read_bytes()}
+        surviving_bytes.update(path.read_bytes() for path in backups)
+        self.assertTrue(originals.issubset(surviving_bytes))
+        self.assertEqual([], sorted(release_safety.glob(".*.tmp")))
+        message = stderr.getvalue()
+        self.assertIn("readiness_outputs: rollback failed", message)
+        self.assertNotIn("/Users/private", message)
+        self.assertNotIn(str(self.repo_root), message)
+        self.assertNotIn("Traceback", message)
 
     def test_cli_validation_error_is_stable_and_writes_nothing(self):
         registry = copy.deepcopy(self.registry)
