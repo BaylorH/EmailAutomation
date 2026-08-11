@@ -308,8 +308,33 @@ def lookup_thread_by_conversation_id_exhaustive(user_id: str, conversation_id: s
         return None
 
 
+def _timestamp_sort_value(value: Any) -> Optional[float]:
+    """Convert supported timestamp values to UTC epoch seconds for sorting."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    elif hasattr(value, "timestamp"):
+        try:
+            return float(value.timestamp())
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
+    else:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc).timestamp()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
 def _direction_aware_message_timestamp(data: Dict[str, Any]) -> Any:
-    """Select a message's authoritative chronology timestamp."""
+    """Select the first parseable timestamp in direction-aware order."""
     direction = str(data.get("direction") or "").strip().lower()
     preferred_fields = (
         ("sentDateTime", "receivedDateTime")
@@ -318,34 +343,31 @@ def _direction_aware_message_timestamp(data: Dict[str, Any]) -> Any:
     )
     for field in (*preferred_fields, "createdAt"):
         value = data.get(field)
-        if value is not None and (not isinstance(value, str) or value.strip()):
+        if _timestamp_sort_value(value) is not None:
             return value
     return None
 
 
-def _timestamp_sort_value(value: Any) -> float:
-    """Convert supported timestamp values to UTC epoch seconds for sorting."""
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str) and value.strip():
-        try:
-            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return 0.0
-    elif hasattr(value, "timestamp"):
-        try:
-            return float(value.timestamp())
-        except (OSError, OverflowError, TypeError, ValueError):
-            return 0.0
-    else:
-        return 0.0
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    try:
-        return parsed.astimezone(timezone.utc).timestamp()
-    except (OSError, OverflowError, TypeError, ValueError):
-        return 0.0
+def _message_dedupe_key(message: Dict[str, Any]) -> Optional[str]:
+    """Return a canonical durable ID shared by Firestore and Graph copies."""
+    data = message.get("data") or {}
+    if not isinstance(data, dict):
+        data = {}
+    headers = data.get("headers") or {}
+    if not isinstance(headers, dict):
+        headers = {}
+    candidates = (
+        data.get("internetMessageId"),
+        headers.get("internetMessageId"),
+        message.get("id"),
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        normalized = normalize_message_id(candidate)
+        if normalized:
+            return f"message-id:{normalized}"
+    return None
 
 
 def _normalized_email_address(value: Any) -> str:
@@ -410,8 +432,14 @@ def _get_thread_messages_chronological(uid: str, thread_id: str) -> List[dict]:
         for msg in messages:
             data = msg.to_dict()
             timestamp = _direction_aware_message_timestamp(data)
+            timestamp_sort_value = _timestamp_sort_value(timestamp)
             message_data.append(
-                (_timestamp_sort_value(timestamp), str(msg.id or ""), data, msg.id)
+                (
+                    timestamp_sort_value if timestamp_sort_value is not None else 0.0,
+                    str(msg.id or ""),
+                    data,
+                    msg.id,
+                )
             )
         
         message_data.sort(key=lambda item: (item[0], item[1]))
@@ -534,19 +562,20 @@ def build_conversation_payload(
             except Exception as e:
                 print(f"⚠️ Failed to fetch Graph messages: {e}")
         
-        # Merge messages from both sources, deduplicate by internetMessageId
+        # Merge messages from both sources, deduplicating canonical durable IDs.
         all_messages = {}
         
-        # Add Firestore messages
-        for msg_info in firestore_messages:
-            msg_id = msg_info.get("id") or ""
-            all_messages[msg_id] = msg_info
+        # Add Firestore messages first so indexed direction/body remain authoritative.
+        for index, msg_info in enumerate(firestore_messages):
+            dedupe_key = _message_dedupe_key(msg_info) or f"firestore-unidentified:{index}"
+            if dedupe_key not in all_messages:
+                all_messages[dedupe_key] = msg_info
         
-        # Add Graph messages (will overwrite Firestore if duplicate, but that's fine)
-        for msg_info in graph_messages:
-            msg_id = msg_info.get("id") or ""
-            if msg_id not in all_messages:  # Only add if not already in Firestore
-                all_messages[msg_id] = msg_info
+        # Add only Graph messages that are not already indexed in Firestore.
+        for index, msg_info in enumerate(graph_messages):
+            dedupe_key = _message_dedupe_key(msg_info) or f"graph-unidentified:{index}"
+            if dedupe_key not in all_messages:
+                all_messages[dedupe_key] = msg_info
         
         # Convert to list and sort chronologically
         messages_list = list(all_messages.values())
@@ -556,9 +585,10 @@ def build_conversation_payload(
         for msg_info in messages_list:
             data = msg_info["data"]
             ts = _direction_aware_message_timestamp(data)
+            timestamp_sort_value = _timestamp_sort_value(ts)
             message_data.append(
                 (
-                    _timestamp_sort_value(ts),
+                    timestamp_sort_value if timestamp_sort_value is not None else 0.0,
                     str(msg_info.get("id") or ""),
                     msg_info,
                 )

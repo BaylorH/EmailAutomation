@@ -288,6 +288,134 @@ class MessagingConversationPayloadTests(unittest.TestCase):
             [item["timestamp"] for item in payload],
         )
 
+    def test_invalid_preferred_timestamp_uses_alternate_without_last_ten_eviction(self):
+        input_order = [5, 0, 11, 3, 8, 1, 10, 2, 7, 4, 9, 6]
+        history = []
+        for index in input_order:
+            received_at = (
+                "not-a-timestamp"
+                if index == 11
+                else f"2026-08-01T10:{index:02d}:00Z"
+            )
+            sent_at = (
+                "2026-08-01T10:11:00Z"
+                if index == 11
+                else f"2026-08-01T09:{index:02d}:00Z"
+            )
+            history.append(
+                {
+                    "id": f"message-{index:02d}",
+                    "data": {
+                        "direction": "inbound",
+                        "sentDateTime": sent_at,
+                        "receivedDateTime": received_at,
+                        "body": {
+                            "content": f"message-{index:02d}",
+                            "preview": f"message-{index:02d}",
+                        },
+                    },
+                }
+            )
+
+        with patch.object(
+            messaging,
+            "_get_thread_messages_chronological",
+            return_value=history,
+        ):
+            payload = messaging.build_conversation_payload("uid-1", "thread-1", limit=10)
+
+        self.assertEqual(10, len(payload))
+        self.assertEqual(
+            [f"message-{index:02d}" for index in range(2, 12)],
+            [item["content"] for item in payload],
+        )
+        self.assertEqual("2026-08-01T10:11:00Z", payload[-1]["timestamp"])
+
+    def test_invalid_sent_and_received_timestamps_fall_back_to_created_at(self):
+        history = [
+            {
+                "id": "message-created-at",
+                "data": {
+                    "direction": "inbound",
+                    "sentDateTime": "also-not-a-timestamp",
+                    "receivedDateTime": "not-a-timestamp",
+                    "createdAt": "2026-08-01T10:12:00Z",
+                    "body": {
+                        "content": "created-at fallback",
+                        "preview": "created-at fallback",
+                    },
+                },
+            }
+        ]
+
+        with patch.object(
+            messaging,
+            "_get_thread_messages_chronological",
+            return_value=history,
+        ):
+            payload = messaging.build_conversation_payload("uid-1", "thread-1")
+
+        self.assertEqual("2026-08-01T10:12:00Z", payload[0]["timestamp"])
+
+    def test_cross_source_rfc_id_dedupe_keeps_firestore_and_exact_last_ten(self):
+        firestore_messages = [
+            {
+                "id": f"unique-{index:02d}@example.test",
+                "data": {
+                    "direction": "outbound",
+                    "sentDateTime": f"2026-08-01T10:{index:02d}:00Z",
+                    "body": {
+                        "content": f"unique-{index:02d}",
+                        "preview": f"unique-{index:02d}",
+                    },
+                },
+            }
+            for index in range(10)
+        ]
+        firestore_messages.append(
+            {
+                "id": "same-message@example.test",
+                "data": {
+                    "direction": "outbound",
+                    "sentDateTime": "2026-08-01T10:10:00Z",
+                    "headers": {
+                        "internetMessageId": "same-message@example.test",
+                    },
+                    "body": {
+                        "content": "firestore authoritative",
+                        "preview": "firestore authoritative",
+                    },
+                },
+            }
+        )
+        graph_messages = [
+            {
+                "id": "graph-copy",
+                "internetMessageId": "<same-message@example.test>",
+                "conversationId": "conversation-1",
+                "from": {"emailAddress": {"address": "operator@example.test"}},
+                "sentDateTime": "2026-08-01T10:10:00Z",
+                "body": {
+                    "contentType": "Text",
+                    "content": "graph duplicate",
+                },
+                "bodyPreview": "graph duplicate",
+            }
+        ]
+
+        payload = self._build_with_graph(
+            graph_messages,
+            firestore_messages=firestore_messages,
+        )
+
+        self.assertEqual(10, len(payload))
+        self.assertEqual(
+            [f"unique-{index:02d}" for index in range(1, 10)]
+            + ["firestore authoritative"],
+            [item["content"] for item in payload],
+        )
+        self.assertNotIn("graph duplicate", [item["content"] for item in payload])
+
     def test_graph_message_with_both_dates_is_outbound_when_from_matches_mailbox(self):
         payload = self._build_with_graph(
             [
