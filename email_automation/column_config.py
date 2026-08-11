@@ -677,8 +677,16 @@ _FIELD_REQUEST_SF_UNIT_PREFIX_RE = re.compile(
     r"(?:/|\bper\s+)\s*$",
     re.IGNORECASE,
 )
+_FIELD_TERM_SEPARATOR_PATTERN = (
+    r"(?:"
+    r"[^\S\r\n]*(?:-|\u00ad|\u2010|\u2011)[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?"
+    r"|[^\S\r\n]*\r?\n[^\S\r\n]*"
+    r"|[^\S\r\n]+"
+    r")"
+)
 _FIELD_MENTION_CONTEXT_BOUNDARY_RE = re.compile(
-    r"(?<!\d)\.|\.(?!\d)|[!?;]+|\r?\n+|\s+[\u2013\u2014]\s+|\s+-\s+|\bbut\b"
+    r"(?<!\d)\.|\.(?!\d)|[!?;,:]+|\r?\n+|[\u2013\u2014]+|\s+-\s+|\bbut\b"
+    r"|(?<=[A-Za-z])-(?=[A-Za-z])"
     r"|(?:,\s*|\b(?:and|or)\s+)(?=(?:"
     r"i|we|you|they|he|she|it|can|could|would|will|may|"
     r"is|are|do|does|did|what|how|please|kindly|tell|let"
@@ -736,21 +744,52 @@ _FIELD_CLEAR_FACTUAL_VALUE_SUFFIX_RE = re.compile(
     r"(?:[$€£]?\s*\d|yes\b|no\b|none\b|unknown\b|available\b|unavailable\b)",
     re.IGNORECASE,
 )
+_FIELD_DIRECT_MARKER_BRIDGE_RE = re.compile(
+    r"\s*(?:(?:about|over)\s+)?"
+    r"(?:(?:the|this|that|these|those|our|your|their)\s+)?",
+    re.IGNORECASE,
+)
+_FIELD_REQUEST_EXCEPTION_RE = re.compile(r"\b(?:just|only)\b", re.IGNORECASE)
+_FIELD_ANAPHORIC_REQUEST_RE = re.compile(
+    r"\s*(?:"
+    r"(?:(?:can|could|would|will|may)\s+(?:you|we)\s+(?:please\s+)?"
+    r"|please\s+)"
+    r"(?:confirm|verify|check)(?:\s+(?P<anaphor>that|it|this|those|them))?"
+    r"|(?P<tag>correct|right)"
+    r")"
+    r"\s*",
+    re.IGNORECASE,
+)
+_FIELD_FACTUAL_VALUE_CONTEXT_RE = re.compile(
+    r"\s*(?:[$€£]?\s*\d|yes\b|no\b|none\b|unknown\b|available\b|unavailable\b)",
+    re.IGNORECASE,
+)
+
+_FIELD_MENTION_REQUEST = "request"
+_FIELD_MENTION_BENIGN = "benign"
+_FIELD_MENTION_UNKNOWN = "unknown"
 
 
-def _field_mention_contexts(text: str) -> List[tuple]:
-    """Return bounded field contexts and whether each ended as a question."""
+def _field_mention_contexts(text: str, mention_spans: List[tuple]) -> List[tuple]:
+    """Return intent contexts without splitting inside a discovered field span."""
     contexts = []
     context_start = 0
     for boundary in _FIELD_MENTION_CONTEXT_BOUNDARY_RE.finditer(text):
-        context = text[context_start:boundary.start()].strip()
-        if context:
-            contexts.append((context, "?" in boundary.group(0)))
+        if any(
+            start < boundary.end() and boundary.start() < end
+            for start, end in mention_spans
+        ):
+            continue
+        if text[context_start:boundary.start()].strip():
+            contexts.append((
+                context_start,
+                boundary.start(),
+                "?" in boundary.group(0),
+            ))
         context_start = boundary.end()
 
-    trailing_context = text[context_start:].strip()
-    if trailing_context:
-        contexts.append((trailing_context, False))
+    if text[context_start:].strip():
+        contexts.append((context_start, len(text), False))
     return contexts
 
 
@@ -764,7 +803,14 @@ def _column_field_term_matches(
     normalized = (term or "").strip()
     if not normalized:
         return []
-    pattern = re.escape(normalized).replace(r"\ ", r"\s+")
+    parts = [
+        part
+        for part in re.split(r"[\s\u00ad\u2010\u2011-]+", normalized)
+        if part
+    ]
+    if not parts:
+        return []
+    pattern = _FIELD_TERM_SEPARATOR_PATTERN.join(re.escape(part) for part in parts)
     matches = list(re.finditer(
         rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])",
         text or "",
@@ -802,78 +848,201 @@ def _field_group_match_spans(text: str, terms: List[str]) -> List[tuple]:
     return sorted(maximal_spans)
 
 
-def _last_match_start(pattern: re.Pattern, text: str) -> int:
-    return max((match.start() for match in pattern.finditer(text)), default=-1)
+def _configured_field_mentions(text: str, field_groups: List[tuple]) -> List[tuple]:
+    """Find maximal configured-field spans across the complete response body."""
+    raw_mentions = {
+        (start, end, group_index)
+        for group_index, (_kind, _header, terms) in enumerate(field_groups)
+        for start, end in _field_group_match_spans(text, terms)
+    }
+    mentions = []
+    for start, end, group_index in sorted(
+        raw_mentions,
+        key=lambda mention: (mention[0] - mention[1], mention[0], mention[2]),
+    ):
+        if any(
+            kept_start <= start
+            and end <= kept_end
+            and (kept_start, kept_end) != (start, end)
+            for kept_start, kept_end, _kept_group in mentions
+        ):
+            continue
+        mentions.append((start, end, group_index))
+    return sorted(mentions)
 
 
-def _field_mention_is_clear_nonrequest(
-    context: str,
+def _last_pattern_match(pattern: re.Pattern, text: str) -> Optional[Any]:
+    return next(reversed(list(pattern.finditer(text))), None)
+
+
+def _last_direct_prefix_match(pattern: re.Pattern, prefix: str) -> Optional[Any]:
+    for match in reversed(list(pattern.finditer(prefix))):
+        if _FIELD_DIRECT_MARKER_BRIDGE_RE.fullmatch(prefix[match.end():]):
+            return match
+    return None
+
+
+def _context_index_for_mention(
     mention_start: int,
     mention_end: int,
-    is_question: bool,
+    contexts: List[tuple],
+) -> Optional[int]:
+    for index, (context_start, context_end, _is_question) in enumerate(contexts):
+        if context_start <= mention_start and mention_end <= context_end:
+            return index
+    return None
+
+
+def _has_immediately_following_anaphoric_request(
+    text: str,
+    mention: tuple,
+    mentions: List[tuple],
+    contexts: List[tuple],
+    context_index: int,
 ) -> bool:
-    """Return True only for clear field-local acknowledgement or factual context."""
-    prefix = context[:mention_start]
-    suffix = context[mention_end:]
-    last_negation = _last_match_start(_FIELD_NEGATED_REQUEST_INTENT_RE, prefix)
-    last_acknowledgement = _last_match_start(
-        _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
-        prefix,
+    mention_start, mention_end, _group_index = mention
+    context_start, context_end, _is_question = contexts[context_index]
+    if context_index + 1 >= len(contexts):
+        return False
+
+    next_start, next_end, _next_is_question = contexts[context_index + 1]
+    if any(
+        next_start <= other_start and other_end <= next_end
+        for other_start, other_end, _other_group in mentions
+    ):
+        return False
+    anaphoric_request = _FIELD_ANAPHORIC_REQUEST_RE.fullmatch(
+        text[next_start:next_end]
     )
-    last_informational = _last_match_start(_FIELD_CLEAR_INFORMATIONAL_RE, prefix)
+    if anaphoric_request is None:
+        return False
+    has_later_field = any(
+        other_start >= mention_end and other_start < context_end
+        for other_start, _other_end, _other_group in mentions
+    )
+    anaphor = anaphoric_request.group("anaphor")
+    is_plural = anaphor is not None and anaphor.lower() in {"those", "them"}
+    return is_plural or not has_later_field
+
+
+def _has_immediately_following_factual_value(
+    text: str,
+    mention_end: int,
+    mentions: List[tuple],
+    contexts: List[tuple],
+    context_index: int,
+) -> bool:
+    _context_start, context_end, _is_question = contexts[context_index]
+    if text[mention_end:context_end].strip() or context_index + 1 >= len(contexts):
+        return False
+
+    next_start, next_end, next_is_question = contexts[context_index + 1]
+    if next_is_question or not re.fullmatch(r"\s*:\s*", text[context_end:next_start]):
+        return False
+    if any(
+        next_start <= other_start and other_end <= next_end
+        for other_start, other_end, _other_group in mentions
+    ):
+        return False
+    return bool(_FIELD_FACTUAL_VALUE_CONTEXT_RE.match(text[next_start:next_end]))
+
+
+def _classify_field_mention(
+    text: str,
+    mention: tuple,
+    mentions: List[tuple],
+    contexts: List[tuple],
+) -> str:
+    """Classify one configured-field mention; uncertain mentions remain UNKNOWN."""
+    mention_start, mention_end, _group_index = mention
+    context_index = _context_index_for_mention(
+        mention_start,
+        mention_end,
+        contexts,
+    )
+    if context_index is None:
+        return _FIELD_MENTION_UNKNOWN
+
+    context_start, context_end, is_question = contexts[context_index]
+    prefix = text[context_start:mention_start]
+    suffix = text[mention_end:context_end]
+    direct_clear_matches = [
+        match
+        for match in (
+            _last_direct_prefix_match(_FIELD_NEGATED_REQUEST_INTENT_RE, prefix),
+            _last_direct_prefix_match(_FIELD_CLEAR_ACKNOWLEDGEMENT_RE, prefix),
+            _last_direct_prefix_match(_FIELD_CLEAR_INFORMATIONAL_RE, prefix),
+        )
+        if match is not None
+    ]
+    last_direct_clear = max(
+        direct_clear_matches,
+        key=lambda match: match.start(),
+        default=None,
+    )
     intent_prefix = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
         lambda match: " " * (match.end() - match.start()),
         prefix,
     )
-    last_affirmative_intent = _last_match_start(
-        _FIELD_REQUEST_INTENT_RE,
-        intent_prefix,
-    )
-
-    last_clear_nonrequest = max(
-        last_negation,
-        last_acknowledgement,
-        last_informational,
-    )
-    if last_affirmative_intent > last_clear_nonrequest:
-        return False
-    if last_clear_nonrequest >= 0:
-        return True
-    if is_question:
-        return False
-    if _FIELD_CLEAR_NEGATED_SUFFIX_RE.search(suffix):
-        return True
-    if _FIELD_CLEAR_ACKNOWLEDGEMENT_SUFFIX_RE.search(suffix):
-        return True
-    if _FIELD_CLEAR_FACTUAL_PREFIX_RE.search(prefix):
-        return True
-    return bool(_FIELD_CLEAR_FACTUAL_VALUE_SUFFIX_RE.search(suffix))
-
-
-def _field_group_has_request_like_mention(
-    mention_contexts: List[tuple],
-    terms: List[str],
-) -> bool:
-    return any(
-        not _field_mention_is_clear_nonrequest(
-            context,
-            mention_start,
-            mention_end,
-            is_question,
+    request_matches = [
+        match
+        for match in (
+            _last_pattern_match(_FIELD_REQUEST_INTENT_RE, intent_prefix),
+            _last_pattern_match(_FIELD_REQUEST_EXCEPTION_RE, intent_prefix),
         )
-        for context, is_question in mention_contexts
-        for mention_start, mention_end in _field_group_match_spans(context, terms)
+        if match is not None
+    ]
+    last_request = max(
+        request_matches,
+        key=lambda match: match.start(),
+        default=None,
     )
 
+    if is_question:
+        return _FIELD_MENTION_REQUEST
+    request_is_inside_clear = (
+        last_request is not None
+        and last_direct_clear is not None
+        and last_direct_clear.start() <= last_request.start() < last_direct_clear.end()
+    )
+    if last_request is not None and not request_is_inside_clear:
+        return _FIELD_MENTION_REQUEST
+    if _has_immediately_following_anaphoric_request(
+        text,
+        mention,
+        mentions,
+        contexts,
+        context_index,
+    ):
+        return _FIELD_MENTION_REQUEST
+    if last_direct_clear is not None:
+        return _FIELD_MENTION_BENIGN
+    if _FIELD_CLEAR_NEGATED_SUFFIX_RE.search(suffix):
+        return _FIELD_MENTION_BENIGN
+    if _FIELD_CLEAR_ACKNOWLEDGEMENT_SUFFIX_RE.search(suffix):
+        return _FIELD_MENTION_BENIGN
+    if _FIELD_CLEAR_FACTUAL_VALUE_SUFFIX_RE.search(suffix):
+        return _FIELD_MENTION_BENIGN
+    if _has_immediately_following_factual_value(
+        text,
+        mention_end,
+        mentions,
+        contexts,
+        context_index,
+    ):
+        return _FIELD_MENTION_BENIGN
+    has_prior_field = any(
+        context_start <= other_start
+        and other_end <= mention_start
+        and (other_start, other_end) != (mention_start, mention_end)
+        for other_start, other_end, _other_group in mentions
+    )
+    if not has_prior_field and _FIELD_CLEAR_FACTUAL_PREFIX_RE.search(prefix):
+        return _FIELD_MENTION_BENIGN
+    return _FIELD_MENTION_UNKNOWN
 
-def get_requested_ask_fields(
-    response_body: str,
-    column_config: Optional[dict],
-) -> List[str]:
-    """Return configured Ask headers targeted by explicit request clauses."""
-    body = (response_body or "").strip()
-    if not body or get_column_config_error(column_config):
-        return []
+
+def _requestable_field_groups(column_config: dict) -> List[tuple]:
     mappings = column_config["mappings"]
     extraction = set(column_config["extractionFields"])
     nonrequestable = (
@@ -881,7 +1050,7 @@ def get_requested_ask_fields(
         | set(column_config["formulaFields"])
         | {"listing_comments", "client_comments"}
     )
-    field_groups = []
+    groups = []
 
     for canonical, configured_header in mappings.items():
         field = CANONICAL_FIELDS.get(canonical, {})
@@ -899,7 +1068,7 @@ def get_requested_ask_fields(
             *field.get("legacy_aliases", []),
             *field.get("ai_synonyms", []),
         ]
-        field_groups.append((configured_header, list(dict.fromkeys(
+        groups.append((configured_header, list(dict.fromkeys(
             term.strip().lower()
             for term in terms
             if isinstance(term, str) and term.strip()
@@ -909,21 +1078,70 @@ def get_requested_ask_fields(
         if config.get("mode") not in {"ask_required", "ask_optional"}:
             continue
         terms = [header.strip().lower(), *_custom_field_paraphrase_terms(header)]
-        field_groups.append((header, list(dict.fromkeys(terms))))
+        groups.append((header, list(dict.fromkeys(terms))))
+
+    return groups
+
+
+def _classify_configured_field_requests(
+    response_body: str,
+    column_config: dict,
+) -> tuple:
+    """Return requested Ask headers and whether any nonrequestable field is requested."""
+    ask_groups = _requestable_field_groups(column_config)
+    field_groups = [
+        ("ask", header, terms)
+        for header, terms in ask_groups
+    ]
+    field_groups.extend(
+        ("nonrequestable", None, terms)
+        for terms in get_non_requestable_field_terms(column_config)
+    )
+    mentions = _configured_field_mentions(response_body, field_groups)
+    mention_spans = list({(start, end) for start, end, _group in mentions})
+    contexts = _field_mention_contexts(response_body, mention_spans)
+    request_like_groups = {
+        group_index
+        for mention in mentions
+        for group_index in (mention[2],)
+        if _classify_field_mention(
+            response_body,
+            mention,
+            mentions,
+            contexts,
+        ) != _FIELD_MENTION_BENIGN
+    }
 
     requested = []
     requested_headers = set()
-    mention_contexts = _field_mention_contexts(body)
-    for header, terms in field_groups:
+    for group_index, (kind, header, _terms) in enumerate(field_groups):
+        if kind != "ask" or group_index not in request_like_groups:
+            continue
         normalized_header = _normalized_column_name(header)
         if normalized_header in requested_headers:
-            continue
-        is_requested = _field_group_has_request_like_mention(mention_contexts, terms)
-        if not is_requested:
             continue
         requested.append(header)
         requested_headers.add(normalized_header)
 
+    requests_nonrequestable = any(
+        kind == "nonrequestable" and group_index in request_like_groups
+        for group_index, (kind, _header, _terms) in enumerate(field_groups)
+    )
+    return requested, requests_nonrequestable
+
+
+def get_requested_ask_fields(
+    response_body: str,
+    column_config: Optional[dict],
+) -> List[str]:
+    """Return configured Ask headers targeted by request-like field mentions."""
+    body = (response_body or "").strip()
+    if not body or get_column_config_error(column_config):
+        return []
+    requested, _requests_nonrequestable = _classify_configured_field_requests(
+        body,
+        column_config,
+    )
     return requested
 
 
@@ -931,18 +1149,18 @@ def response_requests_nonrequestable_fields(
     response_body: str,
     column_config: Optional[dict],
 ) -> bool:
-    """Return True when request language targets a configured Note/Skip field."""
+    """Return True when request-like language targets a Note, Skip, or formula field."""
     body = (response_body or "").strip()
     if not body:
         return False
     if get_column_config_error(column_config):
         return True
 
-    mention_contexts = _field_mention_contexts(body)
-    return any(
-        _field_group_has_request_like_mention(mention_contexts, terms)
-        for terms in get_non_requestable_field_terms(column_config)
+    _requested, requests_nonrequestable = _classify_configured_field_requests(
+        body,
+        column_config,
     )
+    return requests_nonrequestable
 
 
 def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, Any]:

@@ -248,6 +248,329 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             )
         )
 
+    def test_soft_wrapped_multiword_fields_keep_their_configured_modes(self):
+        self.config["customFields"]["Loading Capacity Details"] = {
+            "mode": "ask_required",
+            "description": "Required loading capacity",
+        }
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        body = "Could you confirm operating expenses? What is the loading\ncapacity?"
+        with self.subTest(mode="ask_required"):
+            self.assertEqual(
+                {"ops ex /sf", "Loading Capacity Details"},
+                set(helper(body, self.config)),
+            )
+            self.assertFalse(
+                processing._response_mentions_missing_fields(
+                    body,
+                    ["Ops Ex /SF"],
+                    self.config,
+                )
+            )
+
+        for mode, body in (
+            (
+                "note",
+                "Could you confirm operating expenses? Could you share the building\ncondition?",
+            ),
+            (
+                "formula",
+                "Could you confirm operating expenses? What is the gross\nrent?",
+            ),
+        ):
+            with self.subTest(mode=mode):
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+    def test_bullet_and_paragraph_boundaries_do_not_join_field_aliases(self):
+        self.config["customFields"]["Loading Capacity Details"] = {
+            "mode": "ask_required",
+            "description": "Required loading capacity",
+        }
+        bodies = (
+            "Could you confirm operating expenses?\n- loading\n- capacity",
+            "Could you confirm operating expenses?\nloading\n\ncapacity",
+        )
+
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    {"ops ex /sf"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+    def test_multiword_aliases_accept_whitespace_or_hyphen_separators(self):
+        self.config["mappings"]["docks"] = "Dock High Doors"
+        cases = (
+            (
+                "Could you confirm operating-expenses and the asking rent?",
+                ["Rent/SF /Yr"],
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            (
+                "Could you confirm common-area maintenance and the asking rent?",
+                ["Rent/SF /Yr"],
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            (
+                "Could you confirm common\u00adarea maintenance and the asking rent?",
+                ["Rent/SF /Yr"],
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            (
+                "Could you confirm square-footage and the asking rent?",
+                ["Rent/SF /Yr"],
+                {"total sf", "rent/sf /yr"},
+            ),
+            (
+                "Could you confirm drive-in doors and operating expenses?",
+                ["Ops Ex /SF"],
+                {"drive ins", "ops ex /sf"},
+            ),
+            (
+                "Could you confirm dock-high doors and operating expenses?",
+                ["Ops Ex /SF"],
+                {"Dock High Doors", "ops ex /sf"},
+            ),
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        for body, missing_fields, expected_fields in cases:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    expected_fields,
+                    set(helper(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        missing_fields,
+                        self.config,
+                    )
+                )
+
+    def test_hyphenated_soft_wrap_matches_multiword_alias(self):
+        body = "Could you confirm common-\narea maintenance and the asking rent?"
+
+        self.assertEqual(
+            {"ops ex /sf", "rent/sf /yr"},
+            set(column_config.get_requested_ask_fields(body, self.config)),
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr"],
+                self.config,
+            )
+        )
+
+    def test_just_or_only_field_span_overrides_earlier_no_need_marker(self):
+        for qualifier in ("just", "only"):
+            with self.subTest(qualifier=qualifier, field="flyer"):
+                body = (
+                    "Could you confirm operating expenses? We don't need anything "
+                    f"else, {qualifier} the flyer."
+                )
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+            with self.subTest(qualifier=qualifier, field="asking rent"):
+                body = (
+                    "Could you confirm operating expenses? We don't need the flyer, "
+                    f"{qualifier} the asking rent."
+                )
+                self.assertEqual(
+                    {"ops ex /sf", "rent/sf /yr"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+                self.assertFalse(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+    def test_unspaced_hyphen_starts_a_new_field_intent_context(self):
+        body = "No need to confirm the asking rent-just operating expenses?"
+
+        self.assertEqual(
+            {"ops ex /sf"},
+            set(column_config.get_requested_ask_fields(body, self.config)),
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+    def test_local_question_after_informational_field_does_not_inherit_exemption(self):
+        for separator in (": ", "\u2014", "\u2013"):
+            body = (
+                "Could you confirm operating expenses? Here is the flyer"
+                f"{separator}what's the asking rent?"
+            )
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    {"ops ex /sf", "rent/sf /yr"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+                self.assertFalse(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+
+        self.assertTrue(
+            processing._response_requests_nonrequestable_fields(
+                "It would be possible to send the flyer?",
+                self.config,
+            )
+        )
+        self.assertTrue(
+            processing._response_requests_nonrequestable_fields(
+                "Here is the flyer? Could you confirm operating expenses?",
+                self.config,
+            )
+        )
+
+    def test_request_evidence_overrides_later_direct_benign_marker(self):
+        rent_body = (
+            "Could you confirm operating expenses? "
+            "Let me know if you already have the asking rent."
+        )
+        with self.subTest(field="asking rent"):
+            self.assertEqual(
+                {"ops ex /sf", "rent/sf /yr"},
+                set(column_config.get_requested_ask_fields(rent_body, self.config)),
+            )
+            self.assertFalse(
+                processing._response_mentions_missing_fields(
+                    rent_body,
+                    ["Ops Ex /SF"],
+                    self.config,
+                )
+            )
+
+        flyer_body = (
+            "Could you confirm operating expenses? "
+            "Let me know if you already have the flyer."
+        )
+        with self.subTest(field="flyer"):
+            self.assertTrue(
+                processing._response_requests_nonrequestable_fields(
+                    flyer_body,
+                    self.config,
+                )
+            )
+
+    def test_immediately_following_anaphoric_request_binds_to_factual_field(self):
+        cases = (
+            "The asking rent is $12/SF; can you confirm that?",
+            "The asking rent is $12/SF. Could you verify it?",
+            "The asking rent is $12/SF; please check this.",
+            "The asking rent is $12/SF. Can you confirm?",
+            "The asking rent is $12/SF. Please confirm.",
+            "The asking rent is $12/SF. Correct?",
+        )
+
+        for body in cases:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    {"rent/sf /yr"},
+                    set(column_config.get_requested_ask_fields(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
+        self.assertEqual(
+            [],
+            column_config.get_requested_ask_fields(
+                "The asking rent is $12/SF. The property is available. "
+                "Can you confirm that?",
+                self.config,
+            ),
+        )
+
+    def test_plural_anaphoric_request_binds_all_fields_in_prior_context(self):
+        body = (
+            "The asking rent is $12/SF and operating expenses are $3/SF; "
+            "can you confirm those?"
+        )
+
+        self.assertEqual(
+            {"rent/sf /yr", "ops ex /sf"},
+            set(column_config.get_requested_ask_fields(body, self.config)),
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Ops Ex /SF"],
+                self.config,
+            )
+        )
+
+    def test_unicode_word_hyphens_preserve_formula_alias(self):
+        for separator in ("\u2010", "\u2011"):
+            body = f"Could you confirm gross{separator}rent?"
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    [],
+                    column_config.get_requested_ask_fields(body, self.config),
+                )
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(
+                        body,
+                        self.config,
+                    )
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Rent/SF /Yr"],
+                        self.config,
+                    )
+                )
+
     def test_semicolon_acknowledgement_only_requests_missing_field(self):
         body = (
             "Thanks for confirming the asking rent; could you confirm operating expenses?"
@@ -288,21 +611,26 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
         )
 
     def test_factual_known_ask_value_does_not_become_a_request(self):
-        body = "The asking rent is $12/SF. Could you confirm operating expenses?"
+        bodies = (
+            "The asking rent is $12/SF. Could you confirm operating expenses?",
+            "The asking rent: $12/SF. Could you confirm operating expenses?",
+        )
         helper = getattr(column_config, "get_requested_ask_fields", None)
 
         self.assertTrue(callable(helper))
-        self.assertEqual(
-            {"ops ex /sf"},
-            set(helper(body, self.config)),
-        )
-        self.assertTrue(
-            processing._response_mentions_missing_fields(
-                body,
-                ["Ops Ex /SF"],
-                self.config,
-            )
-        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    {"ops ex /sf"},
+                    set(helper(body, self.config)),
+                )
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
 
     def test_declarative_dock_context_does_not_become_a_request(self):
         bodies = (
