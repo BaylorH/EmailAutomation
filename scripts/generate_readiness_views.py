@@ -52,6 +52,16 @@ _RAW_MESSAGE_FIELDS = {
 }
 _RAW_MESSAGE_MARKERS = ("message", "rawbody", "subject", "sender", "recipient")
 _SECRET_MARKERS = ("apikey", "authorization", "credential", "password", "privatekey", "secret", "token")
+_CREDENTIAL_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{30,}\b"),
+    re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
+    re.compile(r"\bxox[A-Za-z]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE),
+    re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
+)
 
 
 class RegistryError(ValueError):
@@ -146,6 +156,8 @@ def _scan_safe(value: Any, owner: str) -> None:
         for child in value:
             _scan_safe(child, owner)
     elif isinstance(value, str):
+        if any(pattern.search(value) for pattern in _CREDENTIAL_PATTERNS):
+            raise RegistryError(f"{owner}: credential-shaped strings are forbidden")
         if _EMAIL.search(value):
             raise RegistryError(f"{owner}: email addresses are forbidden")
         if "/Users/" in value:
@@ -184,6 +196,7 @@ def _validate_refs(
         return []
     refs = _string_list(item.get(field), owner, field)
     for ref in refs:
+        _scan_safe(ref, owner)
         if ref not in known:
             raise RegistryError(f"{owner}: {field} references unknown stable ID {ref}")
     return refs
@@ -203,6 +216,7 @@ def _release_refs(
         raise RegistryError(f"{evidence_id}: releaseRefs must be nonempty")
     for key, value in refs.items():
         safe_key = _stable_id(key, evidence_id, "releaseRefs key")
+        _scan_safe(safe_key, evidence_id)
         if safe_key not in release_identity:
             raise RegistryError(f"{evidence_id}: releaseRefs references unknown key {safe_key}")
         _nonempty_string(value, evidence_id, "releaseRefs value")
@@ -261,7 +275,7 @@ def _go_evidence_is_current(
         if candidate["proofLevel"] == "historical" or candidate["result"] != "fail":
             continue
         failed_at = parse_utc(candidate["observedAt"])
-        if observed_at < failed_at <= at and _is_current_release(candidate, release_identity):
+        if observed_at <= failed_at <= at and _is_current_release(candidate, release_identity):
             if _scope_overlaps(evidence, candidate):
                 return False
     return True
@@ -320,6 +334,7 @@ def validate_registry(
     )
     for feature_id in fixture_matrix:
         _stable_id(feature_id, "fixture-map", "featureFixtureMatrix key")
+        _scan_safe(feature_id, "fixture-map")
     unknown_fixture_features = set(fixture_matrix) - known_features
     if unknown_fixture_features:
         unknown = sorted(unknown_fixture_features)[0]

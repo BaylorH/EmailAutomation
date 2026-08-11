@@ -371,6 +371,54 @@ class ReadinessRegistryTests(unittest.TestCase):
                 message = self.assert_invalid(candidate, "evidence.login")
                 self.assertNotIn(sensitive_value, message)
 
+    def test_common_credential_signatures_are_rejected_without_echo(self):
+        credentials = (
+            "sk-" + "a" * 40,
+            "ghp_" + "A" * 36,
+            "AIza" + "A" * 35,
+            "AKIA" + "A" * 16,
+            "xoxb-" + "1" * 12 + "-" + "A" * 24,
+            "eyJhbGciOiJIUzI1NiJ9." + "e" * 20 + "." + "s" * 24,
+            "Bearer " + "b" * 32,
+            "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----",
+        )
+        for credential in credentials:
+            with self.subTest(prefix=credential[:12]):
+                candidate = copy.deepcopy(self.registry)
+                candidate["evidence"][0]["limitations"] = [
+                    f"Synthetic credential-shape probe: {credential}"
+                ]
+                message = self.assert_invalid(candidate, "evidence.login")
+                self.assertNotIn(credential, message)
+
+    def test_credential_shaped_unknown_reference_is_rejected_before_echo(self):
+        credential = "sk-" + "z" * 40
+        candidate = copy.deepcopy(self.registry)
+        candidate["rolloutGates"][0]["evidenceIds"] = [credential]
+
+        message = self.assert_invalid(candidate, "login_view")
+        self.assertNotIn(credential, message)
+
+        fixture_credential = "AKIA" + "Z" * 16
+        fixture_map = copy.deepcopy(self.fixture_map)
+        fixture_map["featureFixtureMatrix"][fixture_credential] = {}
+        with self.assertRaises(self.module.RegistryError) as caught:
+            self.validate(fixture_map=fixture_map)
+        self.assertNotIn(fixture_credential, str(caught.exception))
+
+    def test_ordinary_token_and_secret_words_remain_allowed(self):
+        candidate = copy.deepcopy(self.registry)
+        candidate["evidence"][0]["limitations"] = [
+            "The token and secret words describe review categories, not credentials."
+        ]
+        ordinary_quality = copy.deepcopy(candidate["qualityItems"][0])
+        ordinary_quality.update(
+            {"id": "quality.token-secret-review", "blocksGates": []}
+        )
+        candidate["qualityItems"].append(ordinary_quality)
+
+        self.validate(registry=candidate)
+
     def test_sensitive_stable_id_is_rejected_without_echoing_it(self):
         candidate = copy.deepcopy(self.registry)
         candidate["evidence"][0]["id"] = "person@example.com"
@@ -473,6 +521,34 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.add_login_failure(candidate)
 
         self.assert_invalid(candidate, "login_view")
+
+    def test_equal_time_pass_and_fail_invalidates_go(self):
+        candidate = copy.deepcopy(self.registry)
+        self.add_login_failure(candidate, observed_at="2026-08-10T23:00:00Z")
+
+        self.assert_invalid(candidate, "login_view")
+
+    def test_effective_decision_stales_on_equal_time_pass_and_fail(self):
+        base = self.validate()
+        candidate = copy.deepcopy(self.registry)
+        self.add_login_failure(candidate, observed_at="2026-08-10T23:00:00Z")
+        authored = copy.deepcopy(candidate)
+        validated = self.module.ValidatedRegistry(
+            registry=candidate,
+            feature_by_id=base.feature_by_id,
+            fixture_matrix=base.fixture_matrix,
+            gate_ids=base.gate_ids,
+            evidence_by_id={item["id"]: item for item in candidate["evidence"]},
+            quality_by_id=base.quality_by_id,
+        )
+
+        decisions = self.module.effective_gate_decisions(
+            validated, at=self.module.parse_utc("2026-08-11T00:00:00Z")
+        )
+
+        self.assertEqual("stale", decisions["login_view"])
+        self.assertEqual(authored, candidate)
+        self.assertEqual(authored, validated.registry)
 
     def test_same_feature_different_scenario_failure_does_not_regress_go(self):
         candidate = copy.deepcopy(self.registry)
