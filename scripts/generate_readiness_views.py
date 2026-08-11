@@ -243,6 +243,10 @@ def _release_refs(
         if safe_key not in release_identity:
             raise RegistryError(f"{evidence_id}: releaseRefs references unknown key {safe_key}")
         _nonempty_string(value, evidence_id, "releaseRefs value")
+    if required and set(refs) != set(release_identity):
+        raise RegistryError(
+            f"{evidence_id}: releaseRefs must exactly match releaseIdentity keys"
+        )
     return refs
 
 
@@ -250,7 +254,11 @@ def _is_current_release(
     evidence: Mapping[str, Any], release_identity: Mapping[str, Any]
 ) -> bool:
     refs = evidence.get("releaseRefs")
-    return bool(refs) and all(release_identity.get(key) == value for key, value in refs.items())
+    return (
+        bool(refs)
+        and set(refs) == set(release_identity)
+        and all(release_identity.get(key) == value for key, value in refs.items())
+    )
 
 
 def _scope_overlaps(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:

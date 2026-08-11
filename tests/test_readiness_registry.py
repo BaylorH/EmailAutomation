@@ -91,7 +91,10 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.registry = {
             "schemaVersion": 1,
             "updatedAt": "2026-08-11T00:00:00Z",
-            "releaseIdentity": {"backendRevision": "revision-001"},
+            "releaseIdentity": {
+                "backendRevision": "revision-001",
+                "productionRevision": "production-001",
+            },
             "rolloutGates": [
                 {
                     "id": "login_view",
@@ -142,7 +145,10 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "claim": "Returning-user login and read-only inspection succeeded.",
                     "featureIds": ["feature.alpha"],
                     "scenarioIds": ["scenario.event"],
-                    "releaseRefs": {"backendRevision": "revision-001"},
+                    "releaseRefs": {
+                        "backendRevision": "revision-001",
+                        "productionRevision": "production-001",
+                    },
                     "artifact": "docs/release-safety/evidence.md",
                     "observedAt": "2026-08-10T23:00:00Z",
                     "expiresAt": "2026-08-11T01:00:00Z",
@@ -157,7 +163,10 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "claim": "The monitored behavioral proof passed.",
                     "featureIds": ["feature.beta"],
                     "scenarioIds": ["scenario.feature"],
-                    "releaseRefs": {"backendRevision": "revision-001"},
+                    "releaseRefs": {
+                        "backendRevision": "revision-001",
+                        "productionRevision": "production-001",
+                    },
                     "artifact": "docs/release-safety/evidence.md",
                     "observedAt": "2026-08-10T22:00:00Z",
                     "expiresAt": None,
@@ -222,7 +231,10 @@ class ReadinessRegistryTests(unittest.TestCase):
                 "expiresAt": None,
                 "featureIds": ["feature.alpha"] if feature_ids is None else feature_ids,
                 "scenarioIds": ["scenario.event"] if scenario_ids is None else scenario_ids,
-                "releaseRefs": {"backendRevision": release_revision},
+                "releaseRefs": {
+                    "backendRevision": release_revision,
+                    "productionRevision": "production-001",
+                },
             }
         )
         if supersedes is not None:
@@ -560,6 +572,37 @@ class ReadinessRegistryTests(unittest.TestCase):
         candidate["evidence"][1]["releaseRefs"] = {"unknownRelease": "revision-001"}
         self.assert_invalid(candidate, "evidence.live")
 
+    def test_production_evidence_binds_to_every_release_identity_key(self):
+        for evidence_index in (0, 1):
+            with self.subTest(evidence=self.registry["evidence"][evidence_index]["id"]):
+                candidate = copy.deepcopy(self.registry)
+                candidate["evidence"][evidence_index]["releaseRefs"].pop(
+                    "productionRevision"
+                )
+                self.assert_invalid(
+                    candidate, self.registry["evidence"][evidence_index]["id"]
+                )
+
+        base = self.validate()
+        partial_identity = copy.deepcopy(self.registry)
+        partial_identity["evidence"][0]["releaseRefs"].pop("productionRevision")
+        legacy_validated = self.module.ValidatedRegistry(
+            registry=partial_identity,
+            feature_by_id=base.feature_by_id,
+            fixture_matrix=base.fixture_matrix,
+            gate_ids=base.gate_ids,
+            evidence_by_id={
+                item["id"]: item for item in partial_identity["evidence"]
+            },
+            quality_by_id=base.quality_by_id,
+        )
+
+        decisions = self.module.effective_gate_decisions(
+            legacy_validated,
+            at=self.module.parse_utc("2026-08-11T00:00:00Z"),
+        )
+        self.assertEqual("stale", decisions["login_view"])
+
     def test_control_plane_readback_may_use_explicit_empty_scope_but_live_evidence_may_not(self):
         control_plane = copy.deepcopy(self.registry)
         control_plane["evidence"][0]["featureIds"] = []
@@ -593,7 +636,10 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assert_invalid(candidate, "login_view")
 
         candidate = copy.deepcopy(self.registry)
-        candidate["evidence"][0]["releaseRefs"] = {"backendRevision": "revision-000"}
+        candidate["evidence"][0]["releaseRefs"] = {
+            "backendRevision": "revision-000",
+            "productionRevision": "production-001",
+        }
         self.assert_invalid(candidate, "login_view")
 
     def test_same_feature_same_scenario_newer_current_failure_invalidates_go(self):
@@ -1417,6 +1463,28 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             for label, pattern in forbidden_patterns.items():
                 with self.subTest(filename=filename, label=label):
                     self.assertIsNone(pattern.search(payload))
+
+    def test_committed_views_are_clean_at_default_and_snapshot_time(self):
+        commands = (
+            [sys.executable, str(MODULE_PATH), "--check"],
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "--check",
+                "--at",
+                "2026-08-11T07:00:00Z",
+            ],
+        )
+        for command in commands:
+            with self.subTest(command=command[2:]):
+                result = subprocess.run(
+                    command,
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
 
 
 if __name__ == "__main__":
