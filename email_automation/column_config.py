@@ -644,6 +644,9 @@ _FIELD_REQUEST_INTENT_RE = re.compile(
     r"|^\s*do\s+you\s+know\b"
     r"|^\s*would\s+it\s+be\s+possible\s+to\b"
     r"|^\s*i\s+would\s+appreciate\b"
+    r"|^\s*let\s+(?:me|us|you|him|her|them)\s+know\b"
+    r"|^\s*(?:i|we|you|they|he|she)(?:\s+would|['\u2019]d)"
+    r"\s+like\s+to\s+know\b"
     r"|^\s*(?:is|are|was|were)\b"
     r"|^\s*what\s+(?:is|are|was|were)\b"
     r"|^\s*how\s+many\b"
@@ -657,7 +660,7 @@ _FIELD_REQUEST_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_FIELD_REQUEST_SENTENCE_SPLIT_RE = re.compile(r"(?<!\d)\.|\.(?!\d)|[!?]+")
+_FIELD_REQUEST_SENTENCE_BOUNDARY_RE = re.compile(r"(?<!\d)\.|\.(?!\d)|[!?]+")
 _FIELD_REQUEST_COORDINATION_SPLIT_RE = re.compile(r"[,;]+")
 _FIELD_REQUEST_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
 _FIELD_ACKNOWLEDGEMENT_PREFIX_RE = re.compile(
@@ -699,6 +702,22 @@ _FIELD_REQUEST_SF_UNIT_PREFIX_RE = re.compile(
 )
 
 
+def _field_request_sentences(text: str) -> List[tuple]:
+    """Return sentence text with whether its decimal-safe terminator is a question."""
+    sentences = []
+    sentence_start = 0
+    for boundary in _FIELD_REQUEST_SENTENCE_BOUNDARY_RE.finditer(text):
+        sentence = text[sentence_start:boundary.start()].strip()
+        if sentence:
+            sentences.append((sentence, "?" in boundary.group(0)))
+        sentence_start = boundary.end()
+
+    trailing_sentence = text[sentence_start:].strip()
+    if trailing_sentence:
+        sentences.append((trailing_sentence, False))
+    return sentences
+
+
 def _explicit_field_request_clauses(response_body: str) -> List[str]:
     """Return explicit request clauses, including bullets under a request lead-in."""
     request_clauses = []
@@ -714,7 +733,7 @@ def _explicit_field_request_clauses(response_body: str) -> List[str]:
             continue
 
         explicit_clauses = []
-        for sentence in _FIELD_REQUEST_SENTENCE_SPLIT_RE.split(stripped):
+        for sentence, is_question in _field_request_sentences(stripped):
             request_active = False
             for clause in _FIELD_REQUEST_COORDINATION_SPLIT_RE.split(sentence):
                 request_candidate = _FIELD_ACKNOWLEDGEMENT_PREFIX_RE.sub(
@@ -728,6 +747,9 @@ def _explicit_field_request_clauses(response_body: str) -> List[str]:
                     "",
                     request_candidate,
                 )
+                has_negated_intent = bool(
+                    _FIELD_NEGATED_REQUEST_INTENT_RE.search(intent_candidate)
+                )
                 intent_candidate = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
                     "",
                     intent_candidate,
@@ -737,6 +759,9 @@ def _explicit_field_request_clauses(response_body: str) -> List[str]:
                     explicit_clauses.append(
                         intent_candidate[intent_match.start():].strip()
                     )
+                    request_active = True
+                elif is_question and not has_negated_intent:
+                    explicit_clauses.append(intent_candidate)
                     request_active = True
                 elif (
                     request_active

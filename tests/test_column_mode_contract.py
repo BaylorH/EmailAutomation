@@ -172,6 +172,34 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                     )
                 )
 
+    def test_rejects_structural_questions_and_non_question_reask_forms(self):
+        cases = (
+            (
+                "Could you confirm operating expenses? What's the asking rent?",
+                {"ops ex /sf", "rent/sf /yr"},
+            ),
+            ("What’s the asking rent?", {"rent/sf /yr"}),
+            ("Do you happen to know the asking rent?", {"rent/sf /yr"}),
+            ("Let me know the asking rent.", {"rent/sf /yr"}),
+            ("I'd like to know the asking rent.", {"rent/sf /yr"}),
+        )
+        helper = getattr(column_config, "get_requested_ask_fields", None)
+
+        self.assertTrue(callable(helper))
+        for body, expected_fields in cases:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    expected_fields,
+                    set(helper(body, self.config)),
+                )
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Ops Ex /SF"],
+                        self.config,
+                    )
+                )
+
     def test_declarative_dock_context_does_not_become_a_request(self):
         bodies = (
             "There are many docks at the premises. Could you confirm operating expenses?",
@@ -293,6 +321,7 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             "Please note that the asking rent is already confirmed. Could you confirm operating expenses?",
             "Thanks for confirming the asking rent and could you confirm operating expenses?",
             "We already have the asking rent we need. Could you confirm operating expenses?",
+            "The asking rent is already confirmed. Please provide operating expenses.",
         )
 
         for body in bodies:
