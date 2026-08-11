@@ -608,6 +608,11 @@ def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[
         set(column_config["neverRequest"])
         | set(column_config["formulaFields"])
         | skipped_extractable
+        | {
+            canonical
+            for canonical in mappings
+            if get_default_mode_for_canonical(canonical) == "skip"
+        }
         | ({"listing_comments", "client_comments"} & set(mappings))
     )
 
@@ -627,6 +632,19 @@ def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[
             groups.append(list(dict.fromkeys(terms)))
 
     return groups
+
+
+def _contextual_skip_field_term_groups(
+    column_config: Dict[str, Any],
+) -> List[List[str]]:
+    """Return default Skip identity groups that can also occur as context."""
+    formula_fields = set(column_config["formulaFields"])
+    return [
+        _canonical_field_reference_terms(canonical, configured_header)
+        for canonical, configured_header in column_config["mappings"].items()
+        if canonical not in formula_fields
+        and get_default_mode_for_canonical(canonical) == "skip"
+    ]
 
 
 _CUSTOM_FIELD_STOPWORDS = {
@@ -803,6 +821,14 @@ _FIELD_CONTEXT_DEONTIC_RE = re.compile(
     r"\b(?:have|has|had|am|is|are|was|were)\s+to\b",
     re.IGNORECASE,
 )
+_FIELD_PLURAL_ANAPHOR_RE = re.compile(
+    r"\b(?:both|these|those|them)(?:\s+values?)?\b",
+    re.IGNORECASE,
+)
+_FIELD_SINGULAR_ANAPHOR_RE = re.compile(
+    r"\b(?:that|this|it)\b",
+    re.IGNORECASE,
+)
 _FIELD_LIST_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
 
 _FIELD_MENTION_REQUEST = "request"
@@ -928,7 +954,7 @@ def _configured_field_mentions(text: str, field_groups: List[tuple]) -> List[tup
     nonrequestable_spans = [
         (start, end)
         for start, end, group_index in raw_mentions
-        if field_groups[group_index][0] == "nonrequestable"
+        if field_groups[group_index][0] != "ask"
     ]
     mentions = []
     for start, end, group_index in sorted(
@@ -945,7 +971,13 @@ def _configured_field_mentions(text: str, field_groups: List[tuple]) -> List[tup
             kept_start <= start
             and end <= kept_end
             and (kept_start, kept_end) != (start, end)
-            and field_groups[kept_group][0] == kind
+            and (
+                field_groups[kept_group][0] == kind
+                or (
+                    field_groups[kept_group][0] != "ask"
+                    and kind != "ask"
+                )
+            )
             for kept_start, kept_end, kept_group in mentions
         ):
             continue
@@ -1021,6 +1053,38 @@ def _is_compound_context_separator(separator: str) -> bool:
         normalized,
         re.IGNORECASE,
     ))
+
+
+def _request_anaphor_number(context_text: str) -> Optional[str]:
+    if _FIELD_PLURAL_ANAPHOR_RE.search(context_text):
+        return "plural"
+    if _FIELD_SINGULAR_ANAPHOR_RE.search(context_text):
+        return "singular"
+    return None
+
+
+def _is_recent_field_proposition_separator(separator: str) -> bool:
+    """Allow sentence punctuation, but never a paragraph boundary."""
+    normalized = (separator or "").replace("\r\n", "\n")
+    if re.search(r"\n[ \t]*\n", normalized):
+        return False
+    return bool(re.fullmatch(
+        r"[ \t.!?;,:\-\u2013\u2014]*"
+        r"(?:(?:and|or)\b[ \t.!?;,:\-\u2013\u2014]*)?"
+        r"(?:\n[ \t.!?;,:\-\u2013\u2014]*)?",
+        normalized,
+        re.IGNORECASE,
+    ))
+
+
+def _is_bounded_singular_hop_separator(separator: str) -> bool:
+    """Allow one explicit-pronoun hop over a single blank line."""
+    normalized = (separator or "").replace("\r\n", "\n")
+    return (
+        normalized.count("\n") <= 2
+        and len(normalized) <= 16
+        and re.fullmatch(r"[ \t.!?;,:\-\u2013\u2014\n]*", normalized) is not None
+    )
 
 
 def _context_is_factual_value(
@@ -1125,12 +1189,20 @@ def _antecedent_field_group_indices(
     """Return the complete local field proposition governed by a follow-up."""
     request_start, request_end, _is_question = contexts[request_context_index]
     request_text = text[request_start:request_end]
+    anaphor_number = _request_anaphor_number(request_text)
     anchor_field_index = None
 
     if request_context_index > 0:
         previous_index = request_context_index - 1
         previous_end = contexts[previous_index][1]
-        if _is_adjacent_context_separator(text[previous_end:request_start]):
+        separator = text[previous_end:request_start]
+        if (
+            _is_adjacent_context_separator(separator)
+            or (
+                anaphor_number == "singular"
+                and _is_bounded_singular_hop_separator(separator)
+            )
+        ):
             if _context_contains_field_mention(
                 previous_index,
                 mentions,
@@ -1167,12 +1239,23 @@ def _antecedent_field_group_indices(
         contexts,
     )
     cursor = anchor_field_index
+    sentence_hops = 0
     while cursor > 0:
         previous_index = cursor - 1
         previous_end = contexts[previous_index][1]
         cursor_start = contexts[cursor][0]
-        if not _is_compound_context_separator(text[previous_end:cursor_start]):
+        separator = text[previous_end:cursor_start]
+        is_compound = _is_compound_context_separator(separator)
+        is_recent_plural = (
+            anaphor_number == "plural"
+            and _is_recent_field_proposition_separator(separator)
+        )
+        if not (is_compound or is_recent_plural):
             break
+        if is_recent_plural and "." in separator:
+            if sentence_hops >= 1:
+                break
+            sentence_hops += 1
 
         previous_field_index = None
         if _context_contains_field_mention(previous_index, mentions, contexts):
@@ -1199,54 +1282,103 @@ def _structural_followup_request_groups(
     text: str,
     mentions: List[tuple],
     contexts: List[tuple],
+    field_groups: List[tuple],
 ) -> set:
     request_groups = set()
     for context_index, (context_start, context_end, is_question) in enumerate(contexts):
-        if _context_contains_field_mention(context_index, mentions, contexts):
-            continue
+        context_mentions = [
+            mention
+            for mention in mentions
+            if context_start <= mention[0] and mention[1] <= context_end
+        ]
+        if context_mentions:
+            if any(
+                field_groups[group_index][0] != "contextual_nonrequestable"
+                for _mention_start, _mention_end, group_index in context_mentions
+            ):
+                continue
+            if any(
+                _contextual_skip_mention_is_request(
+                    text,
+                    mention,
+                    mentions,
+                    contexts,
+                )
+                for mention in context_mentions
+            ):
+                continue
         context_text = text[context_start:context_end]
         line_start = text.rfind("\n", 0, context_start) + 1
         line_end = text.find("\n", context_end)
         if line_end < 0:
             line_end = len(text)
-        if _line_is_request_list_leadin(text[line_start:line_end]):
+        if (
+            _line_is_request_list_leadin(text[line_start:line_end])
+            and _request_leadin_has_forward_field_cluster(
+                text,
+                line_end,
+                mentions,
+            )
+        ):
             continue
         if not _fieldless_context_is_request_like(context_text, is_question):
             continue
-        request_groups.update(_antecedent_field_group_indices(
+        antecedent_groups = _antecedent_field_group_indices(
             text,
             context_index,
             mentions,
             contexts,
-        ))
+        )
+        for group_index in antecedent_groups:
+            if field_groups[group_index][0] != "contextual_nonrequestable":
+                request_groups.add(group_index)
+                continue
+            prior_mentions = [
+                (mention_start, mention_end)
+                for mention_start, mention_end, mention_group in mentions
+                if mention_group == group_index and mention_end <= context_start
+            ]
+            if not prior_mentions:
+                continue
+            mention_start, mention_end = max(
+                prior_mentions,
+                key=lambda span: span[1],
+            )
+            if len(_FIELD_REFERENCE_TOKEN_RE.findall(
+                text[mention_start:mention_end]
+            )) >= 2:
+                request_groups.add(group_index)
     return request_groups
 
 
-def _line_is_request_list_leadin(line: str) -> bool:
-    stripped = (line or "").strip()
-    if not stripped:
-        return False
+def _explicit_request_intent_match(value: str) -> Optional[Any]:
+    if not (value or "").strip():
+        return None
     request_text = _FIELD_NEGATED_REQUEST_INTENT_RE.sub(
         lambda match: " " * (match.end() - match.start()),
-        stripped,
+        value,
     )
     request_match = _last_pattern_match(_FIELD_REQUEST_INTENT_RE, request_text)
     if request_match is None:
-        return False
+        return None
     clear_matches = [
         match
         for pattern in (
             _FIELD_CLEAR_ACKNOWLEDGEMENT_RE,
             _FIELD_CLEAR_INFORMATIONAL_RE,
         )
-        for match in pattern.finditer(stripped)
+        for match in pattern.finditer(value)
     ]
     if any(
         clear.start() <= request_match.start() < clear.end()
         for clear in clear_matches
     ):
-        return False
-    return "following" in stripped.lower() or stripped.endswith(":")
+        return None
+    return request_match
+
+
+def _line_is_request_list_leadin(line: str) -> bool:
+    return _explicit_request_intent_match(line) is not None
 
 
 def _line_is_list_heading(line: str) -> bool:
@@ -1267,15 +1399,53 @@ def _line_is_list_heading(line: str) -> bool:
     )
 
 
+def _request_leadin_has_forward_field_cluster(
+    text: str,
+    start: int,
+    mentions: List[tuple],
+) -> bool:
+    """Return whether the next bounded non-heading line names a field."""
+    offset = start
+    tail = text[start:]
+    if tail.startswith("\r\n"):
+        offset += 2
+        tail = tail[2:]
+    elif tail.startswith("\n"):
+        offset += 1
+        tail = tail[1:]
+    for raw_line in tail.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        line_start = offset
+        line_end = line_start + len(line)
+        offset += len(raw_line)
+        stripped = line.strip()
+        line_has_field = any(
+            mention_start < line_end and line_start < mention_end
+            for mention_start, mention_end, _group_index in mentions
+        )
+        if not stripped:
+            continue
+        if line_has_field and (
+            _FIELD_LIST_BULLET_RE.match(line) is not None
+            or not stripped.endswith(":")
+        ):
+            return True
+        if _line_is_list_heading(line):
+            continue
+        return False
+    return False
+
+
 def _request_list_field_group_indices(
     text: str,
     mentions: List[tuple],
 ) -> set:
-    """Propagate one explicit list lead-in through its bounded bullet block."""
+    """Propagate an explicit lead-in through its bounded field cluster."""
     request_groups = set()
     pending = False
-    pending_blank_count = 0
     active = False
+    active_is_bulleted = False
+    active_after_blank = False
     offset = 0
 
     for raw_line in text.splitlines(keepends=True):
@@ -1285,47 +1455,124 @@ def _request_list_field_group_indices(
         offset += len(raw_line)
         stripped = line.strip()
         is_bullet = _FIELD_LIST_BULLET_RE.match(line) is not None
+        line_groups = {
+            group_index
+            for mention_start, mention_end, group_index in mentions
+            if mention_start < line_end and line_start < mention_end
+        }
+        line_mention_starts = [
+            mention_start
+            for mention_start, mention_end, _group_index in mentions
+            if mention_start < line_end and line_start < mention_end
+        ]
+        starts_with_field = bool(line_mention_starts) and not text[
+            line_start:min(line_mention_starts)
+        ].strip()
 
         if active:
-            if is_bullet:
-                request_groups.update(
-                    group_index
-                    for mention_start, mention_end, group_index in mentions
-                    if mention_start < line_end and line_start < mention_end
-                )
-                continue
-            active = False
-            pending = False
             if not stripped:
+                if active_is_bulleted:
+                    active_after_blank = True
+                else:
+                    active = False
+                    pending = False
                 continue
-
-        if is_bullet:
-            if pending:
-                active = True
-                request_groups.update(
-                    group_index
-                    for mention_start, mention_end, group_index in mentions
-                    if mention_start < line_end and line_start < mention_end
-                )
-            pending = False
-            continue
+            if active_after_blank and not is_bullet:
+                active = False
+                pending = False
+                active_after_blank = False
+            elif line_groups and (is_bullet or starts_with_field):
+                request_groups.update(line_groups)
+                active_is_bulleted = active_is_bulleted or is_bullet
+                active_after_blank = False
+                continue
+            elif is_bullet:
+                active_after_blank = False
+                continue
+            else:
+                active = False
+                pending = False
+                active_after_blank = False
 
         if _line_is_request_list_leadin(line):
-            pending = True
-            pending_blank_count = 0
+            last_mention_end = max(
+                (
+                    mention_end
+                    for mention_start, mention_end, _group_index in mentions
+                    if mention_start < line_end and line_start < mention_end
+                ),
+                default=None,
+            )
+            open_field_cluster_tail = (
+                last_mention_end is not None
+                and re.match(
+                    r"\s*,?\s*(?:and|or)\b\s+\S+",
+                    text[last_mention_end:line_end],
+                    re.IGNORECASE,
+                ) is not None
+            )
+            if not line_groups or open_field_cluster_tail:
+                pending = True
             continue
 
         if not pending:
             continue
         if not stripped:
-            pending_blank_count += 1
-            if pending_blank_count > 1:
-                pending = False
             continue
-        if _line_is_list_heading(line):
+        if (
+            _line_is_list_heading(line)
+            and not is_bullet
+            and (not line_groups or stripped.endswith(":"))
+        ):
+            continue
+        if line_groups:
+            request_groups.update(line_groups)
+            active = True
+            active_is_bulleted = is_bullet
+            active_after_blank = False
             continue
         pending = False
 
+    return request_groups
+
+
+def _inline_request_field_group_indices(
+    text: str,
+    mentions: List[tuple],
+) -> set:
+    """Propagate `request: field, field` within one bounded sentence."""
+    request_groups = set()
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        match = _explicit_request_intent_match(line)
+        if match is None:
+            offset += len(raw_line)
+            continue
+        scope_start = line.find(":", match.end())
+        if scope_start < 0 or re.search(r"[.!?;]", line[match.end():scope_start]):
+            offset += len(raw_line)
+            continue
+        scope_start += 1
+        scope_end = len(line)
+        for boundary in re.finditer(r"(?<!\d)\.|\.(?!\d)|[!?]", line[scope_start:]):
+            boundary_start = scope_start + boundary.start()
+            absolute_boundary = offset + boundary_start
+            if any(
+                mention_start < absolute_boundary < mention_end
+                for mention_start, mention_end, _group_index in mentions
+            ):
+                continue
+            scope_end = boundary_start
+            break
+        absolute_start = offset + scope_start
+        absolute_end = offset + scope_end
+        request_groups.update(
+            group_index
+            for mention_start, mention_end, group_index in mentions
+            if absolute_start <= mention_start and mention_end <= absolute_end
+        )
+        offset += len(raw_line)
     return request_groups
 
 
@@ -1351,11 +1598,82 @@ def _has_immediately_following_factual_value(
     return bool(_FIELD_FACTUAL_VALUE_CONTEXT_RE.match(text[next_start:next_end]))
 
 
+def _contextual_skip_mention_is_request(
+    text: str,
+    mention: tuple,
+    mentions: List[tuple],
+    contexts: List[tuple],
+) -> bool:
+    """Require a default-Skip identity mention to be a direct field target."""
+    mention_start, mention_end, _group_index = mention
+    context_index = _context_index_for_mention(
+        mention_start,
+        mention_end,
+        contexts,
+    )
+    if context_index is None:
+        return False
+    context_start, context_end, is_question = contexts[context_index]
+    other_mentions = sorted({
+        (other_start, other_end)
+        for other_start, other_end, _other_group in mentions
+        if context_start <= other_start
+        and other_end <= context_end
+        and (other_start, other_end) != (mention_start, mention_end)
+    })
+    coordinated = any(
+        re.fullmatch(
+            r"\s*(?:,|and\b|or\b)\s*(?:the\s+)?",
+            text[left_end:right_start],
+            re.IGNORECASE,
+        ) is not None
+        for left_end, right_start in (
+            *(
+                (other_end, mention_start)
+                for other_start, other_end in other_mentions
+                if other_end <= mention_start
+            ),
+            *(
+                (mention_end, other_start)
+                for other_start, other_end in other_mentions
+                if mention_end <= other_start
+            ),
+        )
+    )
+    context_text = text[context_start:context_end]
+    explicit_request = _explicit_request_intent_match(context_text)
+    request_context = (
+        is_question
+        or (
+            explicit_request is not None
+            and _FIELD_CONTEXT_DECLARATIVE_RE.search(context_text) is None
+        )
+    )
+    if coordinated:
+        return request_context
+    if other_mentions:
+        return False
+    if re.fullmatch(
+        r"\s*(?:(?:please|again)\s*)?",
+        text[mention_end:context_end],
+        re.IGNORECASE,
+    ) is None:
+        return False
+    if is_question:
+        return True
+    return (
+        explicit_request is not None
+        and explicit_request.end() <= mention_start - context_start
+        and _FIELD_CONTEXT_DECLARATIVE_RE.search(context_text) is None
+    )
+
+
 def _classify_field_mention(
     text: str,
     mention: tuple,
     mentions: List[tuple],
     contexts: List[tuple],
+    field_groups: List[tuple],
 ) -> str:
     """Classify one configured-field mention; uncertain mentions remain UNKNOWN."""
     mention_start, mention_end, _group_index = mention
@@ -1370,6 +1688,17 @@ def _classify_field_mention(
     context_start, context_end, is_question = contexts[context_index]
     prefix = text[context_start:mention_start]
     suffix = text[mention_end:context_end]
+    if field_groups[_group_index][0] == "contextual_nonrequestable":
+        return (
+            _FIELD_MENTION_REQUEST
+            if _contextual_skip_mention_is_request(
+                text,
+                mention,
+                mentions,
+                contexts,
+            )
+            else _FIELD_MENTION_BENIGN
+        )
     direct_clear_matches = [
         match
         for match in (
@@ -1484,8 +1813,18 @@ def _classify_configured_field_requests(
         ("ask", header, terms)
         for header, terms in ask_groups
     ]
+    contextual_skip_groups = {
+        frozenset(terms)
+        for terms in _contextual_skip_field_term_groups(column_config)
+    }
     field_groups.extend(
-        ("nonrequestable", None, terms)
+        (
+            "contextual_nonrequestable"
+            if frozenset(terms) in contextual_skip_groups
+            else "nonrequestable",
+            None,
+            terms,
+        )
         for terms in get_non_requestable_field_terms(column_config)
     )
     mentions = _configured_field_mentions(response_body, field_groups)
@@ -1500,14 +1839,20 @@ def _classify_configured_field_requests(
             mention,
             mentions,
             contexts,
+            field_groups,
         ) != _FIELD_MENTION_BENIGN
     }
     request_like_groups.update(_structural_followup_request_groups(
         response_body,
         mentions,
         contexts,
+        field_groups,
     ))
     request_like_groups.update(_request_list_field_group_indices(
+        response_body,
+        mentions,
+    ))
+    request_like_groups.update(_inline_request_field_group_indices(
         response_body,
         mentions,
     ))
@@ -1524,7 +1869,7 @@ def _classify_configured_field_requests(
         requested_headers.add(normalized_header)
 
     requests_nonrequestable = any(
-        kind == "nonrequestable" and group_index in request_like_groups
+        kind != "ask" and group_index in request_like_groups
         for group_index, (kind, _header, _terms) in enumerate(field_groups)
     )
     return requested, requests_nonrequestable
