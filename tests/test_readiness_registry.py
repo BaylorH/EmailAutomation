@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,16 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "generate_readiness_views.py"
 MODULE_NAME = "generate_readiness_views_under_test"
+REGISTRY_PATH = REPO_ROOT / "docs" / "release-safety" / "readiness-registry.json"
+EVIDENCE_NOTE_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "release-safety"
+    / "evidence"
+    / "2026-08-11-controlled-reopen.md"
+)
+CURRENT_VIEW_PATH = REPO_ROOT / "docs" / "release-safety" / "current-user-readiness.md"
+FULL_VIEW_PATH = REPO_ROOT / "docs" / "release-safety" / "full-quality-coverage.md"
 
 
 def _load_module():
@@ -1107,6 +1118,177 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertFalse(
             (self.repo_root / "docs/release-safety/full-quality-coverage.md").exists()
         )
+
+
+class CommittedReadinessArtifactsTests(unittest.TestCase):
+    maxDiff = None
+
+    def load_registry(self):
+        self.assertTrue(REGISTRY_PATH.is_file(), "committed readiness registry is missing")
+        return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+
+    def read_artifact(self, path):
+        self.assertTrue(path.is_file(), f"committed artifact is missing: {path.name}")
+        return path.read_text(encoding="utf-8")
+
+    def test_committed_gate_decisions_match_authoritative_boundary(self):
+        registry = self.load_registry()
+        decisions = {
+            gate["id"]: gate["decision"] for gate in registry["rolloutGates"]
+        }
+
+        self.assertEqual(
+            {
+                "login_view": "go",
+                "supervised_campaign_use": "ready_for_canary",
+                "autonomous_campaign_use": "hold",
+            },
+            decisions,
+        )
+
+    def test_committed_evidence_stays_within_the_four_bounded_claims(self):
+        registry = self.load_registry()
+        evidence_scope = {
+            item["id"]: (set(item["featureIds"]), set(item["scenarioIds"]))
+            for item in registry["evidence"]
+        }
+
+        self.assertEqual(
+            {
+                "returning-workspace-containment-readback": (set(), set()),
+                "m27-ten-row-launch-integrity-live": (
+                    {
+                        "core.launch_draft",
+                        "core.name_resolution",
+                        "core.outbox_send",
+                        "core.scheduler_scope",
+                        "core.upload_mapping",
+                    },
+                    {"launch_with_variable_mapping"},
+                ),
+                "m27-simple-extraction-close-live": (
+                    {
+                        "core.event_classifier",
+                        "core.inbox_auto_reply",
+                        "core.inbox_matching",
+                        "core.property_extraction",
+                        "core.sheet_update",
+                    },
+                    {"broker_available_full_specs"},
+                ),
+                "m27-unavailable-terminalization-live": (
+                    {
+                        "core.event_classifier",
+                        "core.inbox_auto_reply",
+                        "core.inbox_matching",
+                        "core.sheet_update",
+                    },
+                    {"broker_property_unavailable"},
+                ),
+            },
+            evidence_scope,
+        )
+
+    def test_one_row_canary_does_not_clear_followups_or_autonomous_use(self):
+        registry = self.load_registry()
+        gates = {gate["id"]: gate for gate in registry["rolloutGates"]}
+        supervised = gates["supervised_campaign_use"]
+        autonomous = gates["autonomous_campaign_use"]
+
+        self.assertIn("autonomous_followups", supervised["forbids"])
+        self.assertIn("autonomous_followups", autonomous["forbids"])
+        self.assertIn(
+            "autonomous-followups-current-live-gap", autonomous["blockerIds"]
+        )
+        self.assertNotIn(
+            "autonomous-followups-current-live-gap", supervised["blockerIds"]
+        )
+
+    def test_quality_items_have_exact_gate_blocking_links(self):
+        registry = self.load_registry()
+        blocks = {
+            item["id"]: set(item["blocksGates"])
+            for item in registry["qualityItems"]
+        }
+
+        self.assertEqual(
+            {
+                "returning-user-canary-unrun": {
+                    "supervised_campaign_use",
+                    "autonomous_campaign_use",
+                },
+                "autonomous-followups-current-live-gap": {
+                    "autonomous_campaign_use"
+                },
+                "reply-all-cc-multiparty-live-gap": {"autonomous_campaign_use"},
+                "pdf-multi-suite-ambiguity": {"autonomous_campaign_use"},
+                "hard-repeat-ask-rejection-gap": {"autonomous_campaign_use"},
+                "natural-voice-variety": set(),
+                "long-multiturn-ordering-gap": {"autonomous_campaign_use"},
+                "account-b-historical-cleanup": set(),
+            },
+            blocks,
+        )
+
+    def test_full_view_contains_every_core_feature_without_claim_broadening(self):
+        registry = self.load_registry()
+        full_view = self.read_artifact(FULL_VIEW_PATH)
+        feature_registry = json.loads(
+            (REPO_ROOT / "docs" / "release-safety" / "feature-registry.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        core_ids = {
+            feature["id"]
+            for feature in feature_registry["features"]
+            if feature.get("lane") == "production_v1_core"
+        }
+        rows = {
+            line.split("|", 2)[1].strip()
+            for line in full_view.splitlines()
+            if line.startswith("| core.")
+        }
+
+        self.assertEqual(16, len(core_ids))
+        self.assertEqual(core_ids, rows)
+        followups_row = next(
+            line
+            for line in full_view.splitlines()
+            if line.startswith("| core.followups |")
+        )
+        self.assertIn("UNPROVEN", followups_row)
+        self.assertNotIn("m27-ten-row-launch-integrity-live", followups_row)
+        self.assertEqual(4, len(registry["evidence"]))
+
+    def test_committed_artifacts_are_sanitized(self):
+        payloads = {
+            path.name: self.read_artifact(path)
+            for path in (
+                REGISTRY_PATH,
+                EVIDENCE_NOTE_PATH,
+                CURRENT_VIEW_PATH,
+                FULL_VIEW_PATH,
+            )
+        }
+        forbidden_patterns = {
+            "email_address": re.compile(
+                r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE
+            ),
+            "local_user_path": re.compile(r"/Users/"),
+            "file_uri": re.compile(r"file://", re.IGNORECASE),
+            "message_id_header": re.compile(r"\bmessage-id\s*:", re.IGNORECASE),
+            "openai_key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+            "github_token": re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
+            "aws_key": re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
+            "bearer_secret": re.compile(
+                r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE
+            ),
+        }
+
+        for filename, payload in payloads.items():
+            for label, pattern in forbidden_patterns.items():
+                with self.subTest(filename=filename, label=label):
+                    self.assertIsNone(pattern.search(payload))
 
 
 if __name__ == "__main__":
