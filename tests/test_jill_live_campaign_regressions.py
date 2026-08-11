@@ -4698,6 +4698,57 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         self.assertEqual([brochure], current)
         self.assertEqual([], by_event)
 
+    def test_multi_property_pause_quarantines_mixed_attachment_from_current_row(self):
+        mixed = {
+            "name": "Fictional portfolio availability.pdf",
+            "text": (
+                "101 Fictional Forge Road is available, but no confirmed target "
+                "figures are provided. 202 Imaginary Industry Avenue Suite A has "
+                "12,650 SF at $18.75/SF/YR."
+            ),
+        }
+        events = [{
+            "type": "needs_user_input",
+            "reason": "multi_property_attachment",
+            "question": "Which property should receive the attachment facts?",
+        }]
+
+        current, by_event = processing._partition_property_attachments(
+            [mixed],
+            current_anchor="101 Fictional Forge Road, Exampleton",
+            events=events,
+        )
+
+        self.assertEqual([], current)
+        self.assertEqual([], by_event)
+
+    def test_multi_property_pause_routes_only_target_only_attachment(self):
+        target_only = {
+            "name": "Target availability.pdf",
+            "text": "101 Fictional Forge Road, Exampleton is available for lease.",
+        }
+        competing = {
+            "name": "Alternate availability.pdf",
+            "text": "202 Imaginary Industry Avenue, Exampleton has 12,650 SF.",
+        }
+        addressless = {
+            "name": "Unbound availability.pdf",
+            "text": "An industrial option has complete specifications but no address.",
+        }
+        events = [{
+            "type": "needs_user_input",
+            "reason": "multi_property_attachment",
+        }]
+
+        current, by_event = processing._partition_property_attachments(
+            [target_only, competing, addressless],
+            current_anchor="101 Fictional Forge Road, Exampleton",
+            events=events,
+        )
+
+        self.assertEqual([target_only], current)
+        self.assertEqual([], by_event)
+
     def test_same_city_phase_attachments_route_to_the_unique_event(self):
         phase_one = {
             "name": "Sterling Plaza Phase I brochure.pdf",

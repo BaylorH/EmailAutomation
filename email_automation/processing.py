@@ -27,6 +27,7 @@ from .ai_processing import (
     _VIABILITY_NEGATOR_LINK_WORDS,
     _VIABILITY_QUALIFIER_WORDS,
     _VIABILITY_RE,
+    _attachment_property_verdict,
     _append_ai_meta,
     _detect_target_terminal_reason,
     _looks_like_requirements_mismatch_nonviable,
@@ -4235,10 +4236,10 @@ def _partition_property_attachments(
         ):
             return [
                 attachment for attachment in (pdf_manifest or [])
-                if _source_mentions_target_property(
+                if _attachment_property_verdict(
                     _attachment_source_text(attachment),
                     current_anchor,
-                )
+                ) == "target"
             ], []
         return list(pdf_manifest or []), []
 
