@@ -96,6 +96,28 @@ Use this prompt on recovery PRs and any future production-widening PR:
 > Cc/reply-all recipients, duplicate sends after retry, hidden failed sends,
 > UI-only entitlements, and Jill/MOHR identity leakage.
 
+## Current capability clearance
+
+The generated [current-user-readiness.md](current-user-readiness.md) view is
+authoritative for current capability clearance. Its decisions come from the
+hand-authored [readiness-registry.json](readiness-registry.json), while
+[full-quality-coverage.md](full-quality-coverage.md) shows the broader feature
+and evidence backlog. This packet remains the test-selection contract: it
+defines which product paths and evidence a change must exercise, but it does
+not override the current gate decisions.
+
+The initial recorded gate boundary is:
+
+- `login_view = go`: users may sign in and view the product.
+- `supervised_campaign_use = ready_for_canary`: permit only the bounded,
+  monitored canary described by the current readiness view.
+- `autonomous_campaign_use = hold`: do not permit autonomous campaign use.
+
+Historical language in this packet is not a blanket hold; use it as the safety
+and test contract within the current capability boundary.
+Mapped fixtures and P0/P1 labels do not automatically equal live proof or a rollout block.
+Priority alone never blocks a rollout gate; only an explicit blocksGates link does.
+
 ## Evidence Required Before Normal Users Return
 
 No live-user email or data mutation is allowed as part of proving this packet.

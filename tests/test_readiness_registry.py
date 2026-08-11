@@ -29,6 +29,7 @@ EVIDENCE_NOTE_PATH = (
 )
 CURRENT_VIEW_PATH = REPO_ROOT / "docs" / "release-safety" / "current-user-readiness.md"
 FULL_VIEW_PATH = REPO_ROOT / "docs" / "release-safety" / "full-quality-coverage.md"
+PACKET_PATH = REPO_ROOT / "docs" / "release-safety" / "system-audit-packet.md"
 
 
 def _load_module():
@@ -1229,6 +1230,32 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
     def read_artifact(self, path):
         self.assertTrue(path.is_file(), f"committed artifact is missing: {path.name}")
         return path.read_text(encoding="utf-8")
+
+    def test_system_audit_packet_routes_current_clearance_to_readiness_views(self):
+        packet = self.read_artifact(PACKET_PATH)
+        clearance_heading = "## Current capability clearance"
+        evidence_heading = "## Evidence Required Before Normal Users Return"
+
+        self.assertIn(clearance_heading, packet)
+        self.assertLess(packet.index(clearance_heading), packet.index(evidence_heading))
+        clearance = packet[
+            packet.index(clearance_heading) : packet.index(evidence_heading)
+        ]
+        for required_text in (
+            "[readiness-registry.json](readiness-registry.json)",
+            "[current-user-readiness.md](current-user-readiness.md)",
+            "[full-quality-coverage.md](full-quality-coverage.md)",
+            "authoritative for current capability clearance",
+            "This packet remains the test-selection contract",
+            "`login_view = go`",
+            "`supervised_campaign_use = ready_for_canary`",
+            "`autonomous_campaign_use = hold`",
+            "Historical language in this packet is not a blanket hold",
+            "Mapped fixtures and P0/P1 labels do not automatically equal live proof or a rollout block.",
+            "Priority alone never blocks a rollout gate; only an explicit blocksGates link does.",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, clearance)
 
     def test_committed_gate_decisions_match_authoritative_boundary(self):
         registry = self.load_registry()
