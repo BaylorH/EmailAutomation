@@ -6,6 +6,18 @@ from email_automation.column_config import get_default_column_config
 
 
 class ProcessingCompletionGuardTests(unittest.TestCase):
+    def test_reply_review_outcome_never_allows_client_completion(self):
+        self.addCleanup(processing._reset_reply_send_outcome)
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(outcome="blocked_auto_reply_policy")
+
+        self.assertFalse(processing._reply_outcome_allows_client_completion())
+        with patch.object(processing, "_maybe_mark_client_completed") as complete:
+            self.assertFalse(
+                processing._complete_client_after_deferred_reply("uid-1", "client-1")
+            )
+        complete.assert_not_called()
+
     def test_close_event_defers_campaign_completion_for_pending_closing_reply(self):
         proposal = {
             "response_email": "Hi,\n\nThanks for the details.",

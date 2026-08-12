@@ -236,6 +236,8 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         mark_client_completed_mock=None,
         missing_required_fields=None,
         apply_proposal_result=None,
+        create_reply_review_mock=None,
+        queue_pending_mock=None,
     ):
         client_id = "client-1"
         msg = self._common_graph_message(
@@ -335,6 +337,8 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             else None
         )
         cancel_followup = MagicMock(side_effect=cancel_followup_side_effect)
+        create_reply_review = create_reply_review_mock or MagicMock()
+        queue_pending = queue_pending_mock or MagicMock()
         thread_docs = thread_docs or {thread_id: thread_ref}
         patches = [
             patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref, thread_docs=thread_docs)),
@@ -391,6 +395,13 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "_maybe_mark_client_completed", side_effect=mark_client_completed),
             patch.object(
                 processing,
+                "create_policy_blocked_reply_review",
+                new=create_reply_review,
+                create=True,
+            ),
+            patch.object(processing, "queue_pending_response", new=queue_pending),
+            patch.object(
+                processing,
                 "check_missing_required_fields",
                 return_value=list(missing_required_fields or []),
             ),
@@ -429,7 +440,91 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "cancelFollowup": cancel_followup,
             "callTrace": call_trace,
             "threadRef": thread_ref,
+            "createReplyReview": create_reply_review,
+            "queuePending": queue_pending,
         }
+
+    @staticmethod
+    def _policy_blocked_send(*_args, **_kwargs):
+        processing._set_reply_send_outcome(
+            error=(
+                "Automatic inbox replies are disabled for this user; "
+                "manual review required before auto-reply"
+            ),
+            outcome="blocked_auto_reply_policy",
+        )
+        return False
+
+    def test_reply_review_projection_failure_escapes_auto_response_retry_boundary(self):
+        thread_id = "thread-policy-projection-failure"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+        })
+        create_review = MagicMock(
+            side_effect=processing.RetryableProcessingError(
+                "policy-blocked reply review projection failed"
+            )
+        )
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "policy-blocked reply review projection failed",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body="The property is no longer available.",
+                proposal={
+                    "updates": [],
+                    "events": [
+                        {"type": "property_unavailable", "reason": "no_longer_available"}
+                    ],
+                    "response_email": "Thanks for the update.",
+                },
+                thread_ref=thread_ref,
+                send_reply_mock=MagicMock(side_effect=self._policy_blocked_send),
+                create_reply_review_mock=create_review,
+            )
+
+    def test_reply_review_stops_second_response_and_does_not_complete_client(self):
+        thread_id = "thread-policy-single-review"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+        })
+        send_reply = MagicMock(side_effect=self._policy_blocked_send)
+        create_review = MagicMock(return_value=MagicMock(status="created"))
+        complete_client = MagicMock(return_value=True)
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=(
+                "The property is no longer available. Please call me so we can discuss."
+            ),
+            proposal={
+                "updates": [],
+                "events": [
+                    {"type": "property_unavailable", "reason": "no_longer_available"},
+                    {"type": "call_requested"},
+                ],
+                "response_email": "Thanks for the update.",
+            },
+            thread_ref=thread_ref,
+            send_reply_mock=send_reply,
+            create_reply_review_mock=create_review,
+            mark_client_completed_mock=complete_client,
+        )
+
+        send_reply.assert_called_once()
+        create_review.assert_called_once()
+        complete_client.assert_not_called()
+        result["queuePending"].assert_not_called()
 
     def test_inbound_marker_write_failure_escapes_to_retry_boundary(self):
         body = "The property is available and has 600A power."

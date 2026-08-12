@@ -108,6 +108,11 @@ from .campaign_safety import (
     stopped_followup_patch,
 )
 from .system_health import _is_terminal_dead_letter
+from .reply_reviews import (
+    POLICY_BLOCK_FAILURE_CODE,
+    ReplyReviewProjectionError,
+    create_policy_blocked_reply_review,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +404,40 @@ def _queue_response_retry_or_reconciliation(
         print("⚠️ Reply may have sent but was not indexed; recorded reconciliation item instead of retrying send")
         return "sent_unindexed"
 
+    if send_outcome.outcome == POLICY_BLOCK_FAILURE_CODE:
+        if not client_id:
+            raise RetryableProcessingError(
+                "policy-blocked reply review projection failed: client identity is missing"
+            )
+        terminal_disposition = None
+        if terminal_reason is not None:
+            terminal_disposition = {
+                "status": "completed",
+                "reason": terminal_reason,
+                "rowNumber": terminal_row_number,
+            }
+        try:
+            projection = create_policy_blocked_reply_review(
+                user_id=user_id,
+                client_id=client_id,
+                thread_id=thread_id,
+                source_message_id=msg_id,
+                recipient=recipient,
+                response_body=response_body,
+                subject=send_outcome.subject,
+                conversation_id=send_outcome.conversation_id,
+                terminal_disposition=terminal_disposition,
+            )
+        except ReplyReviewProjectionError as exc:
+            raise RetryableProcessingError(
+                "policy-blocked reply review projection failed"
+            ) from exc
+        print(
+            "🛑 Automatic reply requires manual review; "
+            f"projected review {projection.review_id[:12]}..."
+        )
+        return "review_required"
+
     queue_pending_response(
         user_id,
         thread_id,
@@ -441,13 +480,24 @@ def _handle_auto_response_send_failure(
         terminal_reason=terminal_reason,
         terminal_row_number=terminal_row_number,
     )
-    return outcome in {"sent_unindexed", "recipient_suppressed"}
+    return outcome in {"sent_unindexed", "recipient_suppressed", "review_required"}
+
+
+def _reply_outcome_allows_client_completion() -> bool:
+    """Return whether the current reply outcome resolves completion-sensitive work."""
+    outcome = _get_reply_send_outcome()
+    if outcome.campaign_suppression_kind == "terminal":
+        return False
+    outcome_name = str(outcome.outcome or "")
+    return not (
+        outcome_name.startswith("blocked_daily_")
+        or outcome_name == POLICY_BLOCK_FAILURE_CODE
+    )
 
 
 def _complete_client_after_deferred_reply(user_id: str, client_id: str) -> bool:
     """Complete only after a closing reply reaches a terminal send outcome."""
-    outcome = _get_reply_send_outcome()
-    if outcome.campaign_suppression_kind == "terminal" or str(outcome.outcome or "").startswith("blocked_daily_"):
+    if not _reply_outcome_allows_client_completion():
         print("⏹️ Closing reply remains unresolved; completion update skipped")
         return False
     return _maybe_mark_client_completed(user_id, client_id)
@@ -7722,7 +7772,7 @@ def process_inbox_message(
                             user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
                             failure_label="alternatives request"
                         )
-                    if response_sent:
+                    if response_sent and _reply_outcome_allows_client_completion():
                         _maybe_mark_client_completed(user_id, client_id)
                 
                 # Handle call request without phone number - send brief response asking for number
@@ -7865,6 +7915,8 @@ Could you please provide your phone number so I can give you a call?"""
                                     terminal_row_number=rownum,
                                 )
                         
+            except RetryableProcessingError:
+                raise
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")
             finally:

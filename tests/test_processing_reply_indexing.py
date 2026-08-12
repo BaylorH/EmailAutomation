@@ -14,7 +14,7 @@ os.environ.setdefault(
 )
 
 from email_automation import email as email_module
-from email_automation import pending_responses, processing, sheet_operations
+from email_automation import pending_responses, processing, reply_reviews, sheet_operations
 from email_automation.campaign_safety import CampaignAutomationDecision
 
 
@@ -171,6 +171,125 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
         })
         cap_env.start()
         self.addCleanup(cap_env.stop)
+
+    def _set_policy_block_outcome(self, *, subject=None, conversation_id=None):
+        self.addCleanup(processing._reset_reply_send_outcome)
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(
+            error=(
+                "Automatic inbox replies are disabled for this user; "
+                "manual review required before auto-reply"
+            ),
+            outcome="blocked_auto_reply_policy",
+            subject=subject,
+            conversation_id=conversation_id,
+        )
+
+    def test_policy_block_projects_review_before_generic_retry(self):
+        self._set_policy_block_outcome(conversation_id="conversation-1")
+        projection = reply_reviews.ReplyReviewProjection(
+            review_id="review-1",
+            notification_id="notification-1",
+            status="created",
+        )
+
+        with patch.object(
+            processing,
+            "create_policy_blocked_reply_review",
+            return_value=projection,
+            create=True,
+        ) as create_review, patch.object(
+            processing, "queue_pending_response"
+        ) as queue_retry, patch.object(
+            processing, "record_sent_unindexed_response"
+        ) as reconcile:
+            outcome = processing._queue_response_retry_or_reconciliation(
+                "uid-1",
+                "thread-1",
+                "message-1",
+                "contact@example.test",
+                "Hi,\n\nThanks.",
+                "client-1",
+                terminal_reason="all_fields_gathered",
+                terminal_row_number=7,
+            )
+
+        self.assertEqual("review_required", outcome)
+        create_review.assert_called_once_with(
+            user_id="uid-1",
+            client_id="client-1",
+            thread_id="thread-1",
+            source_message_id="message-1",
+            recipient="contact@example.test",
+            response_body="Hi,\n\nThanks.",
+            subject=None,
+            conversation_id="conversation-1",
+            terminal_disposition={
+                "status": "completed",
+                "reason": "all_fields_gathered",
+                "rowNumber": 7,
+            },
+        )
+        queue_retry.assert_not_called()
+        reconcile.assert_not_called()
+
+    def test_reply_review_projection_failure_is_retryable_without_queue_fallback(self):
+        self._set_policy_block_outcome()
+
+        with patch.object(
+            processing,
+            "create_policy_blocked_reply_review",
+            side_effect=reply_reviews.ReplyReviewProjectionError("write failed"),
+            create=True,
+        ), patch.object(
+            processing, "queue_pending_response"
+        ) as queue_retry, patch.object(
+            processing, "record_sent_unindexed_response"
+        ) as reconcile:
+            with self.assertRaisesRegex(
+                processing.RetryableProcessingError,
+                "policy-blocked reply review projection failed",
+            ):
+                processing._queue_response_retry_or_reconciliation(
+                    "uid-1",
+                    "thread-1",
+                    "message-1",
+                    "contact@example.test",
+                    "Hi,\n\nThanks.",
+                    "client-1",
+                )
+
+        queue_retry.assert_not_called()
+        reconcile.assert_not_called()
+
+    def test_reply_review_is_handled_for_this_pass_but_not_delivered(self):
+        self._set_policy_block_outcome()
+
+        with patch.object(
+            processing,
+            "create_policy_blocked_reply_review",
+            return_value=reply_reviews.ReplyReviewProjection(
+                "review-1", "notification-1", "created"
+            ),
+            create=True,
+        ), patch.object(
+            processing, "queue_pending_response"
+        ) as queue_retry:
+            handled = processing._handle_auto_response_send_failure(
+                "uid-1",
+                "thread-1",
+                "message-1",
+                "contact@example.test",
+                "Hi,\n\nThanks.",
+                "client-1",
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            "blocked_auto_reply_policy",
+            processing._get_reply_send_outcome().outcome,
+        )
+        queue_retry.assert_not_called()
 
     def test_other_context_terminal_outcome_cannot_suppress_current_retry(self):
         terminal = CampaignAutomationDecision(
