@@ -2,7 +2,10 @@ import os
 import sys
 import types
 import unittest
+from contextlib import redirect_stdout
 from contextvars import copy_context
+from copy import deepcopy
+from io import StringIO
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -180,7 +183,10 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertEqual(1, len(states))
         self.assertEqual("error", states[0]["status"])
         self.assertEqual("pending_response_review_projection", states[0]["operation"])
-        self.assertIn("transaction failed", states[0]["error"])
+        self.assertEqual(
+            "policy-blocked reply review conversion failed",
+            states[0]["error"],
+        )
         campaign.assert_not_called()
         sent_match.assert_not_called()
         continuation.assert_not_called()
@@ -188,6 +194,121 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertFalse(active_doc.reference.deleted)
         self.assertEqual([], active_doc.reference.update_calls)
         self.assertEqual(4, active_doc.to_dict()["attempts"])
+
+    def test_malformed_legacy_attempts_reach_conversion_without_pii_or_source_mutation(self):
+        for attempts in (None, "4", True, -1):
+            with self.subTest(attempts=attempts):
+                data = {
+                    "threadId": "thread-policy-block",
+                    "msgId": "message-policy-block",
+                    "recipient": "private-recipient@example.test",
+                    "responseBody": "private preserved body",
+                    "clientId": "client-1",
+                    "attempts": attempts,
+                    "lastError": reply_reviews.LEGACY_POLICY_BLOCK_ERROR,
+                }
+                active_doc = FakeDoc("thread-policy-block", data)
+                fake_fs = FakeFirestore([active_doc])
+                before = deepcopy(active_doc.to_dict())
+                output = StringIO()
+
+                with redirect_stdout(output), self._mock_clients_module(
+                    fake_fs
+                ), patch.object(
+                    pending_responses,
+                    "convert_legacy_policy_blocked_pending_response",
+                    side_effect=reply_reviews.ReplyReviewProjectionError(
+                        "invalid legacy attempts"
+                    ),
+                ) as convert, patch.object(
+                    pending_responses, "get_client_automation_decision"
+                ) as campaign, patch.object(
+                    pending_responses, "find_matching_sent_message_for_retry"
+                ) as sent_match, patch.object(
+                    pending_responses,
+                    "find_sent_conversation_continuation_for_retry",
+                ) as continuation, patch.object(
+                    processing, "send_reply_in_thread"
+                ) as send:
+                    states = pending_responses.process_pending_responses(
+                        "uid-1", {"Authorization": "Bearer local-test"}
+                    )
+
+                convert.assert_called_once_with(
+                    user_id="uid-1",
+                    pending_response_id="thread-policy-block",
+                )
+                self.assertEqual(
+                    [{
+                        "status": "error",
+                        "operation": "pending_response_review_projection",
+                        "error": "policy-blocked reply review conversion failed",
+                    }],
+                    states,
+                )
+                campaign.assert_not_called()
+                sent_match.assert_not_called()
+                continuation.assert_not_called()
+                send.assert_not_called()
+                self.assertEqual(before, active_doc.to_dict())
+                self.assertFalse(active_doc.reference.deleted)
+                self.assertEqual([], active_doc.reference.update_calls)
+                self.assertNotIn("private-recipient@example.test", output.getvalue())
+                self.assertNotIn("private preserved body", output.getvalue())
+
+    def test_unexpected_legacy_conversion_error_is_local_and_preserves_source(self):
+        data = {
+            "threadId": "thread-policy-block",
+            "msgId": "message-policy-block",
+            "recipient": "private-recipient@example.test",
+            "responseBody": "private preserved body",
+            "clientId": "client-1",
+            "attempts": 1,
+            "lastError": reply_reviews.LEGACY_POLICY_BLOCK_ERROR,
+        }
+        active_doc = FakeDoc("thread-policy-block", data)
+        fake_fs = FakeFirestore([active_doc])
+        before = deepcopy(active_doc.to_dict())
+        output = StringIO()
+
+        with redirect_stdout(output), self._mock_clients_module(
+            fake_fs
+        ), patch.object(
+            pending_responses,
+            "convert_legacy_policy_blocked_pending_response",
+            side_effect=RuntimeError("unexpected converter crash with private data"),
+        ), patch.object(
+            pending_responses, "get_client_automation_decision"
+        ) as campaign, patch.object(
+            pending_responses, "find_matching_sent_message_for_retry"
+        ) as sent_match, patch.object(
+            pending_responses, "find_sent_conversation_continuation_for_retry"
+        ) as continuation, patch.object(
+            processing, "send_reply_in_thread"
+        ) as send:
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer local-test"}
+            )
+
+        self.assertEqual(
+            [{
+                "status": "error",
+                "operation": "pending_response_review_projection",
+                "error": "policy-blocked reply review conversion failed",
+            }],
+            states,
+        )
+        campaign.assert_not_called()
+        sent_match.assert_not_called()
+        continuation.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(before, active_doc.to_dict())
+        self.assertFalse(active_doc.reference.deleted)
+        self.assertEqual([], active_doc.reference.update_calls)
+        self.assertNotIn("private-recipient@example.test", output.getvalue())
+        self.assertNotIn("private preserved body", output.getvalue())
+        self.assertNotIn("unexpected converter crash", output.getvalue())
+
     def test_successful_retry_rechecks_campaign_completion_after_deleting_pending_work(self):
         pending_doc = FakeDoc("thread-final", {
             "threadId": "thread-final",

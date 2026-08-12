@@ -428,7 +428,7 @@ def _queue_response_retry_or_reconciliation(
                 conversation_id=send_outcome.conversation_id,
                 terminal_disposition=terminal_disposition,
             )
-        except ReplyReviewProjectionError as exc:
+        except (ReplyReviewProjectionError, ValueError) as exc:
             raise RetryableProcessingError(
                 "policy-blocked reply review projection failed"
             ) from exc
