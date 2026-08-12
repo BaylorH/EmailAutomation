@@ -57,16 +57,22 @@ def _subscript_key(node: ast.Subscript) -> object:
     return node.slice.value if isinstance(node.slice, ast.Constant) else None
 
 
-def _is_token_metadata_call(node: ast.Call) -> bool:
+def _token_metadata_taint_candidates(
+    node: ast.Call,
+) -> tuple[ast.expr, ...] | None:
     if _qualified_name(node.func) in TOKEN_METADATA_CALLS:
-        return True
-    return bool(
+        if len(node.args) == 1 and not node.keywords:
+            return ()
+        return None
+    if not (
         isinstance(node.func, ast.Attribute)
         and node.func.attr == "get"
         and node.args
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value in TOKEN_METADATA_KEYS
-    )
+    ):
+        return None
+    return (*node.args[1:], *(keyword.value for keyword in node.keywords))
 
 
 def _contains_token_material(node: ast.AST, tainted_names: set[str]) -> bool:
@@ -88,8 +94,12 @@ def _contains_token_material(node: ast.AST, tainted_names: set[str]) -> bool:
             node.value, tainted_names
         ) or _contains_token_material(node.slice, tainted_names)
     if isinstance(node, ast.Call):
-        if _is_token_metadata_call(node):
-            return False
+        metadata_candidates = _token_metadata_taint_candidates(node)
+        if metadata_candidates is not None:
+            return any(
+                _contains_token_material(candidate, tainted_names)
+                for candidate in metadata_candidates
+            )
         if (
             isinstance(node.func, ast.Attribute)
             and node.func.attr == "get"
@@ -131,8 +141,12 @@ def _assigned_names(target: ast.expr) -> set[str]:
 def _assignment_value_is_tainted(value: ast.expr, tainted_names: set[str]) -> bool:
     if not isinstance(value, ast.Call):
         return _contains_token_material(value, tainted_names)
-    if _is_token_metadata_call(value):
-        return False
+    metadata_candidates = _token_metadata_taint_candidates(value)
+    if metadata_candidates is not None:
+        return any(
+            _contains_token_material(candidate, tainted_names)
+            for candidate in metadata_candidates
+        )
 
     qualified_name = _qualified_name(value.func)
     fetches_access_token = bool(
@@ -444,6 +458,33 @@ def test_guard_rejects_access_token_receiver_call_logging(
         f"access_token = get_token()\nprint(access_token.{method_call})\n",
         encoding="utf-8",
     )
+
+    with pytest.raises(AssertionError, match="prints access-token material"):
+        test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        (
+            "access_token = get_token()\n"
+            "result = get_token_result()\n"
+            "print(result.get('expires_in', access_token))\n"
+        ),
+        (
+            "access_token = get_token()\n"
+            "token = access_token\n"
+            "result = get_token_result()\n"
+            "print(result.get('expires_in', token))\n"
+        ),
+    ),
+    ids=("direct-default", "alias-default"),
+)
+def test_guard_rejects_access_token_expiry_default(
+    tmp_path: Path, source: str
+) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(source, encoding="utf-8")
 
     with pytest.raises(AssertionError, match="prints access-token material"):
         test_entrypoint_never_prints_access_token_material(entrypoint)
