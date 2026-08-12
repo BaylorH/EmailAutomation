@@ -17,6 +17,7 @@ LOG_METHODS = frozenset(
 TAINT_PRESERVING_CALLS = frozenset(
     {"str", "repr", "bytes", "bytearray", "format", "dict", "list", "tuple", "set"}
 )
+TAINT_PRESERVING_METHODS = frozenset({"strip"})
 TOKEN_METADATA_CALLS = frozenset({("_expires_in_seconds",)})
 
 
@@ -28,15 +29,27 @@ def _qualified_name(node: ast.expr) -> tuple[str, ...]:
     return ()
 
 
+def _is_logger_receiver(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in {"logger", "logging", "log"}
+    if isinstance(node, ast.Attribute):
+        return node.attr in {"logger", "logging", "log"} or _is_logger_receiver(
+            node.value
+        )
+    if isinstance(node, ast.Call):
+        return _is_logger_receiver(node.func)
+    return False
+
+
 def _is_log_sink(node: ast.expr) -> bool:
     qualified_name = _qualified_name(node)
     if qualified_name in {("print",), ("builtins", "print")}:
         return True
 
     return bool(
-        qualified_name
-        and qualified_name[-1] in LOG_METHODS
-        and any(part in {"logger", "logging", "log"} for part in qualified_name[:-1])
+        isinstance(node, ast.Attribute)
+        and node.attr in LOG_METHODS
+        and _is_logger_receiver(node.value)
     )
 
 
@@ -71,6 +84,12 @@ def _contains_token_material(node: ast.AST, tainted_names: set[str]) -> bool:
             and node.args
             and isinstance(node.args[0], ast.Constant)
             and node.args[0].value == "access_token"
+        ):
+            return True
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in TAINT_PRESERVING_METHODS
+            and _contains_token_material(node.func.value, tainted_names)
         ):
             return True
         return any(
@@ -114,7 +133,12 @@ def _assignment_value_is_tainted(value: ast.expr, tainted_names: set[str]) -> bo
     preserves_arguments = qualified_name in {
         (name,) for name in TAINT_PRESERVING_CALLS
     }
-    return fetches_access_token or (
+    tainted_receiver = bool(
+        isinstance(value.func, ast.Attribute)
+        and value.func.attr in TAINT_PRESERVING_METHODS
+        and _contains_token_material(value.func.value, tainted_names)
+    )
+    return fetches_access_token or tainted_receiver or (
         preserves_arguments and _contains_token_material(value, tainted_names)
     )
 
@@ -183,6 +207,87 @@ def _tainted_names(nodes: list[ast.AST]) -> set[str]:
     return tainted
 
 
+def _assignment_parts(
+    node: ast.AST,
+) -> tuple[list[ast.expr], ast.expr] | None:
+    if isinstance(node, ast.Assign):
+        return node.targets, node.value
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return [node.target], node.value
+    if isinstance(node, ast.NamedExpr):
+        return [node.target], node.value
+    return None
+
+
+def _assigns_name(node: ast.AST, name: str) -> bool:
+    for candidate in ast.walk(node):
+        assignment = _assignment_parts(candidate)
+        if assignment is None:
+            continue
+        targets, _ = assignment
+        names = set().union(*(_assigned_names(target) for target in targets))
+        if name in names:
+            return True
+    return False
+
+
+def _statement_block_containing(
+    statements: list[ast.stmt], target: ast.AST
+) -> tuple[list[ast.stmt], int] | None:
+    for index, statement in enumerate(statements):
+        if not any(candidate is target for candidate in ast.walk(statement)):
+            continue
+
+        for candidate in ast.walk(statement):
+            for _, value in ast.iter_fields(candidate):
+                if not (
+                    isinstance(value, list)
+                    and value
+                    and all(isinstance(item, ast.stmt) for item in value)
+                ):
+                    continue
+                if not any(
+                    nested is target
+                    for item in value
+                    for nested in ast.walk(item)
+                ):
+                    continue
+                nested_block = _statement_block_containing(value, target)
+                if nested_block is not None:
+                    return nested_block
+
+        return statements, index
+    return None
+
+
+def _tainted_names_at_sink(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    nodes: list[ast.AST],
+    sink: ast.Call,
+) -> set[str]:
+    tainted = _tainted_names(nodes)
+    block_match = _statement_block_containing(scope.body, sink)
+    if block_match is None:
+        return tainted
+
+    statements, sink_index = block_match
+    for name in tainted - {"access_token"}:
+        for statement in reversed(statements[:sink_index]):
+            if not _assigns_name(statement, name):
+                continue
+
+            assignment = _assignment_parts(statement)
+            if assignment is not None:
+                targets, value = assignment
+                directly_assigned = set().union(
+                    *(_assigned_names(target) for target in targets)
+                )
+                if name in directly_assigned and isinstance(value, ast.Constant):
+                    tainted.discard(name)
+            break
+    return tainted
+
+
 @pytest.mark.parametrize("entrypoint", TOKEN_LOG_SURFACES, ids=lambda path: path.name)
 def test_entrypoint_never_prints_access_token_material(entrypoint: Path) -> None:
     """Neither the active worker nor the legacy runner may log token bytes."""
@@ -197,11 +302,11 @@ def test_entrypoint_never_prints_access_token_material(entrypoint: Path) -> None
 
     for scope in scopes:
         nodes = _nodes_in_scope(scope)
-        tainted_names = _tainted_names(nodes)
         for node in nodes:
             if not isinstance(node, ast.Call) or not _is_log_sink(node.func):
                 continue
 
+            tainted_names = _tainted_names_at_sink(scope, nodes, node)
             arguments = (*node.args, *(keyword.value for keyword in node.keywords))
             rendered = ast.get_source_segment(source, node) or ""
             assert not any(
@@ -221,8 +326,21 @@ def test_entrypoint_never_prints_access_token_material(entrypoint: Path) -> None
         ),
         "import builtins\naccess_token = get_token()\nbuiltins.print(access_token)\n",
         "access_token = get_token()\nlogger.info(access_token)\n",
+        "access_token = get_token()\nprint(access_token.strip())\n",
+        (
+            "import logging\n"
+            "access_token = get_token()\n"
+            "logging.getLogger(__name__).info(access_token)\n"
+        ),
     ),
-    ids=("alias", "mapping", "builtins-print", "logger"),
+    ids=(
+        "alias",
+        "mapping",
+        "builtins-print",
+        "logger",
+        "call-receiver",
+        "chained-logger",
+    ),
 )
 def test_guard_rejects_indirect_access_token_logging(
     tmp_path: Path, source: str
@@ -237,6 +355,19 @@ def test_guard_rejects_indirect_access_token_logging(
 def test_guard_allows_harmless_access_token_identifier_text(tmp_path: Path) -> None:
     entrypoint = tmp_path / "sample.py"
     entrypoint.write_text('print("access_token")\n', encoding="utf-8")
+
+    test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+def test_guard_allows_redacted_alias_overwrite(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(
+        "access_token = get_token()\n"
+        "token = access_token\n"
+        'token = "[redacted]"\n'
+        "print(token)\n",
+        encoding="utf-8",
+    )
 
     test_entrypoint_never_prints_access_token_material(entrypoint)
 
