@@ -225,17 +225,16 @@ def _build_notification_document(
 def _existing_review_matches(
     current: Mapping[str, Any],
     *,
-    review_id: str,
-    notification_id: str,
-    intent_hash: str,
+    expected: Mapping[str, Any],
 ) -> bool:
-    return (
-        current.get("recordType") == REPLY_REVIEW_RECORD_TYPE
-        and current.get("schemaVersion") == REPLY_REVIEW_SCHEMA_VERSION
-        and current.get("reviewId") == review_id
-        and current.get("failureCode") == POLICY_BLOCK_FAILURE_CODE
-        and current.get("intentHash") == intent_hash
-        and current.get("notificationId") == notification_id
+    if set(current) != set(expected):
+        return False
+    if current.get("createdAt") is None or current.get("updatedAt") is None:
+        return False
+    return all(
+        current.get(field) == expected.get(field)
+        for field in expected
+        if field not in {"createdAt", "updatedAt"}
     )
 
 
@@ -327,9 +326,7 @@ def create_policy_blocked_reply_review(
                 )
             if not _existing_review_matches(
                 review_snapshot.to_dict() or {},
-                review_id=review_id,
-                notification_id=notification_id,
-                intent_hash=intent_hash,
+                expected=review_document,
             ):
                 raise ReplyReviewConflict("reply review identity has a different intent")
             if not _existing_notification_matches(
