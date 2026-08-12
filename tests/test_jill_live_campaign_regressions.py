@@ -4514,6 +4514,134 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         )
         self.assertEqual([], current)
 
+    def test_competing_multi_property_brochure_keeps_only_canonical_review_event(self):
+        brochure = {
+            "name": "Fictional portfolio availability.pdf",
+            "text": (
+                "100 Main St is the target. "
+                "200 Oak Ave has 9,500 SF available."
+            ),
+        }
+        canonical_review = {
+            "type": "needs_user_input",
+            "reason": "multi_property_attachment",
+            "question": (
+                "The broker offered multiple properties or suites in an attachment, "
+                "but the details could not be bound safely to one row."
+            ),
+        }
+        event_matrix = {
+            "unclear": [{
+                "type": "needs_user_input",
+                "reason": "unclear",
+                "question": "Please review the packet.",
+            }],
+            "call_requested": [{
+                "type": "call_requested",
+                "question": "Please call about an unrelated issue.",
+            }],
+            "property_unavailable": [{
+                "type": "property_unavailable",
+                "reason": "off_market",
+            }],
+            "close_conversation": [{
+                "type": "close_conversation",
+                "reason": "all_info_gathered",
+            }],
+            "all_competing_events_and_duplicate_review": [
+                {
+                    "type": "call_requested",
+                    "question": "Please call about an unrelated issue.",
+                },
+                {
+                    "type": "needs_user_input",
+                    "reason": "unclear",
+                    "question": "Please review the packet.",
+                },
+                {
+                    "type": "property_unavailable",
+                    "reason": "off_market",
+                },
+                {
+                    "type": "close_conversation",
+                    "reason": "all_info_gathered",
+                },
+                {
+                    "type": "needs_user_input",
+                    "reason": "multi_property_attachment",
+                    "question": "Which property should receive the attachment facts?",
+                },
+                {
+                    "type": "needs_user_input",
+                    "reason": "multi_property_attachment",
+                    "question": "Duplicate attachment review.",
+                },
+            ],
+        }
+
+        for name, events in event_matrix.items():
+            with self.subTest(name=name):
+                proposal = {
+                    "updates": [{"column": "Total SF", "value": "9500"}],
+                    "events": events,
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation("The attached packet covers several options."),
+                    "100 Main St, Phoenix",
+                    [brochure],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertEqual([canonical_review], result["events"])
+                self.assertIsNone(result["response_email"])
+
+    def test_validated_contact_optout_dominates_competing_attachment_review(self):
+        first_optout = {
+            "type": "contact_optout",
+            "reason": "unsubscribe",
+        }
+        proposal = {
+            "updates": [{"column": "Total SF", "value": "9500"}],
+            "events": [
+                first_optout,
+                {"type": "contact_optout", "reason": "do_not_contact"},
+                {"type": "call_requested", "question": "Please call."},
+            ],
+            "response_email": "Thanks.",
+        }
+        conversation = _conversation(
+            "Please unsubscribe me and do not contact me again. "
+            "The attached packet covers several options."
+        )
+        brochure = {
+            "name": "Fictional portfolio availability.pdf",
+            "text": (
+                "100 Main St is the target. "
+                "200 Oak Ave has 9,500 SF available."
+            ),
+        }
+
+        proposal = ai_processing._augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+            target_anchor="100 Main St, Phoenix",
+        )
+        self.assertEqual(first_optout, proposal["events"][0])
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            conversation,
+            "100 Main St, Phoenix",
+            [brochure],
+        )
+
+        self.assertEqual([], result["updates"])
+        self.assertEqual([first_optout], result["events"])
+        self.assertIsNone(result["response_email"])
+
     def test_replacement_only_reply_cannot_update_original_row(self):
         proposal = {
             "updates": [

@@ -310,8 +310,8 @@ class MixedPdfAssetQuarantineTests(unittest.TestCase):
             ],
             "events": [{
                 "type": "needs_user_input",
-                "reason": "multi_property_attachment",
-                "question": "Which property should receive the attachment facts?",
+                "reason": "unclear",
+                "question": "Please review the attachment.",
             }],
             "response_email": None,
             "notes": "",

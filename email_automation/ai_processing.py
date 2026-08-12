@@ -4462,23 +4462,21 @@ def _suppress_competing_attachment_updates(
             for source in target_evidence_sources
         )
     ]
-    proposal["events"] = [
+    # Mixed/competing attachment evidence makes every model event untrusted for
+    # this row except an already-validated contact opt-out. Never-recontact wins;
+    # otherwise emit one canonical operator handoff and no competing side effect.
+    contact_optout = next((
         event for event in (proposal.get("events") or [])
-        if (event or {}).get("type") != "tour_requested"
-    ]
-    if not any(
-        (event or {}).get("type") == "needs_user_input"
-        and (event or {}).get("reason") == "multi_property_attachment"
-        for event in proposal["events"]
-    ):
-        proposal["events"].append({
-            "type": "needs_user_input",
-            "reason": "multi_property_attachment",
-            "question": (
-                "The broker offered multiple properties or suites in an attachment, "
-                "but the details could not be bound safely to one row."
-            ),
-        })
+        if (event or {}).get("type") == "contact_optout"
+    ), None)
+    proposal["events"] = [contact_optout or {
+        "type": "needs_user_input",
+        "reason": "multi_property_attachment",
+        "question": (
+            "The broker offered multiple properties or suites in an attachment, "
+            "but the details could not be bound safely to one row."
+        ),
+    }]
     proposal["response_email"] = None
     return proposal
 
