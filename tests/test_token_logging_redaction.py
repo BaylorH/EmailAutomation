@@ -237,16 +237,63 @@ def _assignment_parts(
     return None
 
 
-def _assigns_name(node: ast.AST, name: str) -> bool:
+def _assignment_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
     for candidate in ast.walk(node):
         assignment = _assignment_parts(candidate)
         if assignment is None:
             continue
         targets, _ = assignment
-        names = set().union(*(_assigned_names(target) for target in targets))
-        if name in names:
-            return True
-    return False
+        for target in targets:
+            names.update(_assigned_names(target))
+    return names
+
+
+def _simple_target_names(target: ast.expr) -> set[str] | None:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for item in target.elts:
+            item_names = _simple_target_names(item)
+            if item_names is None:
+                return None
+            names.update(item_names)
+        return names
+    return None
+
+
+def _direct_assignment(
+    statement: ast.stmt,
+) -> tuple[list[ast.expr], ast.expr, bool] | None:
+    assignment = _assignment_parts(statement)
+    if assignment is not None:
+        targets, value = assignment
+        return targets, value, isinstance(statement, ast.AugAssign)
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.NamedExpr):
+        targets, value = _assignment_parts(statement.value) or ([], statement.value)
+        return targets, value, False
+    return None
+
+
+def _token_container_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for candidate in ast.walk(node):
+        if (
+            isinstance(candidate, ast.Subscript)
+            and _subscript_key(candidate) == "access_token"
+        ):
+            names.update(_assigned_names(candidate.value))
+        elif (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Attribute)
+            and candidate.func.attr == "get"
+            and candidate.args
+            and isinstance(candidate.args[0], ast.Constant)
+            and candidate.args[0].value == "access_token"
+        ):
+            names.update(_assigned_names(candidate.func.value))
+    return names
 
 
 def _statement_block_containing(
@@ -283,29 +330,44 @@ def _tainted_names_at_sink(
     nodes: list[ast.AST],
     sink: ast.Call,
 ) -> set[str]:
-    tainted = _tainted_names(nodes)
+    potentially_tainted = _tainted_names(nodes)
+    tainted = set(potentially_tainted)
     block_match = _statement_block_containing(scope.body, sink)
     if block_match is None:
         return tainted
 
     statements, sink_index = block_match
-    for name in tainted - {"access_token"}:
-        for statement in reversed(statements[:sink_index]):
-            if not _assigns_name(statement, name):
-                continue
+    for statement in statements[:sink_index]:
+        assignment = _direct_assignment(statement)
+        if assignment is None:
+            tainted.update(_assignment_names(statement) & potentially_tainted)
+            tainted.update(_token_container_names(statement))
+            continue
 
-            if isinstance(statement, ast.AugAssign):
+        targets, value, is_augmented = assignment
+        direct_names: set[str] = set()
+        for target in targets:
+            target_names = _simple_target_names(target)
+            if target_names is None:
+                tainted.update(_assignment_names(statement) & potentially_tainted)
                 break
-
-            assignment = _assignment_parts(statement)
-            if assignment is not None:
-                targets, value = assignment
-                directly_assigned = set().union(
-                    *(_assigned_names(target) for target in targets)
-                )
-                if name in directly_assigned and isinstance(value, ast.Constant):
+            direct_names.update(target_names)
+        else:
+            value_is_tainted = _assignment_value_is_tainted(value, tainted)
+            for name in direct_names:
+                if name == "access_token" or (
+                    is_augmented and name in tainted
+                ) or value_is_tainted:
+                    tainted.add(name)
+                else:
                     tainted.discard(name)
-            break
+
+            nested_names = (
+                _assignment_names(statement) - direct_names
+            ) & potentially_tainted
+            tainted.update(nested_names)
+
+        tainted.update(_token_container_names(statement))
     return tainted
 
 
@@ -434,6 +496,20 @@ def test_guard_allows_redacted_alias_overwrite(tmp_path: Path) -> None:
         "access_token = get_token()\n"
         "token = access_token\n"
         'token = "[redacted]"\n'
+        "print(token)\n",
+        encoding="utf-8",
+    )
+
+    test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+def test_guard_allows_augassign_after_redacted_alias_overwrite(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(
+        "access_token = get_token()\n"
+        "token = access_token\n"
+        'token = "[redacted]"\n'
+        'token += " suffix"\n'
         "print(token)\n",
         encoding="utf-8",
     )
