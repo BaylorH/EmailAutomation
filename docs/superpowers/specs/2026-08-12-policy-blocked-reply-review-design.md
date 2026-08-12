@@ -2,6 +2,16 @@
 
 Status: approved for implementation on 2026-08-12
 
+## Cross-repository release and rollback invariant
+
+Backend RC status: non-deployable on its own.
+
+The first prerequisite is Firestore rules that make processingFailures owner-readable and server-write-only and exclude that collection from every generic or owner-write catchall. The second prerequisite is the projection-only UI guard and passive review card. Operators must deploy and certify both prerequisites before the backend producer.
+
+Only after both prerequisite surfaces are certified may operators deploy the backend producer with no traffic before promotion. Certification must prove the deployed rules, the deployed passive UI, and the absence of a composer or mutation control for projection-only rows.
+
+For rollback, roll back or disable the backend producer first. Operators must retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain. Operators must never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row.
+
 ## Outcome
 
 When an otherwise valid automatic inbox reply is stopped by the existing
@@ -183,6 +193,45 @@ Missing identities, missing client/thread documents, an unexpected preexisting
 notification, or an intent conflict fail closed. Projection failure never
 falls through to `pendingResponses`. It raises a retryable processing error so
 the inbound item remains visible without provider or outbox effects.
+
+### Projection failure recovery
+
+The inner projection branch performs no failure write. It raises one typed
+error carrying a closed, bounded intent to the outer inbox boundary. That
+boundary writes exactly one `processingFailures` row under the canonical
+`threadId__processedKey` identity, where `processedKey` is the RFC message ID
+when present and otherwise the Graph message ID. The recovery packet binds the
+canonical key, Graph message ID, RFC message ID, client, thread, recipient,
+body, nullable subject/conversation, and validated terminal disposition.
+
+An ordinary inbox scan reads that exact failure document before batching. A
+valid pending packet, an unreadable lookup, or a projection-shaped invalid
+packet blocks ordinary pipeline replay, so Sheet/event work cannot be repeated.
+The dedicated processing-failure worker honors campaign terminal suppression,
+validates the packet's exact keys, version, identity, types, and bounds, then
+calls only the idempotent review projection. It does not fetch Graph, rerun the
+inbox pipeline, write an outbox/pending response, or repeat Sheet/event work.
+On success it writes deduplicated processed markers for the canonical, Graph,
+and RFC identities before deleting the failure row. A projection, marker, or
+delete failure leaves the bounded recovery visible and retryable.
+
+Campaign suppression never replaces a reply-review recovery status. Temporary
+suppression preserves the pending status and retryability for a later direct
+projection attempt. Terminal suppression sets `retryable=false` while retaining
+the pending or manual status and recording only separate
+`automationSuppressed*` metadata.
+
+If the original draft intent itself is invalid or exceeds a closed bound, the
+outer boundary writes a non-retryable identity-only manual-recovery envelope.
+It contains only the stable recovery kind/version/failure code plus exact
+client, thread, canonical, Graph, and RFC message IDs; it never persists or
+logs the invalid recipient, body, subject, or terminal data. Ordinary scans,
+the retry worker, and stale-failure reconciliation all leave this packet inert
+and visible for manual remediation instead of replaying prior side effects.
+
+This recovery packet becomes authoritative only after the server-write-only
+Firestore prerequisite above is deployed and certified. Backend code alone
+must never be deployed while owner clients can rewrite `processingFailures`.
 
 ### Processing branch
 

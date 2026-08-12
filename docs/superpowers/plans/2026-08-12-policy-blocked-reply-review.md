@@ -12,6 +12,18 @@
 
 ---
 
+## Cross-repository release and rollback invariant
+
+Backend RC status: non-deployable on its own.
+
+The first prerequisite is Firestore rules that make processingFailures owner-readable and server-write-only and exclude that collection from every generic or owner-write catchall. The second prerequisite is the projection-only UI guard and passive review card. Operators must deploy and certify both prerequisites before the backend producer.
+
+Only after both prerequisite surfaces are certified may operators deploy the backend producer with no traffic before promotion. Certification must prove the deployed rules, the deployed passive UI, and the absence of a composer or mutation control for projection-only rows.
+
+For rollback, roll back or disable the backend producer first. Operators must retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain. Operators must never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row.
+
+Campaign suppression never replaces a reply-review recovery status. Temporary suppression preserves pending retryability for direct recovery after automation resumes; terminal suppression sets `retryable=false` while retaining the pending or manual status and writing only separate `automationSuppressed*` metadata.
+
 ## File structure
 
 ### Backend repository

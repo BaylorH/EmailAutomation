@@ -11,6 +11,20 @@ GRADEBOOK_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-gradebook.json
 OUTBOUND_INVENTORY_PATH = (
     REPO_ROOT / "docs" / "release-safety" / "outbound-send-surface-inventory.json"
 )
+REPLY_REVIEW_DESIGN_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-12-policy-blocked-reply-review-design.md"
+)
+REPLY_REVIEW_PLAN_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-12-policy-blocked-reply-review.md"
+)
 
 REQUIRED_FEATURE_IDS = {
     "core.upload_mapping",
@@ -722,6 +736,27 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
                         " ".join(scenario["negativeControls"]).lower(),
                         "Every send-risk feature must include a wrong-recipient negative control.",
                     )
+
+
+class PolicyBlockedReplyReviewReleaseContractTests(unittest.TestCase):
+    def test_backend_docs_pin_cross_repo_deploy_and_rollback_invariants(self):
+        required_contract = (
+            "Backend RC status: non-deployable on its own.",
+            "processingFailures owner-readable and server-write-only",
+            "projection-only UI guard and passive review card",
+            "deploy and certify both prerequisites before the backend producer",
+            "deploy the backend producer with no traffic before promotion",
+            "roll back or disable the backend producer first",
+            "retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain",
+            "never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row",
+            "Campaign suppression never replaces a reply-review recovery status",
+        )
+
+        for path in (REPLY_REVIEW_DESIGN_PATH, REPLY_REVIEW_PLAN_PATH):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path):
+                for statement in required_contract:
+                    self.assertIn(statement, text)
 
 
 if __name__ == "__main__":
