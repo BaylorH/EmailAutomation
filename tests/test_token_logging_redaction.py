@@ -310,6 +310,57 @@ def _token_container_names(node: ast.AST) -> set[str]:
     return names
 
 
+def _forget_name_alias(
+    name: str, aliases: dict[str, frozenset[str]]
+) -> None:
+    previous = aliases.pop(name, frozenset())
+    remaining = previous - {name}
+    for alias in remaining:
+        if len(remaining) > 1:
+            aliases[alias] = frozenset(remaining)
+        else:
+            aliases.pop(alias, None)
+
+
+def _union_name_aliases(
+    left: str, right: str, aliases: dict[str, frozenset[str]]
+) -> None:
+    equivalent = aliases.get(left, frozenset({left})) | aliases.get(
+        right, frozenset({right})
+    )
+    for name in equivalent:
+        aliases[name] = equivalent
+
+
+def _update_name_aliases(
+    targets: list[ast.expr],
+    value: ast.expr,
+    is_augmented: bool,
+    aliases: dict[str, frozenset[str]],
+) -> None:
+    if is_augmented or not all(isinstance(target, ast.Name) for target in targets):
+        return
+
+    target_names = [target.id for target in targets if isinstance(target, ast.Name)]
+    for name in target_names:
+        if not (isinstance(value, ast.Name) and name == value.id):
+            _forget_name_alias(name, aliases)
+
+    if isinstance(value, ast.Name):
+        for name in target_names:
+            _union_name_aliases(name, value.id, aliases)
+
+
+def _equivalent_name_aliases(
+    names: set[str], aliases: dict[str, frozenset[str]]
+) -> set[str]:
+    if not names:
+        return set()
+    return set().union(
+        *(aliases.get(name, frozenset({name})) for name in names)
+    )
+
+
 def _statement_block_containing(
     statements: list[ast.stmt], target: ast.AST
 ) -> tuple[list[ast.stmt], int] | None:
@@ -351,11 +402,15 @@ def _tainted_names_at_sink(
         return tainted
 
     statements, sink_index = block_match
+    aliases: dict[str, frozenset[str]] = {}
     for statement in statements[:sink_index]:
+        token_container_names = _equivalent_name_aliases(
+            _token_container_names(statement), aliases
+        )
         assignment = _direct_assignment(statement)
         if assignment is None:
             tainted.update(_assignment_names(statement) & potentially_tainted)
-            tainted.update(_token_container_names(statement))
+            tainted.update(token_container_names)
             continue
 
         targets, value, is_augmented = assignment
@@ -381,7 +436,8 @@ def _tainted_names_at_sink(
             ) & potentially_tainted
             tainted.update(nested_names)
 
-        tainted.update(_token_container_names(statement))
+        _update_name_aliases(targets, value, is_augmented, aliases)
+        tainted.update(token_container_names)
     return tainted
 
 
@@ -447,6 +503,35 @@ def test_guard_rejects_indirect_access_token_logging(
 
     with pytest.raises(AssertionError, match="prints access-token material"):
         test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+def test_guard_rejects_mapping_logging_through_alias(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(
+        "result = get_token_result()\n"
+        "alias = result\n"
+        "access_token = alias['access_token']\n"
+        "print(result)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="prints access-token material"):
+        test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+def test_guard_allows_unrelated_mapping_alias(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(
+        "result = get_token_result()\n"
+        "alias = result\n"
+        "public_result = get_public_result()\n"
+        "public_alias = public_result\n"
+        "access_token = alias['access_token']\n"
+        "print(public_result)\n",
+        encoding="utf-8",
+    )
+
+    test_entrypoint_never_prints_access_token_material(entrypoint)
 
 
 @pytest.mark.parametrize("method_call", ("encode()", "upper()", "casefold()"))
