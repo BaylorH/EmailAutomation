@@ -423,6 +423,31 @@ class ReplyReviewProjectionTests(unittest.TestCase):
         self.assertEqual(before, firestore.store)
         self.assertEqual(write_count, len(firestore.committed_operations))
 
+    def test_tampered_existing_review_is_not_accepted_as_exact_replay(self):
+        tampered_values = (
+            ("responseBody", "tampered body"),
+            ("recipient", "different@example.test"),
+            ("status", "resolved"),
+            ("automaticRetryAllowed", True),
+            ("createdAt", None),
+        )
+        for field, value in tampered_values:
+            with self.subTest(field=field):
+                firestore = self._firestore()
+                self._create(firestore)
+                if field == "createdAt":
+                    firestore.store[self.review_path].pop(field)
+                else:
+                    firestore.store[self.review_path][field] = value
+                before = deepcopy(firestore.store)
+                write_count = len(firestore.committed_operations)
+
+                with self.assertRaises(reply_reviews.ReplyReviewConflict):
+                    self._create(firestore)
+
+                self.assertEqual(before, firestore.store)
+                self.assertEqual(write_count, len(firestore.committed_operations))
+
     def test_missing_client_fails_closed_without_writes(self):
         firestore = self._firestore(client=False)
         before = deepcopy(firestore.store)
