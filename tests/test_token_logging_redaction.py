@@ -294,6 +294,9 @@ def _tainted_names_at_sink(
             if not _assigns_name(statement, name):
                 continue
 
+            if isinstance(statement, ast.AugAssign):
+                break
+
             assignment = _assignment_parts(statement)
             if assignment is not None:
                 targets, value = assignment
@@ -391,6 +394,25 @@ def test_guard_rejects_augassign_access_token_retaint(tmp_path: Path) -> None:
         "token = access_token\n"
         'token = "[redacted]"\n'
         "token += access_token\n"
+        "print(token)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="prints access-token material"):
+        test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+@pytest.mark.parametrize(
+    "augmented_assignment", ('token += "suffix"', "token *= 2")
+)
+def test_guard_preserves_token_taint_through_augassign(
+    tmp_path: Path, augmented_assignment: str
+) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(
+        "access_token = get_token()\n"
+        "token = access_token\n"
+        f"{augmented_assignment}\n"
         "print(token)\n",
         encoding="utf-8",
     )
