@@ -399,6 +399,35 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
         self.assertEqual("sends_email_autonomous", feature.get("sendRisk"))
         self.assertTrue(feature.get("productionGate", {}).get("requiredBeforePush"))
 
+    def test_policy_review_projection_ownership_and_writes_are_registered(self):
+        registry = _read_json(REGISTRY_PATH)
+        features = {feature.get("id"): feature for feature in registry.get("features", [])}
+        feature = features.get("core.inbox_auto_reply")
+
+        self.assertIsNotNone(feature)
+        self.assertIn(
+            "email_automation/reply_reviews.py",
+            feature.get("ownerModules", {}).get("backend", []),
+        )
+        self.assertTrue({
+            "users/{uid}/deadLetterQueue",
+            "users/{uid}/clients/{clientId}",
+            "users/{uid}/clients/{clientId}/notifications",
+            "users/{uid}/threads/{threadId}",
+        }.issubset(set(feature.get("dataWrites", []))))
+        self.assertNotIn(
+            "users/{uid}/clients/{clientId}/threads",
+            feature.get("dataWrites", []),
+        )
+        self.assertIn(
+            "Policy-blocked reply review card",
+            feature.get("uiSurfaces", []),
+        )
+        self.assertIn(
+            "non_allowlisted_auto_reply_review_projection",
+            feature.get("testFixtures", []),
+        )
+
     def test_current_scheduler_scope_is_prod_required(self):
         registry = _read_json(REGISTRY_PATH)
         features = {feature.get("id"): feature for feature in registry.get("features", [])}
