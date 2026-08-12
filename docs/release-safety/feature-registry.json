@@ -252,16 +252,16 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/processing.py", "email_automation/pending_responses.py", "email_automation/outbound_safety.py"],
+        "backend": ["email_automation/processing.py", "email_automation/pending_responses.py", "email_automation/reply_reviews.py", "email_automation/outbound_safety.py"],
         "frontend": ["src/components/ConversationsPanel.jsx", "src/components/HealthWidget.jsx"],
         "functions": [],
         "firestoreRules": []
       },
       "dependencies": ["core.inbox_matching", "core.event_classifier", "core.reply_all_cc", "core.signature_identity"],
       "sendRisk": "sends_email_autonomous",
-      "dataWrites": ["users/{uid}/pendingResponses", "users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/clients/{clientId}/threads"],
+      "dataWrites": ["users/{uid}/pendingResponses", "users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/deadLetterQueue", "users/{uid}/clients/{clientId}/notifications", "users/{uid}/clients/{clientId}/threads"],
       "promptContracts": ["core_reply_body_policy", "no_tour_scheduling_auto_reply", "placeholder_blocking"],
-      "uiSurfaces": ["Conversation panel", "Health widget", "Action audit"],
+      "uiSurfaces": ["Conversation panel", "Policy-blocked reply review card", "Health widget", "Action audit"],
       "testFixtures": [
         "happy_path_auto_closing_reply",
         "terminal_state_no_auto_reply",
@@ -270,7 +270,8 @@
         "non_allowlisted_auto_reply_blocked",
         "manual_continuation_sent_suppresses_retry",
         "duplicate_retry_suppressed",
-        "operator_visible_auto_reply_failure"
+        "operator_visible_auto_reply_failure",
+        "non_allowlisted_auto_reply_review_projection"
       ],
       "manualScreenshotRubrics": ["auto_reply_failure_visible", "thread_state_matches_dashboard"],
       "codeRabbitChecks": ["Outbound safety chokepoint", "AI contract drift", "Recovery and privacy boundary"],
@@ -462,7 +463,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py"],
+        "backend": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py", "email_automation/recovery_payload.py"],
         "frontend": ["src/components/EmailSchedulerButton.jsx", "src/components/HealthWidget.jsx"],
         "functions": [],
         "firestoreRules": []
@@ -523,7 +524,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["main.py", "app.py", "email_automation/scheduler_scope.py", "email_automation/scheduler_lease.py", "email_automation/clients.py"],
+        "backend": ["main.py", "app.py", "email_automation/scheduler_scope.py", "email_automation/scheduler_lease.py", "email_automation/clients.py", "email_automation/campaign_capabilities.py"],
         "frontend": ["src/components/HealthWidget.jsx"],
         "functions": [],
         "firestoreRules": [],
