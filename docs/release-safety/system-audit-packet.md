@@ -109,9 +109,13 @@ not override the current gate decisions.
 The current recorded gate boundary is:
 
 - `login_view = go`: users may sign in and view the product.
-- `supervised_campaign_use = go`: permit only the bounded one-row, monitored,
-  follow-ups-off use described by the current readiness view.
-- `autonomous_campaign_use = hold`: do not permit autonomous campaign use.
+- `supervised_campaign_use = go`: permit only one deliberately admitted,
+  continuously monitored, one-row, one-property existing campaign for one
+  user at a time, with follow-ups off; controls remain Closed/Closed and the
+  client remains paused until admission. This does not authorize a new
+  campaign launch.
+- `autonomous_campaign_use = hold`: do not permit autonomous campaign use;
+  autonomous follow-ups remain the sole named readiness blocker.
 
 Historical language in this packet is not a blanket hold; use it as the safety
 and test contract within the current capability boundary.

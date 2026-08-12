@@ -2,62 +2,60 @@
 
 # Current user readiness
 
-As of `2026-08-11T17:28:58Z`.
+As of `2026-08-12T04:05:30Z`.
 
 `READY FOR CANARY` means one monitored canary under the listed guardrails; it is not a broad production pass.
 
 | Capability | Decision | Scope |
 | --- | --- | --- |
 | Login / view | GO | Returning users may sign in and inspect existing state. |
-| Supervised campaign use | GO | One continuously monitored campaign row at a time, with follow-ups off. |
+| Supervised campaign use | GO | One deliberately admitted, continuously monitored, one-row, one-property existing campaign for one user at a time, with follow-ups off. |
 | Autonomous campaign use | HOLD | Unattended campaigns, autonomous follow-ups, and broader complex inputs. |
 
 ## Login / view — GO
 
 - Scope: Returning users may sign in and inspect existing state.
-- Decision as of: `2026-08-11T01:52:18Z`
+- Decision as of: `2026-08-12T04:05:30Z`
 - Invalidated by: `backend_release_change`, `production_revision_change`, `runtime_allowlist_change`, `campaign_control_change`, `new_operational_residue`, `evidence_expiry`
 - Allowed: `login`, `view_existing_state`
 - Forbidden: `campaign_launch`, `send`
 - Guardrails: Inspection does not authorize campaign activity.
 - Blocking quality items: None
 - Evidence:
-  - `returning-workspace-containment-readback` — production_readback / pass / current; scenarios None; observed 2026-08-11T01:52:18Z (15h 36m old); expires 2026-08-12T01:52:18Z.
+  - `returning-workspace-containment-readback` — production_readback / pass / current; scenarios None; observed 2026-08-12T04:05:30Z (0m old); expires 2026-08-13T04:05:30Z.
 - Next action: None
 - Rollback: Disable returning-user access if the containment readback regresses.
 
 ## Supervised campaign use — GO
 
-- Scope: One continuously monitored campaign row at a time, with follow-ups off.
-- Decision as of: `2026-08-11T17:28:58Z`
+- Scope: One deliberately admitted, continuously monitored, one-row, one-property existing campaign for one user at a time, with follow-ups off.
+- Decision as of: `2026-08-12T04:05:30Z`
 - Invalidated by: `backend_release_change`, `production_revision_change`, `runtime_allowlist_change`, `campaign_control_change`, `queue_or_send_cap_change`, `new_operational_residue`, `evidence_expiry`
-- Allowed: `one_row_monitored_campaign`
-- Forbidden: `autonomous_followups`, `complex_copied_party_threads`, `multirow_campaign`, `unattended_use`
-- Guardrails: Keep follow-ups off.; Use one row only.; Continuously observe launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue.
+- Allowed: `one_existing_row_monitored_campaign`
+- Forbidden: `autonomous_followups`, `broad_campaign_creation`, `cross_tenant_use`, `multirow_campaign`, `new_campaign_launch`, `simultaneous_campaigns`, `uncertain_send_recovery`, `unattended_recovery`, `unattended_use`
+- Guardrails: Keep follow-ups off.; Controls stay Closed/Closed and the exact client stays paused until admission.; Admit only one already-existing row and one property for one user and one campaign at a time.; Continuously observe reply handling, extraction, same-row update, queue drain, counters, and scoped residue.
 - Blocking quality items: None
 - Evidence:
-  - `returning-workspace-containment-readback` — production_readback / pass / current; scenarios None; observed 2026-08-11T01:52:18Z (15h 36m old); expires 2026-08-12T01:52:18Z.
-  - `m27-ten-row-launch-integrity-live` — live_production / pass / current; scenarios `launch_with_variable_mapping`; observed 2026-08-11T00:29:47Z (16h 59m old); no fixed expiry.
-  - `m27-simple-extraction-close-live` — live_production / pass / current; scenarios `broker_available_full_specs`; observed 2026-08-11T01:51:00Z (15h 37m old); no fixed expiry.
-  - `m27-unavailable-terminalization-live` — live_production / pass / current; scenarios `broker_property_unavailable`; observed 2026-08-11T01:51:00Z (15h 37m old); no fixed expiry.
-  - `m27-returning-user-canary-live` — live_production / pass / current; scenarios `broker_available_full_specs`, `broker_available_partial_specs`; observed 2026-08-11T17:28:58Z (0m old); no fixed expiry.
+  - `returning-workspace-containment-readback` — production_readback / pass / current; scenarios None; observed 2026-08-12T04:05:30Z (0m old); expires 2026-08-13T04:05:30Z.
+  - `finish-line-reply-all-cc-carry-forward` — source_review / pass / current; scenarios `reply_all_cc_context`; observed 2026-08-12T04:05:30Z (0m old); no fixed expiry.
+  - `finish-line-ambiguous-pdf-live` — live_production / pass / current; scenarios `broker_attachment_or_link_only`, `broker_available_partial_specs`; observed 2026-08-12T04:05:30Z (0m old); no fixed expiry.
+  - `finish-line-long-multiturn-live` — live_production / pass / current; scenarios `broker_available_partial_specs`, `dashboard_action_resolution`, `manual_user_continuation`; observed 2026-08-12T04:05:30Z (0m old); no fixed expiry.
 - Next action: None
 - Rollback: Pause the campaign immediately and preserve scoped evidence if any guardrail fails.
 
 ## Autonomous campaign use — HOLD
 
 - Scope: Unattended campaigns, autonomous follow-ups, and broader complex inputs.
-- Decision as of: `2026-08-11T17:28:58Z`
+- Decision as of: `2026-08-12T04:05:30Z`
 - Invalidated by: `backend_release_change`, `production_revision_change`, `runtime_allowlist_change`, `campaign_control_change`, `queue_or_send_cap_change`, `new_failure_or_regression`
 - Allowed: None
 - Forbidden: `autonomous_followups`, `broad_user_rollout`, `complex_copied_party_threads`, `ambiguous_multi_suite_documents`, `unattended_campaigns`
 - Guardrails: Keep autonomous execution and follow-ups disabled.
-- Blocking quality items: `autonomous-followups-current-live-gap`, `reply-all-cc-multiparty-live-gap`, `pdf-multi-suite-ambiguity`, `hard-repeat-ask-rejection-gap`, `long-multiturn-ordering-gap`
+- Blocking quality items: `autonomous-followups-current-live-gap`
 - Evidence:
-  - `returning-workspace-containment-readback` — production_readback / pass / current; scenarios None; observed 2026-08-11T01:52:18Z (15h 36m old); expires 2026-08-12T01:52:18Z.
-  - `m27-ten-row-launch-integrity-live` — live_production / pass / current; scenarios `launch_with_variable_mapping`; observed 2026-08-11T00:29:47Z (16h 59m old); no fixed expiry.
-  - `m27-simple-extraction-close-live` — live_production / pass / current; scenarios `broker_available_full_specs`; observed 2026-08-11T01:51:00Z (15h 37m old); no fixed expiry.
-  - `m27-unavailable-terminalization-live` — live_production / pass / current; scenarios `broker_property_unavailable`; observed 2026-08-11T01:51:00Z (15h 37m old); no fixed expiry.
-  - `m27-returning-user-canary-live` — live_production / pass / current; scenarios `broker_available_full_specs`, `broker_available_partial_specs`; observed 2026-08-11T17:28:58Z (0m old); no fixed expiry.
-- Next action: Run separate live proof for each remaining autonomous blocker.
+  - `returning-workspace-containment-readback` — production_readback / pass / current; scenarios None; observed 2026-08-12T04:05:30Z (0m old); expires 2026-08-13T04:05:30Z.
+  - `finish-line-reply-all-cc-carry-forward` — source_review / pass / current; scenarios `reply_all_cc_context`; observed 2026-08-12T04:05:30Z (0m old); no fixed expiry.
+  - `finish-line-ambiguous-pdf-live` — live_production / pass / current; scenarios `broker_attachment_or_link_only`, `broker_available_partial_specs`; observed 2026-08-12T04:05:30Z (0m old); no fixed expiry.
+  - `finish-line-long-multiturn-live` — live_production / pass / current; scenarios `broker_available_partial_specs`, `dashboard_action_resolution`, `manual_user_continuation`; observed 2026-08-12T04:05:30Z (0m old); no fixed expiry.
+- Next action: Run release-matched live autonomous follow-up proof with idempotent send, counters, and scoped readback.
 - Rollback: Keep autonomous execution and follow-ups disabled.
