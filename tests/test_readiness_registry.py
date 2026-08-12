@@ -1412,6 +1412,33 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, clearance)
 
+        normalized_clearance = " ".join(clearance.split())
+        for required_text in (
+            "one deliberately admitted, continuously monitored, one-row, "
+            "one-property existing campaign for one user at a time",
+            "controls remain Closed/Closed and the client remains paused until admission",
+            "autonomous follow-ups remain the sole named readiness blocker",
+        ):
+            with self.subTest(boundary_text=required_text):
+                self.assertIn(required_text, normalized_clearance)
+
+    def test_evidence_note_records_the_current_control_and_finish_line_boundary(self):
+        note = self.read_artifact(EVIDENCE_NOTE_PATH)
+        for required_text in (
+            "## Current control readback",
+            "Login and view remained available",
+            "Controls read back Closed/Closed",
+            "client remained paused outside deliberate admission",
+            "no send-capable residue remained",
+            "## Finish-line certification",
+            "### Copied-party reply-all",
+            "### Ambiguous mixed-property PDF",
+            "### Thirteen-message correction and ordering flow",
+            "Autonomous follow-ups are the sole remaining named readiness blocker",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, note)
+
     def test_committed_gate_decisions_match_authoritative_boundary(self):
         registry = self.load_registry()
         decisions = {
@@ -1427,6 +1454,50 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             decisions,
         )
 
+    def test_finish_line_certification_keeps_the_exact_return_boundary(self):
+        registry = self.load_registry()
+        gates = {gate["id"]: gate for gate in registry["rolloutGates"]}
+
+        login = gates["login_view"]
+        self.assertEqual("go", login["decision"])
+        self.assertEqual(["login", "view_existing_state"], login["allows"])
+
+        supervised = gates["supervised_campaign_use"]
+        self.assertEqual("go", supervised["decision"])
+        self.assertEqual(
+            "One deliberately admitted, continuously monitored, one-row, "
+            "one-property existing campaign for one user at a time, with "
+            "follow-ups off.",
+            supervised["scope"],
+        )
+        self.assertEqual(
+            ["one_existing_row_monitored_campaign"], supervised["allows"]
+        )
+        for forbidden in (
+            "autonomous_followups",
+            "broad_campaign_creation",
+            "cross_tenant_use",
+            "multirow_campaign",
+            "simultaneous_campaigns",
+            "uncertain_send_recovery",
+            "unattended_recovery",
+            "unattended_use",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertIn(forbidden, supervised["forbids"])
+        self.assertIn("new_campaign_launch", supervised["forbids"])
+        self.assertIn("Controls stay Closed/Closed", " ".join(supervised["guardrails"]))
+        self.assertIn("client stays paused until admission", " ".join(supervised["guardrails"]))
+        self.assertNotIn("launch", " ".join(supervised["guardrails"]).lower())
+
+        autonomous = gates["autonomous_campaign_use"]
+        self.assertEqual("hold", autonomous["decision"])
+        self.assertEqual(
+            ["autonomous-followups-current-live-gap"], autonomous["blockerIds"]
+        )
+        self.assertIn("autonomous_followups", autonomous["forbids"])
+        self.assertIn("unattended_campaigns", autonomous["forbids"])
+
     def test_committed_gates_have_exact_decision_provenance(self):
         registry = self.load_registry()
         provenance = {
@@ -1437,7 +1508,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
         self.assertEqual(
             {
                 "login_view": (
-                    "2026-08-11T01:52:18Z",
+                    "2026-08-12T04:05:30Z",
                     [
                         "backend_release_change",
                         "production_revision_change",
@@ -1448,7 +1519,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                     ],
                 ),
                 "supervised_campaign_use": (
-                    "2026-08-11T17:28:58Z",
+                    "2026-08-12T04:05:30Z",
                     [
                         "backend_release_change",
                         "production_revision_change",
@@ -1460,7 +1531,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                     ],
                 ),
                 "autonomous_campaign_use": (
-                    "2026-08-11T17:28:58Z",
+                    "2026-08-12T04:05:30Z",
                     [
                         "backend_release_change",
                         "production_revision_change",
@@ -1474,7 +1545,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             provenance,
         )
 
-    def test_committed_evidence_stays_within_the_five_bounded_claims(self):
+    def test_committed_evidence_stays_within_the_nine_bounded_claims(self):
         registry = self.load_registry()
         evidence_scope = {
             item["id"]: (set(item["featureIds"]), set(item["scenarioIds"]))
@@ -1526,30 +1597,209 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                         "broker_available_partial_specs",
                     },
                 ),
+                "finish-line-reply-all-cc-live": (
+                    {
+                        "core.inbox_auto_reply",
+                        "core.inbox_matching",
+                        "core.outbox_send",
+                        "core.property_extraction",
+                        "core.reply_all_cc",
+                        "core.sheet_update",
+                    },
+                    {"reply_all_cc_context"},
+                ),
+                "finish-line-reply-all-cc-carry-forward": (
+                    {
+                        "core.inbox_auto_reply",
+                        "core.inbox_matching",
+                        "core.outbox_send",
+                        "core.property_extraction",
+                        "core.reply_all_cc",
+                        "core.sheet_update",
+                    },
+                    {"reply_all_cc_context"},
+                ),
+                "finish-line-ambiguous-pdf-live": (
+                    {
+                        "core.event_classifier",
+                        "core.inbox_matching",
+                        "core.property_extraction",
+                        "core.sheet_update",
+                    },
+                    {
+                        "broker_attachment_or_link_only",
+                        "broker_available_partial_specs",
+                    },
+                ),
+                "finish-line-long-multiturn-live": (
+                    {
+                        "core.event_classifier",
+                        "core.inbox_auto_reply",
+                        "core.inbox_matching",
+                        "core.manual_reply",
+                        "core.outbox_send",
+                        "core.property_extraction",
+                        "core.sheet_update",
+                    },
+                    {
+                        "broker_available_partial_specs",
+                        "dashboard_action_resolution",
+                        "manual_user_continuation",
+                    },
+                ),
             },
             evidence_scope,
         )
 
-    def test_returning_user_canary_promotes_only_supervised_use(self):
+    def test_finish_line_evidence_records_exact_sanitized_live_readbacks(self):
+        registry = self.load_registry()
+        evidence = {item["id"]: item for item in registry["evidence"]}
+        current_release_refs = {
+            "backendCommit": "62a7d59e434881e0a230395523b3e6df86dec1f6",
+            "productionRevision": "process-user-00097-yus",
+        }
+        case_one_release_refs = {
+            "backendCommit": "c6dbe4a27140268a0840476c9cf70ff1c72ed7bc",
+            "productionRevision": "process-user-00094-lib",
+        }
+
+        copied_party = evidence["finish-line-reply-all-cc-live"]
+        self.assertEqual("live_production", copied_party["proofLevel"])
+        self.assertEqual("pass", copied_party["result"])
+        self.assertEqual(case_one_release_refs, copied_party["releaseRefs"])
+        self.assertNotEqual(
+            "2026-08-12T04:05:30Z", copied_party["observedAt"]
+        )
+        copied_text = " ".join(
+            [copied_party["claim"], *copied_party["readbacks"], *copied_party["limitations"]]
+        )
+        for required_text in (
+            "canonical To",
+            "one safe copied Cc",
+            "Bcc was empty",
+            "52,400",
+            "14.80",
+            "3.95",
+            "81,875.00",
+            "same-row formula",
+            "terminal",
+            "zero scoped residue",
+        ):
+            with self.subTest(proof="reply-all", required_text=required_text):
+                self.assertIn(required_text, copied_text)
+
+        ambiguous_pdf = evidence["finish-line-ambiguous-pdf-live"]
+        self.assertEqual(current_release_refs, ambiguous_pdf["releaseRefs"])
+        pdf_text = " ".join(
+            [ambiguous_pdf["claim"], *ambiguous_pdf["readbacks"], *ambiguous_pdf["limitations"]]
+        )
+        for required_text in (
+            "exactly one review action",
+            "zero automatic sends",
+            "zero counter delta",
+            "zero fact",
+            "zero asset",
+            "zero Sheet change",
+            "duplicate-action hard stop",
+            "62a7d59",
+            "clean retry",
+            "deployed candidate",
+        ):
+            with self.subTest(proof="pdf", required_text=required_text):
+                self.assertIn(required_text, pdf_text)
+
+        long_turn = evidence["finish-line-long-multiturn-live"]
+        self.assertEqual(current_release_refs, long_turn["releaseRefs"])
+        long_text = " ".join(
+            [long_turn["claim"], *long_turn["readbacks"], *long_turn["limitations"]]
+        )
+        for required_text in (
+            "13-message",
+            "correction precedence",
+            "chronological ordering",
+            "call-request pause",
+            "Dashboard continuation",
+            "only the exact missing fields",
+            "terminal close",
+            "idempotent replay",
+            "40,800",
+            "15.10",
+            "3.75",
+            "64,090.00",
+        ):
+            with self.subTest(proof="long-turn", required_text=required_text):
+                self.assertIn(required_text, long_text)
+
+        carry_forward = evidence["finish-line-reply-all-cc-carry-forward"]
+        self.assertEqual("source_review", carry_forward["proofLevel"])
+        self.assertEqual("pass", carry_forward["result"])
+        self.assertEqual(current_release_refs, carry_forward["releaseRefs"])
+        carry_text = " ".join(
+            [carry_forward["claim"], *carry_forward["readbacks"], *carry_forward["limitations"]]
+        )
+        for required_text in (
+            "attachment-only",
+            "did not touch",
+            "reply-all",
+            "recipient",
+            "send",
+            "Sheet",
+            "not a second live send",
+        ):
+            with self.subTest(proof="carry-forward", required_text=required_text):
+                self.assertIn(required_text, carry_text)
+
+    def test_current_release_control_readback_proves_serving_health_and_settlement(self):
+        registry = self.load_registry()
+        evidence = {item["id"]: item for item in registry["evidence"]}
+        control = evidence["returning-workspace-containment-readback"]
+        text = " ".join([control["claim"], *control["readbacks"], *control["limitations"]])
+        for required_text in (
+            "sole 100 percent serving traffic",
+            "healthy",
+            "7/7",
+            "queue drained",
+            "zero scoped residue",
+            "zero application errors",
+            "zero 5xx responses",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, text)
+
+    def test_finish_line_proofs_close_only_the_live_quality_gaps_they_exercised(self):
+        registry = self.load_registry()
+        quality = {item["id"]: item for item in registry["qualityItems"]}
+        expected_provenance = {
+            "reply-all-cc-multiparty-live-gap": "finish-line-reply-all-cc-carry-forward",
+            "pdf-multi-suite-ambiguity": "finish-line-ambiguous-pdf-live",
+            "hard-repeat-ask-rejection-gap": "finish-line-long-multiturn-live",
+            "long-multiturn-ordering-gap": "finish-line-long-multiturn-live",
+        }
+        for quality_id, evidence_id in expected_provenance.items():
+            with self.subTest(quality_id=quality_id):
+                item = quality[quality_id]
+                self.assertEqual("proven_live", item["state"])
+                self.assertEqual([], item["blocksGates"])
+                self.assertIn(evidence_id, item["evidenceIds"])
+
+        followups = quality["autonomous-followups-current-live-gap"]
+        self.assertEqual("ready_for_live", followups["state"])
+        self.assertEqual(["autonomous_campaign_use"], followups["blocksGates"])
+
+        natural_voice = quality["natural-voice-variety"]
+        self.assertEqual("open", natural_voice["state"])
+        self.assertEqual([], natural_voice["blocksGates"])
+        self.assertIn("finish-line-long-multiturn-live", natural_voice["evidenceIds"])
+
+    def test_prior_returning_user_canary_is_retained_without_driving_current_gates(self):
         registry = self.load_registry()
         gates = {gate["id"]: gate for gate in registry["rolloutGates"]}
         quality = {item["id"]: item for item in registry["qualityItems"]}
         evidence = {item["id"]: item for item in registry["evidence"]}
 
-        supervised = gates["supervised_campaign_use"]
-        self.assertEqual("go", supervised["decision"])
-        self.assertEqual([], supervised["blockerIds"])
-        self.assertIsNone(supervised["nextAction"])
-        self.assertIn("m27-returning-user-canary-live", supervised["evidenceIds"])
-        self.assertIn("autonomous_followups", supervised["forbids"])
-
-        autonomous = gates["autonomous_campaign_use"]
-        self.assertEqual("hold", autonomous["decision"])
-        self.assertNotIn("returning-user-canary-unrun", autonomous["blockerIds"])
-        self.assertIn("autonomous-followups-current-live-gap", autonomous["blockerIds"])
-        self.assertIn("reply-all-cc-multiparty-live-gap", autonomous["blockerIds"])
-        self.assertIn("pdf-multi-suite-ambiguity", autonomous["blockerIds"])
-        self.assertIn("long-multiturn-ordering-gap", autonomous["blockerIds"])
+        for gate in gates.values():
+            with self.subTest(gate_id=gate["id"]):
+                self.assertNotIn("m27-returning-user-canary-live", gate["evidenceIds"])
 
         canary_gap = quality["returning-user-canary-unrun"]
         self.assertEqual("proven_live", canary_gap["state"])
@@ -1568,8 +1818,9 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
         self.assertIn("m27-returning-user-canary-live", natural_voice["evidenceIds"])
 
         repeat_ask = quality["hard-repeat-ask-rejection-gap"]
-        self.assertEqual("partial", repeat_ask["state"])
+        self.assertEqual("proven_live", repeat_ask["state"])
         self.assertIn("m27-returning-user-canary-live", repeat_ask["evidenceIds"])
+        self.assertIn("finish-line-long-multiturn-live", repeat_ask["evidenceIds"])
 
         canary = evidence["m27-returning-user-canary-live"]
         self.assertEqual("2026-08-11T17:28:58Z", canary["observedAt"])
@@ -1628,11 +1879,11 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                 "autonomous-followups-current-live-gap": {
                     "autonomous_campaign_use"
                 },
-                "reply-all-cc-multiparty-live-gap": {"autonomous_campaign_use"},
-                "pdf-multi-suite-ambiguity": {"autonomous_campaign_use"},
-                "hard-repeat-ask-rejection-gap": {"autonomous_campaign_use"},
+                "reply-all-cc-multiparty-live-gap": set(),
+                "pdf-multi-suite-ambiguity": set(),
+                "hard-repeat-ask-rejection-gap": set(),
                 "natural-voice-variety": set(),
-                "long-multiturn-ordering-gap": {"autonomous_campaign_use"},
+                "long-multiturn-ordering-gap": set(),
                 "account-b-historical-cleanup": set(),
             },
             blocks,
@@ -1694,7 +1945,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
         )
         self.assertIn("UNPROVEN", followups_row)
         self.assertNotIn("m27-ten-row-launch-integrity-live", followups_row)
-        self.assertEqual(5, len(registry["evidence"]))
+        self.assertEqual(9, len(registry["evidence"]))
 
     def test_committed_artifacts_are_sanitized(self):
         payloads = {
@@ -1713,6 +1964,16 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             "local_user_path": re.compile(r"/Users/"),
             "file_uri": re.compile(r"file://", re.IGNORECASE),
             "message_id_header": re.compile(r"\bmessage-id\s*:", re.IGNORECASE),
+            "uid": re.compile(r"\buid\b", re.IGNORECASE),
+            "raw_message_material": re.compile(
+                r"\braw\s+(?:body|message)\b", re.IGNORECASE
+            ),
+            "project_id": re.compile(r"\bproject[- ]id\b", re.IGNORECASE),
+            "revision_url": re.compile(r"https?://", re.IGNORECASE),
+            "image_digest": re.compile(r"\bsha256:[0-9a-f]+\b", re.IGNORECASE),
+            "temporary_path": re.compile(
+                r"/(?:tmp|private/var|var/folders)/", re.IGNORECASE
+            ),
             "openai_key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
             "github_token": re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
             "aws_key": re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
@@ -1734,7 +1995,7 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
                 str(MODULE_PATH),
                 "--check",
                 "--at",
-                "2026-08-11T17:28:58Z",
+                "2026-08-12T04:05:30Z",
             ],
         )
         for command in commands:

@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-11T17:28:58Z",
+  "updatedAt": "2026-08-12T04:05:30Z",
   "releaseIdentity": {
-    "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
-    "productionRevision": "process-user-00092-som"
+    "backendCommit": "62a7d59e434881e0a230395523b3e6df86dec1f6",
+    "productionRevision": "process-user-00097-yus"
   },
   "rolloutGates": [
     {
@@ -27,7 +27,7 @@
       "blockerIds": [],
       "nextAction": null,
       "rollback": "Disable returning-user access if the containment readback regresses.",
-      "asOf": "2026-08-11T01:52:18Z",
+      "asOf": "2026-08-12T04:05:30Z",
       "invalidatedBy": [
         "backend_release_change",
         "production_revision_change",
@@ -40,32 +40,37 @@
     {
       "id": "supervised_campaign_use",
       "decision": "go",
-      "scope": "One continuously monitored campaign row at a time, with follow-ups off.",
+      "scope": "One deliberately admitted, continuously monitored, one-row, one-property existing campaign for one user at a time, with follow-ups off.",
       "allows": [
-        "one_row_monitored_campaign"
+        "one_existing_row_monitored_campaign"
       ],
       "forbids": [
         "autonomous_followups",
-        "complex_copied_party_threads",
+        "broad_campaign_creation",
+        "cross_tenant_use",
         "multirow_campaign",
+        "new_campaign_launch",
+        "simultaneous_campaigns",
+        "uncertain_send_recovery",
+        "unattended_recovery",
         "unattended_use"
       ],
       "guardrails": [
         "Keep follow-ups off.",
-        "Use one row only.",
-        "Continuously observe launch, reply handling, extraction, same-row update, queue drain, counters, and scoped residue."
+        "Controls stay Closed/Closed and the exact client stays paused until admission.",
+        "Admit only one already-existing row and one property for one user and one campaign at a time.",
+        "Continuously observe reply handling, extraction, same-row update, queue drain, counters, and scoped residue."
       ],
       "evidenceIds": [
         "returning-workspace-containment-readback",
-        "m27-ten-row-launch-integrity-live",
-        "m27-simple-extraction-close-live",
-        "m27-unavailable-terminalization-live",
-        "m27-returning-user-canary-live"
+        "finish-line-reply-all-cc-carry-forward",
+        "finish-line-ambiguous-pdf-live",
+        "finish-line-long-multiturn-live"
       ],
       "blockerIds": [],
       "nextAction": null,
       "rollback": "Pause the campaign immediately and preserve scoped evidence if any guardrail fails.",
-      "asOf": "2026-08-11T17:28:58Z",
+      "asOf": "2026-08-12T04:05:30Z",
       "invalidatedBy": [
         "backend_release_change",
         "production_revision_change",
@@ -93,21 +98,16 @@
       ],
       "evidenceIds": [
         "returning-workspace-containment-readback",
-        "m27-ten-row-launch-integrity-live",
-        "m27-simple-extraction-close-live",
-        "m27-unavailable-terminalization-live",
-        "m27-returning-user-canary-live"
+        "finish-line-reply-all-cc-carry-forward",
+        "finish-line-ambiguous-pdf-live",
+        "finish-line-long-multiturn-live"
       ],
       "blockerIds": [
-        "autonomous-followups-current-live-gap",
-        "reply-all-cc-multiparty-live-gap",
-        "pdf-multi-suite-ambiguity",
-        "hard-repeat-ask-rejection-gap",
-        "long-multiturn-ordering-gap"
+        "autonomous-followups-current-live-gap"
       ],
-      "nextAction": "Run separate live proof for each remaining autonomous blocker.",
+      "nextAction": "Run release-matched live autonomous follow-up proof with idempotent send, counters, and scoped readback.",
       "rollback": "Keep autonomous execution and follow-ups disabled.",
-      "asOf": "2026-08-11T17:28:58Z",
+      "asOf": "2026-08-12T04:05:30Z",
       "invalidatedBy": [
         "backend_release_change",
         "production_revision_change",
@@ -127,15 +127,18 @@
       "featureIds": [],
       "scenarioIds": [],
       "releaseRefs": {
-        "backendCommit": "831478fc42fae40bf95b79ee4dcd935cadb7e1a1",
-        "productionRevision": "process-user-00092-som"
+        "backendCommit": "62a7d59e434881e0a230395523b3e6df86dec1f6",
+        "productionRevision": "process-user-00097-yus"
       },
       "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
-      "observedAt": "2026-08-11T01:52:18Z",
-      "expiresAt": "2026-08-12T01:52:18Z",
+      "observedAt": "2026-08-12T04:05:30Z",
+      "expiresAt": "2026-08-13T04:05:30Z",
       "readbacks": [
         "Login and view access remained available in the controlled workspace.",
-        "No send-capable residue remained in the audited secondary workspace scope."
+        "The current production revision was healthy and held sole 100 percent serving traffic.",
+        "Finish-line product send and index counters reconciled at 7/7.",
+        "The queue drained with zero scoped residue, zero application errors, and zero 5xx responses.",
+        "Controls read back Closed/Closed, the exact client was paused outside deliberate admission, and no send-capable residue remained in the audited workspace scope."
       ],
       "limitations": [
         "No campaign launch or send was exercised by this readback."
@@ -300,6 +303,177 @@
         "campaign_control_or_send_cap_change",
         "new_failure_or_residue"
       ]
+    },
+    {
+      "id": "finish-line-reply-all-cc-live",
+      "proofLevel": "live_production",
+      "result": "pass",
+      "claim": "One monitored copied-party reply preserved the exact safe audience, extracted the supplied facts, updated only the bound Sheet row, and closed terminally with zero scoped residue.",
+      "featureIds": [
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.outbox_send",
+        "core.property_extraction",
+        "core.reply_all_cc",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "reply_all_cc_context"
+      ],
+      "releaseRefs": {
+        "backendCommit": "c6dbe4a27140268a0840476c9cf70ff1c72ed7bc",
+        "productionRevision": "process-user-00094-lib"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-12T02:09:35Z",
+      "expiresAt": null,
+      "readbacks": [
+        "The automatic response used the canonical To, preserved exactly one safe copied Cc, and Bcc was empty; no product self, alias, duplicate, or unknown audience was present.",
+        "The Sheet read back Total SF 52,400, Rent/SF/Yr 14.80, Ops Ex/SF 3.95, the same-row formula preserved, and Gross 81,875.00.",
+        "The row reached terminal completion with follow-ups stopped, no other-row delta, reconciled send and index counts, and zero scoped residue."
+      ],
+      "limitations": [
+        "This proves one controlled copied-party shape, not arbitrary participant graphs, blocked-party filtering combinations, cross-tenant use, or autonomous follow-ups.",
+        "Naturalness and punctuation remain nonblocking quality observations unless wording changes meaning or requests a known field."
+      ],
+      "retestOn": [
+        "backend_release_change",
+        "production_revision_change",
+        "recipient_filter_or_reply_all_change",
+        "auto_reply_or_send_path_change",
+        "classifier_extraction_or_sheet_path_change",
+        "new_failure_or_residue"
+      ]
+    },
+    {
+      "id": "finish-line-reply-all-cc-carry-forward",
+      "proofLevel": "source_review",
+      "result": "pass",
+      "claim": "The copied-party live proof carries forward to the current release because the intervening fix was attachment-only and did not touch the exercised reply-all, recipient, send, extraction, or Sheet paths.",
+      "featureIds": [
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.outbox_send",
+        "core.property_extraction",
+        "core.reply_all_cc",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "reply_all_cc_context"
+      ],
+      "releaseRefs": {
+        "backendCommit": "62a7d59e434881e0a230395523b3e6df86dec1f6",
+        "productionRevision": "process-user-00097-yus"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-12T04:05:30Z",
+      "expiresAt": null,
+      "readbacks": [
+        "The intervening source delta was attachment-only and limited to coalescing ambiguous attachment review actions.",
+        "The delta did not touch reply-all routing, recipient filtering, outbound send, fact extraction, same-row Sheet update, lifecycle terminalization, or the copied-party scenario contract.",
+        "The preceding live copied-party proof remains separately attributed to its actual release identity."
+      ],
+      "limitations": [
+        "This is a narrow non-impact source review, not a second live send.",
+        "It carries forward only the exact copied-party scenario and does not broaden participant, cross-tenant, autonomous-followup, or recovery claims."
+      ],
+      "retestOn": [
+        "recipient_filter_or_reply_all_change",
+        "auto_reply_or_send_path_change",
+        "classifier_extraction_or_sheet_path_change",
+        "production_revision_change",
+        "new_failure_or_residue"
+      ]
+    },
+    {
+      "id": "finish-line-ambiguous-pdf-live",
+      "proofLevel": "live_production",
+      "result": "pass",
+      "claim": "One monitored mixed-property PDF failed closed after a clean post-fix retry, producing exactly one review action and no send, counter, fact, asset, or Sheet mutation.",
+      "featureIds": [
+        "core.event_classifier",
+        "core.inbox_matching",
+        "core.property_extraction",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_attachment_or_link_only",
+        "broker_available_partial_specs"
+      ],
+      "releaseRefs": {
+        "backendCommit": "62a7d59e434881e0a230395523b3e6df86dec1f6",
+        "productionRevision": "process-user-00097-yus"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-12T04:05:30Z",
+      "expiresAt": null,
+      "readbacks": [
+        "One inbound index produced exactly one proposal audit and exactly one review action with reason multi_property_attachment while the active lifecycle remained paused.",
+        "The clean retry produced zero automatic sends or indexes, zero terminal closes, and zero counter delta.",
+        "The target and every other row had zero fact, zero asset, and zero Sheet change; formula, provenance, and preexisting values remained intact.",
+        "The initial attempt triggered a duplicate-action hard stop; fix commit 62a7d59 coalesced the review action, and the clean retry passed on the deployed candidate with zero duplicate, reconciliation, failure, or queue residue."
+      ],
+      "limitations": [
+        "The initial duplicate-action attempt is invalidated evidence; only the clean post-fix retry supports this pass.",
+        "This proves fail-closed handling for one controlled mixed-property ambiguity shape, not broad PDF extraction quality or every attachment layout."
+      ],
+      "retestOn": [
+        "backend_release_change",
+        "production_revision_change",
+        "attachment_extraction_or_ambiguity_change",
+        "proposal_or_review_action_change",
+        "sheet_or_asset_write_path_change",
+        "new_failure_or_residue"
+      ]
+    },
+    {
+      "id": "finish-line-long-multiturn-live",
+      "proofLevel": "live_production",
+      "result": "pass",
+      "claim": "One monitored 13-message conversation preserved correction precedence and chronological ordering through a call-request pause, Dashboard continuation, exact missing-field asks, terminal close, and idempotent replay.",
+      "featureIds": [
+        "core.event_classifier",
+        "core.inbox_auto_reply",
+        "core.inbox_matching",
+        "core.manual_reply",
+        "core.outbox_send",
+        "core.property_extraction",
+        "core.sheet_update"
+      ],
+      "scenarioIds": [
+        "broker_available_partial_specs",
+        "dashboard_action_resolution",
+        "manual_user_continuation"
+      ],
+      "releaseRefs": {
+        "backendCommit": "62a7d59e434881e0a230395523b3e6df86dec1f6",
+        "productionRevision": "process-user-00097-yus"
+      },
+      "artifact": "docs/release-safety/evidence/2026-08-11-controlled-reopen.md",
+      "observedAt": "2026-08-12T04:05:30Z",
+      "expiresAt": null,
+      "readbacks": [
+        "The settled 13-message spine contained one baseline outbound, six controlled inbounds, one Dashboard continuation, and five automatic responses; product send and index counters increased by exactly six.",
+        "The call request produced one pause and one call action with zero automatic send; the monitored Dashboard continuation resolved the call action, resumed the thread, and asked only the exact missing fields.",
+        "Every later automatic response requested only the exact missing fields, never repeated a known field, and retained chronological context and both corrections.",
+        "The Sheet read back final Total SF 40,800, Rent/SF/Yr 15.10, Ops Ex/SF 3.75, the same-row formula preserved, and Gross 64,090.00 before one terminal close.",
+        "All product outbounds used the canonical audience with Cc and Bcc empty; no other-row delta, duplicate, or scoped residue remained.",
+        "One ordinary worker cycle after settlement was an idempotent replay with zero send, index, counter, fact, asset, lifecycle, action, or Sheet delta."
+      ],
+      "limitations": [
+        "The replay proves settled-event idempotence, not uncertain-provider send recovery, dead-letter recovery, or autonomous follow-ups.",
+        "The proof covers one controlled ordering and correction spine; it does not prove arbitrary long conversations, simultaneous campaigns, multirow use, or cross-tenant use.",
+        "Natural voice remains open and nonblocking; the pass is limited to semantic correctness, groundedness, and exact missing-field behavior."
+      ],
+      "retestOn": [
+        "backend_release_change",
+        "production_revision_change",
+        "history_order_or_correction_precedence_change",
+        "missing_field_or_auto_reply_change",
+        "dashboard_continuation_or_action_change",
+        "sheet_or_lifecycle_change",
+        "new_failure_or_residue"
+      ]
     }
   ],
   "qualityItems": [
@@ -341,7 +515,8 @@
         "manual_user_continuation"
       ],
       "evidenceIds": [
-        "m27-unavailable-terminalization-live"
+        "m27-unavailable-terminalization-live",
+        "finish-line-long-multiturn-live"
       ],
       "blocksGates": [
         "autonomous_campaign_use"
@@ -352,33 +527,33 @@
     },
     {
       "id": "reply-all-cc-multiparty-live-gap",
-      "state": "ready_for_live",
+      "state": "proven_live",
       "severity": "P0",
       "featureIds": [
-        "core.followups",
         "core.inbox_auto_reply",
         "core.inbox_matching",
-        "core.manual_reply",
+        "core.outbox_send",
         "core.reply_all_cc"
       ],
       "scenarioIds": [
         "reply_all_cc_context"
       ],
-      "evidenceIds": [],
+      "evidenceIds": [
+        "finish-line-reply-all-cc-live",
+        "finish-line-reply-all-cc-carry-forward"
+      ],
       "legacyRefs": [
         "FDR-010",
         "FDR-011"
       ],
-      "blocksGates": [
-        "autonomous_campaign_use"
-      ],
-      "guardrail": "Avoid complex copied-party threads in the supervised canary.",
-      "nextProof": "Run a monitored copied-party reply-all proof with participant preservation and same-thread readback.",
+      "blocksGates": [],
+      "guardrail": "Preserve exact canonical To, safe copied Cc, empty Bcc, same-thread audience, and zero unknown recipients.",
+      "nextProof": "Re-run the bounded copied-party proof after a recipient-routing, reply-all, or send-path invalidation trigger.",
       "owner": "reply-routing"
     },
     {
       "id": "pdf-multi-suite-ambiguity",
-      "state": "open",
+      "state": "proven_live",
       "severity": "P1",
       "featureIds": [
         "core.event_classifier",
@@ -390,26 +565,26 @@
         "broker_attachment_or_link_only",
         "broker_available_partial_specs"
       ],
-      "evidenceIds": [],
+      "evidenceIds": [
+        "finish-line-ambiguous-pdf-live"
+      ],
       "legacyRefs": [
         "FDR-010",
         "FDR-011"
       ],
-      "blocksGates": [
-        "autonomous_campaign_use"
-      ],
+      "blocksGates": [],
       "guardrail": "Route ambiguous multi-suite attachments to manual review.",
-      "nextProof": "Pass deterministic ambiguity cases, then run one monitored live multi-suite attachment proof.",
+      "nextProof": "Re-run the bounded mixed-property ambiguity proof after an attachment, extraction, review-action, or Sheet-write invalidation trigger.",
       "owner": "extraction"
     },
     {
       "id": "hard-repeat-ask-rejection-gap",
-      "state": "partial",
+      "state": "proven_live",
       "severity": "P0",
       "featureIds": [
         "core.event_classifier",
-        "core.followups",
         "core.inbox_auto_reply",
+        "core.manual_reply",
         "core.property_extraction",
         "core.sheet_update"
       ],
@@ -419,13 +594,12 @@
       ],
       "evidenceIds": [
         "m27-simple-extraction-close-live",
-        "m27-returning-user-canary-live"
+        "m27-returning-user-canary-live",
+        "finish-line-long-multiturn-live"
       ],
-      "blocksGates": [
-        "autonomous_campaign_use"
-      ],
+      "blocksGates": [],
       "guardrail": "Stop for manual review if an already supplied value is requested again.",
-      "nextProof": "Prove hard repeated-ask rejection across partial-spec and continuation cases, then confirm it live.",
+      "nextProof": "Re-run the bounded exact-missing-field proof after a field-intent, history, correction, or response-generation invalidation trigger.",
       "owner": "response-generation"
     },
     {
@@ -444,7 +618,9 @@
         "manual_user_continuation"
       ],
       "evidenceIds": [
-        "m27-returning-user-canary-live"
+        "m27-returning-user-canary-live",
+        "finish-line-reply-all-cc-live",
+        "finish-line-long-multiturn-live"
       ],
       "legacyRefs": [
         "FDR-010",
@@ -457,31 +633,32 @@
     },
     {
       "id": "long-multiturn-ordering-gap",
-      "state": "ready_for_live",
+      "state": "proven_live",
       "severity": "P0",
       "featureIds": [
         "core.event_classifier",
-        "core.health_recovery",
         "core.inbox_auto_reply",
         "core.inbox_matching",
+        "core.manual_reply",
+        "core.outbox_send",
         "core.property_extraction",
         "core.sheet_update"
       ],
       "scenarioIds": [
         "broker_available_partial_specs",
-        "manual_user_continuation",
-        "retry_after_uncertain_send"
+        "dashboard_action_resolution",
+        "manual_user_continuation"
       ],
-      "evidenceIds": [],
+      "evidenceIds": [
+        "finish-line-long-multiturn-live"
+      ],
       "legacyRefs": [
         "FDR-010",
         "FDR-011"
       ],
-      "blocksGates": [
-        "autonomous_campaign_use"
-      ],
-      "guardrail": "Keep the supervised canary to a short exchange and stop on ordering ambiguity.",
-      "nextProof": "Run a release-matched long multi-turn proof with ordering, retry, extraction, and same-row readback.",
+      "blocksGates": [],
+      "guardrail": "Preserve chronological history, correction precedence, exact missing-field asks, action pause/resume, and settled-event idempotence.",
+      "nextProof": "Re-run the bounded thirteen-message proof after a history, correction, action, reply, extraction, or lifecycle invalidation trigger.",
       "owner": "event-ordering"
     },
     {
