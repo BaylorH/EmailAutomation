@@ -8,7 +8,9 @@ Backend RC status: non-deployable on its own.
 
 The first prerequisite is Firestore rules that make processingFailures owner-readable and server-write-only and exclude that collection from every generic or owner-write catchall. The second prerequisite is the projection-only UI guard and passive review card. Operators must deploy and certify both prerequisites before the backend producer.
 
-Only after both prerequisite surfaces are certified may operators deploy the backend producer with no traffic before promotion. Certification must prove the deployed rules, the deployed passive UI, and the absence of a composer or mutation control for projection-only rows.
+Only after both prerequisite surfaces are certified may operators stage the backend producer as the deterministic `process-user-stage-<12-character-HEAD>` revision. Staging must use an immutable digest, `--no-traffic`, and no tag. Readback must prove that the Ready candidate is untagged at 0 percent while the prior sole 100 percent revision retains the stable `release-a` mapping. Staging does not pause or resume a queue, mutate traffic, certify an HTTP route, promote, or roll back.
+
+Both global campaign switches remain false throughout this milestone. Operators must not call `POST /process-user` or perform a provider or mailbox canary.
 
 For rollback, roll back or disable the backend producer first. Operators must retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain. Operators must never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row.
 

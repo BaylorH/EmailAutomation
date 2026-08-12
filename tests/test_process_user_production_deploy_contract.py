@@ -12,6 +12,13 @@ import tempfile
 import textwrap
 import unittest
 
+from tests import test_process_user_tagless_staging_contract as tagless_contract
+from tests.test_process_user_tagless_staging_contract import (
+    CANDIDATE_REVISION,
+    OLD_REVISION,
+    REVISION_SUFFIX,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_process_user.sh"
@@ -77,6 +84,11 @@ class DeployScriptContractTests(unittest.TestCase):
         self.bin_dir.mkdir()
         self.gcloud_log = self.tmp / "gcloud.log"
         self.git_log = self.tmp / "git.log"
+        self.gcloud_state = self.tmp / "gcloud-state.json"
+        self.gcloud_state.write_text(
+            json.dumps({"service_describes": 0}),
+            encoding="utf-8",
+        )
 
         _write_executable(
             self.bin_dir / "git",
@@ -104,55 +116,7 @@ class DeployScriptContractTests(unittest.TestCase):
         )
         _write_executable(
             self.bin_dir / "gcloud",
-            textwrap.dedent(
-                """\
-                #!/bin/sh
-                printf '%s\\n' "$*" >> "$FAKE_GCLOUD_LOG"
-                if [ "${CLOUDSDK_CORE_ACCOUNT:-}" != "bp21harrison@gmail.com" ]; then
-                  printf '%s\\n' 'gcloud account override is not bound to the approved principal' >&2
-                  exit 70
-                fi
-                case "$1 $2" in
-                  "config get-value")
-                    case "$FAKE_GCLOUD_SCENARIO" in
-                      configured_impersonation) printf '%s\\n' 'deployer@example.iam.gserviceaccount.com' ;;
-                      *) printf '%s\\n' '(unset)' ;;
-                    esac
-                    exit 0
-                    ;;
-                  "auth list")
-                    case "$FAKE_GCLOUD_SCENARIO" in
-                      auth_missing) exit 0 ;;
-                      auth_duplicate)
-                        printf '%s\\n%s\\n' 'bp21harrison@gmail.com' 'bp21harrison@gmail.com'
-                        exit 0
-                        ;;
-                      *) printf '%s\\n' 'bp21harrison@gmail.com'; exit 0 ;;
-                    esac
-                    ;;
-                  "projects describe")
-                    case "$FAKE_GCLOUD_SCENARIO" in
-                      project_wrong_number) printf '%s\\t%s\\n' '999' 'ACTIVE' ;;
-                      project_inactive) printf '%s\\t%s\\n' '248289505828' 'DELETE_REQUESTED' ;;
-                      *) printf '%s\\t%s\\n' '248289505828' 'ACTIVE' ;;
-                    esac
-                    exit 0
-                    ;;
-                  "builds submit") exit 0 ;;
-                  "artifacts docker")
-                    case "$FAKE_GCLOUD_SCENARIO" in
-                      empty_digest) exit 0 ;;
-                      invalid_digest) printf '%s\\n' 'latest' ;;
-                      *) printf '%s\\n' "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;;
-                    esac
-                    exit 0
-                    ;;
-                  "run deploy") exit 0 ;;
-                esac
-                printf 'unexpected fake gcloud command: %s\\n' "$*" >&2
-                exit 65
-                """
-            ),
+            tagless_contract.TaglessStagingContractTests._fake_gcloud_source(),
         )
 
     def _run(
@@ -167,9 +131,14 @@ class DeployScriptContractTests(unittest.TestCase):
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
         env["FAKE_GCLOUD_LOG"] = str(self.gcloud_log)
         env["FAKE_GIT_LOG"] = str(self.git_log)
+        env["FAKE_GCLOUD_STATE"] = str(self.gcloud_state)
         env["FAKE_GIT_SHA"] = SHA
         env["FAKE_REPO_ROOT"] = str(REPO_ROOT)
         env["FAKE_GCLOUD_SCENARIO"] = scenario
+        env["FAKE_CANDIDATE_REVISION"] = CANDIDATE_REVISION
+        env["FAKE_OLD_REVISION"] = OLD_REVISION
+        env["FAKE_OTHER_REVISION"] = "process-user-00096-old"
+        env["FAKE_CANONICAL_IMAGE"] = CANONICAL_IMAGE
         if impersonation_env is None:
             env.pop("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", None)
         else:
@@ -190,7 +159,7 @@ class DeployScriptContractTests(unittest.TestCase):
     def _gcloud_calls(self) -> list[list[str]]:
         if not self.gcloud_log.exists():
             return []
-        return [shlex.split(line) for line in self.gcloud_log.read_text().splitlines()]
+        return [json.loads(line) for line in self.gcloud_log.read_text().splitlines()]
 
     def _git_calls(self) -> list[list[str]]:
         if not self.git_log.exists():
@@ -366,8 +335,9 @@ class DeployScriptContractTests(unittest.TestCase):
         foreign.mkdir()
         result = self._run("--apply", cwd=foreign)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self._gcloud_calls()[-1], self._deploy_call())
-        self.assertEqual(self._gcloud_calls()[-3], self._build_call())
+        calls = self._gcloud_calls()
+        self.assertIn(self._deploy_call(), calls)
+        self.assertEqual(calls[4], self._build_call())
 
     def test_auth_missing_stops_before_project_or_mutation(self):
         result = self._run("--apply", scenario="auth_missing")
@@ -418,15 +388,16 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
         self.assertEqual(calls[:3], self._preflight_calls())
-        self.assertEqual(calls[3], self._build_call())
-        self.assertEqual(calls[4], self._digest_call())
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(calls[3], self._service_describe_call())
+        self.assertEqual(calls[4], self._build_call())
+        self.assertEqual(calls[5], self._digest_call())
+        self.assertEqual(len(calls), 6)
 
     def test_invalid_digest_stops_before_deploy(self):
         result = self._run("--apply", scenario="invalid_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 6)
         self.assertEqual(calls[-1], self._digest_call())
         self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
 
@@ -435,13 +406,21 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self._gcloud_calls(),
-            [*self._preflight_calls(), self._build_call(), self._digest_call(), self._deploy_call()],
+            [
+                *self._preflight_calls(),
+                self._service_describe_call(),
+                self._build_call(),
+                self._digest_call(),
+                self._deploy_call(),
+                self._service_describe_call(),
+                self._revision_describe_call(),
+            ],
         )
 
     def test_deploy_omits_service_wide_scaling_flags(self):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
-        deploy = self._gcloud_calls()[-1]
+        deploy = self._find_deploy_call()
         self.assertNotIn("--min", deploy)
         self.assertNotIn("--max", deploy)
         self.assertEqual(deploy[deploy.index("--min-instances") + 1], "0")
@@ -452,7 +431,7 @@ class DeployScriptContractTests(unittest.TestCase):
     def test_deploy_updates_config_without_erasing_panic_switch_or_other_secrets(self):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
-        deploy = self._gcloud_calls()[-1]
+        deploy = self._find_deploy_call()
         self.assertIn("--update-env-vars", deploy)
         self.assertIn("--update-secrets", deploy)
         self.assertNotIn("--set-env-vars", deploy)
@@ -461,7 +440,7 @@ class DeployScriptContractTests(unittest.TestCase):
     def test_deploy_explicitly_arms_only_the_internal_release_lane(self):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
-        deploy = self._gcloud_calls()[-1]
+        deploy = self._find_deploy_call()
         env_vars = deploy[deploy.index("--update-env-vars") + 1]
         self.assertIn("SITESIFT_OUTBOUND_MODE=live", env_vars)
         self.assertIn("SITESIFT_DAILY_SEND_CAP=20", env_vars)
@@ -492,6 +471,11 @@ class DeployScriptContractTests(unittest.TestCase):
             [*prefix, "status", "--porcelain"],
             [*prefix, "rev-parse", "--short=12", "HEAD"],
         ]
+
+    def _find_deploy_call(self) -> list[str]:
+        return next(
+            call for call in self._gcloud_calls() if call[:2] == ["run", "deploy"]
+        )
 
     @staticmethod
     def _config_call() -> list[str]:
@@ -538,6 +522,16 @@ class DeployScriptContractTests(unittest.TestCase):
         ]
 
     @staticmethod
+    def _service_describe_call() -> list[str]:
+        return [
+            "run", "services", "describe", SERVICE,
+            "--account", ACCOUNT,
+            "--project", PROJECT,
+            "--region", REGION,
+            "--format=json",
+        ]
+
+    @staticmethod
     def _digest_call() -> list[str]:
         return [
             "artifacts",
@@ -572,7 +566,17 @@ class DeployScriptContractTests(unittest.TestCase):
             "--update-env-vars", ENV_VARS,
             "--update-secrets", SECRETS,
             "--no-traffic",
-            "--tag", "release-a",
+            "--revision-suffix", REVISION_SUFFIX,
+        ]
+
+    @staticmethod
+    def _revision_describe_call() -> list[str]:
+        return [
+            "run", "revisions", "describe", CANDIDATE_REVISION,
+            "--account", ACCOUNT,
+            "--project", PROJECT,
+            "--region", REGION,
+            "--format=json",
         ]
 
 

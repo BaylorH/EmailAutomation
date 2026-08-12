@@ -267,6 +267,28 @@ the job scaffold).
   than 40m, raise `DEFAULT_TTL_SECONDS` first, then the timeout, keeping
   timeout `<=` TTL.
 
+### Tagless `process-user` staging gate
+
+`scripts/deploy_process_user.sh` is intentionally limited to staging. Its
+default `--dry-run` executes zero `gcloud` commands and reports the deterministic
+`process-user-stage-<12-character-HEAD>` revision identity. `--apply` first
+requires the existing service to have one sole 100 percent revision with the
+single `release-a` mapping, then builds and resolves an immutable image digest.
+It deploys that digest with `--no-traffic` and the deterministic
+`--revision-suffix`, without any `--tag`, and fails unless service and revision
+readback prove all of the following:
+
+- the candidate is Ready, has the exact immutable image and deployment config,
+  remains untagged, and has 0 percent traffic; and
+- the prior revision remains the sole 100 percent target with its stable
+  `release-a` mapping unchanged.
+
+This script does not pause or resume a queue, mutate traffic, create a temporary
+certification tag, promote a revision, or execute rollback. Those are separate
+bounded rollout steps. Both global campaign switches must remain false, and
+staging must not call `POST /process-user` or perform a provider or mailbox
+canary.
+
 ### Prove rollback and guaranteed Release A restoration
 
 Run this only after the exact `release-a` revision has been promoted to 100%
