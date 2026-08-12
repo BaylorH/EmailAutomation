@@ -489,6 +489,65 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 create_reply_review_mock=create_review,
             )
 
+    def test_oversized_policy_review_draft_stays_retryable_without_second_effect(self):
+        self.addCleanup(processing._reset_reply_send_outcome)
+        processing._reset_reply_send_outcome()
+        thread_id = "thread-policy-oversized-review"
+        oversized_draft = "x" * 100_001
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+        })
+        send_reply = MagicMock(side_effect=self._policy_blocked_send)
+        create_review = MagicMock(
+            side_effect=ValueError("response_body exceeds maximum length 100000")
+        )
+        queue_pending = MagicMock()
+        mark_processed = MagicMock()
+        complete_client = MagicMock(return_value=True)
+
+        with patch.object(
+            processing,
+            "_select_automatic_response_body",
+            return_value=oversized_draft,
+        ), patch.object(processing, "mark_processed", new=mark_processed):
+            with self.assertRaisesRegex(
+                processing.RetryableProcessingError,
+                "policy-blocked reply review projection failed",
+            ):
+                self._run_tour_invite_reply_processing(
+                    thread_id=thread_id,
+                    body="The property is no longer available.",
+                    proposal={
+                        "updates": [],
+                        "events": [
+                            {
+                                "type": "property_unavailable",
+                                "reason": "no_longer_available",
+                            }
+                        ],
+                        "response_email": oversized_draft,
+                    },
+                    thread_ref=thread_ref,
+                    send_reply_mock=send_reply,
+                    create_reply_review_mock=create_review,
+                    queue_pending_mock=queue_pending,
+                    mark_client_completed_mock=complete_client,
+                )
+
+        send_reply.assert_called_once()
+        create_review.assert_called_once()
+        self.assertEqual(
+            oversized_draft,
+            create_review.call_args.kwargs["response_body"],
+        )
+        queue_pending.assert_not_called()
+        mark_processed.assert_not_called()
+        complete_client.assert_not_called()
+
     def test_reply_review_stops_second_response_and_does_not_complete_client(self):
         thread_id = "thread-policy-single-review"
         thread_ref = FakeDocumentRef({

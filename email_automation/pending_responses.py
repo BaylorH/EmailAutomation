@@ -26,7 +26,6 @@ from .column_config import (
     response_requests_nonrequestable_fields,
 )
 from .reply_reviews import (
-    ReplyReviewProjectionError,
     convert_legacy_policy_blocked_pending_response,
     is_legacy_policy_blocked_pending_response,
 )
@@ -313,6 +312,29 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
         doc = item["doc"]
         data = item["data"]
 
+        if is_legacy_policy_blocked_pending_response(data):
+            print(
+                "  → Converting policy-blocked pending response "
+                f"{str(doc.id or 'unknown')[:12]}..."
+            )
+            try:
+                projection = convert_legacy_policy_blocked_pending_response(
+                    user_id=user_id,
+                    pending_response_id=doc.id,
+                )
+                print(
+                    "    🛑 Converted deterministic policy block to review "
+                    f"{projection.review_id[:12]}..."
+                )
+            except Exception:
+                print("    ❌ Policy-blocked reply review conversion failed")
+                operation_states.append({
+                    "status": "error",
+                    "operation": "pending_response_review_projection",
+                    "error": "policy-blocked reply review conversion failed",
+                })
+            continue
+
         thread_id = data.get("threadId")
         msg_id = data.get("msgId")
         recipient = data.get("recipient")
@@ -323,24 +345,6 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
         print(f"  → Retrying response to {recipient} (attempt {attempts + 1}/{MAX_RESPONSE_ATTEMPTS})")
 
         try:
-            if is_legacy_policy_blocked_pending_response(data):
-                try:
-                    projection = convert_legacy_policy_blocked_pending_response(
-                        user_id=user_id,
-                        pending_response_id=doc.id,
-                    )
-                    print(
-                        "    🛑 Converted deterministic policy block to review "
-                        f"{projection.review_id[:12]}..."
-                    )
-                except ReplyReviewProjectionError as exc:
-                    print("    ❌ Policy-blocked reply review conversion failed")
-                    operation_states.append({
-                        "status": "error",
-                        "operation": "pending_response_review_projection",
-                        "error": str(exc)[:1500],
-                    })
-                continue
             if terminal_disposition and data.get("deliveryConfirmed"):
                 processing_module._restore_deferred_terminal_reply(
                     user_id, thread_id, terminal_disposition, data.get("clientId"))
