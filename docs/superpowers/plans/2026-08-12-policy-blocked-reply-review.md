@@ -23,6 +23,7 @@
 - Modify `tests/test_processing_reply_indexing.py`: new policy branch and no-fallback tests.
 - Modify `tests/test_pending_responses.py`: legacy conversion ordering and failure tests.
 - Modify `tests/test_processing_completion_guards.py`: closing draft cannot complete the client.
+- Modify `tests/test_compound_nonviable_processing.py`: route-level retry-boundary and single-response regressions.
 - Create/modify only the #77 contract files replayed in Task 0 before feature work.
 
 ### UI repository
@@ -138,17 +139,20 @@ created = create_policy_blocked_reply_review(
     source_message_id="message-1",
     recipient="contact@example.test",
     response_body="Hi,\n\nThanks.",
-    subject="Re: Example",
+    subject=None,  # Policy guard may run before subject resolution.
     conversation_id="conversation-1",
 )
 assert created.status == "created"
 ```
 
 Assert the exact closed review and notification shapes, one counter increment,
-the thread pause patch, no `retryable: false`, and zero `pendingResponses` or
-`outbox` writes. Add exact replay, different-intent conflict, missing client,
-missing thread, preexisting-notification conflict, and transaction exception
-cases.
+the thread pause patch (including a cleared
+`followUpConfig.processingLeaseUntil` while preserving the independent
+`followUpSendAttempt` reconciliation marker), no `retryable: false`, and zero
+`pendingResponses` or `outbox` writes. Add exact replay, different-intent
+conflict, missing client, missing thread, preexisting-notification conflict,
+and transaction exception cases. Recipient and response body are required;
+nullable subject is a valid positive case and remains null in both projections.
 
 - [ ] **Step 2: Run the focused test and confirm RED**
 
@@ -212,6 +216,7 @@ Expected: every transaction test passes and the worktree is clean after commit.
 - Modify: `email_automation/processing.py`
 - Modify: `tests/test_processing_reply_indexing.py`
 - Modify: `tests/test_processing_completion_guards.py`
+- Modify: `tests/test_compound_nonviable_processing.py`
 
 - [ ] **Step 1: Write focused processing RED tests**
 
@@ -245,6 +250,7 @@ message and prove only the first policy projection occurs.
 .venv/bin/python -m pytest -q \
   tests/test_processing_reply_indexing.py \
   tests/test_processing_completion_guards.py \
+  tests/test_compound_nonviable_processing.py \
   -k 'policy_block or reply_review'
 ```
 
@@ -273,6 +279,7 @@ Map `ReplyReviewProjectionError` to `RetryableProcessingError`. Add
   tests/test_reply_reviews.py \
   tests/test_processing_reply_indexing.py \
   tests/test_processing_completion_guards.py \
+  tests/test_compound_nonviable_processing.py \
   tests/test_processing_reply_safety.py
 ```
 
@@ -283,7 +290,8 @@ Expected: new and existing send-outcome cases pass.
 ```bash
 git add email_automation/processing.py \
   tests/test_processing_reply_indexing.py \
-  tests/test_processing_completion_guards.py
+  tests/test_processing_completion_guards.py \
+  tests/test_compound_nonviable_processing.py
 git diff --cached --check
 git commit -m "fix: stop retrying policy-blocked replies"
 ```
@@ -329,15 +337,14 @@ Expose a pure classifier:
 
 ```python
 def is_legacy_policy_blocked_pending_response(data: Mapping[str, Any]) -> bool:
-    return (
-        data.get("failureCode") == POLICY_BLOCK_FAILURE_CODE
-        or data.get("lastError") == LEGACY_POLICY_BLOCK_ERROR
-    )
+    return data.get("lastError") == LEGACY_POLICY_BLOCK_ERROR
 ```
 
 Call conversion immediately after reading the pending row fields and before
 campaign/provider logic. On projection failure append a local error operation
-state and continue without modifying the pending document.
+state and continue without modifying the pending document. Require the source
+document ID to equal its stored thread ID and `attempts` to be a positive
+non-boolean integer; `failureCode` alone is not legacy provenance.
 
 - [ ] **Step 4: Run full pending/processing GREEN and commit**
 
@@ -405,7 +412,9 @@ exact thread exists, so it is counted and can navigate to the review card.
 - [ ] **Step 3: Write card and panel RED tests**
 
 Assert the card shows the saved draft and boundary copy, has no textbox/button/
-link, and handles missing identity without offering action. At panel level,
+link, and handles missing required identity, recipient, or body without offering
+action. A null subject renders `Subject unavailable` without invalidating the
+otherwise complete projection. At panel level,
 assert an expanded exact thread renders the card and not
 `InlineReplyComposer`; a fuzzy-only thread renders neither card nor composer.
 At row level, assert the safe navigation button says `Review Draft` and only

@@ -71,7 +71,7 @@ the immutable identity and draft fields:
   "recipient": "...",
   "responseBody": "...",
   "sourceMessageId": "...",
-  "subject": "...",
+  "subject": null,
   "terminalDisposition": null,
   "threadId": "..."
 }
@@ -81,6 +81,11 @@ The review ID deduplicates ordinary worker replay. The intent hash prevents a
 different draft or identity packet from being silently written under the same
 source-message identity. An exact replay is a no-op; an identity or intent
 conflict fails closed.
+
+`subject` is deliberately nullable. The automatic-reply policy guard runs
+before `send_reply_in_thread` resolves the Graph subject, and the guard must not
+be moved or weakened to populate a display field. Recipient and response body
+are required; subject and conversation identity are preserved when available.
 
 ### Review record
 
@@ -140,7 +145,7 @@ the exact client:
     "sourceMessageId": "...",
     "suggestedEmail": {
       "to": ["..."],
-      "subject": "...",
+      "subject": null,
       "body": "..."
     }
   }
@@ -163,7 +168,13 @@ For a new review it atomically:
 4. pauses automated continuation on the exact thread by setting
    `status=action_needed`, `statusReason=blocked_auto_reply_policy`,
    `followUpStatus=stopped`, disabling the follow-up config, and clearing any
-   pending follow-up time or processing lease.
+   pending follow-up time plus `processingBy`, `processingAt`, and
+   `processingLeaseUntil`.
+
+The transaction does not clear `followUpSendAttempt.leaseUntil`. That field is
+the separate provider-reconciliation marker for an uncertain send, not the
+worker processing lease, and preserving it avoids erasing delivery-uncertainty
+evidence.
 
 There is no intermediate state where a review exists without its notification
 or where a notification is visible while automatic follow-up remains eligible.
@@ -203,6 +214,11 @@ review, records the source pending ID, and deletes the pending document. An
 exact replay is idempotent. Conversion failure leaves the pending document
 unchanged, records a local operation error, and performs no provider access.
 
+Legacy provenance requires the exact historic `lastError`; a caller-supplied
+`failureCode` alone is insufficient. The pending document ID must equal its
+stored thread ID and `attempts` must be a positive non-boolean integer, matching
+the closed shape created by the old first-attempt queue path.
+
 This milestone does not rewrite arbitrary exhausted dead-letter records or
 infer policy provenance from broad phrases such as "manual review".
 
@@ -239,13 +255,16 @@ The expanded matching conversation renders one
 
 - `Manual review required`;
 - `Saved draft`;
-- the preserved recipient, subject, and body; and
+- the preserved recipient and body;
+- the preserved subject, or `Subject unavailable` when the early policy guard
+  correctly stopped processing before subject resolution; and
 - `Secure review actions are not enabled in this build.`
 
 It has no buttons, editable fields, links that mutate state, Firestore writes,
 Functions calls, outbox calls, retry behavior, or optimistic removal. Missing
-required identity or draft fields fails closed to a compact unavailable notice
-and still exposes no action.
+required identity, recipient, or body fields fails closed to a compact
+unavailable notice and still exposes no action. A missing subject alone is not
+an invalid projection.
 
 Existing sendable action notifications can continue to render their composer
 independently. A projection-only review can never cause `InlineReplyComposer`
