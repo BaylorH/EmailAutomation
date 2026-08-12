@@ -3483,7 +3483,7 @@ def refresh_and_process_user(user_id: str):
     # Helpful logging: was it cached or refreshed?
     token_source = "refreshed_via_refresh_token" if (not before_state and after_state) else "cached_access_token"
     exp_secs = result.get("expires_in")
-    print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s – preview: {access_token[:40]}")
+    print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s")
 
     # (Optional) sanity check on JWT-shaped token & appid
     if access_token.count(".") == 2:
