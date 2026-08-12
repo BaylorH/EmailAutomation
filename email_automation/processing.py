@@ -112,6 +112,9 @@ from .reply_reviews import (
     POLICY_BLOCK_FAILURE_CODE,
     ReplyReviewProjectionError,
     create_policy_blocked_reply_review,
+    validate_policy_blocked_reply_review_intent,
+    validate_policy_blocked_reply_review_recovery_envelope_identity,
+    validate_policy_blocked_reply_review_recovery_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,9 +144,42 @@ DEFAULT_TOUR_ACTION_ALLOWLIST = {
     "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
 }
 
+REPLY_REVIEW_PROJECTION_RECOVERY_STATUS = "reply_review_projection_pending"
+REPLY_REVIEW_PROJECTION_MANUAL_REVIEW_STATUS = (
+    "reply_review_projection_manual_review"
+)
+REPLY_REVIEW_PROJECTION_RECOVERY_STATUSES = frozenset({
+    REPLY_REVIEW_PROJECTION_RECOVERY_STATUS,
+    REPLY_REVIEW_PROJECTION_MANUAL_REVIEW_STATUS,
+})
+REPLY_REVIEW_PROJECTION_RECOVERY_KIND = "policy_blocked_reply_review"
+REPLY_REVIEW_PROJECTION_RECOVERY_SCHEMA_VERSION = 1
+REPLY_REVIEW_PROJECTION_RECOVERY_FIELDS = frozenset({
+    "kind",
+    "schemaVersion",
+    "clientId",
+    "threadId",
+    "canonicalProcessedKey",
+    "sourceGraphMessageId",
+    "sourceInternetMessageId",
+    "recipient",
+    "responseBody",
+    "subject",
+    "conversationId",
+    "terminalDisposition",
+})
+
 
 class RetryableProcessingError(Exception):
     """Raised when a message should remain unprocessed so the next scan can retry it."""
+
+
+class ReplyReviewProjectionPendingError(RetryableProcessingError):
+    """Carries one unsent review intent to the canonical inbox failure boundary."""
+
+    def __init__(self, *, projection_intent: Dict[str, Any]):
+        super().__init__("policy-blocked reply review projection failed")
+        self.projection_intent = projection_intent
 
 
 def _set_reply_campaign_suppression(decision) -> None:
@@ -429,8 +465,18 @@ def _queue_response_retry_or_reconciliation(
                 terminal_disposition=terminal_disposition,
             )
         except (ReplyReviewProjectionError, ValueError) as exc:
-            raise RetryableProcessingError(
-                "policy-blocked reply review projection failed"
+            projection_intent = {
+                "clientId": client_id,
+                "threadId": thread_id,
+                "sourceGraphMessageId": msg_id,
+                "recipient": recipient,
+                "responseBody": response_body,
+                "subject": send_outcome.subject,
+                "conversationId": send_outcome.conversation_id,
+                "terminalDisposition": terminal_disposition,
+            }
+            raise ReplyReviewProjectionPendingError(
+                projection_intent=projection_intent,
             ) from exc
         print(
             "🛑 Automatic reply requires manual review; "
@@ -681,6 +727,136 @@ def _record_ai_processing_failure(
         return False
 
 
+def _build_reply_review_projection_recovery_metadata(
+    error: ReplyReviewProjectionPendingError,
+    *,
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    canonical_processed_key: str,
+    message: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw = error.projection_intent
+    expected_fields = {
+        "clientId",
+        "threadId",
+        "sourceGraphMessageId",
+        "recipient",
+        "responseBody",
+        "subject",
+        "conversationId",
+        "terminalDisposition",
+    }
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != expected_fields
+        or raw.get("clientId") != client_id
+        or raw.get("threadId") != thread_id
+        or raw.get("sourceGraphMessageId") != message.get("id")
+    ):
+        raise ReplyReviewProjectionError(
+            "pending reply review projection identity is invalid"
+        )
+
+    identities = validate_policy_blocked_reply_review_recovery_identity(
+        source_graph_message_id=raw["sourceGraphMessageId"],
+        source_internet_message_id=message.get("internetMessageId"),
+        canonical_processed_key=canonical_processed_key,
+    )
+    intent = validate_policy_blocked_reply_review_intent(
+        user_id=user_id,
+        client_id=raw["clientId"],
+        thread_id=raw["threadId"],
+        source_message_id=raw["sourceGraphMessageId"],
+        recipient=raw["recipient"],
+        response_body=raw["responseBody"],
+        subject=raw["subject"],
+        conversation_id=raw["conversationId"],
+        terminal_disposition=raw["terminalDisposition"],
+    )
+    return {
+        "kind": REPLY_REVIEW_PROJECTION_RECOVERY_KIND,
+        "schemaVersion": REPLY_REVIEW_PROJECTION_RECOVERY_SCHEMA_VERSION,
+        "clientId": intent["clientId"],
+        "threadId": intent["threadId"],
+        **identities,
+        "recipient": intent["recipient"],
+        "responseBody": intent["responseBody"],
+        "subject": intent["subject"],
+        "conversationId": intent["conversationId"],
+        "terminalDisposition": intent["terminalDisposition"],
+    }
+
+
+def _record_inbox_processing_failure(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    canonical_processed_key: str,
+    error: Exception,
+    message: Dict[str, Any],
+) -> bool:
+    if isinstance(error, ReplyReviewProjectionPendingError):
+        try:
+            metadata = _build_reply_review_projection_recovery_metadata(
+                error,
+                user_id=user_id,
+                client_id=client_id,
+                thread_id=thread_id,
+                canonical_processed_key=canonical_processed_key,
+                message=message,
+            )
+        except (ReplyReviewProjectionError, ValueError):
+            metadata = None
+        if metadata is not None:
+            return _record_ai_processing_failure(
+                user_id,
+                client_id,
+                thread_id,
+                canonical_processed_key,
+                "policy-blocked reply review projection failed",
+                recovery_status=REPLY_REVIEW_PROJECTION_RECOVERY_STATUS,
+                metadata=metadata,
+            )
+
+        try:
+            identity = validate_policy_blocked_reply_review_recovery_envelope_identity(
+                user_id=user_id,
+                client_id=client_id,
+                thread_id=thread_id,
+                source_graph_message_id=message.get("id"),
+                source_internet_message_id=message.get("internetMessageId"),
+                canonical_processed_key=canonical_processed_key,
+            )
+        except ValueError:
+            identity = None
+        if identity is not None:
+            return _record_ai_processing_failure(
+                user_id,
+                client_id,
+                thread_id,
+                canonical_processed_key,
+                "policy-blocked reply review intent requires manual recovery",
+                retryable=False,
+                recovery_status=REPLY_REVIEW_PROJECTION_MANUAL_REVIEW_STATUS,
+                metadata={
+                    "kind": REPLY_REVIEW_PROJECTION_RECOVERY_KIND,
+                    "schemaVersion": REPLY_REVIEW_PROJECTION_RECOVERY_SCHEMA_VERSION,
+                    "envelopeType": "identity_only",
+                    "failureCode": "invalid_projection_intent",
+                    **identity,
+                },
+            )
+
+    return _record_ai_processing_failure(
+        user_id,
+        client_id,
+        thread_id,
+        canonical_processed_key,
+        str(error),
+    )
+
+
 def _has_processing_failure_record(user_id: str, thread_id: str, message_id: str) -> bool:
     if not thread_id or not message_id:
         return False
@@ -691,6 +867,67 @@ def _has_processing_failure_record(user_id: str, thread_id: str, message_id: str
     except Exception as e:
         print(f"⚠️ Could not check processing failure retry state: {e}")
         return False
+
+
+def _has_pending_reply_review_projection_recovery(
+    user_id: str,
+    thread_id: str,
+    canonical_processed_key: str,
+    message: Dict[str, Any],
+) -> bool:
+    """Keep projection recovery out of the ordinary inbox replay pipeline."""
+    if not thread_id or not canonical_processed_key:
+        return True
+    try:
+        doc_id = f"{thread_id}__{canonical_processed_key}"
+        snapshot = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("processingFailures")
+            .document(doc_id)
+            .get()
+        )
+    except Exception:
+        print(
+            "⚠️ Reply review projection recovery guard unreadable; "
+            "leaving message for a later scan"
+        )
+        return True
+
+    if not getattr(snapshot, "exists", False):
+        return False
+    data = snapshot.to_dict() or {}
+    metadata = data.get("metadata")
+    projection_shaped = (
+        data.get("recoveryStatus") in REPLY_REVIEW_PROJECTION_RECOVERY_STATUSES
+        or (
+            isinstance(metadata, dict)
+            and metadata.get("kind") == REPLY_REVIEW_PROJECTION_RECOVERY_KIND
+        )
+    )
+    if not projection_shaped:
+        return False
+
+    try:
+        intent = _stored_reply_review_projection_intent(user_id, data)
+    except ReplyReviewProjectionError:
+        print(
+            "⚠️ Reply review projection recovery metadata invalid; "
+            "blocking ordinary inbox replay"
+        )
+        return True
+
+    if (
+        intent["canonical_processed_key"] != canonical_processed_key
+        or intent["source_message_id"] != message.get("id")
+        or intent["source_internet_message_id"] != message.get("internetMessageId")
+    ):
+        print(
+            "⚠️ Reply review projection recovery identity mismatch; "
+            "blocking ordinary inbox replay"
+        )
+        return True
+    return True
 
 
 def _record_processing_failure_blocked_by_manual_continuation(
@@ -1266,6 +1503,84 @@ def _find_sent_item_continuing_conversation(
         return _guard_unreadable_artifact("SentItems/manualContinuation", e)
 
 
+def _stored_reply_review_projection_intent(
+    user_id: str,
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = data.get("metadata")
+    if (
+        data.get("recoveryStatus") != REPLY_REVIEW_PROJECTION_RECOVERY_STATUS
+        or not isinstance(metadata, dict)
+        or set(metadata) != REPLY_REVIEW_PROJECTION_RECOVERY_FIELDS
+        or metadata.get("kind") != REPLY_REVIEW_PROJECTION_RECOVERY_KIND
+        or type(metadata.get("schemaVersion")) is not int
+        or metadata["schemaVersion"] != REPLY_REVIEW_PROJECTION_RECOVERY_SCHEMA_VERSION
+        or metadata.get("clientId") != data.get("clientId")
+        or metadata.get("threadId") != data.get("threadId")
+        or metadata.get("canonicalProcessedKey") != data.get("messageId")
+    ):
+        raise ReplyReviewProjectionError(
+            "stored policy-blocked reply review recovery metadata is invalid"
+        )
+
+    try:
+        identities = validate_policy_blocked_reply_review_recovery_identity(
+            source_graph_message_id=metadata["sourceGraphMessageId"],
+            source_internet_message_id=metadata["sourceInternetMessageId"],
+            canonical_processed_key=metadata["canonicalProcessedKey"],
+        )
+        validated = validate_policy_blocked_reply_review_intent(
+            user_id=user_id,
+            client_id=metadata["clientId"],
+            thread_id=metadata["threadId"],
+            source_message_id=identities["sourceGraphMessageId"],
+            recipient=metadata["recipient"],
+            response_body=metadata["responseBody"],
+            subject=metadata["subject"],
+            conversation_id=metadata["conversationId"],
+            terminal_disposition=metadata["terminalDisposition"],
+        )
+    except ValueError as exc:
+        raise ReplyReviewProjectionError(
+            "stored policy-blocked reply review recovery metadata is invalid"
+        ) from exc
+    return {
+        "client_id": validated["clientId"],
+        "thread_id": validated["threadId"],
+        "source_message_id": validated["sourceMessageId"],
+        "source_internet_message_id": identities["sourceInternetMessageId"],
+        "canonical_processed_key": identities["canonicalProcessedKey"],
+        "recipient": validated["recipient"],
+        "response_body": validated["responseBody"],
+        "subject": validated["subject"],
+        "conversation_id": validated["conversationId"],
+        "terminal_disposition": validated["terminalDisposition"],
+    }
+
+
+def _retry_stored_reply_review_projection(user_id: str, data: Dict[str, Any]):
+    intent = _stored_reply_review_projection_intent(user_id, data)
+    projection = create_policy_blocked_reply_review(
+        user_id=user_id,
+        client_id=intent["client_id"],
+        thread_id=intent["thread_id"],
+        source_message_id=intent["source_message_id"],
+        recipient=intent["recipient"],
+        response_body=intent["response_body"],
+        subject=intent["subject"],
+        conversation_id=intent["conversation_id"],
+        terminal_disposition=intent["terminal_disposition"],
+    )
+    processed_keys = list(dict.fromkeys(
+        key for key in (
+            intent["canonical_processed_key"],
+            intent["source_message_id"],
+            intent["source_internet_message_id"],
+        ) if key
+    ))
+    return projection, processed_keys
+
+
 def _mark_processing_failure_blocked_by_manual_continuation(doc, sent_artifact: Dict[str, Any]):
     try:
         guard_unreadable = bool(sent_artifact.get("guardUnreadable"))
@@ -1332,10 +1647,15 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
             preserve_operator_replay = _is_operator_replay_recovery_status(
                 data.get("recoveryStatus")
             )
+            preserve_reply_review_projection = (
+                data.get("recoveryStatus")
+                in REPLY_REVIEW_PROJECTION_RECOVERY_STATUSES
+            )
             if (
                 message_id
                 and not preserve_operator_warning
                 and not preserve_operator_replay
+                and not preserve_reply_review_projection
                 and has_processed(user_id, message_id)
             ):
                 doc.reference.delete()
@@ -1412,19 +1732,24 @@ def retry_processing_failures(
         if suppression_kind:
             terminal = suppression_kind == "terminal"
             try:
-                doc.reference.set({
+                suppression_update = {
                     "processingAttempts": attempts,
                     "retryable": False if terminal else bool(data.get("retryable", True)),
-                    "recoveryStatus": (
-                        "campaign_stopped"
-                        if terminal
-                        else "campaign_automation_suppressed"
-                    ),
                     "automationSuppressedState": decision.state,
                     "automationSuppressedReason": decision.reason,
                     "automationSuppressedAt": SERVER_TIMESTAMP,
                     "updatedAt": SERVER_TIMESTAMP,
-                }, merge=True)
+                }
+                if (
+                    data.get("recoveryStatus")
+                    not in REPLY_REVIEW_PROJECTION_RECOVERY_STATUSES
+                ):
+                    suppression_update["recoveryStatus"] = (
+                        "campaign_stopped"
+                        if terminal
+                        else "campaign_automation_suppressed"
+                    )
+                doc.reference.set(suppression_update, merge=True)
             except Exception as update_error:
                 print(f"⚠️ Could not preserve processing failure campaign gate: {update_error}")
             result["skipped"] += 1
@@ -1432,6 +1757,39 @@ def retry_processing_failures(
 
         if not data.get("retryable", True) or not message_id or attempts >= max_attempts:
             result["skipped"] += 1
+            continue
+
+        if data.get("recoveryStatus") == REPLY_REVIEW_PROJECTION_RECOVERY_STATUS:
+            result["retried"] += 1
+            try:
+                _, processed_keys = _retry_stored_reply_review_projection(user_id, data)
+                for processed_key in processed_keys:
+                    if mark_processed(user_id, processed_key) is not True:
+                        raise ReplyReviewProjectionError(
+                            "reply review recovery processed marker write failed"
+                        )
+                doc.reference.delete()
+            except Exception:
+                result["failed"] += 1
+                next_attempts = attempts + 1
+                try:
+                    doc.reference.set({
+                        "processingAttempts": next_attempts,
+                        "retryable": next_attempts < max_attempts,
+                        "lastRetryAt": SERVER_TIMESTAMP,
+                        "lastRetryError": (
+                            "policy-blocked reply review projection recovery failed"
+                        ),
+                        "updatedAt": SERVER_TIMESTAMP,
+                    }, merge=True)
+                except Exception as update_error:
+                    print(
+                        "⚠️ Could not update reply review projection recovery state: "
+                        f"{update_error}"
+                    )
+                continue
+
+            result["succeeded"] += 1
             continue
 
         if has_processed(user_id, message_id):
@@ -8017,6 +8375,14 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                 thread_id = _match_message_to_thread(user_id, msg, headers)
 
                 if thread_id:
+                    if _has_pending_reply_review_projection_recovery(
+                        user_id,
+                        thread_id,
+                        processed_key,
+                        msg,
+                    ):
+                        skipped_count += 1
+                        continue
                     thread_messages[thread_id].append(msg)
                 else:
                     orphan_messages.append(msg)
@@ -8110,12 +8476,13 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process batched message: {e}")
-                _record_ai_processing_failure(
+                _record_inbox_processing_failure(
                     user_id,
                     _client_id_for_processing_failure(user_id, thread_id),
                     thread_id,
                     processed_key,
-                    str(e),
+                    e,
+                    last_msg,
                 )
             finally:
                 if _should_mark_processed_after_error(processing_error):
@@ -8145,12 +8512,13 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
-                _record_ai_processing_failure(
+                _record_inbox_processing_failure(
                     user_id,
                     _client_id_for_processing_failure(user_id, thread_id),
                     thread_id,
                     processed_key,
-                    str(e),
+                    e,
+                    msg,
                 )
             finally:
                 if _should_mark_processed_after_error(processing_error):
@@ -8179,12 +8547,13 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         except Exception as e:
             processing_error = e
             print(f"❌ Failed to process orphan message: {e}")
-            _record_ai_processing_failure(
+            _record_inbox_processing_failure(
                 user_id,
                 "unknown",
                 "orphan",
                 processed_key,
-                str(e),
+                e,
+                msg,
             )
         finally:
             if _should_mark_processed_after_error(processing_error):

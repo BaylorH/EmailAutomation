@@ -707,8 +707,10 @@ def mark_processed(user_id: str, key: str):
         _processed_ref(user_id, key).set({
             "processedAt": SERVER_TIMESTAMP
         }, merge=True)
+        return True
     except Exception as e:
         print(f"❌ Failed to mark message as processed {key}: {e}")
+        return False
 
 def _sync_ref(user_id: str):
     """Get reference to sync document."""

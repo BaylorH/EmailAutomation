@@ -167,6 +167,95 @@ def _validated_intent(
     }
 
 
+def validate_policy_blocked_reply_review_intent(
+    *,
+    user_id: Any,
+    client_id: Any,
+    thread_id: Any,
+    source_message_id: Any,
+    recipient: Any,
+    response_body: Any,
+    subject: Any,
+    conversation_id: Any,
+    terminal_disposition: Any,
+) -> Dict[str, Any]:
+    """Validate and normalize a persisted projection intent without writing."""
+    return _validated_intent(
+        user_id=user_id,
+        client_id=client_id,
+        thread_id=thread_id,
+        source_message_id=source_message_id,
+        recipient=recipient,
+        response_body=response_body,
+        subject=subject,
+        conversation_id=conversation_id,
+        terminal_disposition=terminal_disposition,
+    )
+
+
+def validate_policy_blocked_reply_review_recovery_identity(
+    *,
+    source_graph_message_id: Any,
+    source_internet_message_id: Any,
+    canonical_processed_key: Any,
+) -> Dict[str, Optional[str]]:
+    """Validate the exact Graph/RFC identities stored for projection recovery."""
+    graph_message_id = _required_string(
+        "source_graph_message_id",
+        source_graph_message_id,
+        MAX_FIRESTORE_ID_LENGTH,
+    )
+    internet_message_id = _optional_string(
+        "source_internet_message_id",
+        source_internet_message_id,
+        MAX_FIRESTORE_ID_LENGTH,
+    )
+    processed_key = _required_string(
+        "canonical_processed_key",
+        canonical_processed_key,
+        MAX_FIRESTORE_ID_LENGTH,
+    )
+    if processed_key != (internet_message_id or graph_message_id):
+        raise ValueError(
+            "canonical_processed_key must equal the RFC message ID when present, "
+            "otherwise the Graph message ID"
+        )
+    return {
+        "sourceGraphMessageId": graph_message_id,
+        "sourceInternetMessageId": internet_message_id,
+        "canonicalProcessedKey": processed_key,
+    }
+
+
+def validate_policy_blocked_reply_review_recovery_envelope_identity(
+    *,
+    user_id: Any,
+    client_id: Any,
+    thread_id: Any,
+    source_graph_message_id: Any,
+    source_internet_message_id: Any,
+    canonical_processed_key: Any,
+) -> Dict[str, Optional[str]]:
+    """Validate the server-derived identity-only recovery envelope."""
+    _required_string("user_id", user_id, MAX_FIRESTORE_ID_LENGTH)
+    validated_client_id = _required_string(
+        "client_id", client_id, MAX_FIRESTORE_ID_LENGTH
+    )
+    validated_thread_id = _required_string(
+        "thread_id", thread_id, MAX_FIRESTORE_ID_LENGTH
+    )
+    identities = validate_policy_blocked_reply_review_recovery_identity(
+        source_graph_message_id=source_graph_message_id,
+        source_internet_message_id=source_internet_message_id,
+        canonical_processed_key=canonical_processed_key,
+    )
+    return {
+        "clientId": validated_client_id,
+        "threadId": validated_thread_id,
+        **identities,
+    }
+
+
 def _build_review_document(
     *,
     review_id: str,

@@ -242,14 +242,16 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             side_effect=reply_reviews.ReplyReviewProjectionError("write failed"),
             create=True,
         ), patch.object(
+            processing, "_record_ai_processing_failure"
+        ) as record_failure, patch.object(
             processing, "queue_pending_response"
         ) as queue_retry, patch.object(
             processing, "record_sent_unindexed_response"
         ) as reconcile:
             with self.assertRaisesRegex(
-                processing.RetryableProcessingError,
+                processing.ReplyReviewProjectionPendingError,
                 "policy-blocked reply review projection failed",
-            ):
+            ) as raised:
                 processing._queue_response_retry_or_reconciliation(
                     "uid-1",
                     "thread-1",
@@ -259,6 +261,40 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                     "client-1",
                 )
 
+            record_failure.assert_not_called()
+            processing._record_inbox_processing_failure(
+                "uid-1",
+                "client-1",
+                "thread-1",
+                "<internet-message-1@example.test>",
+                raised.exception,
+                {
+                    "id": "message-1",
+                    "internetMessageId": "<internet-message-1@example.test>",
+                },
+            )
+            record_failure.assert_called_once_with(
+                "uid-1",
+                "client-1",
+                "thread-1",
+                "<internet-message-1@example.test>",
+                "policy-blocked reply review projection failed",
+                recovery_status="reply_review_projection_pending",
+                metadata={
+                    "kind": "policy_blocked_reply_review",
+                    "schemaVersion": 1,
+                    "clientId": "client-1",
+                    "threadId": "thread-1",
+                    "canonicalProcessedKey": "<internet-message-1@example.test>",
+                    "sourceGraphMessageId": "message-1",
+                    "sourceInternetMessageId": "<internet-message-1@example.test>",
+                    "recipient": "contact@example.test",
+                    "responseBody": "Hi,\n\nThanks.",
+                    "subject": None,
+                    "conversationId": None,
+                    "terminalDisposition": None,
+                },
+            )
         queue_retry.assert_not_called()
         reconcile.assert_not_called()
 
@@ -290,6 +326,110 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             processing._get_reply_send_outcome().outcome,
         )
         queue_retry.assert_not_called()
+
+    def test_reply_review_recovery_envelope_rejects_different_graph_message(self):
+        error = processing.ReplyReviewProjectionPendingError(
+            projection_intent={
+                "clientId": "client-1",
+                "threadId": "thread-1",
+                "sourceGraphMessageId": "message-1",
+                "recipient": "contact@example.test",
+                "responseBody": "Hi,\n\nThanks.",
+                "subject": None,
+                "conversationId": None,
+                "terminalDisposition": None,
+            }
+        )
+
+        with patch.object(processing, "_record_ai_processing_failure") as record_failure:
+            processing._record_inbox_processing_failure(
+                "uid-1",
+                "client-1",
+                "thread-1",
+                "<internet-message-2@example.test>",
+                error,
+                {
+                    "id": "message-2",
+                    "internetMessageId": "<internet-message-2@example.test>",
+                },
+            )
+
+        record_failure.assert_called_once_with(
+            "uid-1",
+            "client-1",
+            "thread-1",
+            "<internet-message-2@example.test>",
+            "policy-blocked reply review intent requires manual recovery",
+            retryable=False,
+            recovery_status="reply_review_projection_manual_review",
+            metadata={
+                "kind": "policy_blocked_reply_review",
+                "schemaVersion": 1,
+                "envelopeType": "identity_only",
+                "failureCode": "invalid_projection_intent",
+                "clientId": "client-1",
+                "threadId": "thread-1",
+                "canonicalProcessedKey": "<internet-message-2@example.test>",
+                "sourceGraphMessageId": "message-2",
+                "sourceInternetMessageId": "<internet-message-2@example.test>",
+            },
+        )
+
+    def test_invalid_reply_review_intent_records_identity_only_manual_recovery(self):
+        invalid_body = "sensitive-draft-marker" * 10_000
+        error = processing.ReplyReviewProjectionPendingError(
+            projection_intent={
+                "clientId": "client-1",
+                "threadId": "thread-1",
+                "sourceGraphMessageId": "graph-message-1",
+                "recipient": "sensitive-recipient@example.test",
+                "responseBody": invalid_body,
+                "subject": "Sensitive subject",
+                "conversationId": "conversation-1",
+                "terminalDisposition": None,
+            }
+        )
+
+        with patch.object(
+            processing, "_record_ai_processing_failure", return_value=True
+        ) as record_failure:
+            recorded = processing._record_inbox_processing_failure(
+                "uid-1",
+                "client-1",
+                "thread-1",
+                "<internet-message-1@example.test>",
+                error,
+                {
+                    "id": "graph-message-1",
+                    "internetMessageId": "<internet-message-1@example.test>",
+                },
+            )
+
+        self.assertTrue(recorded)
+        record_failure.assert_called_once_with(
+            "uid-1",
+            "client-1",
+            "thread-1",
+            "<internet-message-1@example.test>",
+            "policy-blocked reply review intent requires manual recovery",
+            retryable=False,
+            recovery_status="reply_review_projection_manual_review",
+            metadata={
+                "kind": "policy_blocked_reply_review",
+                "schemaVersion": 1,
+                "envelopeType": "identity_only",
+                "failureCode": "invalid_projection_intent",
+                "clientId": "client-1",
+                "threadId": "thread-1",
+                "canonicalProcessedKey": "<internet-message-1@example.test>",
+                "sourceGraphMessageId": "graph-message-1",
+                "sourceInternetMessageId": "<internet-message-1@example.test>",
+            },
+        )
+        persisted = repr(record_failure.call_args)
+        self.assertNotIn("sensitive-recipient", persisted)
+        self.assertNotIn("sensitive-draft-marker", persisted)
+        self.assertNotIn("Sensitive subject", persisted)
 
     def test_other_context_terminal_outcome_cannot_suppress_current_retry(self):
         terminal = CampaignAutomationDecision(
