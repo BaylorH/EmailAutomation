@@ -17,8 +17,8 @@ LOG_METHODS = frozenset(
 TAINT_PRESERVING_CALLS = frozenset(
     {"str", "repr", "bytes", "bytearray", "format", "dict", "list", "tuple", "set"}
 )
-TAINT_PRESERVING_METHODS = frozenset({"strip"})
 TOKEN_METADATA_CALLS = frozenset({("_expires_in_seconds",)})
+TOKEN_METADATA_KEYS = frozenset({"expires_in"})
 
 
 def _qualified_name(node: ast.expr) -> tuple[str, ...]:
@@ -57,6 +57,18 @@ def _subscript_key(node: ast.Subscript) -> object:
     return node.slice.value if isinstance(node.slice, ast.Constant) else None
 
 
+def _is_token_metadata_call(node: ast.Call) -> bool:
+    if _qualified_name(node.func) in TOKEN_METADATA_CALLS:
+        return True
+    return bool(
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value in TOKEN_METADATA_KEYS
+    )
+
+
 def _contains_token_material(node: ast.AST, tainted_names: set[str]) -> bool:
     if isinstance(node, ast.Constant):
         return False
@@ -76,7 +88,7 @@ def _contains_token_material(node: ast.AST, tainted_names: set[str]) -> bool:
             node.value, tainted_names
         ) or _contains_token_material(node.slice, tainted_names)
     if isinstance(node, ast.Call):
-        if _qualified_name(node.func) in TOKEN_METADATA_CALLS:
+        if _is_token_metadata_call(node):
             return False
         if (
             isinstance(node.func, ast.Attribute)
@@ -86,10 +98,8 @@ def _contains_token_material(node: ast.AST, tainted_names: set[str]) -> bool:
             and node.args[0].value == "access_token"
         ):
             return True
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in TAINT_PRESERVING_METHODS
-            and _contains_token_material(node.func.value, tainted_names)
+        if isinstance(node.func, ast.Attribute) and _contains_token_material(
+            node.func.value, tainted_names
         ):
             return True
         return any(
@@ -121,6 +131,8 @@ def _assigned_names(target: ast.expr) -> set[str]:
 def _assignment_value_is_tainted(value: ast.expr, tainted_names: set[str]) -> bool:
     if not isinstance(value, ast.Call):
         return _contains_token_material(value, tainted_names)
+    if _is_token_metadata_call(value):
+        return False
 
     qualified_name = _qualified_name(value.func)
     fetches_access_token = bool(
@@ -135,7 +147,6 @@ def _assignment_value_is_tainted(value: ast.expr, tainted_names: set[str]) -> bo
     }
     tainted_receiver = bool(
         isinstance(value.func, ast.Attribute)
-        and value.func.attr in TAINT_PRESERVING_METHODS
         and _contains_token_material(value.func.value, tainted_names)
     )
     return fetches_access_token or tainted_receiver or (
@@ -173,7 +184,7 @@ def _nodes_in_scope(scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef |
 
 def _tainted_names(nodes: list[ast.AST]) -> set[str]:
     tainted = {"access_token"}
-    assignments: list[tuple[list[ast.expr], ast.expr]] = []
+    assignments: list[tuple[list[ast.expr], ast.expr, bool]] = []
     for node in nodes:
         if isinstance(node, ast.Subscript) and _subscript_key(node) == "access_token":
             tainted.update(_assigned_names(node.value))
@@ -188,19 +199,24 @@ def _tainted_names(nodes: list[ast.AST]) -> set[str]:
             tainted.update(_assigned_names(node.func.value))
 
         if isinstance(node, ast.Assign):
-            assignments.append((node.targets, node.value))
+            assignments.append((node.targets, node.value, False))
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            assignments.append(([node.target], node.value))
+            assignments.append(([node.target], node.value, False))
         elif isinstance(node, ast.NamedExpr):
-            assignments.append(([node.target], node.value))
+            assignments.append(([node.target], node.value, False))
+        elif isinstance(node, ast.AugAssign):
+            assignments.append(([node.target], node.value, True))
 
     changed = True
     while changed:
         changed = False
-        for targets, value in assignments:
-            if not _assignment_value_is_tainted(value, tainted):
-                continue
+        for targets, value, is_augmented in assignments:
             names = set().union(*(_assigned_names(target) for target in targets))
+            if not (
+                _assignment_value_is_tainted(value, tainted)
+                or (is_augmented and bool(names & tainted))
+            ):
+                continue
             if not names <= tainted:
                 tainted.update(names)
                 changed = True
@@ -215,6 +231,8 @@ def _assignment_parts(
     if isinstance(node, ast.AnnAssign) and node.value is not None:
         return [node.target], node.value
     if isinstance(node, ast.NamedExpr):
+        return [node.target], node.value
+    if isinstance(node, ast.AugAssign):
         return [node.target], node.value
     return None
 
@@ -347,6 +365,35 @@ def test_guard_rejects_indirect_access_token_logging(
 ) -> None:
     entrypoint = tmp_path / "sample.py"
     entrypoint.write_text(source, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="prints access-token material"):
+        test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+@pytest.mark.parametrize("method_call", ("encode()", "upper()", "casefold()"))
+def test_guard_rejects_access_token_receiver_call_logging(
+    tmp_path: Path, method_call: str
+) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(
+        f"access_token = get_token()\nprint(access_token.{method_call})\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="prints access-token material"):
+        test_entrypoint_never_prints_access_token_material(entrypoint)
+
+
+def test_guard_rejects_augassign_access_token_retaint(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "sample.py"
+    entrypoint.write_text(
+        "access_token = get_token()\n"
+        "token = access_token\n"
+        'token = "[redacted]"\n'
+        "token += access_token\n"
+        "print(token)\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(AssertionError, match="prints access-token material"):
         test_entrypoint_never_prints_access_token_material(entrypoint)
