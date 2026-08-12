@@ -259,7 +259,7 @@
       },
       "dependencies": ["core.inbox_matching", "core.event_classifier", "core.reply_all_cc", "core.signature_identity"],
       "sendRisk": "sends_email_autonomous",
-      "dataWrites": ["users/{uid}/pendingResponses", "users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/deadLetterQueue", "users/{uid}/clients/{clientId}/notifications", "users/{uid}/clients/{clientId}/threads"],
+      "dataWrites": ["users/{uid}/pendingResponses", "users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/deadLetterQueue", "users/{uid}/clients/{clientId}", "users/{uid}/clients/{clientId}/notifications", "users/{uid}/threads/{threadId}"],
       "promptContracts": ["core_reply_body_policy", "no_tour_scheduling_auto_reply", "placeholder_blocking"],
       "uiSurfaces": ["Conversation panel", "Policy-blocked reply review card", "Health widget", "Action audit"],
       "testFixtures": [
