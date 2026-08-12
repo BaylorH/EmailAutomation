@@ -185,6 +185,30 @@ class ReplyReviewProjectionTests(unittest.TestCase):
         ):
             return reply_reviews.create_policy_blocked_reply_review(**values)
 
+    def _convert(self, firestore, pending_response_id=None):
+        with patch.object(reply_reviews, "_fs", firestore), patch.object(
+            reply_reviews.firestore, "transactional", fake_transactional
+        ):
+            return reply_reviews.convert_legacy_policy_blocked_pending_response(
+                user_id=self.USER_ID,
+                pending_response_id=pending_response_id or self.THREAD_ID,
+            )
+
+    def _legacy_pending_data(self, **overrides):
+        data = {
+            "threadId": self.THREAD_ID,
+            "msgId": self.SOURCE_MESSAGE_ID,
+            "recipient": self.RECIPIENT,
+            "responseBody": self.RESPONSE_BODY,
+            "clientId": self.CLIENT_ID,
+            "subject": None,
+            "conversationId": self.CONVERSATION_ID,
+            "attempts": 4,
+            "lastError": reply_reviews.LEGACY_POLICY_BLOCK_ERROR,
+        }
+        data.update(overrides)
+        return data
+
     def test_builds_stable_review_and_notification_ids(self):
         self.assertEqual(
             self.review_id,
@@ -229,6 +253,16 @@ class ReplyReviewProjectionTests(unittest.TestCase):
 
     def test_create_writes_closed_review_notification_rollup_and_pause_atomically(self):
         firestore = self._firestore()
+        send_attempt = {
+            "state": "uncertain",
+            "leaseUntil": "provider-reconciliation-lease",
+        }
+        firestore.store[self.thread_path]["followUpConfig.processingLeaseUntil"] = (
+            "active-processing-lease"
+        )
+        firestore.store[self.thread_path]["followUpSendAttempt"] = deepcopy(
+            send_attempt
+        )
 
         result = self._create(firestore)
 
@@ -335,12 +369,18 @@ class ReplyReviewProjectionTests(unittest.TestCase):
         self.assertIsNone(thread["followUpConfig.nextFollowUpAt"])
         self.assertIsNone(thread["followUpConfig.processingBy"])
         self.assertIsNone(thread["followUpConfig.processingAt"])
+        self.assertIsNone(thread["followUpConfig.processingLeaseUntil"])
+        self.assertEqual(send_attempt, thread["followUpSendAttempt"])
         thread_operations = [
             operation
             for operation in firestore.committed_operations
             if operation[1] == self.thread_path
         ]
         self.assertEqual("update", thread_operations[0][0])
+        self.assertIn(
+            "followUpConfig.processingLeaseUntil",
+            thread_operations[0][2],
+        )
 
         touched_paths = [operation[1] for operation in firestore.committed_operations]
         self.assertFalse(
@@ -539,6 +579,169 @@ class ReplyReviewProjectionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self._create(firestore, **{field: value})
                 self.assertEqual([], firestore.transactions)
+
+    def test_legacy_policy_classifier_requires_exact_provenance(self):
+        positives = (
+            {"lastError": reply_reviews.LEGACY_POLICY_BLOCK_ERROR},
+        )
+        negatives = (
+            {},
+            {"failureCode": reply_reviews.POLICY_BLOCK_FAILURE_CODE},
+            {
+                "failureCode": reply_reviews.POLICY_BLOCK_FAILURE_CODE,
+                "lastError": "different failure",
+            },
+            {"lastError": reply_reviews.LEGACY_POLICY_BLOCK_ERROR + "."},
+            {"lastError": "manual review required"},
+            {"failureCode": "blocked_auto_reply"},
+            {"failureCode": None, "lastError": "Manual Review Required"},
+        )
+        for data in positives:
+            with self.subTest(data=data):
+                self.assertTrue(
+                    reply_reviews.is_legacy_policy_blocked_pending_response(data)
+                )
+        for data in negatives:
+            with self.subTest(data=data):
+                self.assertFalse(
+                    reply_reviews.is_legacy_policy_blocked_pending_response(data)
+                )
+
+    def test_legacy_conversion_projects_review_and_deletes_source_atomically(self):
+        firestore = self._firestore()
+        pending_path = ("users", self.USER_ID, "pendingResponses", self.THREAD_ID)
+        firestore.store[pending_path] = self._legacy_pending_data()
+
+        result = self._convert(firestore)
+
+        self.assertEqual("created", result.status)
+        self.assertNotIn(pending_path, firestore.store)
+        self.assertEqual(
+            [
+                pending_path,
+                self.client_path,
+                self.thread_path,
+                self.review_path,
+                self.notification_path,
+            ],
+            firestore.transactions[0].reads,
+        )
+        self.assertEqual(
+            self.THREAD_ID, firestore.store[self.review_path]["sourcePendingResponseId"]
+        )
+        self.assertEqual(
+            ("delete", pending_path, None, False),
+            firestore.committed_operations[-1],
+        )
+        self.assertEqual(5, firestore.store[self.client_path]["notificationsUnread"])
+        touched_paths = [operation[1] for operation in firestore.committed_operations]
+        self.assertFalse(any("outbox" in path for path in touched_paths))
+
+    def test_legacy_conversion_reuses_exact_projection_without_counter_increment(self):
+        seeded = self._firestore()
+        pending_path = ("users", self.USER_ID, "pendingResponses", self.THREAD_ID)
+        seeded.store[pending_path] = self._legacy_pending_data()
+        self._convert(seeded)
+        projected_store = deepcopy(seeded.store)
+        projected_store[pending_path] = self._legacy_pending_data()
+        firestore = FakeFirestore(projected_store)
+        unread_before = firestore.store[self.client_path]["notificationsUnread"]
+
+        result = self._convert(firestore)
+
+        self.assertEqual("existing", result.status)
+        self.assertNotIn(pending_path, firestore.store)
+        self.assertEqual(
+            unread_before, firestore.store[self.client_path]["notificationsUnread"]
+        )
+        self.assertEqual(
+            [("delete", pending_path, None, False)],
+            firestore.committed_operations,
+        )
+
+    def test_legacy_conversion_source_disappearance_fails_closed(self):
+        firestore = self._firestore()
+        before = deepcopy(firestore.store)
+
+        with self.assertRaises(reply_reviews.ReplyReviewProjectionError):
+            self._convert(firestore)
+
+        self.assertEqual(before, firestore.store)
+        self.assertEqual([], firestore.committed_operations)
+
+    def test_legacy_conversion_rejects_non_policy_and_conflicting_rows(self):
+        pending_path = ("users", self.USER_ID, "pendingResponses", self.THREAD_ID)
+        cases = (
+            self._legacy_pending_data(lastError="manual review required"),
+            self._legacy_pending_data(clientId="client-other"),
+        )
+        for data in cases:
+            with self.subTest(data=data):
+                firestore = self._firestore()
+                firestore.store[pending_path] = data
+                before = deepcopy(firestore.store)
+
+                with self.assertRaises(reply_reviews.ReplyReviewProjectionError):
+                    self._convert(firestore)
+
+                self.assertEqual(before, firestore.store)
+                self.assertEqual([], firestore.committed_operations)
+
+    def test_legacy_conversion_rejects_copied_document_identity_and_bad_attempts(self):
+        copied_path = ("users", self.USER_ID, "pendingResponses", "copied-row")
+        invalid_attempts = (None, 0, -1, True, "4")
+        cases = [self._legacy_pending_data()]
+        cases.extend(
+            self._legacy_pending_data(attempts=attempts)
+            for attempts in invalid_attempts
+        )
+        for index, data in enumerate(cases):
+            with self.subTest(index=index, attempts=data.get("attempts")):
+                firestore = self._firestore()
+                if index == 0:
+                    firestore.store[copied_path] = data
+                    pending_id = "copied-row"
+                else:
+                    valid_path = (
+                        "users", self.USER_ID, "pendingResponses", self.THREAD_ID
+                    )
+                    firestore.store[valid_path] = data
+                    pending_id = self.THREAD_ID
+                before = deepcopy(firestore.store)
+
+                with self.assertRaises(reply_reviews.ReplyReviewProjectionError):
+                    self._convert(firestore, pending_response_id=pending_id)
+
+                self.assertEqual(before, firestore.store)
+                self.assertEqual([], firestore.committed_operations)
+
+    def test_legacy_conversion_intent_conflict_keeps_source(self):
+        firestore = self._firestore()
+        pending_path = ("users", self.USER_ID, "pendingResponses", self.THREAD_ID)
+        firestore.store[pending_path] = self._legacy_pending_data()
+        self._create(firestore, response_body="Different current projection")
+        before = deepcopy(firestore.store)
+        write_count = len(firestore.committed_operations)
+
+        with self.assertRaises(reply_reviews.ReplyReviewConflict):
+            self._convert(firestore)
+
+        self.assertEqual(before, firestore.store)
+        self.assertEqual(write_count, len(firestore.committed_operations))
+
+    def test_legacy_conversion_commit_failure_keeps_source_and_attempts(self):
+        firestore = self._firestore()
+        pending_path = ("users", self.USER_ID, "pendingResponses", self.THREAD_ID)
+        firestore.store[pending_path] = self._legacy_pending_data()
+        before = deepcopy(firestore.store)
+        firestore.fail_next_commit = True
+
+        with self.assertRaises(reply_reviews.ReplyReviewProjectionError):
+            self._convert(firestore)
+
+        self.assertEqual(before, firestore.store)
+        self.assertEqual(4, firestore.store[pending_path]["attempts"])
+        self.assertEqual([], firestore.committed_operations)
 
 
 if __name__ == "__main__":

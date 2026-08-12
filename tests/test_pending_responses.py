@@ -12,6 +12,7 @@ os.environ.setdefault(
 )
 
 from email_automation import pending_responses, processing
+from email_automation import reply_reviews
 from email_automation.campaign_safety import CampaignAutomationDecision
 from email_automation.column_config import get_default_column_config
 
@@ -87,6 +88,106 @@ class FakeFirestore:
 
 
 class PendingResponsesTests(unittest.TestCase):
+    def test_reply_review_conversion_precedes_every_campaign_provider_and_attempt_effect(self):
+        active_doc = FakeDoc("thread-policy-block", {
+            "threadId": "thread-policy-block",
+            "msgId": "message-policy-block",
+            "recipient": "contact@example.test",
+            "responseBody": "Hi,\n\nThanks.",
+            "clientId": "client-1",
+            "attempts": 4,
+            "lastError": reply_reviews.LEGACY_POLICY_BLOCK_ERROR,
+        })
+        fake_fs = FakeFirestore([active_doc])
+        events = []
+
+        def converted(**kwargs):
+            events.append(("convert", kwargs))
+            return reply_reviews.ReplyReviewProjection(
+                "review-1", "notification-1", "created"
+            )
+
+        def forbidden(name):
+            def fail(*_args, **_kwargs):
+                events.append((name, {}))
+                raise AssertionError(f"{name} must not run before legacy conversion")
+            return fail
+
+        with self._mock_clients_module(fake_fs), patch.object(
+            pending_responses,
+            "convert_legacy_policy_blocked_pending_response",
+            side_effect=converted,
+            create=True,
+        ) as convert, patch.object(
+            pending_responses,
+            "get_client_automation_decision",
+            side_effect=forbidden("campaign"),
+        ), patch.object(
+            pending_responses,
+            "find_matching_sent_message_for_retry",
+            side_effect=forbidden("sent_match"),
+        ), patch.object(
+            pending_responses,
+            "find_sent_conversation_continuation_for_retry",
+            side_effect=forbidden("continuation"),
+        ), patch.object(
+            processing,
+            "send_reply_in_thread",
+            side_effect=forbidden("send"),
+        ):
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer local-test"}
+            )
+
+        self.assertEqual([], states)
+        self.assertEqual(["convert"], [event[0] for event in events])
+        convert.assert_called_once_with(
+            user_id="uid-1", pending_response_id="thread-policy-block"
+        )
+        self.assertEqual([], active_doc.reference.update_calls)
+
+    def test_reply_review_conversion_failure_is_local_and_preserves_source(self):
+        data = {
+            "threadId": "thread-policy-block",
+            "msgId": "message-policy-block",
+            "recipient": "contact@example.test",
+            "responseBody": "Hi,\n\nThanks.",
+            "clientId": "client-1",
+            "attempts": 4,
+            "lastError": reply_reviews.LEGACY_POLICY_BLOCK_ERROR,
+        }
+        active_doc = FakeDoc("thread-policy-block", data)
+        fake_fs = FakeFirestore([active_doc])
+
+        with self._mock_clients_module(fake_fs), patch.object(
+            pending_responses,
+            "convert_legacy_policy_blocked_pending_response",
+            side_effect=reply_reviews.ReplyReviewProjectionError("transaction failed"),
+            create=True,
+        ), patch.object(
+            pending_responses, "get_client_automation_decision"
+        ) as campaign, patch.object(
+            pending_responses, "find_matching_sent_message_for_retry"
+        ) as sent_match, patch.object(
+            pending_responses, "find_sent_conversation_continuation_for_retry"
+        ) as continuation, patch.object(
+            processing, "send_reply_in_thread"
+        ) as send:
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer local-test"}
+            )
+
+        self.assertEqual(1, len(states))
+        self.assertEqual("error", states[0]["status"])
+        self.assertEqual("pending_response_review_projection", states[0]["operation"])
+        self.assertIn("transaction failed", states[0]["error"])
+        campaign.assert_not_called()
+        sent_match.assert_not_called()
+        continuation.assert_not_called()
+        send.assert_not_called()
+        self.assertFalse(active_doc.reference.deleted)
+        self.assertEqual([], active_doc.reference.update_calls)
+        self.assertEqual(4, active_doc.to_dict()["attempts"])
     def test_successful_retry_rechecks_campaign_completion_after_deleting_pending_work(self):
         pending_doc = FakeDoc("thread-final", {
             "threadId": "thread-final",
