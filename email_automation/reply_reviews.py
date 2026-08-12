@@ -250,11 +250,14 @@ def _existing_notification_matches(
     current: Mapping[str, Any],
     expected: Mapping[str, Any],
 ) -> bool:
-    return (
-        current.get("kind") == expected["kind"]
-        and current.get("priority") == expected["priority"]
-        and current.get("threadId") == expected["threadId"]
-        and current.get("meta") == expected["meta"]
+    if set(current) != set(expected):
+        return False
+    if current.get("createdAt") is None:
+        return False
+    return all(
+        current.get(field) == expected.get(field)
+        for field in expected
+        if field != "createdAt"
     )
 
 
