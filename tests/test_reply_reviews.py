@@ -488,6 +488,54 @@ class ReplyReviewProjectionTests(unittest.TestCase):
                 self.assertEqual(before, firestore.store)
                 self.assertEqual(write_count, len(firestore.committed_operations))
 
+    def test_tampered_existing_notification_is_not_accepted_as_exact_replay(self):
+        mutations = (
+            ("missing_created_at", lambda notification: notification.pop("createdAt")),
+            ("null_created_at", lambda notification: notification.__setitem__("createdAt", None)),
+            ("resolved_status", lambda notification: notification.__setitem__("status", "resolved")),
+            ("resolved_timestamp", lambda notification: notification.__setitem__("resolvedAt", "later")),
+            ("changed_priority", lambda notification: notification.__setitem__("priority", "normal")),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                firestore = self._firestore()
+                self._create(firestore)
+                mutate(firestore.store[self.notification_path])
+                before = deepcopy(firestore.store)
+                write_count = len(firestore.committed_operations)
+
+                with self.assertRaises(reply_reviews.ReplyReviewConflict):
+                    self._create(firestore)
+
+                self.assertEqual(before, firestore.store)
+                self.assertEqual(write_count, len(firestore.committed_operations))
+
+    def test_tampered_notification_keeps_legacy_source_and_attempts(self):
+        mutations = (
+            ("missing_created_at", lambda notification: notification.pop("createdAt")),
+            ("null_created_at", lambda notification: notification.__setitem__("createdAt", None)),
+            ("resolved_status", lambda notification: notification.__setitem__("status", "resolved")),
+            ("resolved_timestamp", lambda notification: notification.__setitem__("resolvedAt", "later")),
+            ("changed_priority", lambda notification: notification.__setitem__("priority", "normal")),
+        )
+        pending_path = ("users", self.USER_ID, "pendingResponses", self.THREAD_ID)
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                seeded = self._firestore()
+                seeded.store[pending_path] = self._legacy_pending_data()
+                self._convert(seeded)
+                seeded.store[pending_path] = self._legacy_pending_data()
+                mutate(seeded.store[self.notification_path])
+                firestore = FakeFirestore(seeded.store)
+                before = deepcopy(firestore.store)
+
+                with self.assertRaises(reply_reviews.ReplyReviewConflict):
+                    self._convert(firestore)
+
+                self.assertEqual(before, firestore.store)
+                self.assertEqual(4, firestore.store[pending_path]["attempts"])
+                self.assertEqual([], firestore.committed_operations)
+
     def test_missing_client_fails_closed_without_writes(self):
         firestore = self._firestore(client=False)
         before = deepcopy(firestore.store)
