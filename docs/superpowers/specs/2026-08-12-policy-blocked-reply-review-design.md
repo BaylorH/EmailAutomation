@@ -198,11 +198,14 @@ the inbound item remains visible without provider or outbox effects.
 
 The inner projection branch performs no failure write. It raises one typed
 error carrying a closed, bounded intent to the outer inbox boundary. That
-boundary writes exactly one `processingFailures` row under the canonical
-`threadId__processedKey` identity, where `processedKey` is the RFC message ID
-when present and otherwise the Graph message ID. The recovery packet binds the
-canonical key, Graph message ID, RFC message ID, client, thread, recipient,
-body, nullable subject/conversation, and validated terminal disposition.
+boundary writes exactly one `processingFailures` row under a
+fixed-length domain-separated SHA-256 document ID derived from length-prefixed
+UTF-8 thread and canonical processed-key identities. Raw identities never
+appear in the document ID; they remain only in the closed recovery envelope. The canonical
+processed key is the RFC message ID when present and otherwise the Graph
+message ID. The recovery packet binds that canonical key, Graph message ID,
+RFC message ID, client, thread, recipient, body, nullable subject/conversation,
+and validated terminal disposition.
 
 An ordinary inbox scan reads that exact failure document before batching. A
 valid pending packet, an unreadable lookup, or a projection-shaped invalid

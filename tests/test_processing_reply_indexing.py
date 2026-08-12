@@ -243,6 +243,8 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             create=True,
         ), patch.object(
             processing, "_record_ai_processing_failure"
+        ) as generic_record_failure, patch.object(
+            processing, "_record_reply_review_projection_failure"
         ) as record_failure, patch.object(
             processing, "queue_pending_response"
         ) as queue_retry, patch.object(
@@ -261,7 +263,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                     "client-1",
                 )
 
-            record_failure.assert_not_called()
+            generic_record_failure.assert_not_called()
             processing._record_inbox_processing_failure(
                 "uid-1",
                 "client-1",
@@ -279,6 +281,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                 "thread-1",
                 "<internet-message-1@example.test>",
                 "policy-blocked reply review projection failed",
+                retryable=True,
                 recovery_status="reply_review_projection_pending",
                 metadata={
                     "kind": "policy_blocked_reply_review",
@@ -341,7 +344,11 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             }
         )
 
-        with patch.object(processing, "_record_ai_processing_failure") as record_failure:
+        with patch.object(
+            processing, "_record_reply_review_projection_failure"
+        ) as record_failure, patch.object(
+            processing, "_record_ai_processing_failure"
+        ) as generic_record_failure:
             processing._record_inbox_processing_failure(
                 "uid-1",
                 "client-1",
@@ -354,6 +361,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                 },
             )
 
+        generic_record_failure.assert_not_called()
         record_failure.assert_called_once_with(
             "uid-1",
             "client-1",
@@ -391,7 +399,9 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
         )
 
         with patch.object(
-            processing, "_record_ai_processing_failure", return_value=True
+            processing,
+            "_record_reply_review_projection_failure",
+            return_value=True,
         ) as record_failure:
             recorded = processing._record_inbox_processing_failure(
                 "uid-1",

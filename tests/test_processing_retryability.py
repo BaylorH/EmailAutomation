@@ -1,5 +1,6 @@
 import unittest
 import os
+import hashlib
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -38,11 +39,24 @@ class _ThreadLookupNode:
         return _ThreadLookupNode(self._root, self._path + (name,))
 
     def document(self, doc_id):
+        if self._root.reject_unsafe_document_ids and (
+            "/" in doc_id or len(doc_id.encode("utf-8")) > 1_500
+        ):
+            raise ValueError("invalid Firestore document ID")
         return _ThreadLookupNode(self._root, self._path + (doc_id,))
 
     def get(self):
         self._root.get_calls.append(self._path)
         return _ThreadLookupSnapshot(self._root.documents.get(self._path))
+
+    def set(self, payload, merge=False):
+        self._root.set_calls.append((self._path, deepcopy(payload), merge))
+        if merge:
+            current = dict(self._root.documents.get(self._path) or {})
+            current.update(deepcopy(payload))
+            self._root.documents[self._path] = current
+        else:
+            self._root.documents[self._path] = deepcopy(payload)
 
 
 class _ThreadLookupFirestore:
@@ -51,6 +65,8 @@ class _ThreadLookupFirestore:
             ("users", user_id, "threads", thread_id): {"clientId": client_id},
         }
         self.get_calls = []
+        self.set_calls = []
+        self.reject_unsafe_document_ids = False
 
     def collection(self, name):
         return _ThreadLookupNode(self, (name,))
@@ -80,6 +96,93 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         )
         self.assertFalse(processing._should_mark_processed_after_error(ValueError("unexpected bug")))
         self.assertTrue(processing._should_mark_processed_after_error(None))
+
+    def test_reply_review_recovery_uses_one_safe_domain_separated_record_id(self):
+        user_id = "uid-1"
+        client_id = "client-1"
+        thread_id = "thread-" + ("t" * (1_500 - len("thread-")))
+        canonical_key = "<slash/" + (
+            "r" * (1_500 - len("<slash/>"))
+        ) + ">"
+        graph_id = "graph-message-1"
+        self.assertEqual(1_500, len(thread_id))
+        self.assertEqual(1_500, len(canonical_key))
+        self.assertNotEqual(graph_id, canonical_key)
+
+        error = processing.ReplyReviewProjectionPendingError(
+            projection_intent={
+                "clientId": client_id,
+                "threadId": thread_id,
+                "sourceGraphMessageId": graph_id,
+                "recipient": "contact@example.test",
+                "responseBody": "Hi,\n\nThanks.",
+                "subject": None,
+                "conversationId": "conversation-1",
+                "terminalDisposition": None,
+            }
+        )
+        message = {
+            "id": graph_id,
+            "internetMessageId": canonical_key,
+        }
+        fake_fs = _ThreadLookupFirestore(user_id, thread_id, client_id)
+        fake_fs.reject_unsafe_document_ids = True
+
+        with patch.object(processing, "_fs", fake_fs):
+            recorded = processing._record_inbox_processing_failure(
+                user_id,
+                client_id,
+                thread_id,
+                canonical_key,
+                error,
+                message,
+            )
+            guarded = processing._has_pending_reply_review_projection_recovery(
+                user_id,
+                thread_id,
+                canonical_key,
+                message,
+            )
+
+        self.assertTrue(recorded)
+        self.assertTrue(guarded)
+        self.assertEqual(1, len(fake_fs.set_calls))
+        written_path = fake_fs.set_calls[0][0]
+        read_path = fake_fs.get_calls[-1]
+        self.assertEqual(written_path, read_path)
+        record_id = written_path[-1]
+        self.assertTrue(record_id.startswith("reply_review_projection__"))
+        self.assertEqual(len("reply_review_projection__") + 64, len(record_id))
+        self.assertNotIn("/", record_id)
+        self.assertNotIn("thread", record_id)
+        self.assertNotIn("slash", record_id)
+
+        domain = b"emailautomation:reply-review-projection-recovery:v1\x00"
+        thread_bytes = thread_id.encode("utf-8")
+        key_bytes = canonical_key.encode("utf-8")
+        expected_digest = hashlib.sha256(
+            domain
+            + len(thread_bytes).to_bytes(4, "big")
+            + thread_bytes
+            + len(key_bytes).to_bytes(4, "big")
+            + key_bytes
+        ).hexdigest()
+        self.assertEqual(
+            f"reply_review_projection__{expected_digest}",
+            record_id,
+        )
+        self.assertNotEqual(
+            "reply_review_projection__"
+            + hashlib.sha256(f"{thread_id}__{canonical_key}".encode()).hexdigest(),
+            record_id,
+        )
+        stored = fake_fs.documents[written_path]
+        self.assertEqual(thread_id, stored["threadId"])
+        self.assertEqual(canonical_key, stored["messageId"])
+        self.assertEqual(graph_id, stored["metadata"]["sourceGraphMessageId"])
+        self.assertEqual(
+            canonical_key, stored["metadata"]["sourceInternetMessageId"]
+        )
 
     def test_sheet_apply_429_escapes_for_retryable_failure_recording(self):
         quota_error = HttpError(
@@ -184,7 +287,9 @@ class ProcessingRetryabilityTests(unittest.TestCase):
                     "users",
                     "uid-1",
                     "processingFailures",
-                    "thread-1__<message-1@example.test>",
+                    processing._reply_review_projection_failure_record_id(
+                        "thread-1", "<message-1@example.test>"
+                    ),
                 ),
                 ("users", "uid-1", "threads", "thread-1"),
             ],
@@ -222,7 +327,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
              patch.object(processing, "_resolve_current_mailbox_email", return_value="operator@example.test"), \
              patch.object(processing, "_has_processing_failure_record", return_value=False), \
              patch.object(processing, "process_inbox_message", side_effect=projection_error), \
-             patch.object(processing, "_record_ai_processing_failure", return_value=True) as record_failure, \
+             patch.object(processing, "_record_reply_review_projection_failure", return_value=True) as record_failure, \
              patch.object(processing, "mark_processed") as mark_processed, \
              patch.object(processing, "set_last_scan_iso"):
             result = processing.scan_inbox_against_index(
@@ -256,7 +361,9 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         client_id = "client-1"
         graph_id = "graph-message-1"
         internet_id = "<internet-message-1@example.test>"
-        failure_id = f"{thread_id}__{internet_id}"
+        failure_id = processing._reply_review_projection_failure_record_id(
+            thread_id, internet_id
+        )
         fake_fs = _ThreadLookupFirestore(user_id, thread_id, client_id)
         fake_fs.documents[("users", user_id, "processingFailures", failure_id)] = {
             "clientId": client_id,
@@ -322,7 +429,9 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         user_id = "uid-1"
         thread_id = "thread-1"
         internet_id = "<internet-message-1@example.test>"
-        failure_id = f"{thread_id}__{internet_id}"
+        failure_id = processing._reply_review_projection_failure_record_id(
+            thread_id, internet_id
+        )
         message = {
             "id": "graph-message-1",
             "internetMessageId": internet_id,
@@ -438,7 +547,9 @@ class ProcessingRetryabilityTests(unittest.TestCase):
                     "users",
                     "uid-1",
                     "processingFailures",
-                    "thread-1__<message-1@example.test>",
+                    processing._reply_review_projection_failure_record_id(
+                        "thread-1", "<message-1@example.test>"
+                    ),
                 ),
                 ("users", "uid-1", "threads", "thread-1"),
             ],

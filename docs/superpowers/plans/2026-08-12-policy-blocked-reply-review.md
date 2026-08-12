@@ -24,6 +24,8 @@ For rollback, roll back or disable the backend producer first. Operators must re
 
 Campaign suppression never replaces a reply-review recovery status. Temporary suppression preserves pending retryability for direct recovery after automation resumes; terminal suppression sets `retryable=false` while retaining the pending or manual status and writing only separate `automationSuppressed*` metadata.
 
+Every reply-review recovery row uses one fixed-length domain-separated SHA-256 document ID derived from length-prefixed UTF-8 thread and canonical processed-key identities. Raw thread, Graph, and RFC identities remain only inside the closed recovery envelope; generic processing-failure document IDs are unchanged.
+
 ## File structure
 
 ### Backend repository

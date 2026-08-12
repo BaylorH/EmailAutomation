@@ -750,6 +750,7 @@ class PolicyBlockedReplyReviewReleaseContractTests(unittest.TestCase):
             "retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain",
             "never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row",
             "Campaign suppression never replaces a reply-review recovery status",
+            "fixed-length domain-separated SHA-256 document ID",
         )
 
         for path in (REPLY_REVIEW_DESIGN_PATH, REPLY_REVIEW_PLAN_PATH):

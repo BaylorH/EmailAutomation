@@ -154,6 +154,11 @@ REPLY_REVIEW_PROJECTION_RECOVERY_STATUSES = frozenset({
 })
 REPLY_REVIEW_PROJECTION_RECOVERY_KIND = "policy_blocked_reply_review"
 REPLY_REVIEW_PROJECTION_RECOVERY_SCHEMA_VERSION = 1
+REPLY_REVIEW_PROJECTION_FAILURE_RECORD_ID_PREFIX = "reply_review_projection__"
+REPLY_REVIEW_PROJECTION_FAILURE_RECORD_ID_DOMAIN = (
+    b"emailautomation:reply-review-projection-recovery:v1\x00"
+)
+REPLY_REVIEW_PROJECTION_IDENTITY_MAX_LENGTH = 1_500
 REPLY_REVIEW_PROJECTION_RECOVERY_FIELDS = frozenset({
     "kind",
     "schemaVersion",
@@ -686,24 +691,19 @@ def _find_recent_sent_message_for_conversation(
     return None
 
 
-def _record_ai_processing_failure(
+def _write_ai_processing_failure(
     user_id: str,
     client_id: str,
     thread_id: str,
     message_id: str,
     reason: str,
     *,
+    doc_id: str,
     retryable: bool = True,
     recovery_status: Optional[str] = None,
-    record_key_suffix: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
-        doc_id = f"{thread_id}__{message_id or int(time.time())}"
-        if record_key_suffix:
-            safe_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", record_key_suffix).strip("_")
-            if safe_suffix:
-                doc_id = f"{doc_id}__{safe_suffix}"
         payload = {
             "clientId": client_id,
             "threadId": thread_id,
@@ -725,6 +725,94 @@ def _record_ai_processing_failure(
     except Exception as e:
         print(f"⚠️ Could not record AI processing failure: {e}")
         return False
+
+
+def _record_ai_processing_failure(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    message_id: str,
+    reason: str,
+    *,
+    retryable: bool = True,
+    recovery_status: Optional[str] = None,
+    record_key_suffix: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    doc_id = f"{thread_id}__{message_id or int(time.time())}"
+    if record_key_suffix:
+        safe_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", record_key_suffix).strip("_")
+        if safe_suffix:
+            doc_id = f"{doc_id}__{safe_suffix}"
+    return _write_ai_processing_failure(
+        user_id,
+        client_id,
+        thread_id,
+        message_id,
+        reason,
+        doc_id=doc_id,
+        retryable=retryable,
+        recovery_status=recovery_status,
+        metadata=metadata,
+    )
+
+
+def _reply_review_projection_failure_record_id(
+    thread_id: str,
+    canonical_processed_key: str,
+) -> str:
+    """Build a fixed-length, non-PII Firestore ID for projection recovery."""
+    framed = bytearray(REPLY_REVIEW_PROJECTION_FAILURE_RECORD_ID_DOMAIN)
+    for name, value in (
+        ("thread_id", thread_id),
+        ("canonical_processed_key", canonical_processed_key),
+    ):
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > REPLY_REVIEW_PROJECTION_IDENTITY_MAX_LENGTH
+        ):
+            raise ReplyReviewProjectionError(
+                f"{name} is invalid for reply review projection recovery"
+            )
+        encoded = value.encode("utf-8")
+        framed.extend(len(encoded).to_bytes(4, "big"))
+        framed.extend(encoded)
+    digest = hashlib.sha256(bytes(framed)).hexdigest()
+    return f"{REPLY_REVIEW_PROJECTION_FAILURE_RECORD_ID_PREFIX}{digest}"
+
+
+def _record_reply_review_projection_failure(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    canonical_processed_key: str,
+    reason: str,
+    *,
+    retryable: bool,
+    recovery_status: str,
+    metadata: Dict[str, Any],
+) -> bool:
+    """Write a projection recovery packet under its dedicated safe identity."""
+    try:
+        doc_id = _reply_review_projection_failure_record_id(
+            thread_id,
+            canonical_processed_key,
+        )
+    except ReplyReviewProjectionError:
+        print("⚠️ Could not build reply review projection recovery record identity")
+        return False
+    return _write_ai_processing_failure(
+        user_id,
+        client_id,
+        thread_id,
+        canonical_processed_key,
+        reason,
+        doc_id=doc_id,
+        retryable=retryable,
+        recovery_status=recovery_status,
+        metadata=metadata,
+    )
 
 
 def _build_reply_review_projection_recovery_metadata(
@@ -809,12 +897,13 @@ def _record_inbox_processing_failure(
         except (ReplyReviewProjectionError, ValueError):
             metadata = None
         if metadata is not None:
-            return _record_ai_processing_failure(
+            return _record_reply_review_projection_failure(
                 user_id,
                 client_id,
                 thread_id,
                 canonical_processed_key,
                 "policy-blocked reply review projection failed",
+                retryable=True,
                 recovery_status=REPLY_REVIEW_PROJECTION_RECOVERY_STATUS,
                 metadata=metadata,
             )
@@ -831,7 +920,7 @@ def _record_inbox_processing_failure(
         except ValueError:
             identity = None
         if identity is not None:
-            return _record_ai_processing_failure(
+            return _record_reply_review_projection_failure(
                 user_id,
                 client_id,
                 thread_id,
@@ -879,7 +968,10 @@ def _has_pending_reply_review_projection_recovery(
     if not thread_id or not canonical_processed_key:
         return True
     try:
-        doc_id = f"{thread_id}__{canonical_processed_key}"
+        doc_id = _reply_review_projection_failure_record_id(
+            thread_id,
+            canonical_processed_key,
+        )
         snapshot = (
             _fs.collection("users")
             .document(user_id)
