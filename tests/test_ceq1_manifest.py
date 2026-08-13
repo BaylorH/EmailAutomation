@@ -1083,6 +1083,28 @@ class Ceq1BootstrapTests(unittest.TestCase):
             self.bootstrap.create_runtime_target("prepare", canonical)
             self.assertEqual(0o700, stat.S_IMODE(canonical.stat().st_mode))
 
+    def test_runtime_tree_copy_preserves_exact_modes_under_private_umask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = root / "source"
+            source.mkdir(mode=0o755)
+            regular = source / "regular.py"
+            regular.write_bytes(b"VALUE = 1\n")
+            regular.chmod(0o644)
+            executable = source / "tool"
+            executable.write_bytes(b"#!/bin/sh\n")
+            executable.chmod(0o755)
+            link = source / "python"
+            os.symlink("tool", link)
+            os.chmod(link, 0o755, follow_symlinks=False)
+            destination = root / "destination"
+            previous_umask = os.umask(0o077)
+            try:
+                expected = self.bootstrap._safe_tree_entries(source, destination)
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(expected, self.bootstrap._safe_tree_entries(destination))
+
     def test_tree_receipt_rejects_relative_symlink_escape(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
