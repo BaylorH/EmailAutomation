@@ -1115,6 +1115,29 @@ class Ceq1BootstrapTests(unittest.TestCase):
                         "archive-v0/example/bin/python",
                         str(outside / "bin/python3.12"),
                     )
+                dangling = pinned / "missing/bin/python3.12"
+                self.assertEqual(
+                    "@DENIED_EXTERNAL_PYTHON/"
+                    "cpython-3.12.13-test/missing/bin/python3.12",
+                    self.bootstrap._logical_cache_target(
+                        root / "cache",
+                        "archive-v0/example/bin/python",
+                        str(dangling),
+                    ),
+                )
+                escaped_root = root / "escaped-python"
+                (escaped_root / "bin").mkdir(parents=True)
+                (escaped_root / "bin/python3.12").write_bytes(b"outside-pinned-tree")
+                os.symlink(escaped_root, pinned / "escape")
+                self.assertEqual(
+                    "@DENIED_EXTERNAL_PYTHON/"
+                    "cpython-3.12.13-test/escape/bin/python3.12",
+                    self.bootstrap._logical_cache_target(
+                        root / "cache",
+                        "archive-v0/example/bin/python",
+                        str(pinned / "escape/bin/python3.12"),
+                    ),
+                )
 
     def test_source_cache_logical_classification_is_rechecked_after_uv_work(self):
         expected = {"algorithmVersion": "ceq1-cache-logical-v1", "logicalDigest": "a"}
