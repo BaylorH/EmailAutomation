@@ -386,7 +386,9 @@ realpaths are all below that copied root, then creates
 `.ceq1-venv/venv` with `uv venv --offline --no-config --no-project
 --relocatable --no-python-downloads --python
 .ceq1-venv/python/bin/python3.12`. It installs
-`requirements.lock` from the exact hash-bound read-only uv cache with
+`requirements.lock` from only the validated task-owned writable cache clone,
+whose logical topology is bound to the before/after receipts of the reviewed
+read-only source cache, with
 `--offline --no-config --no-python-downloads --require-hashes --only-binary
 :all: --link-mode copy --exact`, then installs the derived qualification lock
 from only the promoted wheelhouse with `--offline --no-config
@@ -394,7 +396,8 @@ from only the promoted wheelhouse with `--offline --no-config
 --only-binary :all: --link-mode copy --reinstall`. The second install never
 uses `--exact`, so it cannot remove product dependencies, and `--reinstall`
 forces all five packages—including packaging—to come from the derived
-wheelhouse. After installation, the orchestrator replaces only the generated
+wheelhouse. The reviewed source cache is never any `uv` child's
+`UV_CACHE_DIR`. After installation, the orchestrator replaces only the generated
 venv interpreter links with exact internal relative targets:
 `bin/python -> ../../python/bin/python3.12`, `bin/python3 -> python`, and
 `bin/python3.12 -> python`. It renders a closed `pyvenv.cfg` whose `home` is
