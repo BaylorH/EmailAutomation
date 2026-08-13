@@ -54,10 +54,25 @@ _GENERIC_SERVER_ERROR = "Internal server error"
 _FLOW_TTL_SECONDS = 15 * 60
 _MAX_FLOWS = 1000
 
-cache = SerializableTokenCache()
-msal_app = PublicClientApplication(
-  CLIENT_ID, authority=AUTHORITY, token_cache=cache
-)
+_legacy_msal_lock = threading.Lock()
+_legacy_msal_pair = None
+
+
+def _get_legacy_msal_pair():
+    global _legacy_msal_pair
+    if _legacy_msal_pair is None:
+        with _legacy_msal_lock:
+            if _legacy_msal_pair is None:
+                token_cache = SerializableTokenCache()
+                legacy_app = PublicClientApplication(
+                    CLIENT_ID,
+                    authority=AUTHORITY,
+                    token_cache=token_cache,
+                )
+                _legacy_msal_pair = (legacy_app, token_cache)
+    return _legacy_msal_pair
+
+
 # uid -> {"flow": <msal flow dict>, "ts": <epoch seconds>}
 flows = {}
 
@@ -221,9 +236,20 @@ def complete_flow():
     flow = entry["flow"]
     # #20 isolation: prefer the per-user isolated app + cache; fall back to the shared
     # module app/cache only for legacy flow entries that predate isolation.
-    app_ = entry.get("app") or msal_app
-    cache_ = entry.get("cache") or cache
-    isolated = entry.get("app") is not None
+    entry_app = entry.get("app")
+    entry_cache = entry.get("cache")
+    if (entry_app is None) != (entry_cache is None):
+        return jsonify({"status": "failed", "error": _GENERIC_BAD_REQUEST}), 400
+
+    isolated = entry_app is not None
+    if isolated:
+        app_, cache_ = entry_app, entry_cache
+    else:
+        try:
+            app_, cache_ = _get_legacy_msal_pair()
+        except Exception as exc:
+            print(f"MSAL fallback unavailable: {type(exc).__name__}", flush=True)
+            return jsonify({"status": "failed", "error": _GENERIC_SERVER_ERROR}), 500
     try:
         result = app_.acquire_token_by_device_flow(flow)
     except Exception as e:

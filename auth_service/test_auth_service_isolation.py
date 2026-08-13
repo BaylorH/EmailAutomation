@@ -113,6 +113,19 @@ class MsalIdentityIsolationTests(unittest.TestCase):
         self.assertIsNot(a["cache"], b["cache"], "users must not share a token cache")
         self.assertIsNot(a["app"], b["app"], "users must not share an MSAL app")
 
+    def test_new_flows_never_use_legacy_msal_fallback(self):
+        self.mod._created_apps.clear()
+        with patch.object(self.mod, "_get_legacy_msal_pair") as legacy:
+            first = self._start("userA")
+            second = self._start("userB")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(len(self.mod._created_apps), 2)
+        self.assertIsNot(
+            self.mod.flows["userA"]["app"], self.mod.flows["userB"]["app"]
+        )
+        legacy.assert_not_called()
+
     def test_completion_uploads_only_this_users_single_identity_cache(self):
         self._start("userA")
         cache_a = self.mod.flows["userA"]["cache"]

@@ -641,3 +641,114 @@ class RuntimeProviderInitializationTests(unittest.TestCase):
                 }
             print("BARRIER_OK")
         """, e2e=True))
+
+    def test_auth_service_import_constructs_no_msal_app(self):
+        self.assertEqual("NO_MSAL", _run_probe("""
+            import sys
+            from pathlib import Path
+            from unittest.mock import patch
+            import msal
+            sys.path.insert(0, str(Path.cwd() / "auth_service"))
+            with patch.object(
+                msal,
+                "PublicClientApplication",
+                side_effect=AssertionError("MSAL app constructed during import"),
+            ):
+                import auth_service
+            print("NO_MSAL")
+        """, e2e=True))
+
+    def test_legacy_msal_pair_constructs_once_under_concurrent_first_use(self):
+        self.assertEqual("MSAL_BARRIER_OK", _run_probe("""
+            import sys
+            import threading
+            import time
+            from concurrent.futures import ThreadPoolExecutor
+            from pathlib import Path
+            from unittest.mock import patch
+            import msal
+            sys.path.insert(0, str(Path.cwd() / "auth_service"))
+            workers = 16
+            counts = {"app": 0, "cache": 0}
+            count_lock = threading.Lock()
+
+            class FakeCache:
+                def __init__(self):
+                    with count_lock:
+                        counts["cache"] += 1
+                def serialize(self):
+                    return "cache"
+
+            class FakeApp:
+                def acquire_token_by_device_flow(self, flow):
+                    return {"access_token": "token"}
+
+            def make_app(client_id, authority=None, token_cache=None):
+                with count_lock:
+                    counts["app"] += 1
+                time.sleep(0.03)
+                return FakeApp()
+
+            with patch.object(msal, "PublicClientApplication", side_effect=make_app), \
+                 patch.object(msal, "SerializableTokenCache", side_effect=FakeCache):
+                import auth_service
+                assert counts == {"app": 0, "cache": 0}
+                barrier = threading.Barrier(workers + 1)
+                def worker():
+                    barrier.wait(timeout=5)
+                    return auth_service._get_legacy_msal_pair()
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(worker) for _ in range(workers)]
+                    barrier.wait(timeout=5)
+                    pairs = [future.result(timeout=5) for future in futures]
+                assert all(pair is pairs[0] for pair in pairs)
+                assert counts == {"app": 1, "cache": 1}
+            print("MSAL_BARRIER_OK")
+        """, e2e=True))
+
+    def test_legacy_msal_constructor_failure_is_not_cached(self):
+        self.assertEqual("MSAL_RETRY_OK", _run_probe("""
+            import sys
+            import time
+            from pathlib import Path
+            from unittest.mock import patch
+            import firebase_admin
+            import msal
+            sys.path.insert(0, str(Path.cwd() / "auth_service"))
+            counts = {"app": 0, "cache": 0}
+
+            class FakeCache:
+                def __init__(self):
+                    counts["cache"] += 1
+                def serialize(self):
+                    return "cache"
+
+            class FakeApp:
+                def acquire_token_by_device_flow(self, flow):
+                    return {"access_token": "token"}
+
+            def make_app(client_id, authority=None, token_cache=None):
+                counts["app"] += 1
+                if counts["app"] == 1:
+                    raise RuntimeError("first MSAL failure")
+                return FakeApp()
+
+            with patch.object(firebase_admin, "get_app", return_value=object()), \
+                 patch("firebase_admin.auth.verify_id_token", return_value={"uid": "legacy"}), \
+                 patch.object(msal, "PublicClientApplication", side_effect=make_app), \
+                 patch.object(msal, "SerializableTokenCache", side_effect=FakeCache):
+                import auth_service
+                auth_service.flows["legacy"] = {
+                    "flow": {"code": "legacy"}, "ts": time.time()
+                }
+                with patch.object(auth_service, "upload_token"):
+                    with auth_service.app.test_client() as client:
+                        headers = {"Authorization": "Bearer legacy"}
+                        first = client.post("/complete-device-flow", json={}, headers=headers)
+                        second = client.post("/complete-device-flow", json={}, headers=headers)
+                assert first.status_code == 500
+                assert first.get_json()["error"] == "Internal server error"
+                assert second.status_code == 200
+                assert counts == {"app": 2, "cache": 2}
+            print("MSAL_RETRY_OK")
+        """, e2e=True))

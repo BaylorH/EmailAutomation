@@ -83,16 +83,21 @@ class DeviceFlowBase(unittest.TestCase):
         self.verify_mock.return_value = {"uid": "web_user"}
 
         # Fake MSAL device-flow calls.
-        self._p_init = patch.object(
-            authmod.msal_app, "initiate_device_flow", return_value=dict(FAKE_FLOW)
+        self.legacy_cache = MagicMock(name="legacy_cache")
+        self.legacy_cache.serialize.return_value = "{}"
+        self.legacy_app = MagicMock(name="legacy_app")
+        self.legacy_app.initiate_device_flow.return_value = dict(FAKE_FLOW)
+        self.legacy_app.acquire_token_by_device_flow.return_value = {
+            "access_token": "AT", "token_type": "Bearer"
+        }
+        self.init_mock = self.legacy_app.initiate_device_flow
+        self.acq_mock = self.legacy_app.acquire_token_by_device_flow
+        self._p_legacy = patch.object(
+            authmod,
+            "_get_legacy_msal_pair",
+            return_value=(self.legacy_app, self.legacy_cache),
         )
-        self._p_acq = patch.object(
-            authmod.msal_app,
-            "acquire_token_by_device_flow",
-            return_value={"access_token": "AT", "token_type": "Bearer"},
-        )
-        self.init_mock = self._p_init.start()
-        self.acq_mock = self._p_acq.start()
+        self._p_legacy.start()
 
         # #20 identity-isolation: /start-device-flow now builds a fresh per-user MSAL
         # app + cache via _new_isolated_app() instead of the shared msal_app. Patch it
@@ -118,8 +123,7 @@ class DeviceFlowBase(unittest.TestCase):
 
     def tearDown(self):
         self._p_verify.stop()
-        self._p_init.stop()
-        self._p_acq.stop()
+        self._p_legacy.stop()
         self._p_isolated.stop()
         self._p_upload.stop()
         authmod.flows.clear()
@@ -262,6 +266,25 @@ class TestCompleteDeviceFlow(DeviceFlowBase):
         _, kwargs = self.upload_mock.call_args
         self.assertEqual(kwargs.get("user_id"), "alice")
         self.assertNotIn("alice", authmod.flows)  # consumed
+
+    def test_partial_isolated_entry_fails_closed_without_legacy_fallback(self):
+        authmod.flows["web_user"] = {
+            "flow": dict(FAKE_FLOW),
+            "app": self.fake_app,
+            "ts": time.time(),
+        }
+        self._p_legacy.stop()
+        try:
+            with patch.object(authmod, "_get_legacy_msal_pair") as legacy, \
+                 patch.object(authmod, "upload_token") as upload:
+                response = self.client.post(
+                    "/complete-device-flow", json={}, headers=AUTH
+                )
+            self.assertEqual(response.status_code, 400)
+            legacy.assert_not_called()
+            upload.assert_not_called()
+        finally:
+            self._p_legacy.start()
 
     def test_body_uid_cannot_hijack_identity(self):
         # THE GAP-1 ATTACK: attacker authenticates as themselves, completes their
