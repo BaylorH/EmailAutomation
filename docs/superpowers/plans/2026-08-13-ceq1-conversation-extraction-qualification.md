@@ -319,7 +319,13 @@ copier. The copier holds the source root and every descendant directory with
 destination dirfds, and uses macOS `fclonefileat` with
 `CLONE_NOFOLLOW_ANY|CLONE_RESOLVE_BENEATH|CLONE_NOOWNERCOPY` for regular files.
 It may fall back only to a same-fd byte stream with stable pre/post `fstat`; it
-never reopens the source root or a member by an unresolved pathname. Through
+never reopens the source root or a member by an unresolved pathname. Before any
+opened descendant-directory or regular-file fd is read or cloned, its exact
+`{type,device,inode,mode,link-count,size,mtime,ctime}` must equal the
+corresponding entry from the pre-clone identity receipt, and its `fstat` remains
+stable around the operation. Tests swap and restore both a descendant
+directory and a regular file between receipt and open; each must block even if
+the final path receipt would otherwise equal the first. Through
 those held no-follow directory descriptors it then rewrites only absolute symlinks
 whose targets are strictly below the reviewed source cache to the corresponding
 path below the clone. Real-cache characterization found a closed class of uv
