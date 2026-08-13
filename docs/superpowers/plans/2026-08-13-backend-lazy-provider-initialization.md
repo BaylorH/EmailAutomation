@@ -152,10 +152,22 @@ def blocked(name):
     return fail
 
 
-audit_state = {"block_construction": False}
+audit_state = {
+    "block_construction": False,
+    "probe_expected": None,
+    "probe_seen": [],
+}
+
+
+class AuditProbeBlocked(RuntimeError):
+    pass
 
 
 def reject_socket_audit(event, args):
+    expected = audit_state["probe_expected"]
+    if expected is not None and event == expected:
+        audit_state["probe_seen"].append(event)
+        raise AuditProbeBlocked(event)
     if event == "socket.__new__" and not audit_state["block_construction"]:
         return
     if event in {
@@ -163,12 +175,43 @@ def reject_socket_audit(event, args):
         "socket.connect",
         "socket.connect_ex",
         "socket.getaddrinfo",
+        "socket.gethostbyname",
+        "socket.gethostbyaddr",
+        "socket.getnameinfo",
     }:
         record("BOUNDARY_CALLED:audit:" + event)
         raise RuntimeError("COLLECTION_EFFECT_ATTEMPTED:audit:" + event)
 
 
 sys.addaudithook(reject_socket_audit)
+
+# Prove saved resolver callables emit an audit event before they can
+# resolve anything. gethostbyname_ex shares socket.gethostbyname, and getfqdn
+# reaches socket.gethostbyaddr. A missing audit event aborts sitecustomize
+# before the ready marker, never falling through to an actual lookup.
+resolution_audit_probes = (
+    ("socket.getaddrinfo", socket.getaddrinfo, ("audit.invalid", 443)),
+    ("socket.gethostbyname", socket.gethostbyname, ("audit.invalid",)),
+    ("socket.gethostbyname", socket.gethostbyname_ex, ("audit.invalid",)),
+    ("socket.gethostbyaddr", socket.gethostbyaddr, ("203.0.113.1",)),
+    ("socket.gethostbyaddr", socket.getfqdn, ("203.0.113.1",)),
+    ("socket.getnameinfo", socket.getnameinfo, (("203.0.113.1", 443), 0)),
+)
+for expected_event, resolver, resolver_args in resolution_audit_probes:
+    audit_state["probe_expected"] = expected_event
+    try:
+        resolver(*resolver_args)
+    except AuditProbeBlocked as exc:
+        if str(exc) != expected_event:
+            raise RuntimeError(
+                "COLLECTION_AUDIT_PROBE_WRONG_EVENT:"
+                f"{expected_event}:{exc}"
+            ) from exc
+    else:
+        raise RuntimeError("COLLECTION_AUDIT_PROBE_MISSING:" + expected_event)
+audit_state["probe_expected"] = None
+if audit_state["probe_seen"] != [probe[0] for probe in resolution_audit_probes]:
+    raise RuntimeError("COLLECTION_AUDIT_PROBE_INCOMPLETE")
 
 # SDK import dependencies perform a caught IPv6-capability socket construction
 # inside urllib3. Preload them before the collection measurement boundary while
@@ -240,6 +283,17 @@ protect_module_attribute(socket, "socket", "socket.socket", BlockedSocket)
 protect_module_attribute(
     socket, "create_connection", "socket.create_connection"
 )
+for resolver_name in (
+    "getaddrinfo",
+    "gethostbyname",
+    "gethostbyname_ex",
+    "gethostbyaddr",
+    "getnameinfo",
+    "getfqdn",
+):
+    protect_module_attribute(
+        socket, resolver_name, "socket." + resolver_name
+    )
 protect_module_attribute(urllib.request, "urlopen", "urllib.request.urlopen")
 protect_attribute(
     http.client.HTTPConnection, "request", "http.client.HTTPConnection.request"
@@ -289,7 +343,11 @@ Path(os.environ["COLLECTION_GUARD_READY"]).write_text(
 Keep the existing parent assertion `boundary_calls == []`. Because the guard
 logs calls, replacement attempts, and exit-time identity loss, that one
 assertion proves the blocker identities survived the entire child lifetime—not
-merely that they were restored before the parent read the log.
+merely that they were restored before the parent read the log. The existing
+`guard_ready.read_text(encoding="utf-8") == "ready"` assertion is also an
+executable audit test: the marker is written only after all six saved resolver
+aliases emit their expected audit events and are stopped before DNS/reverse
+lookup.
 
 - [ ] **Step 4: Add the health import RED in its own child interpreter**
 
@@ -350,6 +408,9 @@ def _run_credential_free_health_probe():
                 "socket.connect",
                 "socket.connect_ex",
                 "socket.getaddrinfo",
+                "socket.gethostbyname",
+                "socket.gethostbyaddr",
+                "socket.getnameinfo",
             }:
                 calls.append("audit:" + event)
                 raise AssertionError("offline boundary called: audit:" + event)
@@ -383,6 +444,12 @@ def _run_credential_free_health_probe():
             patch.object(original_socket_type, "connect", blocked("socket.socket.connect")),
             patch.object(socket, "socket", BlockedSocket),
             patch.object(socket, "create_connection", blocked("socket.create_connection")),
+            patch.object(socket, "getaddrinfo", blocked("socket.getaddrinfo")),
+            patch.object(socket, "gethostbyname", blocked("socket.gethostbyname")),
+            patch.object(socket, "gethostbyname_ex", blocked("socket.gethostbyname_ex")),
+            patch.object(socket, "gethostbyaddr", blocked("socket.gethostbyaddr")),
+            patch.object(socket, "getnameinfo", blocked("socket.getnameinfo")),
+            patch.object(socket, "getfqdn", blocked("socket.getfqdn")),
             patch.object(urllib.request, "urlopen", blocked("urllib.request.urlopen")),
             patch.object(http.client.HTTPConnection, "request", blocked("http.client.HTTPConnection.request")),
             patch.object(http.client.HTTPConnection, "connect", blocked("http.client.HTTPConnection.connect")),
@@ -470,7 +537,10 @@ module-scope substitutions first and emits
 `offline boundary called: firestore.Client` or `offline boundary called:
 openai.OpenAI`. The inherited `conftest.py` cannot make either child pass. A
 socket or HTTP entry is an additional real defect, not an acceptable substitute
-RED for an eager constructor.
+RED for an eager constructor. `COLLECTION_AUDIT_PROBE_MISSING`,
+`COLLECTION_AUDIT_PROBE_WRONG_EVENT`, or
+`COLLECTION_AUDIT_PROBE_INCOMPLETE` is a harness defect and must be fixed before
+interpreting the production RED.
 
 - [ ] **Step 6: Commit only the stronger failing contracts**
 
@@ -934,7 +1004,14 @@ existing helper.
 
 - [ ] **Step 6: Defer scheduler validation and constructors**
 
-Replace the import-time raises with:
+Add this absolute package import with the other imports in
+`scheduler_runner.py`:
+
+```python
+from email_automation.lazy_provider import LazyProviderProxy
+```
+
+Then replace the import-time raises with:
 
 ```python
 def _require_runtime_config() -> None:
@@ -1957,19 +2034,20 @@ the direct `_claim_outbox_item` import in place; those fakes exercise runtime
 logic and do not replace a constructor during collection.
 
 The exhaustive guard also exposes one fourth import-only substitution not named
-in the initial review. In `tests/test_full_campaign_e2e.py`, delete:
+in the initial review. In `tests/test_full_campaign_e2e.py`, retain
+`import google.cloud.firestore as _gcf` because `_gcf.SERVER_TIMESTAMP` is used
+by the in-memory timestamp resolver. Delete only this constructor-substitution
+comment and assignment:
 
 ```python
-import google.cloud.firestore as _gcf
-
 # clients.py runs `_fs = firestore.Client()` at import time; stub it so the
 # package imports offline.  The real datastore boundary is faked per-run below.
 _gcf.Client = lambda *a, **k: mock.MagicMock()
 ```
 
-Keep `mock`, the direct `email_automation` imports, `_FS_MODULES`, and the
-per-run fake installation; the executable chained campaign still needs those
-runtime fakes.
+Keep `_gcf`, `mock`, the direct `email_automation` imports, `_FS_MODULES`, and
+the per-run fake installation; the executable chained campaign still needs
+`_gcf.SERVER_TIMESTAMP` and those runtime fakes.
 
 Run this static check:
 
@@ -2024,10 +2102,19 @@ The Task 0 sitecustomize guard records and rejects these boundaries:
 socket.socket
 socket.socket.connect
 socket.create_connection
+socket.getaddrinfo
+socket.gethostbyname
+socket.gethostbyname_ex
+socket.gethostbyaddr
+socket.getnameinfo
+socket.getfqdn
 audit:socket.__new__
 audit:socket.connect
 audit:socket.connect_ex
 audit:socket.getaddrinfo
+audit:socket.gethostbyname
+audit:socket.gethostbyaddr
+audit:socket.getnameinfo
 firestore.Client
 firebase_admin.initialize_app
 msal.PublicClientApplication

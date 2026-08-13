@@ -156,7 +156,10 @@ client = LazyProviderProxy(
 ```
 
 `scheduler_runner.py` uses distinct names in the diagnostic string but the same
-shape. Lambdas deliberately resolve the module attribute at first use rather
+shape and imports the proxy with
+`from email_automation.lazy_provider import LazyProviderProxy` because it is a
+repository-root module rather than a package sibling. Lambdas deliberately
+resolve the module attribute at first use rather
 than capturing a constructor at import, so focused tests can patch
 `firestore.Client` or `openai.OpenAI` before the first access. Remove the
 import-time `openai.api_key = ...` mutations.
@@ -259,10 +262,12 @@ user still receives a fresh cache and app, preserving the wrong-mailbox guard.
    Those substitutions exist only to make the current eager `clients.py`
    importable and would otherwise bypass the stronger constructor guard.
 7. `tests/test_full_campaign_e2e.py`: remove its additional module-scope
-   `google.cloud.firestore.Client` assignment. Exhaustive search found this
-   fourth import-only workaround after the three review-named tests; the
-   temporal guard would correctly reject it too. Retain the per-run chained
-   campaign fake and every runtime assertion.
+   `google.cloud.firestore.Client` assignment and its eager-import comment.
+   Exhaustive search found this fourth import-only workaround after the three
+   review-named tests; the temporal guard would correctly reject it too. Retain
+   `import google.cloud.firestore as _gcf` because the timestamp resolver uses
+   `_gcf.SERVER_TIMESTAMP`, along with the per-run chained campaign fake and
+   every runtime assertion.
 8. `tests/test_test_collection_contract.py`: run the subprocess with
    `--noconftest`, guard constructor attributes against replacement for the
    entire child process, block provider constructors, socket construction and
@@ -307,7 +312,19 @@ openai.OpenAI
 socket.socket
 socket.socket.connect
 socket.create_connection
-Python audit events: socket.__new__, socket.connect, socket.connect_ex, socket.getaddrinfo
+socket.getaddrinfo
+socket.gethostbyname
+socket.gethostbyname_ex
+socket.gethostbyaddr
+socket.getnameinfo
+socket.getfqdn
+Python audit event: socket.__new__
+Python audit event: socket.connect
+Python audit event: socket.connect_ex
+Python audit event: socket.getaddrinfo
+Python audit event: socket.gethostbyname
+Python audit event: socket.gethostbyaddr
+Python audit event: socket.getnameinfo
 requests.api.request
 requests.sessions.Session.request
 urllib.request.urlopen
@@ -322,10 +339,14 @@ module-level `socket.socket` constructor name is replaced. Thus code holding an
 older class reference still cannot connect, while application code imported
 after the ready marker cannot construct a socket. A process-wide Python audit
 hook independently rejects post-bootstrap socket construction plus all
-connect/connect_ex and address-resolution attempts, so temporary replacement
-of a Python-level blocker cannot permit real network I/O. The HTTP
-guards catch the concrete clients used by this
-repository (`requests`), Python's standard URL stack, and the standard library
+connect/connect_ex attempts. Every public resolver named above is also an
+identity-guarded module blocker. Before the ready marker, the harness invokes
+saved callables for `getaddrinfo`, `gethostbyname`, `gethostbyname_ex`,
+`gethostbyaddr`, `getfqdn`, and `getnameinfo`; each must raise the exact expected
+audit event before resolution or startup aborts. Thus even code holding a
+pre-guard resolver alias cannot perform DNS or reverse lookup. The HTTP guards
+catch the concrete clients used by this repository (`requests`), Python's
+standard URL stack, and the standard library
 transport beneath SDK clients. Any optional direct `httpx` transport present in
 the environment is guarded at `Client.send`/`AsyncClient.send` too. The log
 records both boundary calls and forbidden blocker replacement attempts; either
