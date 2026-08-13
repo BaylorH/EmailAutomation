@@ -72,6 +72,11 @@ class ExplodingFirestore:
         raise AssertionError(f"legacy send path touched Firestore collection {name}")
 
 
+class QueryFailingFirestore:
+    def collection(self, name):
+        raise RuntimeError(f"query unavailable for {name}")
+
+
 class SchedulerUserListingTests(unittest.TestCase):
     def test_list_user_ids_skips_api_key_and_non_mailbox_users(self):
         payload = {
@@ -115,6 +120,18 @@ class SchedulerUserListingTests(unittest.TestCase):
         with patch.object(scheduler_runner.requests, "get", return_value=FakeResponse(payload)), \
              patch.object(scheduler_runner, "_fs", fake_fs):
             self.assertEqual(["real-user-1", "real-user-2"], scheduler_runner.list_user_ids())
+
+    def test_per_user_query_errors_still_skip_candidate(self):
+        payload = {
+            "items": [
+                {"name": "msal_caches/real-user-1/msal_token_cache.bin"},
+            ]
+        }
+        for module in (clients, scheduler_runner):
+            with self.subTest(module=module.__name__), \
+                 patch.object(module.requests, "get", return_value=FakeResponse(payload)), \
+                 patch.object(module, "_fs", QueryFailingFirestore()):
+                self.assertEqual([], module.list_user_ids())
 
     def test_legacy_scheduler_runner_send_outboxes_is_disabled(self):
         with patch.object(scheduler_runner, "_fs", ExplodingFirestore()):

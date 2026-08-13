@@ -249,6 +249,141 @@ class RuntimeProviderInitializationTests(unittest.TestCase):
             print("CONFIG_FAIL_FAST_OK")
         """))
 
+    def test_clients_listing_propagates_firestore_startup_failure_and_retries(self):
+        self.assertEqual("LIST_RETRY_OK", _run_probe("""
+            from unittest.mock import patch
+            from google.cloud import firestore
+
+            candidate = "controlled-test-user"
+            payload = {
+                "items": [{
+                    "name": f"msal_caches/{candidate}/msal_token_cache.bin"
+                }]
+            }
+
+            class FakeResponse:
+                def raise_for_status(self):
+                    return None
+                def json(self):
+                    return payload
+
+            class FakeSnapshot:
+                exists = True
+                def to_dict(self):
+                    return {"hasMsalToken": True}
+
+            class FakeDocument:
+                def get(self):
+                    return FakeSnapshot()
+
+            class FakeCollection:
+                def document(self, uid):
+                    assert uid == candidate
+                    return FakeDocument()
+
+            class FakeFirestore:
+                def collection(self, name):
+                    assert name == "users"
+                    return FakeCollection()
+
+            with patch.object(
+                firestore,
+                "Client",
+                side_effect=[RuntimeError("firestore-startup"), FakeFirestore()],
+            ) as constructor:
+                import email_automation.clients as clients
+                with patch.object(
+                    clients.requests, "get", return_value=FakeResponse()
+                ) as token_listing:
+                    try:
+                        clients.list_user_ids()
+                    except RuntimeError as exc:
+                        assert str(exc) == "firestore-startup"
+                    else:
+                        raise AssertionError(
+                            "Firestore startup failure silently skipped candidate"
+                        )
+                    assert constructor.call_count == 1
+                    assert clients._fs.initialized is False
+                    token_listing.assert_not_called()
+
+                    assert clients.list_user_ids() == [candidate]
+                    assert constructor.call_count == 2
+                    assert token_listing.call_count == 1
+            print("LIST_RETRY_OK")
+        """, e2e=True))
+
+    def test_scheduler_listing_propagates_firestore_startup_failure_and_retries(self):
+        self.assertEqual("LIST_RETRY_OK", _run_probe("""
+            import os
+            from unittest.mock import patch
+            from google.cloud import firestore
+
+            os.environ.update({
+                "AZURE_API_APP_ID": "test-client",
+                "AZURE_API_CLIENT_SECRET": "test-secret",
+                "FIREBASE_API_KEY": "test-firebase",
+                "OPENAI_API_KEY": "test-openai",
+            })
+            candidate = "controlled-test-user"
+            payload = {
+                "items": [{
+                    "name": f"msal_caches/{candidate}/msal_token_cache.bin"
+                }]
+            }
+
+            class FakeResponse:
+                def raise_for_status(self):
+                    return None
+                def json(self):
+                    return payload
+
+            class FakeSnapshot:
+                exists = True
+                def to_dict(self):
+                    return {"hasMsalToken": True}
+
+            class FakeDocument:
+                def get(self):
+                    return FakeSnapshot()
+
+            class FakeCollection:
+                def document(self, uid):
+                    assert uid == candidate
+                    return FakeDocument()
+
+            class FakeFirestore:
+                def collection(self, name):
+                    assert name == "users"
+                    return FakeCollection()
+
+            with patch.object(
+                firestore,
+                "Client",
+                side_effect=[RuntimeError("firestore-startup"), FakeFirestore()],
+            ) as constructor:
+                import scheduler_runner as scheduler
+                with patch.object(
+                    scheduler.requests, "get", return_value=FakeResponse()
+                ) as token_listing:
+                    try:
+                        scheduler.list_user_ids()
+                    except RuntimeError as exc:
+                        assert str(exc) == "firestore-startup"
+                    else:
+                        raise AssertionError(
+                            "Firestore startup failure silently skipped candidate"
+                        )
+                    assert constructor.call_count == 1
+                    assert scheduler._fs.initialized is False
+                    token_listing.assert_not_called()
+
+                    assert scheduler.list_user_ids() == [candidate]
+                    assert constructor.call_count == 2
+                    assert token_listing.call_count == 1
+            print("LIST_RETRY_OK")
+        """))
+
     def test_clients_firestore_and_openai_retry_after_first_constructor_failure(self):
         self.assertEqual("RETRY_OK", _run_probe("""
             from types import SimpleNamespace

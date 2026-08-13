@@ -3359,6 +3359,8 @@ def send_email(headers, script: str, emails: List[str], client_id: Optional[str]
 # --- Utility: List user IDs from Firebase ---
 def list_user_ids():
     _require_runtime_config()
+    if isinstance(_fs, LazyProviderProxy):
+        _fs.get()
     url = f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}/o?prefix=msal_caches%2F&key={FIREBASE_API_KEY}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()

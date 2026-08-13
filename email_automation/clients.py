@@ -100,6 +100,8 @@ def _get_client_config(uid: str, client_id: str) -> tuple:
     raise RuntimeError(f"sheetId not found for uid={uid} clientId={client_id}. This field is required.")
 
 def list_user_ids():
+    if isinstance(_fs, LazyProviderProxy):
+        _fs.get()
     url = f"https://firebasestorage.googleapis.com/v0/b/email-automation-cache.firebasestorage.app/o?prefix=msal_caches%2F&key={FIREBASE_API_KEY}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
