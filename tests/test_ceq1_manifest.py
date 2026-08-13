@@ -1023,6 +1023,22 @@ class Ceq1BootstrapTests(unittest.TestCase):
                     ),
                 )
 
+    def test_source_cache_logical_classification_is_rechecked_after_uv_work(self):
+        expected = {"algorithmVersion": "ceq1-cache-logical-v1", "logicalDigest": "a"}
+        with mock.patch.object(
+            self.bootstrap,
+            "cache_logical_receipt",
+            side_effect=(expected, {**expected, "logicalDigest": "b"}),
+        ):
+            initial = self.bootstrap.cache_logical_receipt(Path("/unused"))
+            with self.assertRaisesRegex(
+                self.bootstrap.BootstrapBlocked,
+                "logical topology changed",
+            ):
+                self.bootstrap.require_source_cache_logical_stability(
+                    Path("/unused"), initial
+                )
+
     def test_derived_lock_is_canonical_and_uses_only_derived_hashes(self):
         manifest = json.loads(
             (REPO_ROOT / "docs/release-safety/ceq1-wheelhouse-manifest.json").read_text()
