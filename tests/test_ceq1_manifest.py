@@ -946,6 +946,9 @@ class Ceq1BootstrapTests(unittest.TestCase):
             link = source / "wheels-v6/pypi/demo/1.0-py3-none-any"
             link.parent.mkdir(parents=True)
             os.symlink(archive, link)
+            pinned_link = source / "builds-v0/pinned-python"
+            pinned_link.parent.mkdir(parents=True)
+            os.symlink(self.bootstrap.PINNED_PYTHON, pinned_link)
             before_identity = self.bootstrap.cache_identity_receipt(source)
             expected_topology = self.bootstrap.cache_logical_receipt(source)
             shutil.copytree(source, destination, symlinks=True)
@@ -959,6 +962,10 @@ class Ceq1BootstrapTests(unittest.TestCase):
             self.assertEqual(
                 destination / "archive-v0/exact-archive",
                 Path(os.readlink(destination / link.relative_to(source))),
+            )
+            self.assertEqual(
+                self.bootstrap.PINNED_PYTHON,
+                Path(os.readlink(destination / pinned_link.relative_to(source))),
             )
             self.assertEqual(expected_topology["logicalDigest"], receipt["logicalDigest"])
 
