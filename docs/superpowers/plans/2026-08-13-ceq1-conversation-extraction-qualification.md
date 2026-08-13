@@ -254,18 +254,30 @@ environment. Its canonical entry is exactly:
   -I -S -B scripts/bootstrap_ceq1_runtime.py prepare
 ```
 
-The orchestrator first validates the pinned interpreter and `uv` bytes with
-Python SHA-256, creates task directories with no-follow ownership/mode checks,
-and renders the committed canonical parameterized Seatbelt template into the
-task root. That template is the exact `BOOTSTRAP_SEATBELT_TEMPLATE` string
+The mutation-free outer launcher derives only lexical path parameters and a
+fresh opaque bootstrap identity, renders the canonical Seatbelt template in
+memory, and immediately crosses one true `os.execve()` boundary:
+`/usr/bin/env -i <closed-env> /usr/bin/sandbox-exec -p <rendered-policy>
+<pinned-python> -I -S -B scripts/bootstrap_ceq1_runtime.py <mode>
+--contained --bootstrap <opaque-id>`. It performs no mkdir, copy, hash, cache
+read, profile write, or other state mutation before that boundary. The
+contained worker first validates its exact environment/flags and all source and
+destination roots component-by-component, then creates the unique task root,
+writes the exact rendered-policy/receipt evidence there, and performs the
+entire Task 1 state machine. Every external child begins with a fresh literal
+`/usr/bin/env -i` argv and inherits the already-active Seatbelt; there is no
+nested `sandbox-exec` and no unsandboxed orchestration between children.
+
+Inside that boundary, the orchestrator validates the pinned interpreter and
+`uv` bytes with Python SHA-256 and creates task directories with no-follow
+ownership/mode checks. The template is the exact `BOOTSTRAP_SEATBELT_TEMPLATE` string
 constant in `scripts/bootstrap_ceq1_runtime.py`; it is not a separately mutable
 file. The committed manifests bind only the portable template bytes/hash
 and its exact closed placeholder schema. The ignored runtime receipt binds the
 rendered bytes/hash plus the validated logical-ID-to-absolute-realpath parameter
-map; no absolute path enters a committed manifest or report. It then invokes only literal
-argument arrays beginning with `/usr/bin/env -i` and the host-pinned
-`/usr/bin/sandbox-exec -f <task-profile>`; no shell or command substitution is
-used. The profile denies all network, reads only the exact reviewed source
+map; no absolute path enters a committed manifest or report. No shell or command
+substitution is used. The one outer profile denies all network, and every
+contained child inherits it. It reads only the exact reviewed source
 cache, interpreter, standard library, `uv`, builder, manifests, and lock
 inputs, and writes only under `.ceq1-runtime/bootstrap` and `.ceq1-venv`.
 
@@ -358,12 +370,15 @@ its full closed tree manifest. Any input/output or
 installed-provenance mismatch is `BLOCKED`, never a cache write, download,
 ambient fallback, or weakened hash check.
 
-The load-bearing order is: validate committed inputs; render and bind the
-profile; run diagnostic resolution; run builder stages A and B; compare,
+The load-bearing order is: outer in-memory profile render and true execve;
+contained environment/root validation; create and bind the ignored local
+receipt; validate committed inputs; run diagnostic resolution; run builder
+stages A and B; compare,
 validate, seal, and promote; render and compare the derived lock; create the
 copied Python base and venv; install the product lock; force-reinstall the five
-derived packages; validate and seal the runtime bundle. Tests assert every literal argv/environment field,
-profile content/hash, state transition, and refusal path. The steps never rely
+derived packages; validate and seal the runtime bundle. Tests assert every
+literal argv/environment field, profile content/hash, inherited-sandbox state,
+state transition, and refusal path. The steps never rely
 on a network denial implemented by uv alone.
 
 `scripts/run_ceq1_env.py` resolves and verifies the local interpreter and
