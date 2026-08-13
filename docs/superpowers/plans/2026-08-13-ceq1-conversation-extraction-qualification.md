@@ -146,9 +146,9 @@ by their literal hashes:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest -q \
   -p no:cacheprovider <test-paths>
@@ -267,8 +267,8 @@ environment. Its canonical entry is exactly:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  bootstrap __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ -- prepare
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  bootstrap b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 -- prepare
 ```
 
 No mutable repository script is the root of its own trust. Before either the
@@ -1337,9 +1337,9 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_semantic_replay.py \
@@ -1737,18 +1737,18 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py preflight \
   --output .ceq1-runtime/preflight.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py calibrate \
   --output .ceq1-runtime/calibration.json
@@ -1786,27 +1786,27 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py run --tier all \
   --mode canonical --output .ceq1-runtime/canonical
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py verify-report \
   .ceq1-runtime/canonical/report.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py run --tier all \
   --mode diagnostic-continuation --canonical-report \
@@ -1814,9 +1814,9 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py verify-report \
   .ceq1-runtime/diagnostic/report.json --canonical-report \
@@ -1824,9 +1824,9 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py assemble-evidence \
   --canonical-report .ceq1-runtime/canonical/report.json \
@@ -1835,9 +1835,9 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py verify-report \
   .ceq1-runtime/assembled/report.json
@@ -1872,9 +1872,9 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_sandbox.py \
@@ -1887,9 +1887,9 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest --noconftest --collect-only -q \
   -p no:cacheprovider
@@ -1897,9 +1897,9 @@ Run:
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
   -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
-  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
-  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
-  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
+  scripts/verify_ceq1_entry.pl 77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7 \
+  run b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3 \
+  06c7a1b4ea638de1e9f555832ec2009f363983fc2495b80d241dd55f27a243e7 -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m py_compile \
   tests/ceq1/*.py scripts/bootstrap_ceq1_runtime.py \
