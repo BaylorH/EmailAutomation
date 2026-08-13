@@ -313,8 +313,14 @@ contained worker therefore takes two closed views of the reviewed source
 cache: an identity receipt over path/type/mode/device/inode/link count/size and
 mtime/ctime for before/after immutability, and a logical topology receipt over
 path/type/mode/size/symlink target for clone comparison. It clones the cache
-once with the host-pinned `/bin/cp -cR` into the unique bootstrap root. Through
-held no-follow directory descriptors it then rewrites only absolute symlinks
+once into the unique bootstrap root with a Task-1-owned descriptor-relative
+copier. The copier holds the source root and every descendant directory with
+`openat(O_DIRECTORY|O_NOFOLLOW)`, creates every destination entry through held
+destination dirfds, and uses macOS `fclonefileat` with
+`CLONE_NOFOLLOW_ANY|CLONE_RESOLVE_BENEATH|CLONE_NOOWNERCOPY` for regular files.
+It may fall back only to a same-fd byte stream with stable pre/post `fstat`; it
+never reopens the source root or a member by an unresolved pathname. Through
+those held no-follow directory descriptors it then rewrites only absolute symlinks
 whose targets are strictly below the reviewed source cache to the corresponding
 path below the clone. Real-cache characterization found a closed class of uv
 build-environment interpreter links whose targets are below the uv-managed
@@ -332,9 +338,9 @@ again after the clone and after all `uv` work; any source change is `BLOCKED`.
 Every `uv` child receives only that unique task-owned clone as `UV_CACHE_DIR`;
 no `uv` argv, environment, or resolved cache link may name the reviewed source
 cache. The builder remains a read-only RECORD-closed reader of the reviewed
-source archive and never invokes `uv`. Tests require the clone command to run
+source archive and never invokes `uv`. Tests require the clone operation to run
 inside the inherited outer Seatbelt, refuse a preexisting or symlinked
-destination, prove source-cache immutability, verify exact internal-link
+destination, prove source-cache immutability and held-root identity, verify exact internal-link
 rebasing, exercise a seeded denied-external-link read probe, reject an external
 target outside the closed uv-managed Python-store root, and prove that a uv
 child pointed at any other cache fails contract validation.
@@ -442,6 +448,13 @@ worktree root, creates the task-owned direct-run directories with mode `0700`,
 sets umask `077`, closes all non-stdio descriptors, constructs the exact new
 environment mapping, and uses `os.execve()`; it never reads `.env`, shell
 profiles, keychains, or the parent environment values.
+
+The wrapper reports only the reinitialized interpreter, exact environment,
+closed descriptor set, isolated flags, and sealed paths that child mode can
+observe. It does not emit or imply an independently observable “parent execve
+happened” boolean, because a caller can directly reproduce public child argv.
+The unit spy proves the parent issues the intended `os.execve`; the runtime
+receipt remains limited to child-observable properties.
 
 Generate `ceq1-toolchain-manifest.json` with a closed schema and symbolic
 artifact IDs only—no absolute path. For CPython 3.12.13 and OpenJDK 25.0.2,
