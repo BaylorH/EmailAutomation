@@ -82,6 +82,23 @@ def _record_hash(data: bytes) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 
 
+def _set_fixture_modes(root: Path, *, regular_files: bool = False) -> None:
+    """Make synthetic source/cache topology independent of the caller's umask."""
+    root.chmod(0o755)
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        current_path.chmod(0o755)
+        for name in directories:
+            child = current_path / name
+            if not child.is_symlink():
+                child.chmod(0o755)
+        if regular_files:
+            for name in files:
+                child = current_path / name
+                if not child.is_symlink():
+                    child.chmod(0o644)
+
+
 def _scan_production_imports() -> list[str]:
     files = list((REPO_ROOT / "email_automation").rglob("*.py"))
     files.extend(REPO_ROOT / name for name in ("main.py", "service.py", "scheduler_runner.py", "app.py"))
@@ -161,6 +178,7 @@ def _mini_distribution(root: Path, *, extra_pyc: bool = False) -> tuple[Path, di
             "sha256": "0" * 64,
         },
     }
+    _set_fixture_modes(source, regular_files=True)
     return source, package_record
 
 
@@ -425,6 +443,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
                     (source / "demo_pkg/__init__.py").write_bytes(b"VALUE = 8\n")
                 elif mutation == "extra":
                     (source / "unexpected.py").write_text("bad = True\n")
+                    (source / "unexpected.py").chmod(0o644)
                 elif mutation == "symlink":
                     os.symlink("demo_pkg/__init__.py", source / "alias.py")
                 elif mutation == "hardlink":
@@ -437,6 +456,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
                     (source / "demo_pkg").chmod(0o700)
                 else:
                     (source / "empty-directory").mkdir()
+                    (source / "empty-directory").chmod(0o755)
                 with self.assertRaises((ValueError, OSError)):
                     self.builder.inspect_source(source, package)
 
@@ -464,6 +484,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
                                 info,
                                 b"tampered" if info.filename == target else data,
                             )
+                    changed.chmod(0o644)
                     with self.assertRaises(ValueError):
                         self.builder.inspect_wheel(changed, validate_record=True)
 
@@ -510,6 +531,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
             )
             link.parent.mkdir(parents=True)
             os.symlink(archive, link)
+            _set_fixture_modes(cache)
             self.assertEqual(
                 archive,
                 self.builder.resolve_cache_source(cache, package),
@@ -542,6 +564,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
             link = package_dir / "1.2.3-py3-none-any"
             os.symlink(archive, link)
             package = _mini_distribution(root / "fixture")[1]
+            _set_fixture_modes(cache)
             with self.assertRaises((ValueError, OSError)):
                 self.builder.resolve_cache_source(cache, package)
 
@@ -580,6 +603,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
             package_dir = cache / "wheels-v6/pypi/demo_pkg"
             package_dir.mkdir(parents=True)
             os.symlink(archive, package_dir / "1.2.3-py3-none-any")
+            _set_fixture_modes(cache)
             (cache / "wheels-v6/pypi").chmod(0o700)
             package = _mini_distribution(root / "fixture")[1]
             with self.assertRaises(ValueError):
@@ -599,6 +623,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
             link = package_dir / "1.2.3-py3-none-any"
             os.symlink(archive, link)
             package = _mini_distribution(root / "fixture")[1]
+            _set_fixture_modes(cache)
             real_readlink = os.readlink
             swapped = False
 
@@ -679,6 +704,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
                 with self.subTest(label=label):
                     changed = root / f"{label}.whl"
                     changed.write_bytes(data)
+                    changed.chmod(0o644)
                     with self.assertRaises(ValueError):
                         self.builder.inspect_wheel(changed)
 
@@ -692,6 +718,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
                 for info, data in members:
                     info.external_attr |= 1
                     output_archive.writestr(info, data)
+            changed.chmod(0o644)
             with self.assertRaises(ValueError):
                 self.builder.inspect_wheel(changed)
 
@@ -720,6 +747,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
             with zipfile.ZipFile(changed, "w", compression=zipfile.ZIP_STORED) as archive:
                 for info in infos:
                     archive.writestr(info, payloads[info.filename])
+            changed.chmod(0o644)
             with self.assertRaises(ValueError):
                 self.builder.inspect_wheel(changed, expected_members=package["members"])
 
@@ -764,13 +792,49 @@ class Ceq1BootstrapTests(unittest.TestCase):
             self.assertIn(str(root), profile)
             self.assertEqual(str(root), receipt["parameters"]["REPO"])
             ancestors = receipt["parameters"]["READ_ANCESTOR_RULES"]
+            authorized = {
+                Path(value)
+                for key, value in receipt["parameters"].items()
+                if key != "READ_ANCESTOR_RULES"
+            }
+            expected_ancestors = sorted(
+                {
+                    str(parent)
+                    for path in authorized
+                    for parent in path.parents
+                    if parent != Path("/")
+                }
+            )
+            self.assertEqual(expected_ancestors, ancestors)
             self.assertIn(str(root.parent), ancestors)
             self.assertNotIn(str(root / ".git"), ancestors)
+            recursive_roots = {
+                receipt["parameters"][key]
+                for key in ("PYTHON_SOURCE", "UV_CACHE", "JDK_ROOT", "RUNTIME", "BUNDLE")
+            }
+            for ancestor in ancestors:
+                self.assertIn(f'(literal "{ancestor}")', profile)
+                if ancestor not in recursive_roots:
+                    self.assertNotIn(f'(subpath "{ancestor}")', profile)
+            self.assertNotIn(f'(subpath "{root}")', profile)
+            self.assertNotIn(f'(subpath "{Path.home()}")', profile)
             self.assertEqual(
                 str(relocation),
                 receipt["parameters"]["RELOCATION"],
             )
             self.assertRegex(receipt["renderedSha256"], r"^[0-9a-f]{64}$")
+            alternate_bundle = root.parent / "alternate-ceq1-bundle/nested"
+            _, alternate_receipt = self.bootstrap.render_bootstrap_profile(
+                root,
+                bundle_path=alternate_bundle,
+                relocation_path=relocation,
+            )
+            self.assertNotEqual(
+                receipt["parameters"]["READ_ANCESTOR_RULES"],
+                alternate_receipt["parameters"]["READ_ANCESTOR_RULES"],
+            )
+            self.assertNotEqual(receipt["renderedSha256"], alternate_receipt["renderedSha256"])
+            self.assertNotEqual(receipt["parameterDigest"], alternate_receipt["parameterDigest"])
         outer_executable, outer_argv, outer_env = self.bootstrap.contained_launcher_contract(
             REPO_ROOT,
             REPO_ROOT / ".ceq1-runtime/bootstrap-contract",
@@ -922,12 +986,17 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertEqual(0, inherited.returncode, inherited.stderr)
 
         ancestor_probe = (
-            "import importlib.util,os,sys;"
+            "import errno,importlib.util,os,sys;"
             f"p={str(REPO_ROOT / 'scripts/bootstrap_ceq1_runtime.py')!r};"
             "s=importlib.util.spec_from_file_location('ceq1_ancestor_probe',p);"
             "m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;"
             "s.loader.exec_module(m);"
-            "fd=m._open_directory_chain(m._repo_root()/'.ceq1-runtime');os.close(fd)"
+            "targets=(m._repo_root()/'.ceq1-runtime',m.PINNED_PYTHON_ROOT,"
+            "m.UV_CACHE,m.JDK_ROOT);"
+            "fds=[m._open_directory_chain(x) for x in targets];"
+            "[os.close(fd) for fd in fds];"
+            "denied=(m._repo_root()/'.git',m._repo_root()/'.coderabbit.yaml');"
+            "exec(\"for x in denied:\\n try: os.open(x,os.O_RDONLY)\\n except OSError as e:\\n  assert e.errno in (errno.EPERM,errno.EACCES)\\n else: raise RuntimeError('unlisted read allowed')\")"
         )
         opened = subprocess.run(
             [
