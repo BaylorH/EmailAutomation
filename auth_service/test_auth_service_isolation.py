@@ -19,6 +19,26 @@ os.environ.setdefault("FIREBASE_API_KEY", "test-firebase-key")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+def auth_headers(uid):
+    return {"Authorization": f"Bearer {uid}"}
+
+
+fake_firebase_auth = types.ModuleType("firebase_admin.auth")
+
+
+def verify_id_token(token):
+    return {"uid": token}
+
+
+fake_firebase_auth.verify_id_token = verify_id_token
+
+fake_firebase_admin = types.ModuleType("firebase_admin")
+fake_firebase_admin._apps = {"default": object()}
+fake_firebase_admin.get_app = lambda: fake_firebase_admin._apps["default"]
+fake_firebase_admin.initialize_app = lambda: fake_firebase_admin._apps["default"]
+fake_firebase_admin.auth = fake_firebase_auth
+
+
 def _load_module_with_mocked_msal():
     """Import auth_service with msal + firebase_helpers replaced by fakes."""
     created_apps = []
@@ -55,7 +75,12 @@ def _load_module_with_mocked_msal():
     fake_fh = types.ModuleType("firebase_helpers")
     fake_fh.upload_token = create_autospec(_real_fh.upload_token)
 
-    with patch.dict(sys.modules, {"msal": fake_msal, "firebase_helpers": fake_fh}):
+    with patch.dict(sys.modules, {
+        "msal": fake_msal,
+        "firebase_helpers": fake_fh,
+        "firebase_admin": fake_firebase_admin,
+        "firebase_admin.auth": fake_firebase_auth,
+    }):
         sys.modules.pop("auth_service", None)
         import auth_service as mod
         mod._created_apps = created_apps
@@ -70,18 +95,28 @@ class MsalIdentityIsolationTests(unittest.TestCase):
         self.mod._upload_mock.reset_mock()
         self.client = self.mod.app.test_client()
 
+    def _start(self, uid):
+        return self.client.post(
+            "/start-device-flow", json={}, headers=auth_headers(uid)
+        )
+
+    def _complete(self, uid):
+        return self.client.post(
+            "/complete-device-flow", json={}, headers=auth_headers(uid)
+        )
+
     def test_each_pending_flow_gets_its_own_cache_and_app(self):
-        self.client.post("/start-device-flow", json={"uid": "userA"})
-        self.client.post("/start-device-flow", json={"uid": "userB"})
+        self._start("userA")
+        self._start("userB")
         a = self.mod.flows["userA"]
         b = self.mod.flows["userB"]
         self.assertIsNot(a["cache"], b["cache"], "users must not share a token cache")
         self.assertIsNot(a["app"], b["app"], "users must not share an MSAL app")
 
     def test_completion_uploads_only_this_users_single_identity_cache(self):
-        self.client.post("/start-device-flow", json={"uid": "userA"})
+        self._start("userA")
         cache_a = self.mod.flows["userA"]["cache"]
-        resp = self.client.post("/complete-device-flow", json={"uid": "userA"})
+        resp = self._complete("userA")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["status"], "ok")
         self.mod._upload_mock.assert_called_once()
@@ -92,47 +127,47 @@ class MsalIdentityIsolationTests(unittest.TestCase):
         self.assertNotIn("userA", self.mod.flows, "pending flow must be cleared after success")
 
     def test_multi_account_cache_is_refused_fail_closed(self):
-        self.client.post("/start-device-flow", json={"uid": "userA"})
+        self._start("userA")
         # Simulate a cache that somehow resolved to TWO identities.
         self.mod.flows["userA"]["app"].accounts = [
             {"username": "a@example.com"}, {"username": "b@example.com"}]
-        resp = self.client.post("/complete-device-flow", json={"uid": "userA"})
+        resp = self._complete("userA")
         self.assertEqual(resp.status_code, 409)
         self.assertIn("identity_isolation_violation", resp.get_json()["error"])
         self.mod._upload_mock.assert_not_called()
         self.assertNotIn("userA", self.mod.flows)
 
     def test_zero_account_cache_is_refused_fail_closed(self):
-        self.client.post("/start-device-flow", json={"uid": "userA"})
+        self._start("userA")
         self.mod.flows["userA"]["app"].accounts = []
-        resp = self.client.post("/complete-device-flow", json={"uid": "userA"})
+        resp = self._complete("userA")
         self.assertEqual(resp.status_code, 409)
         self.mod._upload_mock.assert_not_called()
 
     def test_expired_pending_flow_is_pruned_on_completion(self):
-        self.client.post("/start-device-flow", json={"uid": "userA"})
+        self._start("userA")
         # Age the pending entry past the TTL without any new /start-device-flow.
-        self.mod.flows["userA"]["created"] -= self.mod._PENDING_TTL_SECONDS + 1
-        resp = self.client.post("/complete-device-flow", json={"uid": "userA"})
+        self.mod.flows["userA"]["ts"] -= self.mod._FLOW_TTL_SECONDS + 1
+        resp = self._complete("userA")
         self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.get_json()["error"], "no_pending_flow")
+        self.assertEqual(resp.get_json()["error"], "No active device flow")
         self.mod._upload_mock.assert_not_called()
         self.assertNotIn("userA", self.mod.flows)
 
     def test_complete_without_pending_flow_is_rejected(self):
-        resp = self.client.post("/complete-device-flow", json={"uid": "ghost"})
+        resp = self._complete("ghost")
         self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.get_json()["error"], "no_pending_flow")
+        self.assertEqual(resp.get_json()["error"], "No active device flow")
         self.mod._upload_mock.assert_not_called()
 
     def test_two_users_completing_do_not_cross_contaminate_uploads(self):
-        self.client.post("/start-device-flow", json={"uid": "userA"})
-        self.client.post("/start-device-flow", json={"uid": "userB"})
+        self._start("userA")
+        self._start("userB")
         cache_a = self.mod.flows["userA"]["cache"].serialize()
         cache_b = self.mod.flows["userB"]["cache"].serialize()
         self.assertNotEqual(cache_a, cache_b)
-        self.client.post("/complete-device-flow", json={"uid": "userA"})
-        self.client.post("/complete-device-flow", json={"uid": "userB"})
+        self._complete("userA")
+        self._complete("userB")
         calls = {kwargs["user_id"]: kwargs["cache_content"]
                  for _, kwargs in self.mod._upload_mock.call_args_list}
         self.assertEqual(calls["userA"], cache_a)
