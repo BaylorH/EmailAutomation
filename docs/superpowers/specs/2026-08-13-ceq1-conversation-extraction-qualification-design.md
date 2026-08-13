@@ -1,6 +1,6 @@
 # CE-Q1 Conversation and Extraction Qualification Gate Design
 
-**Status:** User-approved direction; written-spec review required before planning
+**Status:** Approved by the user on 2026-08-13; implementation planning and building authorized in this task
 
 **Deliverable:** both
 
