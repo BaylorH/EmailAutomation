@@ -12,7 +12,7 @@ This validates that notifications ACTUALLY fire with correct data,
 not just simulated.
 
 Usage:
-    python tests/full_pipeline_test.py
+    python scripts/full_pipeline.py
 """
 
 import os
@@ -154,7 +154,11 @@ FRONTEND_FIXTURES = {
 
 def save_frontend_fixtures():
     """Save fixtures for frontend testing."""
-    output_path = os.path.join(os.path.dirname(__file__), "frontend_fixtures.json")
+    output_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "tests",
+        "frontend_fixtures.json",
+    )
     with open(output_path, "w") as f:
         json.dump(FRONTEND_FIXTURES, f, indent=2, default=str)
     print(f"\n📁 Frontend fixtures saved to: {output_path}")

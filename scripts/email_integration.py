@@ -18,19 +18,19 @@ Usage:
     # OPENAI_API_KEY=your_openai_key
 
     # Inspect inbox and show raw API response structure
-    python tests/email_integration_test.py inspect-inbox
+    python scripts/email_integration.py inspect-inbox
 
     # Show details of conversation IDs and message IDs
-    python tests/email_integration_test.py inspect-ids
+    python scripts/email_integration.py inspect-ids
 
     # Send a test email and capture its IDs
-    python tests/email_integration_test.py send-test --to someone@example.com
+    python scripts/email_integration.py send-test --to someone@example.com
 
     # Run full conversation test
-    python tests/email_integration_test.py conversation-test --to test@example.com
+    python scripts/email_integration.py conversation-test --to test@example.com
 
     # List all available user accounts
-    python tests/email_integration_test.py list-users
+    python scripts/email_integration.py list-users
 
 Requirements:
     - Valid MSAL token cache in Firebase
@@ -50,7 +50,7 @@ def load_dotenv():
     """Load environment variables from .env file."""
     env_paths = [
         Path(__file__).parent.parent / ".env",  # Project root
-        Path(__file__).parent / ".env",  # tests directory
+        Path(__file__).parent.parent / "tests" / ".env",  # Legacy tests directory
         Path.home() / ".emailautomation.env"  # Home directory
     ]
 
@@ -499,7 +499,7 @@ def cmd_conversation_test(args):
     print("\n" + "="*80)
     print("To complete the test:")
     print(f"  1. Reply to the email '{test_subject}' from {args.to}")
-    print(f"  2. Run: python tests/email_integration_test.py --inspect-ids")
+    print("  2. Run: python scripts/email_integration.py --inspect-ids")
     print("="*80)
 
 

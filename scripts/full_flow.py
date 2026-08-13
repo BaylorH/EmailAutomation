@@ -17,13 +17,13 @@ Usage:
     export OPENAI_API_KEY=sk-...
 
     # Run full flow test
-    python tests/full_flow_test.py
+    python scripts/full_flow.py
 
     # Run specific scenario
-    python tests/full_flow_test.py --scenario call_requested
+    python scripts/full_flow.py --scenario call_requested
 
     # Run with mock OpenAI (no API key needed)
-    python tests/full_flow_test.py --mock-openai
+    python scripts/full_flow.py --mock-openai
 """
 
 import os

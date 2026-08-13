@@ -10,16 +10,16 @@ export OPENAI_API_KEY='your-key-here'
 
 # Run all tests
 cd /Users/baylorharrison/Documents/GitHub/EmailAutomation
-python tests/standalone_test.py
+python scripts/standalone.py
 
 # Run specific scenario
-python tests/standalone_test.py -s complete_info
+python scripts/standalone.py -s complete_info
 
 # List all scenarios
-python tests/standalone_test.py -l
+python scripts/standalone.py -l
 
 # Save results to file
-python tests/standalone_test.py -r results.json
+python scripts/standalone.py -r results.json
 ```
 
 ---

@@ -9,6 +9,12 @@ Requires:
 - OPENAI_API_KEY environment variable
 - Firebase credentials (GOOGLE_APPLICATION_CREDENTIALS or default credentials)
 - Azure env vars (can be dummy values since we use dry_run mode)
+
+Usage:
+    python scripts/standalone.py
+    python scripts/standalone.py -s complete_info
+    python scripts/standalone.py -l
+    python scripts/standalone.py -r tests/test_results.json
 """
 
 import os

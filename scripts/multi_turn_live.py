@@ -9,12 +9,12 @@ the actual production pipeline (main.py) each turn.
 Measures: thread matching, AI extraction accuracy, response quality, latency.
 
 Usage:
-    python tests/multi_turn_live_test.py                    # Run all 3 scenarios
-    python tests/multi_turn_live_test.py --scenario gradual_info_gathering
-    python tests/multi_turn_live_test.py --resume           # Resume interrupted run
-    python tests/multi_turn_live_test.py --wait 90          # Custom wait (seconds)
-    python tests/multi_turn_live_test.py --cleanup          # Remove test data
-    python tests/multi_turn_live_test.py --list             # List scenarios
+    python scripts/multi_turn_live.py                    # Run all 3 scenarios
+    python scripts/multi_turn_live.py --scenario gradual_info_gathering
+    python scripts/multi_turn_live.py --resume           # Resume interrupted run
+    python scripts/multi_turn_live.py --wait 90          # Custom wait (seconds)
+    python scripts/multi_turn_live.py --cleanup          # Remove test data
+    python scripts/multi_turn_live.py --list             # List scenarios
 """
 
 import os
@@ -33,7 +33,7 @@ from dataclasses import dataclass, field, asdict
 def load_dotenv():
     env_paths = [
         Path(__file__).parent.parent / ".env",
-        Path(__file__).parent / ".env",
+        Path(__file__).parent.parent / "tests" / ".env",
         Path.home() / ".emailautomation.env",
     ]
     for env_path in env_paths:
@@ -57,7 +57,7 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from multi_turn_scenarios import (
+from tests.multi_turn_scenarios import (
     ALL_SCENARIOS, MultiTurnScenario, TurnSpec, TurnAction, PropertyStatus,
 )
 
@@ -195,7 +195,7 @@ class MultiTurnTestRunner:
         print("\n--- Initializing clients ---")
 
         # Deferred imports (require credentials)
-        from email_integration_test import (
+        from scripts.email_integration import (
             EmailTestClient as _ETC,
             GmailSender as _GS,
         )

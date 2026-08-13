@@ -76,10 +76,11 @@ This file is pre-configured with:
 │   ├── column_config.py       # Dynamic column mapping system
 │   ├── followup.py            # Automatic follow-up scheduling
 │   └── clients.py             # Firebase/Google API client initialization
-├── tests/                      # Comprehensive test suite
-│   ├── standalone_test.py     # 25 AI extraction scenarios
-│   ├── e2e_test.py            # Full pipeline tests with Scrub file
-│   ├── campaign_lifecycle_test.py  # Multi-property campaign tests
+├── scripts/                    # Manual test executables (outside pytest discovery)
+│   ├── standalone.py          # 25 AI extraction scenarios
+│   ├── e2e.py                 # Full pipeline tests with Scrub file
+│   └── campaign_lifecycle.py  # Multi-property campaign runner
+├── tests/                      # Pytest/unittest suite and test data
 │   └── conversations/         # Broker reply fixtures
 ├── main.py                     # Entry point: processes all users
 ├── app.py                      # Flask server for OAuth & debug APIs
@@ -311,8 +312,8 @@ git add -A && git commit -m "description" && git push
 cd ~/Documents/GitHub/EmailAutomation
 # Make changes to email_automation/
 python3 -m py_compile email_automation/<file>.py   # Syntax check
-python tests/standalone_test.py                     # MUST pass (25/25)
-python tests/e2e_test.py                           # MUST pass
+python scripts/standalone.py                     # MUST pass (25/25)
+python scripts/e2e.py                            # MUST pass
 git add -A && git commit -m "description" && git push
 # GitHub Actions uses main.py for the scheduled production worker
 ```
@@ -323,15 +324,15 @@ git add -A && git commit -m "description" && git push
 
 | Test Suite | Command | Pass Criteria |
 |------------|---------|---------------|
-| AI Extraction | `python tests/standalone_test.py` | 25/25 scenarios pass |
-| E2E Pipeline | `python tests/e2e_test.py` | All properties process correctly |
-| Campaign Lifecycle | `python tests/campaign_lifecycle_test.py` | 11/11 scenarios pass |
+| AI Extraction | `python scripts/standalone.py` | 25/25 scenarios pass |
+| E2E Pipeline | `python scripts/e2e.py` | All properties process correctly |
+| Campaign Lifecycle | `python scripts/campaign_lifecycle.py` | 11/11 scenarios pass |
 
 ### Pre-Commit Checklist
 
 - [ ] `CI=true npm run build` passes (frontend)
-- [ ] `python tests/standalone_test.py` passes (backend)
-- [ ] `python tests/e2e_test.py` passes (backend)
+- [ ] `python scripts/standalone.py` passes (backend)
+- [ ] `python scripts/e2e.py` passes (backend)
 - [ ] Commit message is descriptive
 - [ ] No secrets/credentials in code
 
@@ -529,7 +530,7 @@ OPENAI_ASSISTANT_MODEL=gpt-4o
 **AI not extracting data:**
 - Check OpenAI API key is valid
 - Review `ai_processing.py` prompts
-- Run `python tests/standalone_test.py -s <scenario>` to debug
+- Run `python scripts/standalone.py -s <scenario>` to debug
 
 **Thread not matching:**
 - Check `msgIndex/` and `convIndex/` collections

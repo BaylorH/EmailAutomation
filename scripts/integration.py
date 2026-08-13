@@ -14,7 +14,7 @@ This fills the gaps from unit tests by testing:
 6. Error handling and recovery
 
 Usage:
-    python tests/integration_test.py
+    python scripts/integration.py
 """
 
 import os

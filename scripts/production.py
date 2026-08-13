@@ -15,9 +15,9 @@ This tests:
 7. Edge cases and error recovery
 
 Usage:
-    python tests/production_test.py
-    python tests/production_test.py --quick    # Run subset for quick validation
-    python tests/production_test.py --verbose  # Extra debug output
+    python scripts/production.py
+    python scripts/production.py --quick    # Run subset for quick validation
+    python scripts/production.py --verbose  # Extra debug output
 """
 
 import os

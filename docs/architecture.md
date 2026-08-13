@@ -262,9 +262,9 @@ flowchart TD
 ```mermaid
 flowchart TB
     subgraph TestTypes["Test Types"]
-        Standalone[standalone_test.py<br/>25 scenarios]
-        E2E[e2e_test.py<br/>11 conversations]
-        Campaign[campaign_lifecycle_test.py<br/>11 scenarios]
+        Standalone[scripts/standalone.py<br/>25 scenarios]
+        E2E[scripts/e2e.py<br/>11 conversations]
+        Campaign[scripts/campaign_lifecycle.py<br/>11 scenarios]
         Quality[quality_benchmark.py<br/>8 benchmarks]
         Batch[batch_runner.py<br/>559+ tests]
     end

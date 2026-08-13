@@ -16,12 +16,12 @@ Results Output:
     notifications, and validation results.
 
 Usage:
-    python tests/e2e_test.py                    # Run all E2E tests
-    python tests/e2e_test.py --save             # Run and save results to files
-    python tests/e2e_test.py -p "699 Industrial" # Run specific property
-    python tests/e2e_test.py --list             # List available conversations
-    python tests/e2e_test.py --list-runs        # List previous test runs
-    python tests/e2e_test.py --compare run1 run2 # Compare two runs
+    python scripts/e2e.py                    # Run all E2E tests
+    python scripts/e2e.py --save             # Run and save results to files
+    python scripts/e2e.py -p "699 Industrial" # Run specific property
+    python scripts/e2e.py --list             # List available conversations
+    python scripts/e2e.py --list-runs        # List previous test runs
+    python scripts/e2e.py --compare run1 run2 # Compare two runs
 """
 
 import os
@@ -160,7 +160,7 @@ def load_scrub_file(filepath: str = None) -> Dict[str, Dict]:
 
 def get_conversations_dir() -> Path:
     """Get the conversations directory path."""
-    return Path(__file__).parent / "conversations"
+    return Path(__file__).resolve().parent.parent / "tests" / "conversations"
 
 def load_conversation(property_address: str, subdir: str = None) -> Optional[Dict]:
     """

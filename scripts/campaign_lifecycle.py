@@ -16,9 +16,9 @@ This simulates what happens in production when a user launches a campaign
 and processes broker responses over time.
 
 Usage:
-    python tests/campaign_lifecycle_test.py                  # Run full lifecycle
-    python tests/campaign_lifecycle_test.py --scenario X     # Run specific scenario
-    python tests/campaign_lifecycle_test.py --list           # List scenarios
+    python scripts/campaign_lifecycle.py                  # Run full lifecycle
+    python scripts/campaign_lifecycle.py --scenario X     # Run specific scenario
+    python scripts/campaign_lifecycle.py --list           # List scenarios
 """
 
 import os
@@ -26,48 +26,67 @@ import sys
 import json
 import copy
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Sequence, Tuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
 # ============================================================================
-# ENVIRONMENT SETUP
+# EXPLICIT RUNTIME SETUP
 # ============================================================================
 
-env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
-if os.path.exists(env_path):
-    with open(env_path) as f:
-        for line in f:
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+propose_sheet_updates = None
+
+
+class RuntimeConfigurationError(RuntimeError):
+    """Raised when the explicitly invoked lifecycle runner cannot start."""
+
+
+def _load_environment() -> None:
+    """Load the repository-local environment only for an explicit CLI run."""
+    env_path = os.path.join(REPO_ROOT, ".env")
+    if not os.path.exists(env_path):
+        return
+
+    with open(env_path) as env_file:
+        for line in env_file:
             line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, value = line.split('=', 1)
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
                 os.environ[key] = value
 
-if not os.getenv("OPENAI_API_KEY"):
-    print("OPENAI_API_KEY environment variable not set")
-    sys.exit(1)
 
-for var in ["AZURE_API_APP_ID", "AZURE_API_CLIENT_SECRET", "FIREBASE_API_KEY"]:
-    if not os.getenv(var):
-        os.environ[var] = f"test-{var.lower()}"
+def _initialize_runtime() -> None:
+    """Validate configuration and install manual-run dependencies."""
+    global propose_sheet_updates
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _load_environment()
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeConfigurationError("OPENAI_API_KEY environment variable not set")
 
-# Mock Firestore before importing production code
-from unittest.mock import MagicMock
-import sys as _sys
+    for var in ["AZURE_API_APP_ID", "AZURE_API_CLIENT_SECRET", "FIREBASE_API_KEY"]:
+        if not os.getenv(var):
+            os.environ[var] = f"test-{var.lower()}"
 
-mock_firestore = MagicMock()
-mock_firestore.Client = MagicMock(return_value=MagicMock())
-mock_firestore.SERVER_TIMESTAMP = "SERVER_TIMESTAMP"
-_sys.modules['google.cloud.firestore'] = mock_firestore
-_sys.modules['google.cloud'] = MagicMock()
-_sys.modules['google.oauth2.credentials'] = MagicMock()
-_sys.modules['google.auth.transport.requests'] = MagicMock()
-_sys.modules['googleapiclient.discovery'] = MagicMock()
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
 
-from email_automation.ai_processing import propose_sheet_updates
-from email_automation.app_config import REQUIRED_FIELDS_FOR_CLOSE
+    # Mock Firestore before importing production code. These process-global
+    # mutations are valid only after the manual executable is explicitly run.
+    from unittest.mock import MagicMock
+
+    mock_firestore = MagicMock()
+    mock_firestore.Client = MagicMock(return_value=MagicMock())
+    mock_firestore.SERVER_TIMESTAMP = "SERVER_TIMESTAMP"
+    sys.modules["google.cloud.firestore"] = mock_firestore
+    sys.modules["google.cloud"] = MagicMock()
+    sys.modules["google.oauth2.credentials"] = MagicMock()
+    sys.modules["google.auth.transport.requests"] = MagicMock()
+    sys.modules["googleapiclient.discovery"] = MagicMock()
+
+    from email_automation.ai_processing import propose_sheet_updates as implementation
+
+    propose_sheet_updates = implementation
 
 # ============================================================================
 # DATA TYPES
@@ -1170,13 +1189,19 @@ def run_all_scenarios(verbose: bool = True) -> List[Dict]:
 # MAIN
 # ============================================================================
 
-def main():
+def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(description="Campaign Lifecycle E2E Tests")
     parser.add_argument("--scenario", "-s", help="Run specific scenario by name")
     parser.add_argument("--list", "-l", action="store_true", help="List available scenarios")
     parser.add_argument("--quiet", "-q", action="store_true", help="Minimal output")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    try:
+        _initialize_runtime()
+    except RuntimeConfigurationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     if args.list:
         print("\nAvailable campaign scenarios:")
@@ -1185,7 +1210,7 @@ def main():
             print(f"  {s.name}")
             print(f"    {s.description}")
             print(f"    Properties: {len(s.properties)}")
-        return
+        return 0
 
     print("\n" + "="*70)
     print("CAMPAIGN LIFECYCLE E2E TEST SUITE")
@@ -1198,10 +1223,10 @@ def main():
         if not scenario:
             print(f"Unknown scenario: {args.scenario}")
             print("Use --list to see available scenarios")
-            sys.exit(1)
+            return 1
 
         passed, result = run_campaign_scenario(scenario, not args.quiet)
-        sys.exit(0 if passed else 1)
+        return 0 if passed else 1
 
     # Run all scenarios
     results = run_all_scenarios(not args.quiet)
@@ -1226,8 +1251,8 @@ def main():
                 if r.get("error"):
                     print(f"      - ERROR: {r['error']}")
 
-    sys.exit(0 if passed == total else 1)
+    return 0 if passed == total else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
