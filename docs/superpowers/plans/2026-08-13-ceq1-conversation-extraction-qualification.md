@@ -380,7 +380,8 @@ Tests must prove:
 - public records reject `expectedVerdict`, `oracleHash`, `expectedState`, and `sabotageId` anywhere;
 - the public execution schedule has only `schemaVersion`,
   `productionAncestor`, `implementationBase`, and `entries`; each entry has
-  exactly `scenarioId`, `variantId`, `layers`, `inputHash`, and `responseHash`;
+  exactly `ordinal`, `scenarioId`, `variantId`, `layers`, `inputHash`, and
+  `responseHash`;
   it rejects response class, voice eligibility, oracle, sabotage, expected
   outcome, promotion class, and non-claim fields;
 - coverage records have exactly `variantId`, `scenarioId`, `layers`,
@@ -419,6 +420,8 @@ Return typed `ValidatedManifest`, `ValidatedExecutionSchedule`, and
 `ValidatedCoverage` objects only after exact set equality, path containment,
 byte-hash, owner-module-hash, privacy validation, and equality of public
 schedule versus sealed coverage `{scenarioId, variantId, layers}` all pass.
+Ordinals are unique contiguous integers starting at zero and match the reviewed
+Task 7 matrix row order.
 The trusted host scheduler may read the public schedule but not the sealed
 coverage or oracle. It emits one child descriptor with exactly
 `{scenarioId, variantId, layer, inputHash, responseHash}`; the SUT never reads
@@ -555,8 +558,12 @@ copied `uv` with `--no-config --no-project --relocatable`; package installation
 uses `--require-hashes --only-binary :all: --link-mode copy --exact` and never
 downloads. Reject any venv link resolving outside the task runtime. Hash the resulting interpreter, `pyvenv.cfg`, every installed
 distribution `RECORD`, executable, and native library before release and after
-cleanup. No role reads the original user-writable runtime/JDK/JAR after this
-copy step.
+cleanup. After installation, remove write bits from the complete uv/Python/
+venv/JDK/JAR runtime, recompute its closed manifest, and grant every role
+read-only access; writable HOME/tmp/cache/output live outside `runtime/`.
+Mutation, write-attempt, and post-run digest tests must prove the sealed runtime
+did not change. No role reads the original user-writable runtime/JDK/JAR after
+this copy step.
 
 The fixed runtime-preparation bootstrap itself runs once via
 `/usr/bin/sandbox-exec` under a no-network profile before copied role runtimes
@@ -941,7 +948,7 @@ promotion.
 | `acknowledgement-not-question` | `CEQ-MEM-01` | `L1+L2+L3` | `SAB-EXT01-04` | `ACK_MISCLASSIFIED_AS_QUESTION` | `missing_field_reply` | `false` | `required` | `FAIL` |
 | `fresh-target-terminal` | `CEQ-TERM-01` | `L1+L2+L3` | `SAB-EXT02-01` | `CITED_TERMINAL_NOT_APPLIED` | `terminal_reply` | `false` | `required` | `FAIL` |
 | `stale-quoted-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-02` | `QUOTED_ONLY_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
-| `wrong-property-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-03` | `CROSS_ENTITY_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `wrong-property-terminal` | `CEQ-WRONG-01` | `L1+L2+L3` | `SAB-EXT02-03` | `CROSS_ENTITY_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
 | `addressless-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-04` | `UNCITED_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
 | `ambiguous-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-05` | `AMBIGUOUS_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
 | `same-address-two-suites` | `CEQ-SUITE-01` | `L1+L2+L3` | `SAB-EXT03-01` | `CROSS_SUITE_FACT_ACCEPTED` | `review_no_reply` | `false` | `required` | `FAIL` |
@@ -1051,14 +1058,15 @@ raw `proposal.response_email`, `_select_automatic_response_body()` output, a
 missing-field template, harness-reconstructed metadata, or a draft without one
 of the five production-owned finalizer identities required by the spec.
 
-Define five scored dimensions—context continuity, directness, professional
-human voice, grammar/punctuation, and sequence-level phrase variety—and hard
+Define the exact five scored dimensions—natural flow, professional tone,
+context continuity, concision, and absence of obvious AI tells—and hard
 faults for semantic/grounding error, known/declined-field re-ask, invented
 commitment, audience/signature drift, duplicate greeting/signoff, and AI-tell
 or broken punctuation. A synthetic instrument-only packet tests exact scores,
 two blinded independent reviewers, a third reviewer when any dimension differs
-by more than one point, zero hard faults, median at least four on every
-dimension for at least 90% of drafts, and no score below three. At least one
+by more than one point, zero hard faults, and **both reviewers scoring every
+dimension at least 4/5**. Any draft below 3/5, any hard semantic fault, or any
+safety disagreement fails rather than being averaged. At least one
 reviewer must have role `human_operator`; reviewer IDs are opaque role-local
 codes and contain no name, email, or other PII.
 
@@ -1166,6 +1174,11 @@ A client interceptor injects one opaque `x-ceq1-operation-id` from the wrapper
 reconcile to one wrapper ledger operation by operation ID, method, ordered
 attempt, and canonical resource set. Transaction retries reuse the operation ID
 with an exact attempt ordinal; one wrapper operation need not equal one RPC.
+Independently of wrapper attribution, the proxy validates every parsed request
+and response against the exact `(default)` database root and task namespace
+document prefix **before** forwarding or returning it. Collection-group/all-
+descendant queries, malformed names, missing attribution, or any resource
+outside the prefix are rejected and mark `INSTRUMENT_FAILURE`.
 
 The topology is exact and independently attacked:
 
@@ -1281,19 +1294,20 @@ git commit -m "test: prove CE-Q1 emulator persistence"
 
 - [ ] **Step 1: Write failing CLI, schedule, and report-schema tests**
 
-Require exact subcommands `preflight`, `calibrate`, `run`, and
-`verify-report`. `run` has only declared tiers `l1`, `l2`, `l3`, or `all`.
+Require exact subcommands `preflight`, `calibrate`, `run`, `verify-report`, and
+`assemble-evidence`. `run` has only declared tiers `l1`, `l2`, `l3`, or `all`.
 The frozen full schedule is required variants forward once, required variants
 in reverse once, three fresh-process repetitions, then declared diagnostic
 variants. No retry-until-green, case filter, xfail, skip, or best-of-N option
 exists.
 
-“Forward” is the exact 55-row matrix order in Task 7, expanding each row's
-layers in `L1`, `L2`, `L3` order and omitting undeclared layers. “Reverse” is
-the exact reverse tuple sequence. Repetitions 1, 2, and 3 each restart at the
-forward first tuple with a new task ID, process tree, adapter state, and L3
-namespace. Diagnostic rows retain their table positions but run only after all
-required repetition tuples. The public schedule stores this ordinal explicitly;
+“Forward” is the Task 7 matrix filtered to `promotionClass=required` in
+ascending `ordinal`, expanding each row's layers in `L1`, `L2`, `L3` order and
+omitting undeclared layers. “Reverse” is that exact required tuple sequence in
+reverse. Repetitions 1, 2, and 3 each restart at the required forward first
+tuple with a new task ID, process tree, adapter state, and L3 namespace. Only
+after those required tuples, diagnostic rows execute in ascending ordinal and
+declared-layer order. The public schedule stores each matrix ordinal explicitly;
 the validator recomputes it from the matrix and rejects reordering, duplication,
 or omission.
 
@@ -1306,6 +1320,13 @@ may execute the unexecuted remainder; it reports coverage and future work but
 cannot replace, widen, or issue a gate verdict. Tests require the canonical
 verdict source and diagnostic coverage receipt to be separately labeled and
 prove the report reducer never derives a verdict from diagnostic attempts.
+The canonical and diagnostic reports are distinct immutable closed records.
+The diagnostic report contains the canonical report hash and exact next tuple,
+contains no gate-verdict field, and covers only the unexecuted suffix.
+`assemble-evidence` accepts only two already-verified immutable reports (or one
+fully complete green canonical report), proves their schedule partitions are
+ordered/disjoint/complete, preserves the canonical verdict byte-for-byte, and
+deterministically produces the sole combined evidence view.
 
 Report tests require separate `executionHead` and `evidenceCarrierHead`, product
 source/production ancestor, toolchain/dependency/public-manifest/public-schedule/
@@ -1365,6 +1386,14 @@ diagnostic continuation runs only the unexecuted suffix after a non-pass
 canonical report. Typed digests omit only declared volatile process/time/path
 receipt fields.
 
+`verify-report` validates canonical, diagnostic, and assembled schemas without
+rewriting them. `assemble-evidence` reads a verified canonical report plus its
+hash-bound verified diagnostic continuation, recomputes complete cardinality,
+and emits `assembled-report.json`/`.md`; its verdict field is copied only from
+the canonical report. Tests mutate either input, overlap/drop/reorder a tuple,
+add a verdict to diagnostics, or change the canonical verdict and require exact
+rejection.
+
 - [ ] **Step 4: Run fresh preflight and calibration**
 
 Run:
@@ -1412,6 +1441,15 @@ Run:
 ./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py run --tier all \
   --mode diagnostic-continuation --canonical-report \
   .ceq1-runtime/canonical/report.json --output .ceq1-runtime/diagnostic
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py verify-report \
+  .ceq1-runtime/diagnostic/report.json --canonical-report \
+  .ceq1-runtime/canonical/report.json
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py assemble-evidence \
+  --canonical-report .ceq1-runtime/canonical/report.json \
+  --diagnostic-report .ceq1-runtime/diagnostic/report.json \
+  --output .ceq1-runtime/assembled
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py verify-report \
+  .ceq1-runtime/assembled/report.json
 ```
 
 Expected canonical product outcome on `b400ee5`: stop at the first required
@@ -1424,14 +1462,16 @@ baseline and triggers adversarial review rather than promotion.
 
 - [ ] **Step 7: Generate sanitized committed evidence from the verified report**
 
-Only after the quarantine and output tree pass `privacy.scan_tree()`, render
-`baseline-report.json` and `.md` from the structured report. Include stable
+Only after canonical, diagnostic, and assembled reports independently verify
+and the quarantine/output trees pass `privacy.scan_tree()`, copy the assembled
+`report.json`/`.md` as `baseline-report.json`/`.md`. Include stable
 reason codes and redacted diffs, never raw fixture bodies. Before rendering,
 `lstat` every candidate output, reject links/special files/multiple hard links,
 open with `O_NOFOLLOW`, scan and hash through that FD, rehash without closing,
 then atomically copy the exact scanned bytes through a fsynced evidence-
-directory FD. Run `verify-report` again on the committed form and compare its
-semantic digest to the quarantined canonical report.
+directory FD. Run `verify-report` again on the committed form and require exact
+semantic equality to the quarantined assembled report, canonical-report hash,
+diagnostic-report hash, and unchanged canonical verdict.
 
 - [ ] **Step 8: Run the final affected and broad regression gates**
 
