@@ -30,7 +30,9 @@ class LazyProviderProxy(Generic[T]):
         return cast(T, instance)
 
     def __getattr__(self, attribute: str):
-        if attribute.startswith("__") and attribute.endswith("__"):
+        if (
+            attribute.startswith("__") and attribute.endswith("__")
+        ) or attribute in {"_is_coroutine", "_is_coroutine_marker"}:
             raise AttributeError(attribute)
         return getattr(self.get(), attribute)
 

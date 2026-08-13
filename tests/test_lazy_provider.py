@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from email_automation.lazy_provider import LazyProviderProxy
 
@@ -64,6 +65,18 @@ class LazyProviderProxyTests(unittest.TestCase):
         proxy = LazyProviderProxy("introspection", lambda: calls.append(1) or object())
         self.assertFalse(hasattr(proxy, "__test__"))
         self.assertFalse(hasattr(proxy, "__bases__"))
+        self.assertEqual([], calls)
+
+    def test_mock_patch_replacement_does_not_construct(self):
+        calls = []
+
+        class Holder:
+            provider = LazyProviderProxy(
+                "patch", lambda: calls.append(1) or object()
+            )
+
+        with patch.object(Holder, "provider"):
+            pass
         self.assertEqual([], calls)
 
     def test_attribute_access_delegates_and_constructs_once(self):
