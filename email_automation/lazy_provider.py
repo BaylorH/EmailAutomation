@@ -30,6 +30,8 @@ class LazyProviderProxy(Generic[T]):
         return cast(T, instance)
 
     def __getattr__(self, attribute: str):
+        if attribute.startswith("__") and attribute.endswith("__"):
+            raise AttributeError(attribute)
         return getattr(self.get(), attribute)
 
     def __repr__(self) -> str:

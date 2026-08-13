@@ -59,6 +59,13 @@ class LazyProviderProxyTests(unittest.TestCase):
         self.assertIn("quiet", repr(proxy))
         self.assertEqual([], calls)
 
+    def test_dunder_introspection_does_not_construct(self):
+        calls = []
+        proxy = LazyProviderProxy("introspection", lambda: calls.append(1) or object())
+        self.assertFalse(hasattr(proxy, "__test__"))
+        self.assertFalse(hasattr(proxy, "__bases__"))
+        self.assertEqual([], calls)
+
     def test_attribute_access_delegates_and_constructs_once(self):
         calls = []
 
