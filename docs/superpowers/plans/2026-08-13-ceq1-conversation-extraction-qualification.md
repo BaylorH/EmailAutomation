@@ -145,7 +145,7 @@ by their literal hashes:
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -265,7 +265,7 @@ environment. Its canonical entry is exactly:
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   bootstrap __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ -- prepare
 ```
@@ -282,8 +282,12 @@ Perl trampoline opens `scripts/verify_ceq1_entry.pl` with `O_NOFOLLOW`, requires
 a single regular link and exact reviewed byte hash, reads it once, requires
 stable pre/post `stat`, and `eval`s those exact already-read bytes; it never
 asks an interpreter to reopen the mutable verifier pathname. The verifier
-imports no repository module, spawns no subprocess, runs no version probe, and
-writes nothing. It opens every target with no-follow-any behavior, matches
+imports no repository module, runs no version probe, and writes no filesystem
+state. It may fork exactly one tightly controlled pipe writer per Python target:
+the parent closes every unrelated descriptor, the child writes exactly the
+declared verified byte count and exits, and the parent requires that exact PID
+to exit zero before accepting target completion. No other subprocess is
+allowed. It opens every target with no-follow-any behavior, matches
 pre/post descriptor identity, reads exactly the fstat size with a loop that
 rejects read errors, short reads, or an extra byte, and executes the
 already-verified bootstrap or wrapper as bytes rather than by reopening its
@@ -294,6 +298,18 @@ symbolic filename, and does not import target code before that read completes.
 The verifier controls both pipe ends and child environment, closes unrelated
 descriptors, and does not accept a caller-supplied target fd. Swap-race tests
 cover both verifier and target transitions.
+
+The fixed loader uses only the root-owned Apple-signed Command Line Tools
+Python at `/Library/Developer/CommandLineTools/usr/bin/python3` and its
+root-owned framework/stdlib. That Apple-managed runtime is part of the same
+explicit platform trust prerequisite, not an artifact CE-Q1 proves. It
+evaluates only already-verified repository target bytes and is never the sealed
+qualification runtime. The verifier does not start the user-writable uv-managed
+CPython until bootstrap input verification has passed; after the sealed bundle
+is built and fully output-verified, qualification commands use the task-owned
+copied CPython. The plan makes no claim of atomic path-swap resistance for
+root-owned Apple-managed platform files against a root attacker. Any
+ownership/mode/code-signature drift in that declared trust base is `BLOCKED`.
 
 The verifier has two non-interchangeable modes. `bootstrap` requires the exact
 hash of `ceq1-input-manifest.json` and statically validates only build inputs:
@@ -1291,7 +1307,7 @@ Run:
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1691,7 +1707,7 @@ Run:
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1700,7 +1716,7 @@ Run:
   --output .ceq1-runtime/preflight.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1740,7 +1756,7 @@ Run:
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1749,7 +1765,7 @@ Run:
   --mode canonical --output .ceq1-runtime/canonical
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1758,7 +1774,7 @@ Run:
   .ceq1-runtime/canonical/report.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1768,7 +1784,7 @@ Run:
   .ceq1-runtime/canonical/report.json --output .ceq1-runtime/diagnostic
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1778,7 +1794,7 @@ Run:
   .ceq1-runtime/canonical/report.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1789,7 +1805,7 @@ Run:
   --output .ceq1-runtime/assembled
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1826,7 +1842,7 @@ Run:
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1841,7 +1857,7 @@ Run:
 
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
@@ -1851,7 +1867,7 @@ Run:
 
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
-  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}die if sysread($f,my $x,1);my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);die unless defined($r)&&$r>0;$s.=$c;$n-=$r}my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}0..$#b;die unless sha256_hex($s)eq$h;@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
   scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
   run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
   __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
