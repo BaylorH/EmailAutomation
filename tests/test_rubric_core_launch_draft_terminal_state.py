@@ -5,24 +5,6 @@ os.environ.setdefault("E2E_TEST_MODE", "true")
 import unittest
 from unittest import mock
 
-import google.cloud.firestore as _gcf
-
-
-class _FsForImport:
-    """Stand-in returned by firestore.Client() so email_automation.clients is
-    importable offline (no ADC). The real datastore boundary is faked per-call
-    via mock.patch on email_automation.clients._fs; any accidental use here
-    fails loudly instead of hitting real Firestore."""
-
-    def __getattr__(self, name):
-        raise AssertionError(
-            f"real Firestore access '{name}' during test -- boundary not faked"
-        )
-
-
-# clients.py runs `_fs = firestore.Client()` at import time; stub it first.
-_gcf.Client = lambda *a, **k: _FsForImport()
-
 from email_automation import email as email_mod
 from email_automation.campaign_safety import CampaignAutomationDecision
 

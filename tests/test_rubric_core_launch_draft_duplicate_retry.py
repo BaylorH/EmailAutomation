@@ -6,32 +6,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-import google.cloud.firestore as _gcf
-
-
 # ---------------------------------------------------------------------------
 # Fakes that model ONLY the Firestore datastore boundary. The unit under test
 # (_claim_outbox_item and its transactional claim logic) is exercised for real.
 # ---------------------------------------------------------------------------
-class _FakeFsForImport:
-    """Stand-in returned by firestore.Client() so email_automation.clients is
-    importable offline (no ADC). Never used for the actual claim logic; the
-    per-call _FakeFs below supplies the transaction the unit exercises."""
-
-    def transaction(self):
-        return _FakeTransaction()
-
-    def __getattr__(self, name):
-        raise AssertionError(
-            f"real Firestore access '{name}' during test -- boundary not faked"
-        )
-
-
-# Patch the Firestore client constructor (datastore boundary) BEFORE importing
-# the production module, whose clients.py does `_fs = firestore.Client()` at
-# import time.
-_gcf.Client = lambda *a, **k: _FakeFsForImport()
-
 from email_automation.email import _claim_outbox_item, CLAIM_TIMEOUT_SECONDS, WORKER_ID
 
 

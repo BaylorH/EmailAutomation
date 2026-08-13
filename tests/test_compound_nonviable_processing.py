@@ -4,8 +4,7 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
-with patch("google.cloud.firestore.Client", return_value=MagicMock()):
-    from email_automation import ai_processing, campaign_safety, email as email_module, processing
+from email_automation import ai_processing, campaign_safety, email as email_module, processing
 
 
 class FakeSnapshot:

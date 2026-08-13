@@ -37,10 +37,6 @@ from unittest import mock
 
 import google.cloud.firestore as _gcf
 
-# clients.py runs `_fs = firestore.Client()` at import time; stub it so the
-# package imports offline.  The real datastore boundary is faked per-run below.
-_gcf.Client = lambda *a, **k: mock.MagicMock()
-
 from email_automation import (
     ai_processing,
     campaign_safety,
