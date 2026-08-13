@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-from types import SimpleNamespace
 import unittest
 
 
@@ -47,58 +46,12 @@ def _credential_absent_env() -> dict[str, str]:
         env.pop(name, None)
     env.pop("PYTEST_ADDOPTS", None)
     env.pop("PYTHONPATH", None)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
 class TestTestCollectionContract(unittest.TestCase):
-    def test_provider_client_boundary_is_collection_only_and_restored(self):
-        try:
-            import conftest as collection_config
-        except ModuleNotFoundError:
-            self.fail("root conftest.py does not define the collection-only provider boundary")
-
-        import firebase_admin
-        from google.cloud import firestore
-        import msal
-
-        original_firestore_client = firestore.Client
-        original_firebase_initialize_app = firebase_admin.initialize_app
-        original_msal_public_client = msal.PublicClientApplication
-        normal_config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
-        collection_config.pytest_configure(normal_config)
-        self.assertIs(original_firestore_client, firestore.Client)
-        self.assertIs(original_firebase_initialize_app, firebase_admin.initialize_app)
-        self.assertIs(original_msal_public_client, msal.PublicClientApplication)
-        collection_config.pytest_unconfigure(normal_config)
-
-        collect_config = SimpleNamespace(option=SimpleNamespace(collectonly=True))
-        collection_config.pytest_configure(collect_config)
-        try:
-            self.assertIsNot(original_firestore_client, firestore.Client)
-            self.assertIsNot(original_firebase_initialize_app, firebase_admin.initialize_app)
-            self.assertIsNot(original_msal_public_client, msal.PublicClientApplication)
-            self.assertIs(firestore.Client(), firestore.Client())
-        finally:
-            collection_config.pytest_unconfigure(collect_config)
-
-        self.assertIs(original_firestore_client, firestore.Client)
-        self.assertIs(original_firebase_initialize_app, firebase_admin.initialize_app)
-        self.assertIs(original_msal_public_client, msal.PublicClientApplication)
-
-        with self.subTest("partial setup failure restores earlier provider patches"):
-            failed_config = SimpleNamespace(option=SimpleNamespace(collectonly=True))
-            del msal.PublicClientApplication
-            try:
-                with self.assertRaises(AttributeError):
-                    collection_config.pytest_configure(failed_config)
-
-                self.assertIs(original_firestore_client, firestore.Client)
-                self.assertIs(original_firebase_initialize_app, firebase_admin.initialize_app)
-            finally:
-                msal.PublicClientApplication = original_msal_public_client
-                collection_config.pytest_unconfigure(failed_config)
-
     def test_manual_executables_are_outside_pytest_discovery(self):
         for discovered_relative, manual_relative in MANUAL_EXECUTABLE_MOVES:
             discovered_path = REPO_ROOT / discovered_relative
@@ -254,35 +207,255 @@ class TestTestCollectionContract(unittest.TestCase):
             (import_guard / "sitecustomize.py").write_text(
                 textwrap.dedent(
                     """
+                    import atexit
+                    import http.client
                     import os
                     from pathlib import Path
                     import socket
+                    import sys
+                    import types
+                    import urllib.request
 
                     guard_log = Path(os.environ["COLLECTION_GUARD_LOG"])
+                    module_guards = []
+                    attribute_guards = []
+                    protected_module_attributes = {}
 
-                    def _blocked_boundary(name):
-                        def blocked(*args, **kwargs):
-                            with guard_log.open("a", encoding="utf-8") as log_file:
-                                log_file.write(name + "\\n")
+
+                    def record(name):
+                        with guard_log.open("a", encoding="utf-8") as log_file:
+                            log_file.write(name + "\\n")
+
+
+                    def blocked(name):
+                        def fail(*args, **kwargs):
+                            record("BOUNDARY_CALLED:" + name)
                             raise RuntimeError("COLLECTION_EFFECT_ATTEMPTED:" + name)
-                        return blocked
+                        return fail
 
-                    socket.socket.connect = _blocked_boundary("socket.socket.connect")
-                    socket.create_connection = _blocked_boundary(
-                        "socket.create_connection"
+
+                    audit_state = {
+                        "block_construction": False,
+                        "probe_expected": None,
+                        "probe_seen": [],
+                    }
+
+
+                    class AuditProbeBlocked(RuntimeError):
+                        pass
+
+
+                    def reject_socket_audit(event, args):
+                        expected = audit_state["probe_expected"]
+                        if expected is not None and event == expected:
+                            audit_state["probe_seen"].append(event)
+                            raise AuditProbeBlocked(event)
+                        if event == "socket.__new__" and not audit_state["block_construction"]:
+                            return
+                        if event in {
+                            "socket.__new__",
+                            "socket.connect",
+                            "socket.connect_ex",
+                            "socket.getaddrinfo",
+                            "socket.gethostbyname",
+                            "socket.gethostbyaddr",
+                            "socket.getnameinfo",
+                        }:
+                            record("BOUNDARY_CALLED:audit:" + event)
+                            raise RuntimeError("COLLECTION_EFFECT_ATTEMPTED:audit:" + event)
+
+
+                    sys.addaudithook(reject_socket_audit)
+
+                    # Prove saved resolver callables emit an audit event before they can
+                    # resolve anything. gethostbyname_ex shares socket.gethostbyname, and getfqdn
+                    # reaches socket.gethostbyaddr. A missing audit event aborts sitecustomize
+                    # before the ready marker, never falling through to an actual lookup.
+                    resolution_audit_probes = (
+                        ("socket.getaddrinfo", socket.getaddrinfo, ("audit.invalid", 443)),
+                        ("socket.gethostbyname", socket.gethostbyname, ("audit.invalid",)),
+                        ("socket.gethostbyname", socket.gethostbyname_ex, ("audit.invalid",)),
+                        ("socket.gethostbyaddr", socket.gethostbyaddr, ("203.0.113.1",)),
+                        ("socket.gethostbyaddr", socket.getfqdn, ("203.0.113.1",)),
+                        ("socket.getnameinfo", socket.getnameinfo, (("203.0.113.1", 443), 0)),
                     )
+                    for expected_event, resolver, resolver_args in resolution_audit_probes:
+                        audit_state["probe_expected"] = expected_event
+                        try:
+                            resolver(*resolver_args)
+                        except AuditProbeBlocked as exc:
+                            if str(exc) != expected_event:
+                                raise RuntimeError(
+                                    "COLLECTION_AUDIT_PROBE_WRONG_EVENT:"
+                                    f"{expected_event}:{exc}"
+                                ) from exc
+                        else:
+                            raise RuntimeError(
+                                "COLLECTION_AUDIT_PROBE_MISSING:" + expected_event
+                            )
+                    audit_state["probe_expected"] = None
+                    if audit_state["probe_seen"] != [
+                        probe[0] for probe in resolution_audit_probes
+                    ]:
+                        raise RuntimeError("COLLECTION_AUDIT_PROBE_INCOMPLETE")
 
+                    # SDK import dependencies perform a caught IPv6-capability socket
+                    # construction inside urllib3. Preload them before the collection
+                    # measurement boundary while the audit hook already forbids DNS and
+                    # connection attempts.
                     import firebase_admin
                     from google.cloud import firestore
                     import msal
+                    import openai
+                    import requests
 
-                    firestore.Client = _blocked_boundary("firestore.Client")
-                    firebase_admin.initialize_app = _blocked_boundary(
-                        "firebase_admin.initialize_app"
+                    try:
+                        import httpx
+                    except ImportError:
+                        httpx = None
+
+                    audit_state["block_construction"] = True
+
+
+                    class GuardedModule(types.ModuleType):
+                        def __setattr__(self, attribute, value):
+                            guard = protected_module_attributes.get((id(self), attribute))
+                            if guard is not None and value is not guard["value"]:
+                                record("BOUNDARY_REPLACED:" + guard["name"])
+                                raise RuntimeError(
+                                    "COLLECTION_GUARD_REPLACED:" + guard["name"]
+                                )
+                            super().__setattr__(attribute, value)
+
+                        def __delattr__(self, attribute):
+                            guard = protected_module_attributes.get((id(self), attribute))
+                            if guard is not None:
+                                record("BOUNDARY_REPLACED:" + guard["name"])
+                                raise RuntimeError(
+                                    "COLLECTION_GUARD_REPLACED:" + guard["name"]
+                                )
+                            super().__delattr__(attribute)
+
+
+                    def protect_module_attribute(module, attribute, name, value=None):
+                        expected = blocked(name) if value is None else value
+                        setattr(module, attribute, expected)
+                        guard = {
+                            "module": module,
+                            "attribute": attribute,
+                            "name": name,
+                            "value": expected,
+                        }
+                        protected_module_attributes[(id(module), attribute)] = guard
+                        module_guards.append(guard)
+                        if module.__class__ is types.ModuleType:
+                            module.__class__ = GuardedModule
+                        return expected
+
+
+                    def protect_attribute(owner, attribute, name):
+                        expected = blocked(name)
+                        setattr(owner, attribute, expected)
+                        attribute_guards.append((owner, attribute, name, expected))
+                        return expected
+
+
+                    original_socket_type = socket.socket
+                    protect_attribute(
+                        original_socket_type, "connect", "socket.socket.connect"
                     )
-                    msal.PublicClientApplication = _blocked_boundary(
-                        "msal.PublicClientApplication"
+
+
+                    class BlockedSocket(original_socket_type):
+                        def __new__(cls, *args, **kwargs):
+                            record("BOUNDARY_CALLED:socket.socket")
+                            raise RuntimeError(
+                                "COLLECTION_EFFECT_ATTEMPTED:socket.socket"
+                            )
+
+
+                    protect_module_attribute(
+                        socket, "socket", "socket.socket", BlockedSocket
                     )
+                    protect_module_attribute(
+                        socket, "create_connection", "socket.create_connection"
+                    )
+                    for resolver_name in (
+                        "getaddrinfo",
+                        "gethostbyname",
+                        "gethostbyname_ex",
+                        "gethostbyaddr",
+                        "getnameinfo",
+                        "getfqdn",
+                    ):
+                        protect_module_attribute(
+                            socket, resolver_name, "socket." + resolver_name
+                        )
+                    protect_module_attribute(
+                        urllib.request, "urlopen", "urllib.request.urlopen"
+                    )
+                    protect_attribute(
+                        http.client.HTTPConnection,
+                        "request",
+                        "http.client.HTTPConnection.request",
+                    )
+                    protect_attribute(
+                        http.client.HTTPConnection,
+                        "connect",
+                        "http.client.HTTPConnection.connect",
+                    )
+                    protect_attribute(
+                        http.client.HTTPSConnection,
+                        "request",
+                        "http.client.HTTPSConnection.request",
+                    )
+                    protect_attribute(
+                        http.client.HTTPSConnection,
+                        "connect",
+                        "http.client.HTTPSConnection.connect",
+                    )
+
+                    protect_module_attribute(firestore, "Client", "firestore.Client")
+                    protect_module_attribute(
+                        firebase_admin,
+                        "initialize_app",
+                        "firebase_admin.initialize_app",
+                    )
+                    protect_module_attribute(
+                        msal,
+                        "PublicClientApplication",
+                        "msal.PublicClientApplication",
+                    )
+                    protect_module_attribute(openai, "OpenAI", "openai.OpenAI")
+                    protect_module_attribute(
+                        requests.api, "request", "requests.api.request"
+                    )
+                    protect_attribute(
+                        requests.sessions.Session,
+                        "request",
+                        "requests.sessions.Session.request",
+                    )
+
+                    if httpx is not None:
+                        protect_attribute(httpx.Client, "send", "httpx.Client.send")
+                        protect_attribute(
+                            httpx.AsyncClient, "send", "httpx.AsyncClient.send"
+                        )
+
+
+                    @atexit.register
+                    def assert_guard_identity():
+                        for guard in module_guards:
+                            current = getattr(
+                                guard["module"], guard["attribute"], None
+                            )
+                            if current is not guard["value"]:
+                                record("BOUNDARY_IDENTITY_LOST:" + guard["name"])
+                        for owner, attribute, name, expected in attribute_guards:
+                            if getattr(owner, attribute, None) is not expected:
+                                record("BOUNDARY_IDENTITY_LOST:" + name)
+
+
                     Path(os.environ["COLLECTION_GUARD_READY"]).write_text(
                         "ready", encoding="utf-8"
                     )
@@ -301,6 +474,7 @@ class TestTestCollectionContract(unittest.TestCase):
                     sys.executable,
                     "-m",
                     "pytest",
+                    "--noconftest",
                     "--collect-only",
                     "-q",
                     "-p",
