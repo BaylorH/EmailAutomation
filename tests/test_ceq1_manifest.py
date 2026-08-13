@@ -808,7 +808,9 @@ class Ceq1BootstrapTests(unittest.TestCase):
 
     def test_outer_policy_bytes_are_identical_and_outer_has_no_stateful_work(self):
         bootstrap = REPO_ROOT / ".ceq1-runtime/bootstrap-contract-red"
-        expected_profile, _ = self.bootstrap.render_bootstrap_profile(REPO_ROOT)
+        expected_profile, _ = self.bootstrap.render_bootstrap_profile(
+            REPO_ROOT, relocation_path=bootstrap / "relocation-proof"
+        )
         executable, argv, environment = self.bootstrap.contained_launcher_contract(
             REPO_ROOT,
             bootstrap,
@@ -855,7 +857,9 @@ class Ceq1BootstrapTests(unittest.TestCase):
         bootstrap_name = "bootstrap-direct-contained-red"
         bootstrap_path = REPO_ROOT / ".ceq1-runtime" / bootstrap_name
         self.assertFalse(bootstrap_path.exists())
-        profile, _ = self.bootstrap.render_bootstrap_profile(REPO_ROOT)
+        profile, _ = self.bootstrap.render_bootstrap_profile(
+            REPO_ROOT, relocation_path=bootstrap_path / "relocation-proof"
+        )
         encoded = base64.b64encode(profile.encode("utf-8")).decode("ascii")
         environment = {
             "HOME": str(bootstrap_path / "home"),
