@@ -99,7 +99,6 @@ the already-installed CPython 3.12.13 tree:
 ```text
 /Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12
 launcher sha256 e2605291e058fdbe3102e8185d0ac5fe0e063398de617010a6af3a42a78f05e3
-full regular-file tree digest 71d5b02f92bb3e27876b9345196b94dcd96d817205eda8d685d3823f65c3bd9d
 ```
 
 The pinned `uv` executable is `/Users/baylorharrison/.local/bin/uv`, SHA-256
