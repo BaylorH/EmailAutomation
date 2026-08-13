@@ -748,7 +748,8 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertIn('(literal "/dev/null")', template)
         self.assertIn('(subpath "{JDK_ROOT}")', template)
         self.assertIn('(literal "{FIRESTORE_JAR}")', template)
-        self.assertIn('(literal "{RELOCATION}/venv/bin/python")', template)
+        self.assertIn('(literal "{RELOCATION}/python/bin/python3.12")', template)
+        self.assertNotIn('(literal "{RELOCATION}/venv/bin/python")', template)
         for required_input in ("INPUT_MANIFEST", "VERIFIER_SCRIPT", "WRAPPER_SCRIPT"):
             self.assertIn(f'(literal "{{{required_input}}}")', template)
         self.assertIn("{READ_ANCESTOR_RULES}", template)
