@@ -87,6 +87,7 @@ Important import detail: `processing.py` and `ai_processing.py` import dependenc
 | `tests/test_ceq1_voice.py` | Frozen-draft eligibility and blinded-review instrument calibration |
 | `scripts/bootstrap_ceq1_runtime.py` | Exact Task 1 orchestrator for the sandboxed double build, derived-lock verification, and sealed local venv |
 | `scripts/build_ceq1_wheelhouse.py` | Deterministically reconstructs reviewed pure-Python wheel bytes from exact uv-cache RECORD members without mutating the cache |
+| `scripts/verify_ceq1_entry.py` | Externally hash-pinned, mutation-free standard-library verifier that validates the toolchain before bootstrap/wrapper execution |
 | `scripts/run_ceq1.py` | Thin CLI over the host supervisor |
 | `scripts/run_ceq1_env.py` | Empty-environment Python/test launcher used before the full supervisor exists |
 
@@ -250,11 +251,30 @@ environment. Its canonical entry is exactly:
 
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-  /Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12 \
+/Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12 \
   -I -S -B scripts/bootstrap_ceq1_runtime.py prepare
 ```
 
-The mutation-free outer launcher derives only lexical path parameters and a
+No mutable repository script is the root of its own trust. Before either the
+bootstrap or direct wrapper is imported or executed, pinned CPython runs a
+literal standard-library `-c` trampoline. The final Task 1 plan and local
+receipt record the exact literal SHA-256 of `scripts/verify_ceq1_entry.py` and
+of the committed toolchain manifest. The trampoline opens the verifier with
+`O_NOFOLLOW`, requires a single regular link and its exact byte hash, and
+`execve`s pinned Python `-I -S -B` into that verified file with the expected
+toolchain-manifest hash and requested target. The verifier imports no
+repository module, spawns no subprocess, runs no version probe, and writes
+nothing. Through componentwise held directory descriptors it requires the
+exact manifest byte hash and closed schema, then statically validates the
+bootstrap, builder, wrapper, wheelhouse manifest, locks, pinned binary/JAR
+bytes, source-runtime trees, sealed bundle tree, and wheelhouse bytes. Only
+after exact static equality does it `execve` either the bootstrap or wrapper.
+The toolchain manifest binds the verifier and wrapper hashes as well as the
+bootstrap and builder hashes. After Task 1 freezes, the two named review-hash
+placeholders in this plan must be replaced with literal reviewed hashes and the
+canonical commands rerun; an unresolved placeholder is a completion blocker.
+
+The mutation-free verified outer launcher derives only lexical path parameters and a
 fresh opaque bootstrap identity, renders the canonical Seatbelt template in
 memory, and immediately crosses one true `os.execve()` boundary:
 `/usr/bin/env -i <closed-env> /usr/bin/sandbox-exec -p <rendered-policy>
@@ -299,6 +319,10 @@ substitution is used. The one outer profile denies all network, and every
 contained child inherits it. It reads only the exact reviewed source
 cache, interpreter, standard library, `uv`, builder, manifests, and lock
 inputs, and writes only under `.ceq1-runtime/bootstrap` and `.ceq1-venv`.
+The bootstrap hashes the builder before importing it. Version-output probes run
+only after the verifier and bootstrap have established exact static byte/tree
+equality, and only inside the inherited Seatbelt. The direct wrapper never
+executes version probes.
 
 Inside that profile, the orchestrator runs `uv pip compile` only as a diagnostic
 resolution step, writing below `.ceq1-runtime/bootstrap` and using all of
@@ -470,7 +494,7 @@ every entry; reject sockets/devices/FIFOs and links escaping the artifact root.
 Record entry count, tree digest, launcher hash, version output hash, and the
 digest algorithm version. Record the Firestore 1.19.8 JAR byte hash and the
 two lockfile hashes. The toolchain manifest also binds the wheelhouse manifest,
-bootstrap-orchestrator source, reconstructor source, canonical parameterized
+entry verifier, direct wrapper, bootstrap-orchestrator source, reconstructor source, canonical parameterized
 Seatbelt-template content/hash/schema, every promoted derived wheel hash, and
 the sealed Python-plus-venv runtime tree. The ignored runtime receipt, not the
 committed manifest, binds the rendered profile and absolute parameters. A
