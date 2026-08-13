@@ -319,7 +319,9 @@ This entry check detects pre-run drift and refuses mismatched bytes, metadata,
 links, manifests, and runtime trees. CE-Q1 assumes an exclusive local build/run
 window after verification: a malicious concurrent same-UID process or root
 attacker that mutates the verified host interpreter/stdlib or repository paths
-during the verifier-to-exec transition is explicitly outside the threat model.
+during the verifier-to-exec transition—or swaps and restores a uv-store alias
+chain while its before/after receipts are being established—is explicitly
+outside the threat model.
 The plan therefore makes no atomic host path-swap claim and includes no
 post-verification adversarial launcher/stdlib race acceptance test. This does
 not weaken the contained worker boundary: Seatbelt denial, exact empty child
@@ -388,6 +390,13 @@ substitution is used. The one outer profile denies all network, and every
 contained child inherits it. It reads only the exact reviewed source
 cache, interpreter, standard library, `uv`, builder, manifests, and lock
 inputs, and writes only under `.ceq1-runtime/bootstrap` and `.ceq1-venv`.
+Because the componentwise no-follow walkers must open each directory from `/`,
+the rendered profile grants only a sorted, receipt-bound union of exact
+`(literal ...)` ancestor directories for those already-authorized paths. It
+never grants a home, repository, or ancestor `subpath`. Those literal directory
+grants necessarily permit traversal and immediate-child-name enumeration, but
+not descendant content reads; that narrow disclosure is accepted only for the
+exact-hash/tree-trusted executables under deny-network containment.
 The bootstrap hashes the builder before importing it. Version-output probes run
 only after the verifier and bootstrap have established exact static byte/tree
 equality, and only inside the inherited Seatbelt. The direct wrapper never
@@ -422,18 +431,21 @@ the final path receipt would otherwise equal the first. Through
 those held no-follow directory descriptors it then rewrites only absolute symlinks
 whose targets are strictly below the reviewed source cache to the corresponding
 path below the clone. Real-cache characterization found a closed class of uv
-build-environment interpreter links whose targets are below the uv-managed
-Python-store root but outside both the cache and the manifest-bound CPython
-source. Those links may be copied verbatim only when each exact relative path
-and target is present in both source receipts; they are classified
-`DENIED_EXTERNAL_PYTHON_LINK`, are never followed during clone validation, and
-must fail an OS-contained read probe with `EPERM` because the Seatbelt profile
-does not grant their target roots. No lock-selected archive or wheel may depend
-on one. Any other absolute/escaping link, any changed target, or any readable
-denied link is `BLOCKED`. The clone's complete logical topology must equal the
-source topology after applying the internal-root substitution and retaining
-that exact denied-link class. The worker takes the source identity receipt
-again after the clone and after all `uv` work; any source change is `BLOCKED`.
+build-environment interpreter links whose textual targets are below the
+uv-managed Python-store root but outside the cache. An exact link is classified
+`@PINNED_PYTHON` only when its strict resolved path is below the manifest-bound
+CPython tree; otherwise it is `@DENIED_EXTERNAL_PYTHON` and must fail an
+OS-contained read probe with `EPERM` because the Seatbelt profile does not
+grant its target root. An outside-store alias is blocked even when it resolves
+into the pinned tree. These links may be copied verbatim only when each exact
+relative path and textual target is present in both source receipts. No
+lock-selected archive or wheel may depend on a denied link. Any other
+absolute/escaping link, changed target or classification, or readable denied
+link is `BLOCKED`. The clone's complete logical topology must equal the source
+topology after applying the internal-root substitution and retaining those
+exact pinned/denied classes. After all `uv` work, the worker recomputes and
+requires both source identity and logical-topology receipts; any source or
+alias-classification change is `BLOCKED`.
 Every `uv` child receives only that unique task-owned clone as `UV_CACHE_DIR`;
 no `uv` argv, environment, or resolved cache link may name the reviewed source
 cache. The builder remains a read-only RECORD-closed reader of the reviewed
@@ -485,7 +497,7 @@ The orchestrator runs the builder twice into disjoint stage A/B roots, validates
 both, requires byte identity, copies the validated result into the promoted
 task-owned wheelhouse, seals it read-only, and verifies it again. It then
 renders a deterministic candidate qualification lock below
-`.ceq1-runtime/bootstrap` from the five promoted derived wheel hashes. The
+`.ceq1-runtime/bootstrap/review-candidate` from the five promoted derived wheel hashes. The
 candidate format and dependency order are fixed by the orchestrator and it
 must compare byte-for-byte with committed `requirements-ceq1.lock`; canonical
 execution never rewrites a repository file. The separate development command
