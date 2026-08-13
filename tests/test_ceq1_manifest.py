@@ -8,6 +8,7 @@ import csv
 import hashlib
 import importlib.util
 import io
+import inspect
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -1035,6 +1036,14 @@ class Ceq1BootstrapTests(unittest.TestCase):
                         textual_target,
                     ),
                 )
+                outside = root / "outside-alias"
+                os.symlink(pinned, outside)
+                with self.assertRaises(self.bootstrap.BootstrapBlocked):
+                    self.bootstrap._logical_cache_target(
+                        root / "cache",
+                        "archive-v0/example/bin/python",
+                        str(outside / "bin/python3.12"),
+                    )
 
     def test_source_cache_logical_classification_is_rechecked_after_uv_work(self):
         expected = {"algorithmVersion": "ceq1-cache-logical-v1", "logicalDigest": "a"}
@@ -1051,6 +1060,21 @@ class Ceq1BootstrapTests(unittest.TestCase):
                 self.bootstrap.require_source_cache_logical_stability(
                     Path("/unused"), initial
                 )
+
+        source = inspect.getsource(self.bootstrap._prepare)
+        last_uv = source.index("_run(commands[5]")
+        logical_recheck = source.index("require_source_cache_logical_stability")
+        normalize = source.index("normalize_uv_install_metadata")
+        self.assertLess(last_uv, logical_recheck)
+        self.assertLess(logical_recheck, normalize)
+
+    def test_review_candidate_artifacts_stay_below_review_candidate_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bootstrap = Path(tmp).resolve() / "bootstrap-exact"
+            lock, toolchain = self.bootstrap.review_candidate_artifact_paths(bootstrap)
+            review_root = bootstrap / "review-candidate"
+            self.assertEqual(review_root / "requirements-ceq1.lock", lock)
+            self.assertEqual(review_root / "ceq1-toolchain-manifest.json", toolchain)
 
     def test_derived_lock_is_canonical_and_uses_only_derived_hashes(self):
         manifest = json.loads(
