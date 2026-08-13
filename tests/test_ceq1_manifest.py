@@ -748,6 +748,8 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertIn('(literal "/dev/null")', template)
         self.assertIn('(subpath "{JDK_ROOT}")', template)
         self.assertIn('(literal "{FIRESTORE_JAR}")', template)
+        for required_input in ("INPUT_MANIFEST", "VERIFIER_SCRIPT", "WRAPPER_SCRIPT"):
+            self.assertIn(f'(literal "{{{required_input}}}")', template)
         self.assertIn("{READ_ANCESTOR_RULES}", template)
         self.assertNotIn("/Users/", template)
         with tempfile.TemporaryDirectory() as tmp:
