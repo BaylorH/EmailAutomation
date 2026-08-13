@@ -273,15 +273,23 @@ the job scaffold).
 default `--dry-run` executes zero `gcloud` commands and reports the deterministic
 `process-user-stage-<12-character-HEAD>` revision identity. `--apply` first
 requires the existing service to have one sole 100 percent revision with the
-single `release-a` mapping, then builds and resolves an immutable image digest.
+single `release-a` mapping, plus explicit revision-pinned canonical
+`spec.traffic` with unique well-formed tags. Auxiliary pinned tags are permitted
+only when their exact mappings remain unchanged. Before building, the script
+also reads the complete service revision inventory to prove the deterministic
+candidate does not already exist and describes the baseline positive revision
+for an exact configuration comparison. It then builds and resolves an immutable
+image digest.
 It deploys that digest with `--no-traffic` and the deterministic
 `--revision-suffix`, without any `--tag`, and fails unless service and revision
 readback prove all of the following:
 
-- the candidate is Ready, has the exact immutable image and deployment config,
+- the candidate is Ready, has the exact immutable image, matches the baseline
+  revision configuration apart from immutable image and revision identity,
   remains untagged, and has 0 percent traffic; and
 - the prior revision remains the sole 100 percent target with its stable
-  `release-a` mapping unchanged.
+  `release-a` mapping, every auxiliary tag, and canonical `spec.traffic`
+  unchanged.
 
 This script does not pause or resume a queue, mutate traffic, create a temporary
 certification tag, promote a revision, or execute rollback. Those are separate

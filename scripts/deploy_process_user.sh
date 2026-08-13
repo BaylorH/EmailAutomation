@@ -91,6 +91,7 @@ if ! baseline_revision="$({
   python3 - <<'PY'
 import json
 import os
+import re
 
 
 def refuse(message):
@@ -103,45 +104,70 @@ except (KeyError, json.JSONDecodeError) as error:
     refuse(f"baseline service JSON is invalid: {error}")
 
 status = service.get("status")
-traffic = status.get("traffic") if isinstance(status, dict) else None
-if not isinstance(traffic, list):
+status_traffic = status.get("traffic") if isinstance(status, dict) else None
+if not isinstance(status_traffic, list):
     refuse("baseline service traffic is missing or invalid")
 
-positive = {}
-for item in traffic:
-    if not isinstance(item, dict):
-        refuse("baseline traffic contains a non-object entry")
-    percent = item.get("percent", 0)
-    if isinstance(percent, bool) or not isinstance(percent, (int, float)):
-        refuse("baseline traffic contains an invalid percent")
-    if percent < 0 or percent > 100:
-        refuse("baseline traffic percent is outside 0..100")
-    if percent > 0:
+spec = service.get("spec")
+spec_traffic = spec.get("traffic") if isinstance(spec, dict) else None
+if not isinstance(spec_traffic, list) or not spec_traffic:
+    refuse("baseline spec.traffic is missing or invalid")
+
+
+def validate_traffic(items, surface):
+    positive = {}
+    tags = {}
+    canonical = []
+    for item in items:
+        if not isinstance(item, dict):
+            refuse(f"{surface} traffic contains a non-object entry")
+        if item.get("latestRevision") not in (None, False):
+            refuse(f"{surface} traffic contains a LATEST target")
+        if "revisionName" not in item:
+            refuse(f"{surface} traffic contains an implicit target")
         revision = item.get("revisionName")
         if not isinstance(revision, str) or not revision:
-            refuse("positive baseline traffic does not name an exact revision")
-        positive[revision] = positive.get(revision, 0) + percent
+            refuse(f"{surface} traffic does not name an exact revision")
+        percent = item.get("percent", 0)
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+            refuse(f"{surface} traffic contains an invalid percent")
+        if percent < 0 or percent > 100:
+            refuse(f"{surface} traffic percent is outside 0..100")
+        if percent > 0:
+            positive[revision] = positive.get(revision, 0) + percent
+        tag = item.get("tag")
+        if tag is not None:
+            if not isinstance(tag, str) or re.fullmatch(
+                r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", tag
+            ) is None:
+                refuse(f"{surface} traffic contains an invalid tag")
+            if tag in tags:
+                refuse(f"{surface} traffic duplicates a tag")
+            tags[tag] = revision
+        canonical.append((revision, percent, tag))
+    return positive, tags, sorted(canonical, key=lambda item: (item[2] or "", item[0], item[1]))
 
-if len(positive) != 1:
-    refuse(f"expected exactly one positive baseline revision, found {positive!r}")
-baseline_revision, baseline_percent = next(iter(positive.items()))
+spec_positive, spec_tags, _ = validate_traffic(spec_traffic, "baseline spec")
+status_positive, status_tags, _ = validate_traffic(status_traffic, "baseline status")
+
+if len(spec_positive) != 1:
+    refuse(f"expected exactly one positive baseline spec revision, found {spec_positive!r}")
+baseline_revision, baseline_percent = next(iter(spec_positive.items()))
 if baseline_percent != 100:
-    refuse(f"baseline revision traffic is {baseline_percent!r}, not 100")
+    refuse(f"baseline spec revision traffic is {baseline_percent!r}, not 100")
+if status_positive != spec_positive:
+    refuse("baseline status traffic does not match explicit spec traffic")
 
-release_a = [
-    item.get("revisionName")
-    for item in traffic
-    if isinstance(item, dict) and item.get("tag") == "release-a"
-]
-if release_a != [baseline_revision]:
+if spec_tags.get("release-a") != baseline_revision or list(spec_tags).count("release-a") != 1:
     refuse(
-        "release-a must map exactly once to the sole 100 percent baseline "
-        f"revision; found {release_a!r}"
+        "release-a must map exactly once to the sole 100 percent baseline revision"
     )
+if status_tags != spec_tags:
+    refuse("baseline status tags do not match explicit spec tags")
 
 candidate = os.environ["CANDIDATE_REVISION"]
 if status.get("latestCreatedRevisionName") == candidate or any(
-    item.get("revisionName") == candidate for item in traffic
+    item.get("revisionName") == candidate for item in (*spec_traffic, *status_traffic)
 ):
     refuse(f"deterministic candidate revision already appears in service state: {candidate}")
 
@@ -154,6 +180,97 @@ PY
 })"; then
   printf 'Refusing to stage: baseline service contract is not exact.\n' >&2
   exit 74
+fi
+
+revision_list_command=(
+  gcloud run revisions list
+  --service "$SERVICE"
+  --account "$ACCOUNT"
+  --project "$PROJECT"
+  --region "$REGION"
+  --format=json
+)
+if ! revision_inventory_json="$("${revision_list_command[@]}")"; then
+  printf 'Refusing to stage: revision inventory read failed.\n' >&2
+  exit 79
+fi
+if ! REVISION_INVENTORY_JSON="$revision_inventory_json" \
+    CANDIDATE_REVISION="$candidate_revision" \
+    python3 - <<'PY'
+import json
+import os
+
+
+def refuse(message):
+    raise SystemExit(message)
+
+
+try:
+    inventory = json.loads(os.environ["REVISION_INVENTORY_JSON"])
+except (KeyError, json.JSONDecodeError) as error:
+    refuse(f"revision inventory JSON is invalid: {error}")
+if not isinstance(inventory, list):
+    refuse("revision inventory is not a list")
+names = []
+for entry in inventory:
+    if not isinstance(entry, dict):
+        refuse("revision inventory contains a non-object entry")
+    name = entry.get("metadata", {}).get("name")
+    if not isinstance(name, str) or not name:
+        refuse("revision inventory contains an invalid identity")
+    names.append(name)
+if len(set(names)) != len(names):
+    refuse("revision inventory contains duplicate identities")
+if os.environ["CANDIDATE_REVISION"] in names:
+    refuse("deterministic candidate revision already exists in full inventory")
+PY
+then
+  printf 'Refusing to stage: revision inventory contract is not exact.\n' >&2
+  exit 80
+fi
+
+baseline_revision_describe_command=(
+  gcloud run revisions describe "$baseline_revision"
+  --account "$ACCOUNT"
+  --project "$PROJECT"
+  --region "$REGION"
+  --format=json
+)
+if ! baseline_revision_json="$("${baseline_revision_describe_command[@]}")"; then
+  printf 'Refusing to stage: baseline revision read failed.\n' >&2
+  exit 81
+fi
+if ! BASELINE_REVISION_JSON="$baseline_revision_json" \
+    EXPECTED_REVISION="$baseline_revision" \
+    python3 - <<'PY'
+import json
+import os
+
+
+def refuse(message):
+    raise SystemExit(message)
+
+
+try:
+    revision = json.loads(os.environ["BASELINE_REVISION_JSON"])
+except (KeyError, json.JSONDecodeError) as error:
+    refuse(f"baseline revision JSON is invalid: {error}")
+if not isinstance(revision, dict):
+    refuse("baseline revision is not a JSON object")
+if revision.get("metadata", {}).get("name") != os.environ["EXPECTED_REVISION"]:
+    refuse("baseline revision identity does not match the sole positive target")
+spec = revision.get("spec")
+if not isinstance(spec, dict):
+    refuse("baseline revision spec is missing")
+containers = spec.get("containers")
+if not isinstance(containers, list) or len(containers) != 1:
+    refuse("baseline revision must have exactly one container")
+if not isinstance(containers[0].get("image"), str) or "@sha256:" not in containers[0]["image"]:
+    refuse("baseline revision image is not immutable")
+PY
+then
+  printf 'Refusing to stage: baseline revision contract is not exact.\n' >&2
+  exit 82
 fi
 
 "${build_command[@]}"
@@ -197,6 +314,7 @@ if ! BASELINE_SERVICE_JSON="$baseline_service_json" \
     python3 - <<'PY'
 import json
 import os
+import re
 
 
 def refuse(message):
@@ -215,38 +333,75 @@ def load(name):
 
 def normalized_routes(service):
     status = service.get("status")
-    traffic = status.get("traffic") if isinstance(status, dict) else None
-    if not isinstance(traffic, list):
-        refuse("service traffic is missing or invalid")
-    positive = {}
-    tags = []
-    for item in traffic:
-        if not isinstance(item, dict):
-            refuse("traffic contains a non-object entry")
-        percent = item.get("percent", 0)
-        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
-            refuse("traffic contains an invalid percent")
-        if percent < 0 or percent > 100:
-            refuse("traffic percent is outside 0..100")
-        revision = item.get("revisionName")
-        if percent > 0:
+    status_traffic = status.get("traffic") if isinstance(status, dict) else None
+    spec = service.get("spec")
+    spec_traffic = spec.get("traffic") if isinstance(spec, dict) else None
+    if not isinstance(status_traffic, list) or not isinstance(spec_traffic, list):
+        refuse("service spec or status traffic is missing or invalid")
+
+    def parse(items, surface):
+        positive = {}
+        tags = {}
+        canonical = []
+        for item in items:
+            if not isinstance(item, dict):
+                refuse(f"{surface} traffic contains a non-object entry")
+            if item.get("latestRevision") not in (None, False):
+                refuse(f"{surface} traffic contains a LATEST target")
+            revision = item.get("revisionName")
             if not isinstance(revision, str) or not revision:
-                refuse("positive traffic does not name an exact revision")
-            positive[revision] = positive.get(revision, 0) + percent
-        tag = item.get("tag")
-        if tag is not None:
-            if not isinstance(tag, str) or not tag:
-                refuse("traffic contains an invalid tag")
-            if not isinstance(revision, str) or not revision:
-                refuse("tagged traffic does not name an exact revision")
-            tags.append((tag, revision))
-    return status, traffic, positive, sorted(tags)
+                refuse(f"{surface} traffic does not name an exact revision")
+            percent = item.get("percent", 0)
+            if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+                refuse(f"{surface} traffic contains an invalid percent")
+            if percent < 0 or percent > 100:
+                refuse(f"{surface} traffic percent is outside 0..100")
+            if percent > 0:
+                positive[revision] = positive.get(revision, 0) + percent
+            tag = item.get("tag")
+            if tag is not None:
+                if not isinstance(tag, str) or re.fullmatch(
+                    r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", tag
+                ) is None:
+                    refuse(f"{surface} traffic contains an invalid tag")
+                if tag in tags:
+                    refuse(f"{surface} traffic duplicates a tag")
+                tags[tag] = revision
+            canonical.append((revision, percent, tag))
+        return positive, tags, sorted(canonical, key=lambda item: (item[2] or "", item[0], item[1]))
+
+    status_positive, status_tags, status_canonical = parse(status_traffic, "status")
+    spec_positive, spec_tags, spec_canonical = parse(spec_traffic, "spec")
+    if status_positive != spec_positive or status_tags != spec_tags:
+        refuse("service status routing does not match explicit spec routing")
+    return (
+        status,
+        status_traffic,
+        status_positive,
+        status_tags,
+        spec_canonical,
+        status_canonical,
+    )
 
 
 baseline = load("BASELINE_SERVICE_JSON")
 post = load("POST_SERVICE_JSON")
-_, _, baseline_positive, baseline_tags = normalized_routes(baseline)
-post_status, post_traffic, post_positive, post_tags = normalized_routes(post)
+(
+    _,
+    _,
+    baseline_positive,
+    baseline_tags,
+    baseline_spec,
+    baseline_status,
+) = normalized_routes(baseline)
+(
+    post_status,
+    post_traffic,
+    post_positive,
+    post_tags,
+    post_spec,
+    post_status_routes,
+) = normalized_routes(post)
 baseline_revision = os.environ["BASELINE_REVISION"]
 candidate = os.environ["CANDIDATE_REVISION"]
 
@@ -262,13 +417,17 @@ if post_positive != baseline_positive:
         "positive traffic changed during tagless staging: "
         f"before={baseline_positive!r} after={post_positive!r}"
     )
-if baseline_tags != [("release-a", baseline_revision)]:
-    refuse(f"baseline tag mapping is ambiguous: {baseline_tags!r}")
+if baseline_tags.get("release-a") != baseline_revision:
+    refuse("baseline release-a mapping is not bound to the sole positive revision")
 if post_tags != baseline_tags:
     refuse(
         "traffic tag mapping changed during tagless staging: "
         f"before={baseline_tags!r} after={post_tags!r}"
     )
+if post_spec != baseline_spec:
+    refuse("canonical spec.traffic changed during tagless staging")
+if post_status_routes != baseline_status:
+    refuse("canonical status.traffic changed during tagless staging")
 
 candidate_percent = sum(
     item.get("percent", 0)
@@ -304,6 +463,7 @@ if ! candidate_revision_json="$("${revision_describe_command[@]}")"; then
   exit 77
 fi
 if ! REVISION_JSON="$candidate_revision_json" \
+    BASELINE_REVISION_JSON="$baseline_revision_json" \
     EXPECTED_REVISION="$candidate_revision" \
     EXPECTED_IMAGE="${IMAGE_REPOSITORY}@${digest}" \
     EXPECTED_SERVICE_ACCOUNT="$SERVICE_ACCOUNT" \
@@ -320,6 +480,10 @@ try:
     revision = json.loads(os.environ["REVISION_JSON"])
 except (KeyError, json.JSONDecodeError) as error:
     refuse(f"candidate revision JSON is invalid: {error}")
+try:
+    baseline_revision = json.loads(os.environ["BASELINE_REVISION_JSON"])
+except (KeyError, json.JSONDecodeError) as error:
+    refuse(f"baseline revision JSON is invalid: {error}")
 
 if revision.get("metadata", {}).get("name") != os.environ["EXPECTED_REVISION"]:
     refuse("candidate revision name does not match the deterministic identity")
@@ -333,6 +497,9 @@ if annotations.get("autoscaling.knative.dev/minScale") not in (None, "0"):
 spec = revision.get("spec")
 if not isinstance(spec, dict):
     refuse("candidate revision spec is missing")
+baseline_spec = baseline_revision.get("spec")
+if not isinstance(baseline_spec, dict):
+    refuse("baseline revision spec is missing")
 if spec.get("serviceAccountName") != os.environ["EXPECTED_SERVICE_ACCOUNT"]:
     refuse("candidate service account does not match")
 if spec.get("containerConcurrency") != 1:
@@ -344,6 +511,10 @@ containers = spec.get("containers")
 if not isinstance(containers, list) or len(containers) != 1:
     refuse("candidate must have exactly one container")
 container = containers[0]
+baseline_containers = baseline_spec.get("containers")
+if not isinstance(baseline_containers, list) or len(baseline_containers) != 1:
+    refuse("baseline must have exactly one container")
+baseline_container = baseline_containers[0]
 if container.get("image") != os.environ["EXPECTED_IMAGE"]:
     refuse(f"candidate image is not the expected immutable digest: {container.get('image')!r}")
 if container.get("command") != ["gunicorn"]:
@@ -398,6 +569,17 @@ for name in (
     secret_ref = by_name.get(name, {}).get("valueFrom", {}).get("secretKeyRef", {})
     if secret_ref.get("name") != name or secret_ref.get("key") != "latest":
         refuse(f"candidate secret reference does not match for {name}")
+
+def canonical_spec(value):
+    value = json.loads(json.dumps(value))
+    containers = value.get("containers")
+    if isinstance(containers, list) and len(containers) == 1:
+        containers[0].pop("image", None)
+    return value
+
+
+if canonical_spec(spec) != canonical_spec(baseline_spec):
+    refuse("candidate config differs from the baseline revision beyond immutable image")
 
 ready_conditions = [
     condition

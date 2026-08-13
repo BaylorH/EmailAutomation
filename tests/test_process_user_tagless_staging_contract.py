@@ -176,6 +176,8 @@ class TaglessStagingContractTests(unittest.TestCase):
             [
                 *self._preflight_calls(),
                 self._service_describe_call(),
+                self._revision_list_call(),
+                self._baseline_revision_describe_call(),
                 self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
@@ -236,6 +238,56 @@ class TaglessStagingContractTests(unittest.TestCase):
     def test_baseline_read_failure_stops_before_build(self):
         self._assert_baseline_refused("baseline_read_failure")
 
+    def test_latest_revision_spec_target_is_rejected_before_build(self):
+        self._assert_baseline_refused("latest_spec")
+
+    def test_implicit_spec_target_is_rejected_before_build(self):
+        self._assert_baseline_refused("implicit_spec_target")
+
+    def test_duplicate_spec_tag_is_rejected_before_build(self):
+        self._assert_baseline_refused("spec_duplicate_tag")
+
+    def test_malformed_spec_tag_is_rejected_before_build(self):
+        self._assert_baseline_refused("spec_invalid_tag")
+
+    def test_existing_candidate_outside_service_status_is_rejected_before_build(self):
+        self._assert_inventory_refused("inventory_candidate_collision")
+
+    def test_revision_inventory_read_failure_is_rejected_before_build(self):
+        self._assert_inventory_refused("inventory_read_failure")
+
+    def test_malformed_revision_inventory_is_rejected_before_build(self):
+        self._assert_inventory_refused("inventory_malformed")
+
+    def test_duplicate_revision_inventory_is_rejected_before_build(self):
+        self._assert_inventory_refused("inventory_duplicate")
+
+    def test_real_auxiliary_tags_are_accepted_and_preserved(self):
+        result = self._run("--apply", scenario="ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("release-a", result.stdout)
+        self.assertEqual(self._gcloud_calls()[3], self._service_describe_call())
+        self.assertEqual(self._gcloud_calls()[4], self._revision_list_call())
+        self.assertEqual(self._gcloud_calls()[5], self._baseline_revision_describe_call())
+
+    def test_baseline_revision_read_failure_is_rejected_before_build(self):
+        self._assert_baseline_revision_refused("baseline_revision_read_failure")
+
+    def test_malformed_baseline_revision_is_rejected_before_build(self):
+        self._assert_baseline_revision_refused("baseline_revision_malformed")
+
+    def test_candidate_added_environment_entry_is_rejected(self):
+        self._assert_revision_refused("candidate_extra_env")
+
+    def test_candidate_changed_inherited_environment_entry_is_rejected(self):
+        self._assert_revision_refused("candidate_changed_extra_env")
+
+    def test_candidate_removed_inherited_environment_entry_is_rejected(self):
+        self._assert_revision_refused("candidate_missing_extra_env")
+
+    def test_candidate_other_config_drift_is_rejected(self):
+        self._assert_revision_refused("candidate_other_config_drift")
+
     def test_candidate_must_remain_untagged(self):
         self._assert_post_readback_refused("candidate_tagged")
 
@@ -250,6 +302,9 @@ class TaglessStagingContractTests(unittest.TestCase):
 
     def test_service_config_must_not_drift(self):
         self._assert_post_readback_refused("service_config_drift")
+
+    def test_canonical_spec_traffic_must_not_change(self):
+        self._assert_post_readback_refused("spec_mutation")
 
     def test_missing_latest_created_revision_is_refused(self):
         self._assert_post_readback_refused("latest_created_missing")
@@ -280,6 +335,8 @@ class TaglessStagingContractTests(unittest.TestCase):
             [
                 *self._preflight_calls(),
                 self._service_describe_call(),
+                self._revision_list_call(),
+                self._baseline_revision_describe_call(),
                 self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
@@ -302,6 +359,8 @@ class TaglessStagingContractTests(unittest.TestCase):
             [
                 *self._preflight_calls(),
                 self._service_describe_call(),
+                self._revision_list_call(),
+                self._baseline_revision_describe_call(),
                 self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
@@ -317,11 +376,38 @@ class TaglessStagingContractTests(unittest.TestCase):
             [
                 *self._preflight_calls(),
                 self._service_describe_call(),
+                self._revision_list_call(),
+                self._baseline_revision_describe_call(),
                 self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
                 self._service_describe_call(),
                 self._revision_describe_call(),
+            ],
+        )
+
+    def _assert_inventory_refused(self, scenario: str) -> None:
+        result = self._run("--apply", scenario=scenario)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(
+            self._gcloud_calls(),
+            [
+                *self._preflight_calls(),
+                self._service_describe_call(),
+                self._revision_list_call(),
+            ],
+        )
+
+    def _assert_baseline_revision_refused(self, scenario: str) -> None:
+        result = self._run("--apply", scenario=scenario)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(
+            self._gcloud_calls(),
+            [
+                *self._preflight_calls(),
+                self._service_describe_call(),
+                self._revision_list_call(),
+                self._baseline_revision_describe_call(),
             ],
         )
 
@@ -363,6 +449,17 @@ class TaglessStagingContractTests(unittest.TestCase):
     def _service_describe_call() -> list[str]:
         return [
             "run", "services", "describe", SERVICE,
+            "--account", ACCOUNT,
+            "--project", PROJECT,
+            "--region", REGION,
+            "--format=json",
+        ]
+
+    @staticmethod
+    def _revision_list_call() -> list[str]:
+        return [
+            "run", "revisions", "list",
+            "--service", SERVICE,
             "--account", ACCOUNT,
             "--project", PROJECT,
             "--region", REGION,
@@ -422,6 +519,16 @@ class TaglessStagingContractTests(unittest.TestCase):
         ]
 
     @staticmethod
+    def _baseline_revision_describe_call() -> list[str]:
+        return [
+            "run", "revisions", "describe", OLD_REVISION,
+            "--account", ACCOUNT,
+            "--project", PROJECT,
+            "--region", REGION,
+            "--format=json",
+        ]
+
+    @staticmethod
     def _fake_gcloud_source() -> str:
         return textwrap.dedent(
             """\
@@ -452,53 +559,89 @@ class TaglessStagingContractTests(unittest.TestCase):
                 state_path.write_text(json.dumps(state), encoding="utf-8")
 
             def service_document(post_deploy):
-                traffic = [
+                include_auxiliary_tags = scenario not in {
+                    "latest_spec",
+                    "implicit_spec_target",
+                    "spec_duplicate_tag",
+                    "spec_invalid_tag",
+                    "spec_mutation",
+                }
+                spec_traffic = [
                     {"revisionName": old, "percent": 100},
-                    {"revisionName": old, "tag": "release-a", "url": "https://release-a.invalid"},
+                    {"revisionName": old, "tag": "release-a"},
                 ]
+                if include_auxiliary_tags:
+                    spec_traffic.extend([
+                        {"revisionName": other, "tag": "rollback-door"},
+                        {"revisionName": "process-user-00095-jil", "tag": "jill-one"},
+                        {"revisionName": "process-user-00094-lck", "tag": "lock"},
+                    ])
+                status_traffic = [dict(item) for item in spec_traffic]
+                for item in status_traffic:
+                    if item.get("tag"):
+                        item["url"] = "https://" + item["tag"] + ".invalid"
                 document = {
                     "metadata": {"annotations": {"run.googleapis.com/maxScale": "20"}},
+                    "spec": {"traffic": spec_traffic},
                     "status": {
                         "latestCreatedRevisionName": candidate if post_deploy else old,
-                        "traffic": traffic,
+                        "traffic": status_traffic,
                     },
                 }
                 if not post_deploy:
                     if scenario == "missing_positive":
-                        traffic[0].pop("percent")
+                        status_traffic[0].pop("percent")
                     elif scenario == "multiple_positive":
-                        traffic[0]["percent"] = 50
-                        traffic.append({"revisionName": other, "percent": 50})
+                        status_traffic[0]["percent"] = 50
+                        status_traffic.append({"revisionName": other, "percent": 50})
                     elif scenario == "release_a_wrong":
-                        traffic[1]["revisionName"] = other
+                        status_traffic[1]["revisionName"] = other
                     elif scenario == "release_a_duplicate":
-                        traffic.append({"revisionName": old, "tag": "release-a"})
+                        status_traffic.append({"revisionName": old, "tag": "release-a"})
                     elif scenario == "candidate_collision":
-                        traffic.append({"revisionName": candidate, "tag": "staging"})
+                        status_traffic.append({"revisionName": candidate, "tag": "staging"})
+                    elif scenario == "latest_spec":
+                        spec_traffic[0] = {"latestRevision": True, "percent": 100}
+                    elif scenario == "implicit_spec_target":
+                        spec_traffic[0] = {"percent": 100}
+                    elif scenario == "spec_duplicate_tag":
+                        spec_traffic.extend([
+                            {"revisionName": old, "tag": "lock"},
+                            {"revisionName": other, "tag": "lock"},
+                        ])
+                    elif scenario == "spec_invalid_tag":
+                        spec_traffic.append({"revisionName": other, "tag": "Bad_Tag"})
                     return document
 
                 if scenario == "candidate_tagged":
-                    traffic.append({"revisionName": candidate, "tag": "staging"})
+                    status_traffic.append({"revisionName": candidate, "tag": "staging"})
                 elif scenario == "candidate_positive":
-                    traffic[0]["percent"] = 90
-                    traffic.append({"revisionName": candidate, "percent": 10})
+                    status_traffic[0]["percent"] = 90
+                    status_traffic.append({"revisionName": candidate, "percent": 10})
                 elif scenario == "old_positive_drift":
-                    traffic[0] = {"revisionName": other, "percent": 100}
+                    status_traffic[0] = {"revisionName": other, "percent": 100}
                 elif scenario == "old_tag_drift":
-                    traffic[1]["revisionName"] = other
+                    status_traffic[1]["revisionName"] = other
                 elif scenario == "service_config_drift":
                     document["metadata"]["annotations"]["run.googleapis.com/maxScale"] = "21"
+                elif scenario == "spec_mutation":
+                    spec_traffic.append({"revisionName": other, "tag": "unexpected"})
                 elif scenario == "latest_created_missing":
                     document["status"].pop("latestCreatedRevisionName")
                 elif scenario == "latest_created_ambiguous":
                     document["status"]["latestCreatedRevisionName"] = other
                 return document
 
-            def revision_document():
+            def revision_document(is_baseline=False):
                 image = canonical_image
                 concurrency = 1
                 ready = "True"
-                if scenario == "wrong_image":
+                if is_baseline:
+                    image = (
+                        "us-central1-docker.pkg.dev/email-automation-cache/"
+                        "cloud-run-source-deploy/process-user@sha256:" + "c" * 64
+                    )
+                elif scenario == "wrong_image":
                     image = canonical_image.rsplit("sha256:", 1)[0] + "sha256:" + "b" * 64
                 elif scenario == "config_mismatch":
                     concurrency = 2
@@ -513,7 +656,14 @@ class TaglessStagingContractTests(unittest.TestCase):
                     "SITESIFT_GLOBAL_DAILY_SEND_CAP": "20",
                     "SITESIFT_TOUR_ACTION_ALLOWLIST": "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
                     "SITESIFT_OUTBOUND_MODE": "live",
+                    "SITESIFT_SOURCE_COORDINATOR_MODE": "locked",
                 }
+                if not is_baseline and scenario == "candidate_extra_env":
+                    values["UNEXPECTED_EXTRA_MODE"] = "1"
+                elif not is_baseline and scenario == "candidate_changed_extra_env":
+                    values["SITESIFT_SOURCE_COORDINATOR_MODE"] = "changed"
+                elif not is_baseline and scenario == "candidate_missing_extra_env":
+                    values.pop("SITESIFT_SOURCE_COORDINATOR_MODE")
                 secret_names = [
                     "AZURE_API_APP_ID",
                     "AZURE_API_CLIENT_SECRET",
@@ -531,9 +681,9 @@ class TaglessStagingContractTests(unittest.TestCase):
                     }
                     for name in secret_names
                 )
-                return {
+                document = {
                     "metadata": {
-                        "name": candidate,
+                        "name": old if is_baseline else candidate,
                         "annotations": {
                             "autoscaling.knative.dev/minScale": "0",
                             "autoscaling.knative.dev/maxScale": "10",
@@ -560,6 +710,9 @@ class TaglessStagingContractTests(unittest.TestCase):
                     },
                     "status": {"conditions": [{"type": "Ready", "status": ready}]},
                 }
+                if not is_baseline and scenario == "candidate_other_config_drift":
+                    document["spec"]["containers"][0]["resources"]["limits"]["cpu"] = "2"
+                return document
 
             if args[:2] == ["config", "get-value"]:
                 if scenario == "configured_impersonation":
@@ -594,6 +747,24 @@ class TaglessStagingContractTests(unittest.TestCase):
                     raise SystemExit(1)
                 print(json.dumps(service_document(post_deploy=describe_index > 0)))
                 raise SystemExit(0)
+            if args[:3] == ["run", "revisions", "list"]:
+                if scenario == "inventory_read_failure":
+                    raise SystemExit(1)
+                if scenario == "inventory_malformed":
+                    print("{not-json")
+                    raise SystemExit(0)
+                revisions = [
+                    {"metadata": {"name": old}},
+                    {"metadata": {"name": other}},
+                    {"metadata": {"name": "process-user-00095-jil"}},
+                    {"metadata": {"name": "process-user-00094-lck"}},
+                ]
+                if scenario == "inventory_candidate_collision":
+                    revisions.append({"metadata": {"name": candidate}})
+                elif scenario == "inventory_duplicate":
+                    revisions.append({"metadata": {"name": old}})
+                print(json.dumps(revisions))
+                raise SystemExit(0)
             if args[:2] == ["builds", "submit"]:
                 raise SystemExit(0)
             if args[:3] == ["artifacts", "docker", "images"]:
@@ -609,9 +780,15 @@ class TaglessStagingContractTests(unittest.TestCase):
                     raise SystemExit(1)
                 raise SystemExit(0)
             if args[:3] == ["run", "revisions", "describe"]:
-                if scenario == "revision_read_failure":
+                revision_name = args[3]
+                if revision_name == old and scenario == "baseline_revision_read_failure":
                     raise SystemExit(1)
-                print(json.dumps(revision_document()))
+                if revision_name == old and scenario == "baseline_revision_malformed":
+                    print("{not-json")
+                    raise SystemExit(0)
+                if revision_name == candidate and scenario == "revision_read_failure":
+                    raise SystemExit(1)
+                print(json.dumps(revision_document(is_baseline=revision_name == old)))
                 raise SystemExit(0)
             print("unexpected fake gcloud command: " + " ".join(args), file=sys.stderr)
             raise SystemExit(65)

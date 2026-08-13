@@ -337,7 +337,7 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self._gcloud_calls()
         self.assertIn(self._deploy_call(), calls)
-        self.assertEqual(calls[4], self._build_call())
+        self.assertEqual(calls[6], self._build_call())
 
     def test_auth_missing_stops_before_project_or_mutation(self):
         result = self._run("--apply", scenario="auth_missing")
@@ -389,15 +389,17 @@ class DeployScriptContractTests(unittest.TestCase):
         calls = self._gcloud_calls()
         self.assertEqual(calls[:3], self._preflight_calls())
         self.assertEqual(calls[3], self._service_describe_call())
-        self.assertEqual(calls[4], self._build_call())
-        self.assertEqual(calls[5], self._digest_call())
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(calls[4], self._revision_list_call())
+        self.assertEqual(calls[5], self._baseline_revision_describe_call())
+        self.assertEqual(calls[6], self._build_call())
+        self.assertEqual(calls[7], self._digest_call())
+        self.assertEqual(len(calls), 8)
 
     def test_invalid_digest_stops_before_deploy(self):
         result = self._run("--apply", scenario="invalid_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 8)
         self.assertEqual(calls[-1], self._digest_call())
         self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
 
@@ -409,6 +411,8 @@ class DeployScriptContractTests(unittest.TestCase):
             [
                 *self._preflight_calls(),
                 self._service_describe_call(),
+                self._revision_list_call(),
+                self._baseline_revision_describe_call(),
                 self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
@@ -530,6 +534,14 @@ class DeployScriptContractTests(unittest.TestCase):
             "--region", REGION,
             "--format=json",
         ]
+
+    @staticmethod
+    def _revision_list_call() -> list[str]:
+        return tagless_contract.TaglessStagingContractTests._revision_list_call()
+
+    @staticmethod
+    def _baseline_revision_describe_call() -> list[str]:
+        return tagless_contract.TaglessStagingContractTests._baseline_revision_describe_call()
 
     @staticmethod
     def _digest_call() -> list[str]:
