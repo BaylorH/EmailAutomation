@@ -1090,6 +1090,23 @@ class Ceq1BootstrapTests(unittest.TestCase):
             with self.assertRaises(self.wrapper.EnvironmentBoundaryError):
                 self.wrapper.build_child_env(linked)
 
+        sentinel = RuntimeError("wrapper execve reached")
+        with (
+            mock.patch.object(self.wrapper, "require_isolated_flags"),
+            mock.patch.object(
+                self.wrapper.sys,
+                "flags",
+                SimpleNamespace(isolated=1, no_site=1, dont_write_bytecode=1),
+            ),
+            mock.patch.object(self.wrapper, "_close_non_stdio_fds") as close_fds,
+            mock.patch.object(self.wrapper.os, "execve", side_effect=sentinel) as execve,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "wrapper execve reached"):
+                self.wrapper.main(["--inspect-runtime"])
+        close_fds.assert_called_once_with()
+        self.assertEqual(REPO_ROOT / ".ceq1-venv/python/bin/python3.12", Path(execve.call_args.args[0]))
+        self.assertEqual(set(self.wrapper.CLOSED_ENV_KEYS), set(execve.call_args.args[2]))
+
     def test_wrapper_inspection_child_has_no_ambient_secret_or_extra_fd(self):
         script = REPO_ROOT / "scripts/run_ceq1_env.py"
         bundle_python = REPO_ROOT / ".ceq1-venv/python/bin/python3.12"
