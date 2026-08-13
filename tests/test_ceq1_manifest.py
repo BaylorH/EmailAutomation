@@ -729,6 +729,17 @@ class Ceq1BootstrapTests(unittest.TestCase):
         cls.bootstrap = _load_script("bootstrap_ceq1_runtime.py")
         cls.wrapper = _load_script("run_ceq1_env.py")
 
+    def test_os_injected_text_encoding_forms_are_closed(self):
+        for module in (self.bootstrap, self.wrapper):
+            with self.subTest(module=module.__name__, form="ordinary"):
+                module.validate_cf_user_text_encoding("0x1F5:0x0:0x0")
+            with self.subTest(module=module.__name__, form="seatbelt"):
+                module.validate_cf_user_text_encoding("0x1F5:0:0")
+            for invalid in ("1F5:0:0", "0x1F5:1:0", "0x1F5:0", "garbage"):
+                with self.subTest(module=module.__name__, invalid=invalid):
+                    with self.assertRaises(Exception):
+                        module.validate_cf_user_text_encoding(invalid)
+
     def test_bootstrap_profile_is_portable_and_command_vectors_are_closed(self):
         template = self.bootstrap.BOOTSTRAP_SEATBELT_TEMPLATE
         self.assertIn("(deny default)", template)
