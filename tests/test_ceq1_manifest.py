@@ -48,6 +48,16 @@ EXPECTED_PACKAGES = {
     "pygments": ("2.20.0", "pFcp15BRXIJdISPErAGLj"),
     "packaging": ("26.2", "U8I70fV3E7adQmQckZ_fB"),
 }
+PERL_TRAMPOLINE = (
+    'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;'
+    'my @b=stat($f);die unless -f _&&$b[3]==1&&$b[7]<=262144;'
+    'my($s,$n)=("",$b[7]);while($n){my $r=sysread($f,my $c,$n);'
+    'die unless defined($r)&&$r>0;$s.=$c;$n-=$r}'
+    'my $r=sysread($f,my $x,1);die unless defined($r)&&$r==0;'
+    'my @e=stat($f);die unless @b==@e&&!grep{$b[$_]!=$e[$_]}(0,1,2,3,7,9,10);'
+    'die unless sha256_hex($s)eq$h;@ARGV=@a;'
+    'eval "package CEQ1::VerifiedEntry;\\n$s";die $@ if $@'
+)
 
 
 def _load_script(name: str):
@@ -231,6 +241,124 @@ class Ceq1BoundaryTests(unittest.TestCase):
         self.assertIn("waitpid", source)
         self.assertNotIn("system(", source)
         self.assertNotIn("qx/", source)
+
+    def _synthetic_verifier_root(self, parent: Path, *, exit_code: int = 0) -> tuple[Path, str, str]:
+        root = parent / "repo"
+        (root / "scripts").mkdir(parents=True)
+        (root / "docs/release-safety").mkdir(parents=True)
+        shutil.copy2(REPO_ROOT / "scripts/verify_ceq1_entry.pl", root / "scripts/verify_ceq1_entry.pl")
+        policy = "(version 1)\n(deny default)\n"
+        bootstrap = (
+            "import json,os,sys\n"
+            f"BOOTSTRAP_SEATBELT_TEMPLATE = r'''{policy}'''\n\n"
+            "fds=[]\n"
+            "for fd in range(256):\n"
+            "    try: os.fstat(fd)\n"
+            "    except OSError: continue\n"
+            "    fds.append(fd)\n"
+            "print(json.dumps({'name':__name__,'file':__file__,'package':__package__,"
+            "'spec':None if __spec__ is None else str(__spec__),'argv':sys.argv,'fds':fds},sort_keys=True))\n"
+            f"raise SystemExit({exit_code})\n"
+        )
+        files = {
+            "docs/release-safety/ceq1-wheelhouse-manifest.json": b"{}\n",
+            "requirements-ceq1.in": b"pytest==9.1.1\n",
+            "requirements-ceq1.lock": b"fixture\n",
+            "requirements.lock": b"fixture\n",
+            "scripts/bootstrap_ceq1_runtime.py": bootstrap.encode(),
+            "scripts/build_ceq1_wheelhouse.py": b"# fixture\n",
+            "scripts/run_ceq1_env.py": b"# fixture\n",
+            "scripts/verify_ceq1_entry.pl": (root / "scripts/verify_ceq1_entry.pl").read_bytes(),
+        }
+        for relative, data in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        reference = json.loads(
+            (REPO_ROOT / "docs/release-safety/ceq1-input-manifest.json").read_text()
+        )
+        manifest = {
+            "schemaVersion": 1,
+            "algorithmVersion": "ceq1-input-v1",
+            "files": {
+                relative: {"sha256": _sha256(data), "size": len(data)}
+                for relative, data in files.items()
+            },
+            "trees": reference["trees"],
+            "portablePolicy": {
+                "templateSha256": _sha256(policy.encode()),
+                "placeholders": reference["portablePolicy"]["placeholders"],
+            },
+            "platformTrust": reference["platformTrust"],
+        }
+        input_path = root / "docs/release-safety/ceq1-input-manifest.json"
+        input_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        return root, _sha256(files["scripts/verify_ceq1_entry.pl"]), _sha256(input_path.read_bytes())
+
+    def test_real_trampoline_restores_script_context_and_closes_inherited_fds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, verifier_hash, input_hash = self._synthetic_verifier_root(Path(tmp).resolve())
+            inherited = os.open(root / "requirements.lock", os.O_RDONLY)
+            os.set_inheritable(inherited, True)
+            try:
+                result = subprocess.run(
+                    [
+                        "/usr/bin/perl",
+                        "-MDigest::SHA=sha256_hex",
+                        "-MFcntl=:DEFAULT",
+                        "-e",
+                        PERL_TRAMPOLINE,
+                        "scripts/verify_ceq1_entry.pl",
+                        verifier_hash,
+                        "bootstrap",
+                        input_hash,
+                        "--",
+                        "derive-review-candidate",
+                    ],
+                    cwd=root,
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                    pass_fds=(inherited,),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+            finally:
+                os.close(inherited)
+            self.assertEqual(0, result.returncode, result.stderr)
+            receipt = json.loads(result.stdout)
+            expected_file = str(root / "scripts/bootstrap_ceq1_runtime.py")
+            self.assertEqual("__main__", receipt["name"])
+            self.assertEqual(expected_file, receipt["file"])
+            self.assertIsNone(receipt["package"])
+            self.assertIsNone(receipt["spec"])
+            self.assertEqual([expected_file, "derive-review-candidate"], receipt["argv"])
+            self.assertEqual([0, 1, 2], receipt["fds"])
+
+    def test_real_trampoline_rejects_target_drift_and_propagates_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, verifier_hash, input_hash = self._synthetic_verifier_root(
+                Path(tmp).resolve(), exit_code=7
+            )
+            command = [
+                "/usr/bin/perl",
+                "-MDigest::SHA=sha256_hex",
+                "-MFcntl=:DEFAULT",
+                "-e",
+                PERL_TRAMPOLINE,
+                "scripts/verify_ceq1_entry.pl",
+                verifier_hash,
+                "bootstrap",
+                input_hash,
+                "--",
+                "prepare",
+            ]
+            exited = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+            self.assertEqual(7, exited.returncode, exited.stderr)
+            target = root / "scripts/bootstrap_ceq1_runtime.py"
+            target.write_text(target.read_text() + "# drift\n", encoding="utf-8")
+            blocked = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+            self.assertNotEqual(0, blocked.returncode)
+            self.assertIn("input file", blocked.stderr)
 
 
 class Ceq1WheelBuilderTests(unittest.TestCase):
