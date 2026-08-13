@@ -8,11 +8,16 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import openai
 from .app_config import FIREBASE_API_KEY, OPENAI_API_KEY, OPENAI_ASSISTANT_MODEL
+from .lazy_provider import LazyProviderProxy
 
-# Initialize clients
-_fs = firestore.Client()
-openai.api_key = OPENAI_API_KEY
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+_fs = LazyProviderProxy(
+    "email_automation.clients.firestore",
+    lambda: firestore.Client(),
+)
+client = LazyProviderProxy(
+    "email_automation.clients.openai",
+    lambda: openai.OpenAI(api_key=OPENAI_API_KEY),
+)
 
 def _helper_google_creds():
     client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID")

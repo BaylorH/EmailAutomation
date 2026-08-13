@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import openai
 from bs4 import BeautifulSoup
 from google.cloud.firestore_v1 import FieldFilter
+from email_automation.lazy_provider import LazyProviderProxy
 
 # Config
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
@@ -49,18 +50,25 @@ REQUIRED_FIELDS_FOR_CLOSE = [
     "Drive Ins","Docks","Ceiling Ht","Power"
 ]
 
-if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
-    raise RuntimeError("Missing required env vars")
+def _require_runtime_config() -> None:
+    if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
+        raise RuntimeError("Missing required env vars")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY env var")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY env var")
 
-# Initialize OpenAI client
-openai.api_key = OPENAI_API_KEY
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+def _new_firestore_client():
+    _require_runtime_config()
+    return firestore.Client()
 
-# Firestore Admin client (uses GOOGLE_APPLICATION_CREDENTIALS)
-_fs = firestore.Client()
+
+def _new_openai_client():
+    _require_runtime_config()
+    return openai.OpenAI(api_key=OPENAI_API_KEY)
+
+
+client = LazyProviderProxy("scheduler_runner.openai", _new_openai_client)
+_fs = LazyProviderProxy("scheduler_runner.firestore", _new_firestore_client)
 
 # Helper: detect HTML vs text
 _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
@@ -3350,6 +3358,7 @@ def send_email(headers, script: str, emails: List[str], client_id: Optional[str]
 
 # --- Utility: List user IDs from Firebase ---
 def list_user_ids():
+    _require_runtime_config()
     url = f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}/o?prefix=msal_caches%2F&key={FIREBASE_API_KEY}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -3439,6 +3448,7 @@ def process_replies(headers, user_id):
 
 # --- Main Loop ---
 def refresh_and_process_user(user_id: str):
+    _require_runtime_config()
     print(f"\n🔄 Processing user: {user_id}")
 
     download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
@@ -3508,6 +3518,7 @@ def refresh_and_process_user(user_id: str):
 
 # --- Entry ---
 if __name__ == "__main__":
+    _require_runtime_config()
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
 
