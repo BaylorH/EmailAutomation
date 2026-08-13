@@ -986,6 +986,43 @@ class Ceq1BootstrapTests(unittest.TestCase):
                     expected_topology,
                 )
 
+    def test_external_python_alias_is_pinned_only_by_manifest_bound_realpath(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            store = root / "python-store"
+            pinned = store / "cpython-3.12.13-test"
+            executable = pinned / "bin/python3.12"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"manifest-bound-python")
+            alias = store / "cpython-3.12-test"
+            os.symlink(pinned, alias)
+            textual_target = str(alias / "bin/python3.12")
+            with (
+                mock.patch.object(self.bootstrap, "UV_PYTHON_STORE", store),
+                mock.patch.object(self.bootstrap, "PINNED_PYTHON_ROOT", pinned),
+            ):
+                self.assertEqual(
+                    "@PINNED_PYTHON/bin/python3.12",
+                    self.bootstrap._logical_cache_target(
+                        root / "cache",
+                        "archive-v0/example/bin/python",
+                        textual_target,
+                    ),
+                )
+                alias.unlink()
+                other = store / "cpython-3.12.99-unreviewed"
+                (other / "bin").mkdir(parents=True)
+                (other / "bin/python3.12").write_bytes(b"unreviewed-python")
+                os.symlink(other, alias)
+                self.assertEqual(
+                    "@DENIED_EXTERNAL_PYTHON/cpython-3.12-test/bin/python3.12",
+                    self.bootstrap._logical_cache_target(
+                        root / "cache",
+                        "archive-v0/example/bin/python",
+                        textual_target,
+                    ),
+                )
+
     def test_derived_lock_is_canonical_and_uses_only_derived_hashes(self):
         manifest = json.loads(
             (REPO_ROOT / "docs/release-safety/ceq1-wheelhouse-manifest.json").read_text()
