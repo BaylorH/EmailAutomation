@@ -298,6 +298,14 @@ pathname. For Python targets it passes those bytes through a protected pipe to
 a fixed, literal `-c` evaluator; the evaluator reads an exact declared byte
 count, rejects short/extra input, compiles those bytes with only a diagnostic
 symbolic filename, and does not import target code before that read completes.
+Immediately before executing the compiled object it restores the exact closed
+script context: `__name__='__main__'`, `__file__` is the verifier-validated
+canonical target path, `__package__=None`, `__spec__=None`, and
+`sys.argv=[__file__, *verified_target_args]`. The protected pipe descriptor,
+declared byte length, loader code, and verifier plumbing never enter target
+`sys.argv`. Real-trampoline tests require bootstrap worktree-root derivation and
+wrapper argument equality through this context, not merely a unit-level loader
+simulation.
 The verifier controls both pipe ends and child environment, closes unrelated
 descriptors, and does not accept a caller-supplied target fd.
 
