@@ -169,8 +169,8 @@ def _prune_flows(now=None):
 # mailbox confusion — mail sent AS THE WRONG USER). Fix: every device flow uses its
 # OWN isolated app + cache; we upload ONLY that user's single-account cache and
 # FAIL CLOSED if the cache resolves to anything other than exactly one account. The
-# module-level msal_app/cache above remain as a legacy fallback for flow entries
-# that predate isolation.
+# Flow entries that predate isolation use the process-lazy compatibility fallback
+# returned by _get_legacy_msal_pair(); every new device flow remains per-user isolated.
 # ---------------------------------------------------------------------------
 _flows_lock = threading.Lock()
 
@@ -234,8 +234,8 @@ def complete_flow():
         # No active flow for this identity — fail closed, do NOT hand None to MSAL.
         return jsonify({"status": "failed", "error": "No active device flow"}), 400
     flow = entry["flow"]
-    # #20 isolation: prefer the per-user isolated app + cache; fall back to the shared
-    # module app/cache only for legacy flow entries that predate isolation.
+    # #20 isolation: new flows carry a per-user app + cache; only legacy entries
+    # without that pair use the process-lazy fallback from _get_legacy_msal_pair().
     entry_app = entry.get("app")
     entry_cache = entry.get("cache")
     if (entry_app is None) != (entry_cache is None):
