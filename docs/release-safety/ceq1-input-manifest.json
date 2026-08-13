@@ -1,0 +1,97 @@
+{
+  "algorithmVersion": "ceq1-input-v1",
+  "files": {
+    "docs/release-safety/ceq1-wheelhouse-manifest.json": {
+      "sha256": "89d953d0a044dc8f50eb9b58fdcd028ff0ded267773598e4f47b6ffd0aac34df",
+      "size": 97764
+    },
+    "requirements-ceq1.in": {
+      "sha256": "93c4ab5f175d24229e46ec70a8ecaeb6db8b36e3f54d8005808044c060acbc92",
+      "size": 14
+    },
+    "requirements-ceq1.lock": {
+      "sha256": "119f7c7691a30d80c88513e689fb7ebbe18502329dd00ed5827776765ad0dce6",
+      "size": 627
+    },
+    "requirements.lock": {
+      "sha256": "ec29c5f51bb6dfa484ac6173952b756d5ce2d0ec34a197af8ff528a7f8a9366e",
+      "size": 93362
+    },
+    "scripts/bootstrap_ceq1_runtime.py": {
+      "sha256": "242ec049cec1d281788f770a1dd141179db812b6dbf2ce6c1eccb32974ffccb9",
+      "size": 87119
+    },
+    "scripts/build_ceq1_wheelhouse.py": {
+      "sha256": "3cee44867998478767192ee60a9ff1fae7d4960119a5e4ebb6c3853f2b8faf73",
+      "size": 42760
+    },
+    "scripts/run_ceq1_env.py": {
+      "sha256": "3da408858ddff95f7e48ba882619fc8ba1413239da0153c9a90ee1919a47d90a",
+      "size": 12310
+    },
+    "scripts/verify_ceq1_entry.pl": {
+      "sha256": "77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7",
+      "size": 31096
+    }
+  },
+  "platformTrust": {
+    "firestoreJar": {
+      "pathId": "FIRESTORE_JAR_1_19_8",
+      "sha256": "9d43599ed6151199e8d604dc87fac51218e49e5f3a48519b1ae560bbe5e3382d",
+      "size": 63634791
+    },
+    "perl": {
+      "ownerUid": 0,
+      "pathId": "APPLE_SYSTEM_PERL",
+      "requiredModules": [
+        "Digest::SHA",
+        "Fcntl",
+        "JSON::PP"
+      ]
+    },
+    "uv": {
+      "pathId": "PINNED_UV",
+      "sha256": "4424f8430c3cb3990daaa68268af640bdc61190f2e5c276197e3473358b1e4e8",
+      "size": 47017584
+    }
+  },
+  "portablePolicy": {
+    "placeholders": [
+      "BOOTSTRAP_SCRIPT",
+      "BUILDER_SCRIPT",
+      "BUNDLE",
+      "FIRESTORE_JAR",
+      "INPUT_MANIFEST",
+      "JDK_ROOT",
+      "PRODUCT_LOCK",
+      "PYTHON_SOURCE",
+      "QUALIFICATION_INPUT",
+      "QUALIFICATION_LOCK",
+      "READ_ANCESTOR_RULES",
+      "RELOCATION",
+      "REPO",
+      "RUNTIME",
+      "TOOLCHAIN_MANIFEST",
+      "UV",
+      "UV_CACHE",
+      "VERIFIER_SCRIPT",
+      "WHEELHOUSE_MANIFEST",
+      "WRAPPER_SCRIPT"
+    ],
+    "templateSha256": "ecfb0c9e77c3d24fa28cdd53b157f597e87d4a2e8651e7aa85ef28665f4d6a7e"
+  },
+  "schemaVersion": 1,
+  "trees": {
+    "cpythonSource": {
+      "algorithmVersion": "ceq1-tree-v1",
+      "entryCount": 2338,
+      "launcherSha256": "e2605291e058fdbe3102e8185d0ac5fe0e063398de617010a6af3a42a78f05e3",
+      "treeDigest": "4b78cda90b5e1c0fbe4c4d98c2ea43edc7cf5f557f15a55a102f8ef0690be43f"
+    },
+    "openjdkSource": {
+      "algorithmVersion": "ceq1-tree-v1",
+      "entryCount": 624,
+      "treeDigest": "7f44764e004361832dc274c38ec33f49a35add6b32b1784b0c7bf7dcdcccad13"
+    }
+  }
+}

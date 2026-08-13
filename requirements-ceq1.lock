@@ -1,0 +1,12 @@
+# Deterministic CE-Q1 derived-wheel lock.
+# These hashes identify local RECORD-closed reconstructions, not upstream wheels.
+iniconfig==2.3.0 \
+    --hash=sha256:3f2b9a9a03e402fb89197f87c367aebbf0cd45f75f60390a1634cea34d6e3db2
+packaging==26.2 \
+    --hash=sha256:84d3335e0c82d2d69c554ee091688aecc713597c93be44c87fca2551754bfe62
+pluggy==1.6.0 \
+    --hash=sha256:fe39fb4918fdfb5aedc2e75e590f034e6ac4717de90fde3bc6000511002898cf
+pygments==2.20.0 \
+    --hash=sha256:f87cf807c10dc5374064f22e9d8de95edeb29ffe48775bcc99c8b458b0690e6d
+pytest==9.1.1 \
+    --hash=sha256:1cee25ff11f6eecfd32e9fdc6c171599b2c498ccb986a9f86bec31f8e8f923e6

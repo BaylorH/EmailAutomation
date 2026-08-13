@@ -1,0 +1,79 @@
+{
+  "algorithmVersion": "ceq1-toolchain-v1",
+  "artifacts": {
+    "cpythonSource": {
+      "algorithmVersion": "ceq1-tree-v1",
+      "entryCount": 2338,
+      "launcherSha256": "e2605291e058fdbe3102e8185d0ac5fe0e063398de617010a6af3a42a78f05e3",
+      "treeDigest": "4b78cda90b5e1c0fbe4c4d98c2ea43edc7cf5f557f15a55a102f8ef0690be43f",
+      "version": "3.12.13",
+      "versionOutputSha256": "55ae85cf4bdb38743edbcd53ea68ff36511997ec6c21b1e83d8bebc939bf056b"
+    },
+    "directWrapper": {
+      "sha256": "3da408858ddff95f7e48ba882619fc8ba1413239da0153c9a90ee1919a47d90a"
+    },
+    "entryVerifier": {
+      "sha256": "77a9f14e73cd49b5e970dc4ecd769ee1891216a24eebd1f2c52751ee948c9ca7"
+    },
+    "firestoreJar": {
+      "sha256": "9d43599ed6151199e8d604dc87fac51218e49e5f3a48519b1ae560bbe5e3382d",
+      "size": 63634791,
+      "version": "1.19.8",
+      "versionOutputSha256": "e116492258762c59909def4bd9aaa1cc69d6e79c8bc101eff97d13af6dd44eeb"
+    },
+    "openjdkSource": {
+      "algorithmVersion": "ceq1-tree-v1",
+      "entryCount": 624,
+      "treeDigest": "7f44764e004361832dc274c38ec33f49a35add6b32b1784b0c7bf7dcdcccad13",
+      "version": "25.0.2",
+      "versionOutputSha256": "860aca8da7e1f7e59108ea254111f4a2a84e1659be6b47854ef841ee1eac8812"
+    },
+    "uv": {
+      "sha256": "4424f8430c3cb3990daaa68268af640bdc61190f2e5c276197e3473358b1e4e8",
+      "version": "0.11.3",
+      "versionOutputSha256": "762a56205224fba460982ddbbc7f0dbf968128c97d79d6cb7e1eed20278df753"
+    },
+    "zipfile": {
+      "sha256": "94c53aedba0b0f7d6f71bf8ec34973e666ee0c0e56e6800ff4c26d2e3951987a"
+    }
+  },
+  "bootstrapSha256": "242ec049cec1d281788f770a1dd141179db812b6dbf2ce6c1eccb32974ffccb9",
+  "builderSha256": "3cee44867998478767192ee60a9ff1fae7d4960119a5e4ebb6c3853f2b8faf73",
+  "inputManifestSha256": "b9ece02c1996e1f26e6f93951579f9c3fc636c24c817830d8bbf6d0fe03eb0a3",
+  "lockfiles": {
+    "product": "ec29c5f51bb6dfa484ac6173952b756d5ce2d0ec34a197af8ff528a7f8a9366e",
+    "qualification": "119f7c7691a30d80c88513e689fb7ebbe18502329dd00ed5827776765ad0dce6"
+  },
+  "schemaVersion": 1,
+  "sealedRuntime": {
+    "algorithmVersion": "ceq1-tree-v1",
+    "entryCount": 8764,
+    "treeDigest": "8c4d004d1443044874ea8a1850f353cab401b306d35c9b9ea3b143b4853f14e4"
+  },
+  "seatbeltTemplate": {
+    "placeholders": [
+      "BOOTSTRAP_SCRIPT",
+      "BUILDER_SCRIPT",
+      "BUNDLE",
+      "FIRESTORE_JAR",
+      "INPUT_MANIFEST",
+      "JDK_ROOT",
+      "PRODUCT_LOCK",
+      "PYTHON_SOURCE",
+      "QUALIFICATION_INPUT",
+      "QUALIFICATION_LOCK",
+      "READ_ANCESTOR_RULES",
+      "RELOCATION",
+      "REPO",
+      "RUNTIME",
+      "TOOLCHAIN_MANIFEST",
+      "UV",
+      "UV_CACHE",
+      "VERIFIER_SCRIPT",
+      "WHEELHOUSE_MANIFEST",
+      "WRAPPER_SCRIPT"
+    ],
+    "sha256": "ecfb0c9e77c3d24fa28cdd53b157f597e87d4a2e8651e7aa85ef28665f4d6a7e"
+  },
+  "wheelhouseManifestSha256": "89d953d0a044dc8f50eb9b58fdcd028ff0ded267773598e4f47b6ffd0aac34df"
+}

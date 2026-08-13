@@ -82,3 +82,5 @@ tests/.multi_turn_state.json
 tests/.multi_turn_state*.json
 token_cache.bin
 logs/
+.ceq1-runtime/
+.ceq1-venv/
