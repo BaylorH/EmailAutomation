@@ -11,16 +11,26 @@ from firebase_helpers import upload_token
 try:
     import firebase_admin
     from firebase_admin import auth as firebase_auth
-
-    if not firebase_admin._apps:
-        try:
-            firebase_admin.initialize_app()
-        except Exception as _fb_init_err:  # pragma: no cover - env dependent
-            print(f"⚠️ firebase_admin.initialize_app() deferred: {_fb_init_err}", flush=True)
 except Exception as _fb_import_err:  # pragma: no cover - env dependent
     firebase_admin = None
     firebase_auth = None
-    print(f"⚠️ firebase_admin unavailable: {_fb_import_err}", flush=True)
+    print(
+        f"⚠️ firebase_admin unavailable: {type(_fb_import_err).__name__}",
+        flush=True,
+    )
+
+_firebase_init_lock = threading.Lock()
+
+
+def _get_firebase_auth():
+    if firebase_admin is None or firebase_auth is None:
+        raise RuntimeError("firebase_admin unavailable")
+    with _firebase_init_lock:
+        try:
+            firebase_admin.get_app()
+        except ValueError:
+            firebase_admin.initialize_app()
+    return firebase_auth
 
 app = Flask(__name__)
 
@@ -98,13 +108,21 @@ def verify_firebase_token(f):
         token = auth_header[len("Bearer "):].strip()
         if not token:
             return jsonify({"status": "failed", "error": "Authentication required"}), 401
-        if firebase_auth is None:
-            print("❌ Firebase auth unavailable; rejecting authenticated request", flush=True)
+        try:
+            auth_client = _get_firebase_auth()
+        except Exception as exc:
+            print(
+                f"❌ Firebase auth unavailable: {type(exc).__name__}",
+                flush=True,
+            )
             return jsonify({"status": "failed", "error": "Authentication unavailable"}), 401
         try:
-            decoded = firebase_auth.verify_id_token(token)
-        except Exception as e:
-            print(f"⚠️ Firebase token verification failed: {type(e).__name__}", flush=True)
+            decoded = auth_client.verify_id_token(token)
+        except Exception as exc:
+            print(
+                f"⚠️ Firebase token verification failed: {type(exc).__name__}",
+                flush=True,
+            )
             return jsonify({"status": "failed", "error": "Invalid authentication token"}), 401
         uid = decoded.get("uid") if isinstance(decoded, dict) else None
         if not _is_nonempty_str(uid):

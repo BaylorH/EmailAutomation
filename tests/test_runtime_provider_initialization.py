@@ -378,3 +378,266 @@ class RuntimeProviderInitializationTests(unittest.TestCase):
                 assert ai_calls == 1
             print("CONCURRENCY_OK")
         """, e2e=True))
+
+    def test_app_import_and_missing_bearer_do_not_initialize_firebase(self):
+        self.assertEqual("NO_INIT", _run_probe("""
+            from unittest.mock import patch
+            import firebase_admin
+            calls = []
+
+            def initialize():
+                calls.append("initialize_app")
+                return object()
+
+            with patch.object(
+                firebase_admin,
+                "initialize_app",
+                side_effect=initialize,
+            ):
+                import app
+                response = app.app.test_client().post("/api/trigger-scheduler", json={})
+                assert response.status_code == 401
+                assert response.get_json()["error"] == "Authentication required"
+                assert calls == []
+            print("NO_INIT")
+        """, e2e=True))
+
+    def test_auth_service_import_and_missing_bearer_do_not_initialize_firebase(self):
+        self.assertEqual("NO_INIT", _run_probe("""
+            import sys
+            from pathlib import Path
+            from unittest.mock import patch
+            import firebase_admin
+            sys.path.insert(0, str(Path.cwd() / "auth_service"))
+            calls = []
+
+            def initialize():
+                calls.append("initialize_app")
+                return object()
+
+            with patch.object(
+                firebase_admin,
+                "initialize_app",
+                side_effect=initialize,
+            ):
+                import auth_service
+                response = auth_service.app.test_client().post(
+                    "/start-device-flow", json={}
+                )
+                assert response.status_code == 401
+                assert response.get_json()["error"] == "Authentication required"
+                assert calls == []
+            print("NO_INIT")
+        """, e2e=True))
+
+    def test_app_firebase_initialization_failure_is_fail_closed_and_retryable(self):
+        self.assertEqual("RETRY_OK", _run_probe("""
+            from unittest.mock import patch
+            import firebase_admin
+            state = {"ready": False}
+
+            def get_app():
+                if not state["ready"]:
+                    raise ValueError("no default app")
+                return object()
+
+            def initialize():
+                if initialize.calls == 0:
+                    initialize.calls += 1
+                    raise RuntimeError("adc unavailable")
+                initialize.calls += 1
+                state["ready"] = True
+                return object()
+            initialize.calls = 0
+
+            with patch.object(firebase_admin, "get_app", side_effect=get_app), \
+                 patch.object(firebase_admin, "initialize_app", side_effect=initialize), \
+                 patch("firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}):
+                import app
+                client = app.app.test_client()
+                headers = {"Authorization": "Bearer test-token"}
+                first = client.post("/api/trigger-scheduler", json={}, headers=headers)
+                second = client.post("/api/trigger-scheduler", json={}, headers=headers)
+                assert first.status_code == 401
+                assert first.get_json()["error"] == "Authentication unavailable"
+                assert second.status_code == 503
+                assert initialize.calls == 2
+            print("RETRY_OK")
+        """, e2e=True))
+
+    def test_auth_service_firebase_failure_is_fail_closed_and_retryable(self):
+        self.assertEqual("RETRY_OK", _run_probe("""
+            import sys
+            from pathlib import Path
+            from unittest.mock import MagicMock, patch
+            import firebase_admin
+            sys.path.insert(0, str(Path.cwd() / "auth_service"))
+            state = {"ready": False, "calls": 0}
+
+            def get_app():
+                if not state["ready"]:
+                    raise ValueError("no default app")
+                return object()
+
+            def initialize():
+                state["calls"] += 1
+                if state["calls"] == 1:
+                    raise RuntimeError("adc unavailable")
+                state["ready"] = True
+                return object()
+
+            fake_app = MagicMock()
+            fake_app.initiate_device_flow.return_value = {
+                "message": "enter code", "user_code": "CODE"
+            }
+            fake_cache = MagicMock()
+            with patch.object(firebase_admin, "get_app", side_effect=get_app), \
+                 patch.object(firebase_admin, "initialize_app", side_effect=initialize), \
+                 patch("firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}):
+                import auth_service
+                with patch.object(
+                    auth_service,
+                    "_new_isolated_app",
+                    return_value=(fake_app, fake_cache),
+                ):
+                    client = auth_service.app.test_client()
+                    headers = {"Authorization": "Bearer test-token"}
+                    first = client.post("/start-device-flow", json={}, headers=headers)
+                    second = client.post("/start-device-flow", json={}, headers=headers)
+                assert first.status_code == 401
+                assert first.get_json()["error"] == "Authentication unavailable"
+                assert second.status_code == 200
+                assert state["calls"] == 2
+            print("RETRY_OK")
+        """, e2e=True))
+
+    def test_app_firebase_initializes_once_under_concurrent_first_access(self):
+        self.assertEqual("BARRIER_OK", _run_probe("""
+            import threading
+            import time
+            from concurrent.futures import ThreadPoolExecutor
+            from unittest.mock import patch
+            import firebase_admin
+            workers = 16
+            state = {"ready": False, "init_calls": 0, "verify_calls": 0}
+            state_lock = threading.Lock()
+
+            def get_app():
+                with state_lock:
+                    if not state["ready"]:
+                        raise ValueError("no default app")
+                return object()
+
+            def initialize():
+                with state_lock:
+                    state["init_calls"] += 1
+                time.sleep(0.03)
+                with state_lock:
+                    state["ready"] = True
+                return object()
+
+            def verify(token, check_revoked=False):
+                with state_lock:
+                    state["verify_calls"] += 1
+                return {"uid": token}
+
+            with patch.object(firebase_admin, "get_app", side_effect=get_app), \
+                 patch.object(firebase_admin, "initialize_app", side_effect=initialize), \
+                 patch("firebase_admin.auth.verify_id_token", side_effect=verify):
+                import app
+                assert state == {
+                    "ready": False, "init_calls": 0, "verify_calls": 0
+                }
+
+                @app.app.route("/__firebase_barrier_probe", methods=["POST"])
+                @app.verify_firebase_token
+                def firebase_barrier_probe():
+                    return "", 204
+
+                barrier = threading.Barrier(workers + 1)
+                def worker(index):
+                    barrier.wait(timeout=5)
+                    with app.app.test_client() as client:
+                        return client.post(
+                            "/__firebase_barrier_probe",
+                            json={},
+                            headers={"Authorization": f"Bearer user-{index}"},
+                        ).status_code
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(worker, index) for index in range(workers)]
+                    barrier.wait(timeout=5)
+                    statuses = [future.result(timeout=5) for future in futures]
+                assert statuses == [204] * workers
+                assert state == {
+                    "ready": True, "init_calls": 1, "verify_calls": workers
+                }
+            print("BARRIER_OK")
+        """, e2e=True))
+
+    def test_auth_service_firebase_initializes_once_under_concurrent_first_access(self):
+        self.assertEqual("BARRIER_OK", _run_probe("""
+            import sys
+            import threading
+            import time
+            from concurrent.futures import ThreadPoolExecutor
+            from pathlib import Path
+            from unittest.mock import patch
+            import firebase_admin
+            sys.path.insert(0, str(Path.cwd() / "auth_service"))
+            workers = 16
+            state = {"ready": False, "init_calls": 0, "verify_calls": 0}
+            state_lock = threading.Lock()
+
+            def get_app():
+                with state_lock:
+                    if not state["ready"]:
+                        raise ValueError("no default app")
+                return object()
+
+            def initialize():
+                with state_lock:
+                    state["init_calls"] += 1
+                time.sleep(0.03)
+                with state_lock:
+                    state["ready"] = True
+                return object()
+
+            def verify(token):
+                with state_lock:
+                    state["verify_calls"] += 1
+                return {"uid": token}
+
+            with patch.object(firebase_admin, "get_app", side_effect=get_app), \
+                 patch.object(firebase_admin, "initialize_app", side_effect=initialize), \
+                 patch("firebase_admin.auth.verify_id_token", side_effect=verify):
+                import auth_service
+                assert state == {
+                    "ready": False, "init_calls": 0, "verify_calls": 0
+                }
+
+                @auth_service.app.route(
+                    "/__firebase_barrier_probe", methods=["POST"]
+                )
+                @auth_service.verify_firebase_token
+                def firebase_barrier_probe():
+                    return "", 204
+
+                barrier = threading.Barrier(workers + 1)
+                def worker(index):
+                    barrier.wait(timeout=5)
+                    with auth_service.app.test_client() as client:
+                        return client.post(
+                            "/__firebase_barrier_probe",
+                            json={},
+                            headers={"Authorization": f"Bearer user-{index}"},
+                        ).status_code
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(worker, index) for index in range(workers)]
+                    barrier.wait(timeout=5)
+                    statuses = [future.result(timeout=5) for future in futures]
+                assert statuses == [204] * workers
+                assert state == {
+                    "ready": True, "init_calls": 1, "verify_calls": workers
+                }
+            print("BARRIER_OK")
+        """, e2e=True))
