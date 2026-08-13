@@ -163,11 +163,13 @@ import-time `openai.api_key = ...` mutations.
 
 The existing scheduler import-time credential exceptions move to
 `_require_runtime_config()`. It is called at the beginning of the legacy
-`refresh_and_process_user()` entry and immediately inside the `__main__` block,
+`list_user_ids()` storage/HTTP boundary, at the beginning of
+`refresh_and_process_user()`, and immediately inside the `__main__` block,
 before listing users or touching a provider. The proxy factories also call this
-validator before constructing OpenAI or Firestore, so direct legacy helpers
-cannot bypass the former fail-fast check. Import alone never makes the choice.
-The exception texts remain byte-for-byte identical.
+validator before constructing OpenAI or Firestore, so every supported legacy
+runtime entry and either lazy client retain the former fail-fast check. Import
+alone never makes the choice. The exception texts remain byte-for-byte
+identical.
 
 ### Firebase Admin getters
 
@@ -250,9 +252,84 @@ user still receives a fresh cache and app, preserving the wrong-mailbox guard.
    contracts.
 5. `conftest.py`: delete the collection-time provider substitutions. A test
    suite must not make broken production imports appear safe.
-6. `tests/test_test_collection_contract.py`: run the subprocess with
-   `--noconftest`, block the four constructor symbols plus sockets, require an
-   empty boundary log, and retain the complete node-ID/inventory assertions.
+6. `tests/test_compound_nonviable_processing.py`,
+   `tests/test_rubric_core_launch_draft_terminal_state.py`, and
+   `tests/test_rubric_core_launch_draft_duplicate_retry.py`: remove their
+   obsolete module-scope replacements of `google.cloud.firestore.Client`.
+   Those substitutions exist only to make the current eager `clients.py`
+   importable and would otherwise bypass the stronger constructor guard.
+7. `tests/test_full_campaign_e2e.py`: remove its additional module-scope
+   `google.cloud.firestore.Client` assignment. Exhaustive search found this
+   fourth import-only workaround after the three review-named tests; the
+   temporal guard would correctly reject it too. Retain the per-run chained
+   campaign fake and every runtime assertion.
+8. `tests/test_test_collection_contract.py`: run the subprocess with
+   `--noconftest`, guard constructor attributes against replacement for the
+   entire child process, block provider constructors, socket construction and
+   connection, and the concrete HTTP entry points, require an empty boundary
+   log, and retain the complete node-ID/inventory assertions.
+
+## Test-process isolation and boundary instrumentation
+
+Provider-module imports are stateful: importing `app.py` registers Flask
+routes, importing `auth_service.py` creates module locks and maps, and importing
+either provider SDK can retain patched constructors. Therefore every production
+import, first-use, failure/retry, and concurrency probe runs in a fresh
+`subprocess.run([sys.executable, "-c", source], ...)` child. The parent runtime
+test module imports no production application module. `importlib.reload` is
+forbidden for these proofs because it reuses stale module globals, can duplicate
+Flask route registration, and can make assignment inside a test function create
+an `UnboundLocalError` before the intended assertion.
+
+The collection child installs a `sitecustomize.py` before pytest starts. An
+early Python audit hook blocks DNS and connection attempts while the harness
+preloads SDK dependencies. That bootstrap excludes only urllib3's caught local
+IPv6-capability socket construction; no application module has been imported.
+The harness then arms socket-construction blocking, installs named
+constructor/HTTP blockers, and changes each protected module's `__class__` to a
+guarded `types.ModuleType` subclass before writing the ready marker and starting
+pytest. The child sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, so unrelated
+workstation plugins cannot create effects or alter inventory. Its `__setattr__`
+rejects any attempt to replace a
+protected constructor with an object other than the exact blocker, and its
+`__delattr__` rejects removal. This makes the assertion temporal: a
+module-scope patch cannot hide an eager construction and restore the blocker
+later. An `atexit` check also asserts every protected attribute is still the
+same blocker identity.
+
+The guard covers these exact surfaces:
+
+```text
+google.cloud.firestore.Client
+firebase_admin.initialize_app
+msal.PublicClientApplication
+openai.OpenAI
+socket.socket
+socket.socket.connect
+socket.create_connection
+Python audit events: socket.__new__, socket.connect, socket.connect_ex, socket.getaddrinfo
+requests.api.request
+requests.sessions.Session.request
+urllib.request.urlopen
+http.client.HTTPConnection.request
+http.client.HTTPConnection.connect
+http.client.HTTPSConnection.request
+http.client.HTTPSConnection.connect
+```
+
+`socket.socket.connect` is patched on the original socket class before the
+module-level `socket.socket` constructor name is replaced. Thus code holding an
+older class reference still cannot connect, while application code imported
+after the ready marker cannot construct a socket. A process-wide Python audit
+hook independently rejects post-bootstrap socket construction plus all
+connect/connect_ex and address-resolution attempts, so temporary replacement
+of a Python-level blocker cannot permit real network I/O. The HTTP
+guards catch the concrete clients used by this
+repository (`requests`), Python's standard URL stack, and the standard library
+transport beneath SDK clients. Any optional direct `httpx` transport present in
+the environment is guarded at `Client.send`/`AsyncClient.send` too. The log
+records both boundary calls and forbidden blocker replacement attempts; either
+is a hard failure.
 
 ## Tests and falsification
 
@@ -263,22 +340,30 @@ credentials:
   object, does not initialize for `repr`/`initialized`, and retries after one
   factory exception.
 - Import probes for `email_automation.clients`, `scheduler_runner`, `app.py`, and
-  `auth_service/auth_service.py` record zero Firestore, Firebase, MSAL, OpenAI,
-  socket, or HTTP boundary calls.
+  `auth_service/auth_service.py` each run in their own fresh child and fail on
+  the constructor relevant to that site. The separate whole-collection and
+  health children additionally block socket construction/connect and every
+  enumerated HTTP entry point, so the broader offline claim is instrumented.
 - Repository-wide `pytest --collect-only --noconftest` returns every node ID,
   including auth-service and collection-contract tests, with no credentials and
-  an empty constructor/network log. No test hook replaces provider constructors.
+  an empty constructor/network/replacement log. The four constructor blockers
+  retain exact identity from sitecustomize installation through process exit.
 - `service:app` imports with constructors blocked, and both `GET /health` and
   `GET /healthz` retain exact `200 {"status":"ok"}` bodies without initializing
   any provider.
-- First Firestore/OpenAI use invokes its real constructor seam once; a failed
-  first constructor is observable and a later use retries.
+- Fresh-child Firestore/OpenAI probes prove first use invokes the constructor
+  seam once, concurrent first use behind a `threading.Barrier` invokes it once,
+  and a failed first constructor is observable while a later use retries once.
 - Missing or malformed Bearer tokens initialize no Firebase app. A valid-token
-  request initializes once across concurrent calls, reuses an existing default
-  app, and fails closed before the protected handler when initialization fails.
+  request initializes once across threads released by an exact barrier, reuses
+  an existing default app, and fails closed before the protected handler when
+  initialization fails. The barrier test checks one initialization call and one
+  verification call per request after all threads join.
 - New auth-service device flows construct only isolated per-user MSAL pairs.
-  Only explicitly legacy entries construct/reuse the fallback pair; partial
-  entries and constructor failures fail closed.
+  Only explicitly legacy entries construct/reuse the fallback pair. A fresh
+  child releases simultaneous legacy completions through a barrier and asserts
+  exactly one fallback app/cache construction; partial entries and constructor
+  failures fail closed and a later request retries.
 - Existing scheduler listing, scheduler lease, process-user service, dashboard
   auth, device-flow, and identity-isolation suites remain green with fake
   providers and zero external effects.
