@@ -215,8 +215,9 @@ any interpreter/stdlib/extension/package realpath outside that bundle.
 The RED also requires the root-owned Apple-signed `/usr/bin/perl` trust base;
 the exact read-once/eval trampoline; pre-bootstrap versus full-run verifier
 modes; execution from already-read verified script bytes; and failures for
-verifier/bootstrap/wrapper path swaps, input/output manifest drift, and any
-canonical command retaining a direct bootstrap/wrapper bypass.
+verifier/bootstrap/wrapper byte or symlink drift present at verification time,
+input/output manifest drift, and any canonical command retaining a direct
+bootstrap/wrapper bypass.
 
 ```python
 class Ceq1DependencyDirectionTests(unittest.TestCase):
@@ -283,11 +284,13 @@ a single regular link and exact reviewed byte hash, reads it once, requires
 stable pre/post `stat`, and `eval`s those exact already-read bytes; it never
 asks an interpreter to reopen the mutable verifier pathname. The verifier
 imports no repository module, runs no version probe, and writes no filesystem
-state. It may fork exactly one tightly controlled pipe writer per Python target:
-the parent closes every unrelated descriptor, the child writes exactly the
-declared verified byte count and exits, and the parent requires that exact PID
-to exit zero before accepting target completion. No other subprocess is
-allowed. It opens every target with no-follow-any behavior, matches
+state. It may fork exactly once per Python target: the parent verifier is the
+byte writer and reaper, while the child closes every unrelated descriptor and
+executes the fixed Python loader with only the pipe read end plus standard
+descriptors. The parent writes exactly the declared verified byte count, closes
+its pipe end, waits for that exact child PID, and returns only the child's exact
+terminal status. No other subprocess is allowed. It opens every target with
+no-follow-any behavior, matches
 pre/post descriptor identity, reads exactly the fstat size with a loop that
 rejects read errors, short reads, or an extra byte, and executes the
 already-verified bootstrap or wrapper as bytes rather than by reopening its
@@ -296,20 +299,26 @@ a fixed, literal `-c` evaluator; the evaluator reads an exact declared byte
 count, rejects short/extra input, compiles those bytes with only a diagnostic
 symbolic filename, and does not import target code before that read completes.
 The verifier controls both pipe ends and child environment, closes unrelated
-descriptors, and does not accept a caller-supplied target fd. Swap-race tests
-cover both verifier and target transitions.
+descriptors, and does not accept a caller-supplied target fd.
 
-The fixed loader uses only the root-owned Apple-signed Command Line Tools
-Python at `/Library/Developer/CommandLineTools/usr/bin/python3` and its
-root-owned framework/stdlib. That Apple-managed runtime is part of the same
-explicit platform trust prerequisite, not an artifact CE-Q1 proves. It
-evaluates only already-verified repository target bytes and is never the sealed
-qualification runtime. The verifier does not start the user-writable uv-managed
-CPython until bootstrap input verification has passed; after the sealed bundle
-is built and fully output-verified, qualification commands use the task-owned
-copied CPython. The plan makes no claim of atomic path-swap resistance for
-root-owned Apple-managed platform files against a root attacker. Any
-ownership/mode/code-signature drift in that declared trust base is `BLOCKED`.
+The fixed loader is the exact uv-managed CPython 3.12.13 tree bound by the
+input manifest. Apple system Perl verifies that interpreter, its startup
+stdlib/native tree, and the target bytes before forking the loader. After the
+sealed bundle is built and fully output-verified, qualification commands use
+the task-owned copied CPython instead.
+
+This entry check detects pre-run drift and refuses mismatched bytes, metadata,
+links, manifests, and runtime trees. CE-Q1 assumes an exclusive local build/run
+window after verification: a malicious concurrent same-UID process or root
+attacker that mutates the verified host interpreter/stdlib or repository paths
+during the verifier-to-exec transition is explicitly outside the threat model.
+The plan therefore makes no atomic host path-swap claim and includes no
+post-verification adversarial launcher/stdlib race acceptance test. This does
+not weaken the contained worker boundary: Seatbelt denial, exact empty child
+environments, no-follow descriptor operations, stable per-operation identity
+checks, sealed task-owned outputs, and all provider/network/write prohibitions
+remain mandatory. Any drift present before entry, or any mutation observed by
+the contained per-operation checks, is `BLOCKED` or `INSTRUMENT_FAILURE`.
 
 The verifier has two non-interchangeable modes. `bootstrap` requires the exact
 hash of `ceq1-input-manifest.json` and statically validates only build inputs:
