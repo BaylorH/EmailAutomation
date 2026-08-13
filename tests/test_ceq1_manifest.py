@@ -951,13 +951,16 @@ class Ceq1BootstrapTests(unittest.TestCase):
             os.symlink(self.bootstrap.PINNED_PYTHON, pinned_link)
             before_identity = self.bootstrap.cache_identity_receipt(source)
             expected_topology = self.bootstrap.cache_logical_receipt(source)
-            shutil.copytree(source, destination, symlinks=True)
-            receipt = self.bootstrap.rebase_and_validate_cache_clone(
-                source,
-                destination,
-                before_identity,
-                expected_topology,
-            )
+            previous_umask = os.umask(0o077)
+            try:
+                receipt = self.bootstrap.clone_cache_to_task(
+                    source,
+                    destination,
+                    before_identity,
+                    expected_topology,
+                )
+            finally:
+                os.umask(previous_umask)
             self.assertEqual(before_identity, self.bootstrap.cache_identity_receipt(source))
             self.assertEqual(
                 destination / "archive-v0/exact-archive",
@@ -966,6 +969,10 @@ class Ceq1BootstrapTests(unittest.TestCase):
             self.assertEqual(
                 self.bootstrap.PINNED_PYTHON,
                 Path(os.readlink(destination / pinned_link.relative_to(source))),
+            )
+            self.assertEqual(
+                stat.S_IMODE(pinned_link.lstat().st_mode),
+                stat.S_IMODE((destination / pinned_link.relative_to(source)).lstat().st_mode),
             )
             self.assertEqual(expected_topology["logicalDigest"], receipt["logicalDigest"])
 
