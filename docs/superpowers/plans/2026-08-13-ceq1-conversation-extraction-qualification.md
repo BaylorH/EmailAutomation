@@ -87,7 +87,7 @@ Important import detail: `processing.py` and `ai_processing.py` import dependenc
 | `tests/test_ceq1_voice.py` | Frozen-draft eligibility and blinded-review instrument calibration |
 | `scripts/bootstrap_ceq1_runtime.py` | Exact Task 1 orchestrator for the sandboxed double build, derived-lock verification, and sealed local venv |
 | `scripts/build_ceq1_wheelhouse.py` | Deterministically reconstructs reviewed pure-Python wheel bytes from exact uv-cache RECORD members without mutating the cache |
-| `scripts/verify_ceq1_entry.py` | Externally hash-pinned, mutation-free standard-library verifier that validates the toolchain before bootstrap/wrapper execution |
+| `scripts/verify_ceq1_entry.pl` | Externally hash-pinned, mutation-free Apple-system-Perl verifier that validates inputs/outputs before bootstrap/wrapper execution |
 | `scripts/run_ceq1.py` | Thin CLI over the host supervisor |
 | `scripts/run_ceq1_env.py` | Empty-environment Python/test launcher used before the full supervisor exists |
 
@@ -137,12 +137,18 @@ Any drift is `BLOCKED` before a
 product or emulator child starts. The emulator JAR is executed only from the
 verified task-owned copy.
 
-Every direct Python/pytest command below is executed through this literal
-empty-environment wrapper; “canonical pytest prefix” means the wrapper refuses
-to start unless `-I -S -B` are present exactly as shown:
+Every direct Python/pytest command below is executed through the verified entry
+and then the empty-environment wrapper. “Canonical pytest prefix” means the
+following exact command after the three review placeholders have been replaced
+by their literal hashes:
 
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest -q \
   -p no:cacheprovider <test-paths>
@@ -179,7 +185,9 @@ any attempt to use a generated sentinel at a client boundary is fatal.
 - Create: `tests/test_ceq1_manifest.py`
 - Create: `requirements-ceq1.in`
 - Create: `requirements-ceq1.lock`
+- Create: `docs/release-safety/ceq1-input-manifest.json`
 - Create: `docs/release-safety/ceq1-wheelhouse-manifest.json`
+- Create: `scripts/verify_ceq1_entry.pl`
 - Create: `scripts/run_ceq1_env.py`
 - Create: `scripts/bootstrap_ceq1_runtime.py`
 - Create: `scripts/build_ceq1_wheelhouse.py`
@@ -191,7 +199,7 @@ any attempt to use a generated sentinel at a client boundary is fatal.
 
 Add tests that scan `email_automation/**/*.py`, `main.py`, `service.py`, `scheduler_runner.py`, and `app.py` with `ast`. They must reject imports whose module begins with `tests.ceq1` or `scripts.run_ceq1`, and reject literal references to `tests/fixtures/ceq1`. Add assertions that `.ceq1-runtime/` and `.ceq1-venv/` are ignored while committed evidence files are not ignored. Add a fresh-child test for `run_ceq1_env.py` that prints only sorted environment key names and require exact equality with the closed allowlist above, even when the parent injects `OBSIDIAN_REST_API_KEY`, `SSH_AUTH_SOCK`, proxy, credential, and token variables.
 
-Task 1 RED also covers the wheelhouse manifest's exact closed schema and cache
+Task 1 RED also covers the input and wheelhouse manifests' exact closed schemas and cache
 source identities; builder/reconstructor/CPython/`zipfile.py` binding; exact
 RECORD-member closure; rejection of cache/archive-ID, byte, mode, size, path,
 symlink, hard-link, special, `.data`, native, signature, non-ASCII, traversal,
@@ -204,6 +212,11 @@ temporary miniature cache trees for every sabotage and may not mutate the real
 uv cache. They also require the sealed bundle's copied Python base and venv
 payload, explicit isolated site-packages bootstrap under `-I -S -B`, and reject
 any interpreter/stdlib/extension/package realpath outside that bundle.
+The RED also requires the root-owned Apple-signed `/usr/bin/perl` trust base;
+the exact read-once/eval trampoline; pre-bootstrap versus full-run verifier
+modes; execution from already-read verified script bytes; and failures for
+verifier/bootstrap/wrapper path swaps, input/output manifest drift, and any
+canonical command retaining a direct bootstrap/wrapper bypass.
 
 ```python
 class Ceq1DependencyDirectionTests(unittest.TestCase):
@@ -251,28 +264,45 @@ environment. Its canonical entry is exactly:
 
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-/Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12 \
-  -I -S -B scripts/bootstrap_ceq1_runtime.py prepare
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  bootstrap __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ -- prepare
 ```
 
 No mutable repository script is the root of its own trust. Before either the
 bootstrap or direct wrapper is imported or executed, pinned CPython runs a
 literal standard-library `-c` trampoline. The final Task 1 plan and local
 receipt record the exact literal SHA-256 of `scripts/verify_ceq1_entry.py` and
-of the committed toolchain manifest. The trampoline opens the verifier with
-`O_NOFOLLOW`, requires a single regular link and its exact byte hash, and
-`execve`s pinned Python `-I -S -B` into that verified file with the expected
-toolchain-manifest hash and requested target. The verifier imports no
-repository module, spawns no subprocess, runs no version probe, and writes
-nothing. Through componentwise held directory descriptors it requires the
-exact manifest byte hash and closed schema, then statically validates the
-bootstrap, builder, wrapper, wheelhouse manifest, locks, pinned binary/JAR
-bytes, source-runtime trees, sealed bundle tree, and wheelhouse bytes. Only
-after exact static equality does it `execve` either the bootstrap or wrapper.
-The toolchain manifest binds the verifier and wrapper hashes as well as the
-bootstrap and builder hashes. After Task 1 freezes, the two named review-hash
-placeholders in this plan must be replaced with literal reviewed hashes and the
-canonical commands rerun; an unresolved placeholder is a completion blocker.
+of the applicable committed manifest. The explicit pre-Python trust base is
+the root-owned Apple-signed `/usr/bin/perl` and its root-owned system core
+modules (`Digest::SHA`, `Fcntl`, and `JSON::PP`), plus the macOS kernel. This is
+a declared platform prerequisite rather than code proved by CE-Q1. The literal
+Perl trampoline opens `scripts/verify_ceq1_entry.pl` with `O_NOFOLLOW`, requires
+a single regular link and exact reviewed byte hash, reads it once, requires
+stable pre/post `stat`, and `eval`s those exact already-read bytes; it never
+asks an interpreter to reopen the mutable verifier pathname. The verifier
+imports no repository module, spawns no subprocess, runs no version probe, and
+writes nothing. It opens every target with no-follow-any behavior, matches
+pre/post descriptor identity, and executes the already-verified bootstrap or
+wrapper source through an inheritable verified descriptor (`/dev/fd/<n>`) whose
+identity is rechecked in the child before evaluation; swap-race tests cover
+both transitions.
+
+The verifier has two non-interchangeable modes. `bootstrap` requires the exact
+hash of `ceq1-input-manifest.json` and statically validates only build inputs:
+verifier/bootstrap/builder/wrapper bytes, wheelhouse manifest and locks, pinned
+uv/Python/JDK/JAR bytes/trees, and portable policy template. It then permits
+`derive-review-candidate` or a deterministic `prepare` build. It does not
+require bootstrap-produced wheelhouse/runtime outputs. After the derivation,
+an independently reviewed `ceq1-toolchain-manifest.json` binds those outputs.
+`run` requires both the input-manifest hash and full toolchain-manifest hash,
+validates all input and output equality—including sealed bundle and wheelhouse—
+then permits the wrapper. Thus a clean checkout can derive outputs without a
+cycle, while no qualification run can use unreviewed outputs. After Task 1
+freezes, the three named review-hash placeholders in this plan must be replaced
+with literal reviewed hashes and every canonical command rerun; any unresolved
+placeholder is a completion blocker.
 
 The mutation-free verified outer launcher derives only lexical path parameters and a
 fresh opaque bootstrap identity, renders the canonical Seatbelt template in
@@ -512,10 +542,11 @@ Expected: PASS and no provider/network output.
 
 ```bash
 git add .gitignore requirements-ceq1.in requirements-ceq1.lock \
+  docs/release-safety/ceq1-input-manifest.json \
   docs/release-safety/ceq1-wheelhouse-manifest.json \
   docs/release-safety/ceq1-toolchain-manifest.json \
   scripts/bootstrap_ceq1_runtime.py scripts/build_ceq1_wheelhouse.py \
-  scripts/run_ceq1_env.py \
+  scripts/run_ceq1_env.py scripts/verify_ceq1_entry.pl \
   tests/ceq1/__init__.py \
   tests/test_ceq1_manifest.py docs/release-safety/evidence/ceq1/README.md
 git commit -m "test: establish CE-Q1 qualification boundary"
@@ -1253,6 +1284,11 @@ Run:
 
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_semantic_replay.py \
@@ -1648,10 +1684,20 @@ Run:
 
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py preflight \
   --output .ceq1-runtime/preflight.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py calibrate \
   --output .ceq1-runtime/calibration.json
@@ -1687,30 +1733,60 @@ Run:
 
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py run --tier all \
   --mode canonical --output .ceq1-runtime/canonical
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py verify-report \
   .ceq1-runtime/canonical/report.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py run --tier all \
   --mode diagnostic-continuation --canonical-report \
   .ceq1-runtime/canonical/report.json --output .ceq1-runtime/diagnostic
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py verify-report \
   .ceq1-runtime/diagnostic/report.json --canonical-report \
   .ceq1-runtime/canonical/report.json
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py assemble-evidence \
   --canonical-report .ceq1-runtime/canonical/report.json \
   --diagnostic-report .ceq1-runtime/diagnostic/report.json \
   --output .ceq1-runtime/assembled
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   scripts/run_ceq1.py verify-report \
   .ceq1-runtime/assembled/report.json
@@ -1743,6 +1819,11 @@ Run:
 
 ```bash
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_sandbox.py \
@@ -1753,11 +1834,21 @@ Run:
   tests/test_process_user_service.py
 
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m pytest --noconftest --collect-only -q \
   -p no:cacheprovider
 
 /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/perl -MDigest::SHA=sha256_hex -MFcntl=:DEFAULT \
+  -e 'my($p,$h,@a)=@ARGV;sysopen(my $f,$p,O_RDONLY|O_NOFOLLOW)or die;my @b=stat($f);die unless -f _&&$b[3]==1;local $/;my $s=<$f>;die unless sha256_hex($s)eq$h;my @e=stat($f);die unless "@b"eq"@e";@ARGV=@a;eval "package CEQ1::VerifiedEntry;\n$s";die $@ if $@' \
+  scripts/verify_ceq1_entry.pl __CEQ1_ENTRY_SHA256_REVIEWED__ \
+  run __CEQ1_INPUT_MANIFEST_SHA256_REVIEWED__ \
+  __CEQ1_TOOLCHAIN_MANIFEST_SHA256_REVIEWED__ -- \
   ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
   -m py_compile \
   tests/ceq1/*.py scripts/bootstrap_ceq1_runtime.py \
