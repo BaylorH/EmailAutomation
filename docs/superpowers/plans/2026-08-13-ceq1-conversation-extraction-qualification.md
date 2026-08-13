@@ -49,6 +49,7 @@ Important import detail: `processing.py` and `ai_processing.py` import dependenc
 | `.gitignore` | Ignore task-owned runtime/quarantine state only |
 | `requirements-ceq1.in` | Qualification-only pytest input constrained by the production lock |
 | `requirements-ceq1.lock` | Offline hash-pinned qualification test dependencies |
+| `docs/release-safety/ceq1-wheelhouse-manifest.json` | Reviewed derived-wheel input/output manifest; source RECORD/member digests and derived wheel hashes only, never an upstream-equivalence claim |
 | `docs/release-safety/ceq1-execution-manifest.json` | Public scenario registry and input/response/owner hashes; no oracle or expected verdict |
 | `docs/release-safety/ceq1-execution-schedule.json` | Public oracle-free scenario/variant/layer schedule and input/response hashes |
 | `docs/release-safety/ceq1-toolchain-manifest.json` | Closed full-tree Python/JDK/JAR/venv dependency manifest and digests |
@@ -84,6 +85,8 @@ Important import detail: `processing.py` and `ai_processing.py` import dependenc
 | `tests/test_ceq1_stateful_replay.py` | L2 real-entrypoint state/effect/replay scoring |
 | `tests/test_ceq1_emulator_replay.py` | L3 preflight, namespace, transport audit, persistence, interruption, cleanup |
 | `tests/test_ceq1_voice.py` | Frozen-draft eligibility and blinded-review instrument calibration |
+| `scripts/bootstrap_ceq1_runtime.py` | Exact Task 1 orchestrator for the sandboxed double build, derived-lock verification, and sealed local venv |
+| `scripts/build_ceq1_wheelhouse.py` | Deterministically reconstructs reviewed pure-Python wheel bytes from exact uv-cache RECORD members without mutating the cache |
 | `scripts/run_ceq1.py` | Thin CLI over the host supervisor |
 | `scripts/run_ceq1_env.py` | Empty-environment Python/test launcher used before the full supervisor exists |
 
@@ -93,8 +96,10 @@ Do not create a production package for CE-Q1. No production module may import `t
 
 Run every command from the worktree root. Never use the symlinked environment
 from another worktree and never copy the ambient environment then unset a
-partial variable list. Task 1 creates a local ignored `.ceq1-venv` offline from
-the already-installed CPython 3.12.13 tree:
+partial variable list. Task 1 creates a local ignored sealed runtime bundle at
+`.ceq1-venv/` offline from the already-installed CPython 3.12.13 tree. The
+bundle contains `python/` (the complete copied CPython base) and `venv/` (the
+installed dependency payload):
 
 ```text
 /Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12
@@ -110,30 +115,35 @@ the interpreter tree, both locks, `pyvenv.cfg`, every installed distribution
 `RECORD`, native library, and executable in `.ceq1-venv`; the canonical report
 binds that frozen environment digest.
 
-The ignored `.ceq1-venv` is only the development/test bootstrap. A canonical
+The ignored `.ceq1-venv` is a sealed source runtime bundle. Direct Task 1 tests
+execute `.ceq1-venv/python/bin/python3.12`, never the venv launcher; the wrapper
+adds only the manifest-bound `.ceq1-venv/venv` site-packages after startup. A canonical
 run does not execute from the user-writable source runtime in place. Task 5
-first validates a closed toolchain manifest containing `uv` plus every Python and JDK
-entry's relative path, file type, mode, symlink target, and content hash; copies
-the verified `uv`, Python runtime, JDK, and Firestore JAR into the task-owned runtime
-root without following undeclared links; verifies exact manifest equality;
-makes the copy read-only; builds a fresh task-owned venv from that copied
-interpreter; installs both locks offline; and hashes `pyvenv.cfg`, every
+first validates the closed Task 1 toolchain manifest, then copies the sealed
+`.ceq1-venv`, JDK, Firestore JAR, and validated derived wheelhouse into the
+task-owned runtime root without following undeclared links. It verifies exact
+manifest equality, preserves the read-only seal, and hashes `pyvenv.cfg`, every
 distribution `RECORD`, executable, and native library before and after the run.
+Task 5 performs no install or rebuild and never reads the original uv cache.
 The source and copied manifests, code-signature status where present, ownership,
 realpaths, and aggregate digests are recorded. Source reads and copies use
 `openat(O_NOFOLLOW)` plus matching pre/post `fstat`; hard links, special files,
 absolute/escaping links, size/content/mode drift, and an unexpected executable
-bit are rejected. Runtime preparation itself runs inside a no-network Seatbelt
-profile with an empty environment, read access only to verified sources, locks,
-and the offline uv cache, and write access only to the task runtime. Any drift is `BLOCKED` before a
+bit are rejected. Runtime copying itself runs inside a no-network Seatbelt
+profile with an empty environment, read access only to the sealed Task 1
+artifacts and committed manifests, and write access only to the task runtime.
+Any drift is `BLOCKED` before a
 product or emulator child starts. The emulator JAR is executed only from the
 verified task-owned copy.
 
 Every direct Python/pytest command below is executed through this literal
-empty-environment wrapper; “canonical pytest prefix” means:
+empty-environment wrapper; “canonical pytest prefix” means the wrapper refuses
+to start unless `-I -S -B` are present exactly as shown:
 
 ```bash
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest -q \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  -m pytest -q \
   -p no:cacheprovider <test-paths>
 ```
 
@@ -168,7 +178,10 @@ any attempt to use a generated sentinel at a client boundary is fatal.
 - Create: `tests/test_ceq1_manifest.py`
 - Create: `requirements-ceq1.in`
 - Create: `requirements-ceq1.lock`
+- Create: `docs/release-safety/ceq1-wheelhouse-manifest.json`
 - Create: `scripts/run_ceq1_env.py`
+- Create: `scripts/bootstrap_ceq1_runtime.py`
+- Create: `scripts/build_ceq1_wheelhouse.py`
 - Create: `docs/release-safety/ceq1-toolchain-manifest.json`
 - Create: `docs/release-safety/evidence/ceq1/README.md`
 - Modify: `.gitignore`
@@ -176,6 +189,20 @@ any attempt to use a generated sentinel at a client boundary is fatal.
 - [ ] **Step 1: Write the failing one-way dependency and runtime-artifact tests**
 
 Add tests that scan `email_automation/**/*.py`, `main.py`, `service.py`, `scheduler_runner.py`, and `app.py` with `ast`. They must reject imports whose module begins with `tests.ceq1` or `scripts.run_ceq1`, and reject literal references to `tests/fixtures/ceq1`. Add assertions that `.ceq1-runtime/` and `.ceq1-venv/` are ignored while committed evidence files are not ignored. Add a fresh-child test for `run_ceq1_env.py` that prints only sorted environment key names and require exact equality with the closed allowlist above, even when the parent injects `OBSIDIAN_REST_API_KEY`, `SSH_AUTH_SOCK`, proxy, credential, and token variables.
+
+Task 1 RED also covers the wheelhouse manifest's exact closed schema and cache
+source identities; builder/reconstructor/CPython/`zipfile.py` binding; exact
+RECORD-member closure; rejection of cache/archive-ID, byte, mode, size, path,
+symlink, hard-link, special, `.data`, native, signature, non-ASCII, traversal,
+duplicate, and undeclared-extra drift; allowance of only explicitly
+manifest-recorded regular `**/__pycache__/*.pyc` excluded extras; deterministic
+double build and byte equality; finished ZIP metadata and RECORD invariants;
+derived lock rewrite/validation; output seal/rehash; cache immutability; and the
+exact host-pinned sandboxed reconstruction/install command path. These tests use
+temporary miniature cache trees for every sabotage and may not mutate the real
+uv cache. They also require the sealed bundle's copied Python base and venv
+payload, explicit isolated site-packages bootstrap under `-I -S -B`, and reject
+any interpreter/stdlib/extension/package realpath outside that bundle.
 
 ```python
 class Ceq1DependencyDirectionTests(unittest.TestCase):
@@ -215,47 +242,129 @@ Expected: FAIL because the ignore/evidence/runtime-wrapper contracts are absent.
 
 Implement `scan_production_imports()` in the test itself for this bootstrap task; move no code into production.
 
-Create `requirements-ceq1.in` containing exactly `pytest==9.1.1`, then generate
-the lock from the offline cache and production constraints:
+Create `requirements-ceq1.in` containing exactly `pytest==9.1.1`.
+`scripts/bootstrap_ceq1_runtime.py` is the only Task 1 orchestrator. It derives
+and validates the worktree root from its own resolved `__file__`; it never
+accepts or expands `PWD`, reads a shell profile, or copies the parent
+environment. Its canonical entry is exactly:
 
 ```bash
-mkdir -p .ceq1-runtime/bootstrap/home .ceq1-runtime/bootstrap/cache
-test "$(shasum -a 256 /Users/baylorharrison/.local/bin/uv | awk '{print $1}')" = \
-  4424f8430c3cb3990daaa68268af640bdc61190f2e5c276197e3473358b1e4e8
-env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
-  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
-  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
-  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-  /Users/baylorharrison/.local/bin/uv pip compile --offline --generate-hashes \
-  --python-version 3.12 --constraint requirements.lock \
-  --output-file requirements-ceq1.lock requirements-ceq1.in
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12 \
+  -I -S -B scripts/bootstrap_ceq1_runtime.py prepare
 ```
 
-Assert the generated lock contains exactly pytest `9.1.1`, pluggy `1.6.0`,
-iniconfig `2.3.0`, pygments `2.20.0`, and production-constrained packaging
-`26.2`, all with hashes and no URL/path source. Create the local environment:
+The orchestrator first validates the pinned interpreter and `uv` bytes with
+Python SHA-256, creates task directories with no-follow ownership/mode checks,
+and renders the committed canonical parameterized Seatbelt template into the
+task root. That template is the exact `BOOTSTRAP_SEATBELT_TEMPLATE` string
+constant in `scripts/bootstrap_ceq1_runtime.py`; it is not a separately mutable
+file. The committed manifests bind only the portable template bytes/hash
+and its exact closed placeholder schema. The ignored runtime receipt binds the
+rendered bytes/hash plus the validated logical-ID-to-absolute-realpath parameter
+map; no absolute path enters a committed manifest or report. It then invokes only literal
+argument arrays beginning with `/usr/bin/env -i` and the host-pinned
+`/usr/bin/sandbox-exec -f <task-profile>`; no shell or command substitution is
+used. The profile denies all network, reads only the exact reviewed source
+cache, interpreter, standard library, `uv`, builder, manifests, and lock
+inputs, and writes only under `.ceq1-runtime/bootstrap` and `.ceq1-venv`.
 
-```bash
-env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
-  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
-  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
-  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-  /Users/baylorharrison/.local/bin/uv venv --offline --no-python-downloads \
-  --python /Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12 \
-  .ceq1-venv
-env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
-  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
-  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
-  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-  /Users/baylorharrison/.local/bin/uv pip install --offline --require-hashes \
-  --python .ceq1-venv/bin/python -r requirements.lock
-env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
-  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
-  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
-  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-  /Users/baylorharrison/.local/bin/uv pip install --offline --require-hashes \
-  --python .ceq1-venv/bin/python -r requirements-ceq1.lock
-```
+Inside that profile, the orchestrator runs `uv pip compile` only as a diagnostic
+resolution step, writing below `.ceq1-runtime/bootstrap` and using all of
+`--offline --no-config --no-python-downloads --generate-hashes`, the literal
+pinned `--python`, and `--constraint requirements.lock`. It requires exactly
+pytest `9.1.1`, pluggy `1.6.0`, iniconfig `2.3.0`, pygments `2.20.0`, and
+production-constrained packaging `26.2`. Upstream/cache hashes from that
+diagnostic file never enter the canonical qualification lock.
+
+The reviewed uv cache contains extracted exact distributions but not every
+original wheel byte needed by hash-required offline installation. Before
+creating the venv, `scripts/build_ceq1_wheelhouse.py` therefore reconstructs
+only the five reviewed pure-Python wheels into two independent task-owned
+staging directories. It never writes to the uv cache. For each package it
+resolves the expected cache wheel link under `UV_CACHE_DIR`, requires the
+resolved source to stay under `archive-v0`, and matches the committed
+`docs/release-safety/ceq1-wheelhouse-manifest.json` package, version, cache
+archive ID, original RECORD-byte hash, and complete sorted RECORD-member
+path/hash/size set before reading any payload. The manifest also binds the
+reconstructor source hash, exact CPython launcher/version hashes, and the exact
+standard-library `zipfile.py` hash used to emit and inspect the archives.
+
+The builder resolves source entries through a held directory file descriptor
+and `openat(O_NOFOLLOW)`, with matching stable pre/post `fstat`; it rejects hard
+links, symlinks, special files, `.data` trees, native binaries, signature files,
+non-ASCII paths, traversal, duplicates, and undeclared extras. The sole allowed
+extras are regular `**/__pycache__/*.pyc` files individually listed, hashed, and
+classified as excluded in the manifest; no other bytecode or extra is allowed.
+It accepts only unique safe relative POSIX regular-file paths named by RECORD
+and verifies every payload member's exact RECORD SHA-256 and size. The RECORD
+self-row is excluded only from those payload hash/size checks; its exact
+original bytes are included once as the physically final ZIP member, after all
+other RECORD paths have been sorted lexically.
+`WHEEL` must say exactly
+wheel version `1.0`, `Root-Is-Purelib: true`, and the sole tag `py3-none-any`.
+Each derived archive uses `ZIP_STORED`, sorted members, timestamp
+`1980-01-01T00:00:00`, empty member extras and archive comment, Unix regular
+file mode `0644`, empty member comments, `create_system=3`, ZIP create version
+`20`, extract version `20`, zero internal attributes and flag bits, no data
+descriptors, no directory entries, and no Zip64. Archive order is exactly
+`sorted(non-RECORD members) + RECORD`. The two independent builds
+must be byte-identical. The builder then validates the finished ZIP and RECORD
+again and matches the manifest's derived filename, member count, byte size, and
+new SHA-256, then seals the output read-only and rehashes it. These deterministic
+derived hashes are explicitly **not** claimed to equal upstream wheel hashes.
+
+The orchestrator runs the builder twice into disjoint stage A/B roots, validates
+both, requires byte identity, copies the validated result into the promoted
+task-owned wheelhouse, seals it read-only, and verifies it again. It then
+renders a deterministic candidate qualification lock below
+`.ceq1-runtime/bootstrap` from the five promoted derived wheel hashes. The
+candidate format and dependency order are fixed by the orchestrator and it
+must compare byte-for-byte with committed `requirements-ceq1.lock`; canonical
+execution never rewrites a repository file. The separate development command
+`derive-review-candidate` may emit proposed manifest and lock bytes only below
+`.ceq1-runtime/bootstrap/review-candidate`; promotion into version control uses
+an explicit reviewed patch, never a tool write.
+
+`requirements-ceq1.lock` therefore pins only the five reviewed derived wheel
+hashes. The orchestrator copies the complete manifest-bound CPython base into
+`.ceq1-venv/python`, verifies that the copied interpreter's `sys.executable`,
+`sys.prefix`, `sys.base_prefix`, stdlib, platstdlib, and loaded extension-module
+realpaths are all below that copied root, then creates
+`.ceq1-venv/venv` with `uv venv --offline --no-config --no-project
+--relocatable --no-python-downloads --python
+.ceq1-venv/python/bin/python3.12`. It installs
+`requirements.lock` from the exact hash-bound read-only uv cache with
+`--offline --no-config --no-python-downloads --require-hashes --only-binary
+:all: --link-mode copy --exact`, then installs the derived qualification lock
+from only the promoted wheelhouse with `--offline --no-config
+--no-python-downloads --no-index --find-links <wheelhouse> --require-hashes
+--only-binary :all: --link-mode copy --reinstall`. The second install never
+uses `--exact`, so it cannot remove product dependencies, and `--reinstall`
+forces all five packages—including packaging—to come from the derived
+wheelhouse. After installation, the orchestrator replaces only the generated
+venv interpreter links with exact internal relative targets:
+`bin/python -> ../../python/bin/python3.12`, `bin/python3 -> python`, and
+`bin/python3.12 -> python`. It renders a closed `pyvenv.cfg` whose `home` is
+exactly `../python/bin`; no link or config value names the source worktree. It
+copies the completed bundle to a second task path and proves both the venv and
+base launchers resolve every prefix, stdlib, extension, and package path inside
+that copy. The venv launcher is never a canonical execution entry; the copied
+base interpreter runs with `-I -S -B`, and `run_ceq1_env.py` inserts only the
+validated copied venv's site-packages. The orchestrator validates the exact five
+installed versions and their RECORD members, rejects any bundle link escaping
+`.ceq1-venv`, seals the complete Python-plus-venv bundle read-only, and records
+its full closed tree manifest. Any input/output or
+installed-provenance mismatch is `BLOCKED`, never a cache write, download,
+ambient fallback, or weakened hash check.
+
+The load-bearing order is: validate committed inputs; render and bind the
+profile; run diagnostic resolution; run builder stages A and B; compare,
+validate, seal, and promote; render and compare the derived lock; create the
+copied Python base and venv; install the product lock; force-reinstall the five
+derived packages; validate and seal the runtime bundle. Tests assert every literal argv/environment field,
+profile content/hash, state transition, and refusal path. The steps never rely
+on a network denial implemented by uv alone.
 
 `scripts/run_ceq1_env.py` resolves and verifies the local interpreter and
 worktree root, creates the task-owned direct-run directories with mode `0700`,
@@ -270,7 +379,12 @@ compute a deterministic tree digest over the sorted sequence
 every entry; reject sockets/devices/FIFOs and links escaping the artifact root.
 Record entry count, tree digest, launcher hash, version output hash, and the
 digest algorithm version. Record the Firestore 1.19.8 JAR byte hash and the
-two lockfile hashes. A test recomputes exact equality and a one-byte, mode, path,
+two lockfile hashes. The toolchain manifest also binds the wheelhouse manifest,
+bootstrap-orchestrator source, reconstructor source, canonical parameterized
+Seatbelt-template content/hash/schema, every promoted derived wheel hash, and
+the sealed Python-plus-venv runtime tree. The ignored runtime receipt, not the
+committed manifest, binds the rendered profile and absolute parameters. A
+test recomputes exact equality and a one-byte, mode, path,
 or symlink-target mutation must fail. Independent review of this manifest is a
 canonical preflight prerequisite.
 
@@ -284,8 +398,11 @@ Expected: PASS and no provider/network output.
 
 ```bash
 git add .gitignore requirements-ceq1.in requirements-ceq1.lock \
+  docs/release-safety/ceq1-wheelhouse-manifest.json \
   docs/release-safety/ceq1-toolchain-manifest.json \
-  scripts/run_ceq1_env.py tests/ceq1/__init__.py \
+  scripts/bootstrap_ceq1_runtime.py scripts/build_ceq1_wheelhouse.py \
+  scripts/run_ceq1_env.py \
+  tests/ceq1/__init__.py \
   tests/test_ceq1_manifest.py docs/release-safety/evidence/ceq1/README.md
 git commit -m "test: establish CE-Q1 qualification boundary"
 ```
@@ -527,6 +644,16 @@ descendant absence and socket/port closure, and only then removes temp/receipt. 
 SIGKILL retains a durable receipt and blocks the next run pending exact
 reconciliation.
 
+Add boundary tests that copy the exact sealed Task 1 Python-plus-venv bundle
+into a temporary task runtime and require byte/mode/link-manifest equality,
+relocatability, and zero escaping links. A released child must prove that
+`sys.executable`, `sys.prefix`, `sys.base_prefix`, stdlib, platstdlib, imported
+extension modules, and inserted package paths all resolve under its task
+runtime while a direct source-Python read is OS-denied. Mutants for a changed
+byte/mode/link target, an unsealed source, an attempted uv-cache/source-runtime
+read, and any venv create/install/rebuild invocation must all fail before
+worker release.
+
 - [ ] **Step 2: Run sandbox tests to verify RED**
 
 Run the canonical pytest prefix with `tests/test_ceq1_sandbox.py`.
@@ -549,38 +676,32 @@ fsyncs `STARTED`, then sends one release byte. Tests deliberately attempt
 `fork`, same-interpreter exec, shell exec, and a spawned descendant after
 `STRICT_READY`; all must be OS-denied.
 
-Before profile generation, validate the closed toolchain manifest, copy `uv`,
-the Python runtime, JDK tree, and emulator JAR into the task root, verify exact
-entry-set/digest equality, reject escaping links/special files, and remove
-write bits. Build/install the task venv offline from the copied Python and
-copied `uv` with `--no-config --no-project --relocatable`; package installation
-uses `--require-hashes --only-binary :all: --link-mode copy --exact` and never
-downloads. Reject any venv link resolving outside the task runtime. Hash the resulting interpreter, `pyvenv.cfg`, every installed
-distribution `RECORD`, executable, and native library before release and after
-cleanup. After installation, remove write bits from the complete uv/Python/
-venv/JDK/JAR runtime, recompute its closed manifest, and grant every role
-read-only access; writable HOME/tmp/cache/output live outside `runtime/`.
+Before profile generation, validate the closed toolchain manifest and copy the
+already sealed Task 1 Python-plus-venv `.ceq1-venv` bundle, JDK tree, emulator JAR, and validated
+derived wheelhouse into the task root. Task 5 does not reinstall either lock
+and never reads the original uv cache. Verify exact entry-set/digest equality,
+reject escaping links/special files, preserve read-only modes, and require the
+copied dependency payload to remain relocatable within the task runtime. Every
+worker executes `<task>/runtime/ceq1/python/bin/python3.12 -I -S -B`, then the
+reviewed bootstrap inserts only `<task>/runtime/ceq1/venv` site-packages. Before
+release, assert `sys.executable`, `sys.prefix`, `sys.base_prefix`, stdlib,
+platstdlib, every extension-module realpath, and every inserted package path
+are below `<task>/runtime/ceq1`; OS-deny all reads from the source CPython tree.
+Hash the copied interpreter, `pyvenv.cfg`, every installed distribution
+`RECORD`, executable, and native library before release and after cleanup. Grant every role read-only
+access; writable HOME/tmp/cache/output live outside `runtime/`.
 Mutation, write-attempt, and post-run digest tests must prove the sealed runtime
 did not change. No role reads the original user-writable runtime/JDK/JAR after
 this copy step.
 
-The fixed runtime-preparation bootstrap itself runs once via
-`/usr/bin/sandbox-exec` under a no-network profile before copied role runtimes
-exist. It receives an empty environment and may read only the hash-verified
-source Python/JDK/uv/JAR, committed toolchain/lock files, and offline uv cache;
-it may write only `<task>/runtime`. It copies `uv` first, verifies the copy, and
-uses only that copied binary for the offline venv/install commands. A missing
-wheel/cache entry is `BLOCKED`, never a download or ambient fallback.
-
-```text
-<task>/runtime/uv venv --offline --no-python-downloads --no-config \
-  --no-project --relocatable \
-  --python <task>/runtime/python/bin/python3.12 <task>/runtime/venv
-<task>/runtime/uv pip install --offline --no-python-downloads --no-config \
-  --require-hashes --only-binary :all: --link-mode copy --exact \
-  --python <task>/runtime/venv/bin/python \
-  -r requirements.lock -r requirements-ceq1.lock
-```
+The fixed runtime-preparation bootstrap runs once via `/usr/bin/sandbox-exec`
+under a no-network profile before copied role runtimes exist. It receives an
+empty environment and may read only the manifest-bound Task 1 sealed venv,
+JDK/JAR, derived wheelhouse, committed manifests, and locks; it may write only
+`<task>/runtime`. It copies and independently rehashes those artifacts, then
+compares the complete task-runtime manifest with the Task 1 source manifest.
+A missing entry, escaping link, mode drift, or digest mismatch is `BLOCKED`,
+never a rebuild, install, download, original-cache read, or ambient fallback.
 
 The outer unsandboxed supervisor never consumes case data or oracles. It owns
 only process setup, profiles, receipts, quarantine, and cleanup. It writes and
@@ -1017,7 +1138,9 @@ to `approved` in a separate commit before a canonical baseline run.
 Run:
 
 ```bash
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest -q -p no:cacheprovider \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_semantic_replay.py \
   tests/test_ceq1_stateful_replay.py
 ```
@@ -1330,7 +1453,14 @@ deterministically produces the sole combined evidence view.
 Report tests require `executionHead` plus non-self-referential
 `evidenceCarrierParent`, product
 source/production ancestor, toolchain/dependency/public-manifest/public-schedule/
-sealed-coverage/fixture/oracle/owner/projection hashes; the planned exact 19
+sealed-coverage/fixture/oracle/owner/projection hashes; and a path-free
+`sandboxPolicyReceiptDigest` over the rendered-profile hash plus a canonical
+logical-ID-to-realpath-parameter digest. The raw parameter map and absolute
+paths remain only in the ignored receipt; canonical, diagnostic, assembled,
+and committed reports carry the same opaque receipt digest, and
+`verify-report` must recompute it while the ignored receipt is available and
+otherwise verify its chain from the already verified parent report. Any digest
+mismatch or missing receipt is `INSTRUMENT_FAILURE`. Reports also require the planned exact 19
 scenarios/55 variants; canonical attempted cardinality through its first
 non-pass; diagnostic full closure and attempt cardinality; separate
 historical/current source labels; per-layer structured results;
@@ -1403,9 +1533,13 @@ rejection.
 Run:
 
 ```bash
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py preflight \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py preflight \
   --output .ceq1-runtime/preflight.json
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py calibrate \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py calibrate \
   --output .ceq1-runtime/calibration.json
 ```
 
@@ -1438,21 +1572,33 @@ test -z "$(git status --short)"
 Run:
 
 ```bash
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py run --tier all \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py run --tier all \
   --mode canonical --output .ceq1-runtime/canonical
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py verify-report \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py verify-report \
   .ceq1-runtime/canonical/report.json
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py run --tier all \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py run --tier all \
   --mode diagnostic-continuation --canonical-report \
   .ceq1-runtime/canonical/report.json --output .ceq1-runtime/diagnostic
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py verify-report \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py verify-report \
   .ceq1-runtime/diagnostic/report.json --canonical-report \
   .ceq1-runtime/canonical/report.json
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py assemble-evidence \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py assemble-evidence \
   --canonical-report .ceq1-runtime/canonical/report.json \
   --diagnostic-report .ceq1-runtime/diagnostic/report.json \
   --output .ceq1-runtime/assembled
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py verify-report \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  scripts/run_ceq1.py verify-report \
   .ceq1-runtime/assembled/report.json
 ```
 
@@ -1482,7 +1628,9 @@ diagnostic-report hash, and unchanged canonical verdict.
 Run:
 
 ```bash
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest -q -p no:cacheprovider \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_sandbox.py \
   tests/test_ceq1_semantic_replay.py tests/test_ceq1_stateful_replay.py \
   tests/test_ceq1_emulator_replay.py tests/test_ceq1_voice.py \
@@ -1490,11 +1638,16 @@ Run:
   tests/test_runtime_provider_initialization.py \
   tests/test_process_user_service.py
 
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest --noconftest --collect-only -q \
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  -m pytest --noconftest --collect-only -q \
   -p no:cacheprovider
 
-./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m py_compile \
-  tests/ceq1/*.py scripts/run_ceq1.py scripts/run_ceq1_env.py
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ./.ceq1-venv/python/bin/python3.12 -I -S -B scripts/run_ceq1_env.py \
+  -m py_compile \
+  tests/ceq1/*.py scripts/bootstrap_ceq1_runtime.py \
+  scripts/build_ceq1_wheelhouse.py scripts/run_ceq1.py scripts/run_ceq1_env.py
 git diff --check b400ee5..HEAD
 git status --short
 ```
