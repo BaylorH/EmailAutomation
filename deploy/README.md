@@ -306,7 +306,9 @@ prerequisite surfaces are already live, run
 The reviewed `--apply` mode is the only Phase 1 promotion path. It pins the
 rules, Hosting version/assets, both false campaign switches, exact private
 Cloud Run service and project-level invoker policies on the verified parentless
-project, prior revision/digest, all existing traffic tags, candidate
+project, the exact named operator account with no Cloud SDK access-token,
+credential-file, impersonation, account, or project override, prior
+revision/digest, all existing traffic tags, candidate
 digest/config/readiness, and the exact `graph-process-user` queue configuration.
 
 The controller pauses the queue and requires three empty task snapshots over at

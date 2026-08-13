@@ -66,6 +66,19 @@ EXPECTED_IAM = {
         "serviceAccount:248289505828-compute@developer.gserviceaccount.com",
     ),
 }
+AUTH_OVERRIDE_ENV = (
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_CORE_ACCOUNT",
+    "CLOUDSDK_CORE_PROJECT",
+)
+AUTH_OVERRIDE_PROPERTIES = (
+    "auth/impersonate_service_account",
+    "auth/access_token_file",
+    "auth/credential_file_override",
+)
 
 
 class RolloutError(RuntimeError):
@@ -76,6 +89,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
         del request, fp, code, message, headers, new_url
         return None
+
+
+def validate_auth_environment(environment: Mapping[str, str]) -> None:
+    if environment.get("GCLOUD_ACCOUNT") != ACCOUNT:
+        raise RolloutError("GCLOUD_ACCOUNT is not the approved account")
+    if any(environment.get(name) not in (None, "") for name in AUTH_OVERRIDE_ENV):
+        raise RolloutError("Cloud SDK authentication environment override is set")
 
 
 @dataclass(frozen=True)
@@ -654,6 +674,12 @@ class SubprocessOps:
             self._access_token = token
         return self._access_token
 
+    def _validate_gcloud_auth_config(self) -> None:
+        for property_name in AUTH_OVERRIDE_PROPERTIES:
+            value = self._gcloud(["config", "get-value", property_name], 30)
+            if value not in ("", "(unset)"):
+                raise RolloutError("Cloud SDK authentication config override is set")
+
     def _http_bytes(
         self, url: str, *, token: str | None = None, timeout: int = 20
     ) -> bytes:
@@ -684,10 +710,7 @@ class SubprocessOps:
             raise RolloutError("HTTP read returned invalid JSON") from error
 
     def preflight(self) -> None:
-        if os.environ.get("GCLOUD_ACCOUNT") != ACCOUNT:
-            raise RolloutError("GCLOUD_ACCOUNT is not the approved account")
-        if os.environ.get("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT"):
-            raise RolloutError("service-account impersonation is enabled")
+        validate_auth_environment(os.environ)
         if self._run(["git", "rev-parse", "HEAD"], 30) != self.head_sha:
             raise RolloutError("checkout HEAD changed")
         if self._run(["git", "status", "--porcelain=v1"], 30):
@@ -699,11 +722,7 @@ class SubprocessOps:
         ).split()
         if not remote or remote[0] != self.head_sha:
             raise RolloutError("remote branch does not equal HEAD")
-        impersonation = self._gcloud(
-            ["config", "get-value", "auth/impersonate_service_account"], 30
-        )
-        if impersonation not in ("", "(unset)"):
-            raise RolloutError("gcloud impersonation is configured")
+        self._validate_gcloud_auth_config()
         accounts = self._json_command(["auth", "list"], 30)
         active = [
             row.get("account")

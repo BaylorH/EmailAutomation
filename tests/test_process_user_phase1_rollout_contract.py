@@ -508,6 +508,32 @@ class StaticSafetyTests(unittest.TestCase):
 
 
 class AdapterContractTests(unittest.TestCase):
+    def test_cloud_sdk_auth_override_environment_is_closed(self):
+        phase1_rollout.validate_auth_environment({"GCLOUD_ACCOUNT": phase1_rollout.ACCOUNT})
+        for name in (
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CORE_PROJECT",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_auth_environment({
+                        "GCLOUD_ACCOUNT": phase1_rollout.ACCOUNT,
+                        name: "override",
+                    })
+
+    def test_cloud_sdk_auth_override_config_is_closed(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        with patch.object(ops, "_gcloud", return_value="(unset)") as gcloud:
+            ops._validate_gcloud_auth_config()
+        self.assertEqual(3, gcloud.call_count)
+        with patch.object(ops, "_gcloud", side_effect=["(unset)", "/tmp/token", "(unset)"]):
+            with self.assertRaises(phase1_rollout.RolloutError):
+                ops._validate_gcloud_auth_config()
+
     def test_iam_contract_is_exact_and_rejects_public_or_extra_members(self):
         exact = {
             "bindings": [{
