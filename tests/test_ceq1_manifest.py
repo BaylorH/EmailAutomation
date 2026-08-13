@@ -748,12 +748,16 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertIn('(literal "/dev/null")', template)
         self.assertIn('(subpath "{JDK_ROOT}")', template)
         self.assertIn('(literal "{FIRESTORE_JAR}")', template)
+        self.assertIn("{READ_ANCESTOR_RULES}", template)
         self.assertNotIn("/Users/", template)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             profile, receipt = self.bootstrap.render_bootstrap_profile(root)
             self.assertIn(str(root), profile)
             self.assertEqual(str(root), receipt["parameters"]["REPO"])
+            ancestors = receipt["parameters"]["READ_ANCESTOR_RULES"]
+            self.assertIn(str(root.parent), ancestors)
+            self.assertNotIn(str(root / ".git"), ancestors)
             self.assertRegex(receipt["renderedSha256"], r"^[0-9a-f]{64}$")
         outer_executable, outer_argv, outer_env = self.bootstrap.contained_launcher_contract(
             REPO_ROOT,
@@ -900,6 +904,34 @@ class Ceq1BootstrapTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(0, inherited.returncode, inherited.stderr)
+
+        ancestor_probe = (
+            "import importlib.util,os,sys;"
+            f"p={str(REPO_ROOT / 'scripts/bootstrap_ceq1_runtime.py')!r};"
+            "s=importlib.util.spec_from_file_location('ceq1_ancestor_probe',p);"
+            "m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;"
+            "s.loader.exec_module(m);"
+            "fd=m._open_directory_chain(m._repo_root()/'.ceq1-runtime');os.close(fd)"
+        )
+        opened = subprocess.run(
+            [
+                "/usr/bin/sandbox-exec",
+                "-p",
+                profile,
+                str(PINNED_PYTHON),
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                ancestor_probe,
+            ],
+            cwd=REPO_ROOT,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, opened.returncode, opened.stderr)
 
     def test_task_cache_clone_rebases_only_internal_absolute_links(self):
         with tempfile.TemporaryDirectory() as tmp:
