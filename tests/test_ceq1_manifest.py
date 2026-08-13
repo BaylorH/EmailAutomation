@@ -900,6 +900,7 @@ class Ceq1BootstrapTests(unittest.TestCase):
             mock.patch.object(self.bootstrap, "_sha256_file") as hash_file,
             mock.patch.object(self.bootstrap, "cache_metadata_receipt") as cache_receipt,
             mock.patch.object(self.bootstrap, "_ensure_private_root") as ensure_root,
+            mock.patch.object(self.bootstrap, "_close_non_stdio_fds") as close_fds,
             mock.patch.object(self.bootstrap.os, "execve", side_effect=sentinel),
         ):
             with self.assertRaisesRegex(RuntimeError, "execve boundary reached"):
@@ -907,6 +908,7 @@ class Ceq1BootstrapTests(unittest.TestCase):
         hash_file.assert_not_called()
         cache_receipt.assert_not_called()
         ensure_root.assert_not_called()
+        close_fds.assert_called_once_with()
 
     def test_outer_closes_inherited_descriptors_before_contained_exec(self):
         sentinel = RuntimeError("execve boundary reached")
