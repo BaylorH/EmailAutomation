@@ -748,18 +748,26 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertIn('(literal "/dev/null")', template)
         self.assertIn('(subpath "{JDK_ROOT}")', template)
         self.assertIn('(literal "{FIRESTORE_JAR}")', template)
+        self.assertIn('(literal "{RELOCATION}/venv/bin/python")', template)
         for required_input in ("INPUT_MANIFEST", "VERIFIER_SCRIPT", "WRAPPER_SCRIPT"):
             self.assertIn(f'(literal "{{{required_input}}}")', template)
         self.assertIn("{READ_ANCESTOR_RULES}", template)
         self.assertNotIn("/Users/", template)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            profile, receipt = self.bootstrap.render_bootstrap_profile(root)
+            relocation = root / ".ceq1-runtime/bootstrap-contract/relocation-proof"
+            profile, receipt = self.bootstrap.render_bootstrap_profile(
+                root, relocation_path=relocation
+            )
             self.assertIn(str(root), profile)
             self.assertEqual(str(root), receipt["parameters"]["REPO"])
             ancestors = receipt["parameters"]["READ_ANCESTOR_RULES"]
             self.assertIn(str(root.parent), ancestors)
             self.assertNotIn(str(root / ".git"), ancestors)
+            self.assertEqual(
+                str(relocation),
+                receipt["parameters"]["RELOCATION"],
+            )
             self.assertRegex(receipt["renderedSha256"], r"^[0-9a-f]{64}$")
         outer_executable, outer_argv, outer_env = self.bootstrap.contained_launcher_contract(
             REPO_ROOT,
