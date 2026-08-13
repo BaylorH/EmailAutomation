@@ -638,6 +638,10 @@ class Ceq1BootstrapTests(unittest.TestCase):
             cache_values = [item for item in command if item.startswith("UV_CACHE_DIR=")]
             self.assertEqual(1, len(cache_values))
             self.assertIn(".ceq1-runtime/bootstrap/uv-cache", cache_values[0])
+        for builder in (commands[1], commands[2]):
+            cache_root = builder[builder.index("--cache-root") + 1]
+            self.assertTrue(cache_root.endswith("/.ceq1-runtime/bootstrap/uv-cache"))
+            self.assertNotEqual(str(self.bootstrap.UV_CACHE), cache_root)
         compile_command = next(c for c in commands if "compile" in c)
         for flag in ("--offline", "--no-config", "--no-python-downloads", "--generate-hashes"):
             self.assertIn(flag, compile_command)
@@ -909,6 +913,7 @@ class Ceq1BootstrapTests(unittest.TestCase):
                 "algorithmVersion",
                 "artifacts",
                 "lockfiles",
+                "inputManifestSha256",
                 "wheelhouseManifestSha256",
                 "bootstrapSha256",
                 "builderSha256",
