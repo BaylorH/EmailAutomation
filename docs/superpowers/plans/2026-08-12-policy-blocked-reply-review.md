@@ -42,6 +42,23 @@ traffic cleanup, restore the old revision and `release-a`, and resume only after
 old topology/digest/health/IAM/switch/task proofs pass. If PAUSED itself is not
 proved, report queue state as unverified rather than claiming containment.
 
+After a complete read-only baseline/preflight and before pausing, acquire the
+fixed default-denied root Firestore lock `releaseLocks/processUserPhase1` with
+atomic create-if-absent, exact HEAD, and a random per-run nonce. Pin Firestore
+`updateTime`; assert exact nonce/HEAD/updateTime before and after every queue,
+tag, or traffic mutation, including cleanup. Never use TTL or automatic stale
+takeover. Prove exact operator get/create/delete permission before create.
+Reconcile an ambiguous create only by exact nonce readback; a different owner
+after any ambiguous create is manual recovery, not clean contention. Lock loss
+or unreadability means manual recovery with no further mutation. Delete only
+with the pinned `updateTime` and exact 404 proof after success or fully proven
+old-state recovery; preserve a still-owned lock on manual recovery and require
+manual process-death plus full-state proof before any orphan deletion. The only
+pre-reviewed orphan deletion mode, `--clear-orphan-lock-old-state`, requires the
+exact lock HEAD and nonce/updateTime, repeats the full old/RUNNING baseline plus
+empty task-list proof twice, and performs no queue, tag, traffic, provider, or
+mailbox mutation.
+
 For rollback, roll back or disable the backend producer first. Operators must retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain. Operators must never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row.
 
 Campaign suppression never replaces a reply-review recovery status. Temporary suppression preserves pending retryability for direct recovery after automation resumes; terminal suppression sets `retryable=false` while retaining the pending or manual status and writing only separate `automationSuppressed*` metadata.

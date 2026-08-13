@@ -37,6 +37,25 @@ digest, health, IAM, switches, and zero tasks are proven; otherwise the state is
 manual recovery and the controller must never claim that an unproved queue is
 paused.
 
+Before the first mutation, but only after a full read-only baseline and operator
+preflight, the controller atomically creates the fixed default-denied root
+Firestore lock `releaseLocks/processUserPhase1`. Its closed packet binds exact
+HEAD plus a cryptographic per-invocation nonce; Firestore `updateTime` fences
+every queue/tag/traffic mutation before and after. There is no TTL or automatic
+takeover. Before create, the exact operator must prove Firestore get/create/
+delete permission. Ambiguous create is accepted only on exact nonce readback;
+a different owner observed after any ambiguous create is itself manual recovery,
+not ordinary contention. Ownership
+loss or unreadability forbids cleanup and all further mutation. Successful or
+fully recovered old-state completion deletes with the exact `updateTime`
+precondition and proves 404. Crash/orphan recovery is manual after proving the
+prior process dead and reading every rollout surface; a manual-recovery exit
+retains any still-owned lock. The closed `--clear-orphan-lock-old-state` mode is
+the only pre-reviewed deletion lane: from the exact lock HEAD it repeats the
+complete old/RUNNING baseline and empty-task proof twice, reasserts the fence,
+then performs the conditional delete and canonical 404 readback without any
+queue, tag, traffic, provider, or mailbox mutation.
+
 For rollback, roll back or disable the backend producer first. Operators must retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain. Operators must never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row.
 
 ## Outcome

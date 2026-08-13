@@ -315,6 +315,45 @@ The exact queue contract also requires the whole queue-level `httpTarget` and
 App Engine routing override surfaces to be absent; URI, method, header,
 OAuth, or OIDC overrides all fail closed.
 
+After a complete read-only baseline/preflight, `--apply` atomically creates the
+fixed root Firestore document `releaseLocks/processUserPhase1`. The pinned live
+rules expose no browser read or write path for that root collection. The closed
+lock contains only a schema version, service, exact HEAD, and a cryptographically
+random per-run nonce. Every queue, tag, or traffic mutation is fenced before and
+after by the exact nonce plus Firestore `updateTime`; no TTL or automatic stale
+takeover exists. A competing invocation stops before mutation. An ambiguous
+create is adopted only when exact nonce readback proves this invocation owns it.
+Lock loss or unreadability stops every further mutation, including cleanup. A
+crash can intentionally leave the lock for manual inspection; never delete it
+until the prior process is proved dead and queue, traffic, tags, switches, and
+candidate state are read back. Release uses an `updateTime` precondition and
+requires exact 404 readback.
+
+Orphan removal is a separate explicit operator recovery action, never part of
+`--apply`. First prove the prior controller PID is gone, both campaign switches
+remain false, and record the exact queue, task-list, traffic/tag, old/candidate,
+rules, Hosting, IAM, and health state. Read the lock through the authenticated
+Firestore REST document URL and validate the same closed four-field packet;
+capture its exact `headSha`, `ownerNonce`, and server `updateTime` without
+printing the nonce. For the fully restored old revision plus RUNNING empty queue,
+check out that exact lock `headSha`, keep the approved account in
+`GCLOUD_ACCOUNT`, and run:
+
+```bash
+GCLOUD_ACCOUNT="bp21harrison@gmail.com" \
+  scripts/rollout_process_user_phase1.sh \
+  --clear-orphan-lock-old-state "$LOCK_HEAD" "$LOCK_NONCE" "$LOCK_UPDATE_TIME"
+```
+
+This closed recovery mode repeats the entire old-state baseline twice, requires
+an exact empty task-list snapshot in both passes, reasserts the exact nonce and
+`updateTime` after each pass, then conditionally deletes and proves the canonical
+404. It makes no queue, tag, traffic, campaign-switch, provider, or mailbox
+mutation and never prints the nonce. Any other contained state requires a
+separately reviewed recovery action; do not use a generic REST deletion. Never
+use an unconditional delete, guessed nonce/time, force overwrite, TTL, or
+stale-age heuristic.
+
 The controller pauses the queue and requires three empty task snapshots over at
 least ten seconds before creating a unique temporary certification tag. It
 requires unauthenticated Cloud Run rejection, exact legacy `/health`, and exact

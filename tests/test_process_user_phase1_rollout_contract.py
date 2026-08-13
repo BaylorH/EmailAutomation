@@ -1,5 +1,7 @@
 import ast
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
@@ -136,6 +138,26 @@ def queue(state="RUNNING"):
     }
 
 
+def lock_document(nonce="a" * 64, head="1" * 40, update_time="2026-08-12T00:00:00Z"):
+    return {
+        "name": phase1_rollout.LOCK_DOCUMENT_NAME,
+        "fields": {
+            "schemaVersion": {"integerValue": "1"},
+            "service": {"stringValue": "process-user"},
+            "headSha": {"stringValue": head},
+            "ownerNonce": {"stringValue": nonce},
+        },
+        "createTime": "2026-08-12T00:00:00Z",
+        "updateTime": update_time,
+    }
+
+
+def firestore_error(code, status):
+    return json.dumps(
+        {"error": {"code": code, "message": "generic", "status": status}}
+    ).encode()
+
+
 class FakeOps:
     def __init__(self):
         self.events = []
@@ -156,9 +178,46 @@ class FakeOps:
         self.fail_legacy_health_after = None
         self.identity_interrupt = False
         self.prerequisite_calls = 0
+        self.lock_held = False
+        self.lock_nonce = None
+        self.lock_assertions = 0
+        self.lose_lock_on_assert = None
+        self.fail_acquire_lock = False
+        self.acquire_error = None
 
     def preflight(self):
         self.events.append("preflight")
+
+    def verify_lock_permissions(self):
+        self.events.append("lock:permissions")
+
+    def acquire_lock(self, head_sha, nonce):
+        self.events.append("lock:acquire")
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        if self.fail_acquire_lock or self.lock_held:
+            raise phase1_rollout.RolloutLockHeld("lock unavailable")
+        self.lock_held = True
+        self.lock_nonce = nonce
+        return phase1_rollout.RolloutLock(
+            owner_nonce=nonce,
+            head_sha=head_sha,
+            update_time="2026-08-12T00:00:00Z",
+        )
+
+    def assert_lock(self, lock):
+        self.events.append("lock:assert")
+        self.lock_assertions += 1
+        if self.lose_lock_on_assert == self.lock_assertions:
+            self.lock_held = False
+        if not self.lock_held or lock.owner_nonce != self.lock_nonce:
+            raise phase1_rollout.RolloutLockLost("lock lost")
+
+    def release_lock(self, lock):
+        self.events.append("lock:release")
+        if not self.lock_held or lock.owner_nonce != self.lock_nonce:
+            raise phase1_rollout.RolloutLockLost("lock lost")
+        self.lock_held = False
 
     def verify_rules_ui_switches(self):
         self.prerequisite_calls += 1
@@ -353,12 +412,13 @@ class ValidatorTests(unittest.TestCase):
 
 
 class StateMachineTests(unittest.TestCase):
-    def make_rollout(self, ops):
+    def make_rollout(self, ops, nonce="a" * 64):
         sleeps = []
         rollout = phase1_rollout.Phase1Rollout(
             ops=ops,
             head_sha="1234567890abcdef1234567890abcdef12345678",
             sleeper=sleeps.append,
+            nonce_factory=lambda: nonce,
         )
         return rollout, sleeps
 
@@ -392,7 +452,166 @@ class StateMachineTests(unittest.TestCase):
         self.assertLess(ops.events.index("tag:add"), ops.events.index("tag:remove"))
         self.assertLess(ops.events.index("tag:remove"), ops.events.index("promote"))
         self.assertLess(ops.events.index("promote"), ops.events.index("resume"))
+        self.assertLess(ops.events.index("preflight"), ops.events.index("lock:acquire"))
+        self.assertLess(ops.events.index("lock:acquire"), ops.events.index("pause"))
+        self.assertEqual("lock:release", ops.events[-1])
+        self.assertFalse(ops.lock_held)
+        mutation_names = {
+            "pause", "resume", "tag:add", "tag:remove", "promote", "rollback"
+        }
+        for index, event in enumerate(ops.events):
+            if event in mutation_names:
+                with self.subTest(event=event, index=index):
+                    self.assertEqual("lock:assert", ops.events[index - 1])
+                    self.assertEqual("lock:assert", ops.events[index + 1])
         self.assertEqual("RUNNING", ops.queue["state"])
+
+    def test_competing_lock_stops_after_read_only_baseline(self):
+        ops = FakeOps()
+        ops.fail_acquire_lock = True
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaises(phase1_rollout.RolloutError):
+            rollout.apply()
+        self.assertIn("lock:acquire", ops.events)
+        self.assertFalse(
+            {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+            & set(ops.events)
+        )
+        self.assertEqual("RUNNING", ops.queue["state"])
+
+    def test_authoritative_lock_failures_do_not_enter_abort_or_retry_path(self):
+        for error in (
+            phase1_rollout.RolloutLockHeld("competing lock"),
+            phase1_rollout.RolloutError("rollout lock create was rejected"),
+        ):
+            with self.subTest(error=error):
+                ops = FakeOps()
+                ops.acquire_error = error
+                rollout, _ = self.make_rollout(ops)
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    rollout.apply()
+                self.assertEqual(1, ops.events.count("lock:acquire"))
+                self.assertNotIn("lock:abort", ops.events)
+                self.assertFalse(
+                    {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+                    & set(ops.events)
+                )
+
+    def test_lock_nonce_is_unique_input_not_head_identity(self):
+        first = FakeOps()
+        second = FakeOps()
+        first_rollout, _ = self.make_rollout(first, "a" * 64)
+        second_rollout, _ = self.make_rollout(second, "b" * 64)
+        first_rollout.apply()
+        second_rollout.apply()
+        self.assertEqual("a" * 64, first.lock_nonce)
+        self.assertEqual("b" * 64, second.lock_nonce)
+
+    def test_lock_loss_before_promotion_stops_without_cleanup_mutation(self):
+        ops = FakeOps()
+        ops.lose_lock_on_assert = 8
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaisesRegex(
+            phase1_rollout.RolloutError, "rollout lock ownership lost"
+        ):
+            rollout.apply()
+        lost_index = len(ops.events) - 1
+        self.assertEqual("lock:assert", ops.events[lost_index])
+        self.assertNotIn("promote", ops.events)
+        self.assertFalse(
+            {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+            & set(ops.events[lost_index + 1:])
+        )
+        self.assertTrue(ops.lock_held is False)
+
+    def test_lock_loss_after_promotion_never_rolls_back_or_resumes(self):
+        ops = FakeOps()
+        ops.lose_lock_on_assert = 14
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaisesRegex(
+            phase1_rollout.RolloutError, "rollout lock ownership lost"
+        ):
+            rollout.apply()
+        self.assertIn("promote", ops.events)
+        lost_index = len(ops.events) - 1
+        self.assertEqual("lock:assert", ops.events[lost_index])
+        self.assertFalse(
+            {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+            & set(ops.events[lost_index + 1:])
+        )
+
+    def test_manual_recovery_keeps_owned_lock_and_queue_paused(self):
+        ops = FakeOps()
+        ops.identity["revision"] = OLD_REVISION
+        ops.fail_remove = True
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
+            rollout.apply()
+        self.assertTrue(ops.lock_held)
+        self.assertNotIn("lock:release", ops.events)
+        self.assertEqual("PAUSED", ops.queue["state"])
+
+    def test_orphan_clear_requires_two_exact_old_state_proofs(self):
+        ops = FakeOps()
+        ops.lock_held = True
+        ops.lock_nonce = "a" * 64
+        lock = phase1_rollout.RolloutLock(
+            owner_nonce="a" * 64,
+            head_sha="1234567890abcdef1234567890abcdef12345678",
+            update_time="2026-08-12T00:00:00Z",
+        )
+        rollout, _ = self.make_rollout(ops)
+        rollout.clear_orphan_lock_old_state(lock)
+        self.assertEqual(2, ops.events.count("preflight"))
+        self.assertEqual("lock:release", ops.events[-1])
+        self.assertFalse(ops.lock_held)
+        self.assertFalse(
+            {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+            & set(ops.events)
+        )
+
+    def test_orphan_clear_refuses_non_old_state_without_deleting(self):
+        ops = FakeOps()
+        ops.lock_held = True
+        ops.lock_nonce = "a" * 64
+        ops.queue["state"] = "PAUSED"
+        lock = phase1_rollout.RolloutLock(
+            owner_nonce="a" * 64,
+            head_sha="1234567890abcdef1234567890abcdef12345678",
+            update_time="2026-08-12T00:00:00Z",
+        )
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaises(phase1_rollout.RolloutError):
+            rollout.clear_orphan_lock_old_state(lock)
+        self.assertNotIn("lock:release", ops.events)
+        self.assertTrue(ops.lock_held)
+
+    def test_orphan_clear_refuses_tasks_in_either_old_state_proof(self):
+        for task_snapshots in (
+            [[{"name": "opaque-task"}]],
+            [[], [{"name": "opaque-task"}]],
+        ):
+            with self.subTest(task_snapshots=task_snapshots):
+                ops = FakeOps()
+                ops.lock_held = True
+                ops.lock_nonce = "a" * 64
+                ops.task_snapshots = task_snapshots
+                lock = phase1_rollout.RolloutLock(
+                    owner_nonce="a" * 64,
+                    head_sha="1234567890abcdef1234567890abcdef12345678",
+                    update_time="2026-08-12T00:00:00Z",
+                )
+                rollout, _ = self.make_rollout(ops)
+                with self.assertRaisesRegex(
+                    phase1_rollout.RolloutError, "tasks are not empty"
+                ):
+                    rollout.clear_orphan_lock_old_state(lock)
+                self.assertNotIn("lock:release", ops.events)
+                self.assertTrue(ops.lock_held)
+                self.assertFalse(
+                    {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+                    & set(ops.events)
+                )
 
     def test_wrong_identity_removes_tag_and_resumes_without_traffic_mutation(self):
         ops = FakeOps()
@@ -417,7 +636,7 @@ class StateMachineTests(unittest.TestCase):
     def test_failed_old_health_during_cleanup_keeps_queue_paused(self):
         ops = FakeOps()
         ops.identity["revision"] = OLD_REVISION
-        ops.fail_legacy_health_after = 2
+        ops.fail_legacy_health_after = 5
         rollout, _ = self.make_rollout(ops)
         with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
             rollout.apply()
@@ -466,7 +685,7 @@ class StateMachineTests(unittest.TestCase):
 
     def test_prerequisite_drift_before_promotion_removes_tag_and_resumes_old(self):
         ops = FakeOps()
-        ops.fail_prerequisites_after = 1
+        ops.fail_prerequisites_after = 2
         rollout, _ = self.make_rollout(ops)
         with self.assertRaises(phase1_rollout.RolloutError):
             rollout.apply()
@@ -477,7 +696,7 @@ class StateMachineTests(unittest.TestCase):
     def test_prerequisite_drift_during_cleanup_keeps_queue_paused(self):
         ops = FakeOps()
         ops.identity["revision"] = OLD_REVISION
-        ops.fail_prerequisites_after = 1
+        ops.fail_prerequisites_after = 2
         rollout, _ = self.make_rollout(ops)
         with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
             rollout.apply()
@@ -495,7 +714,7 @@ class StateMachineTests(unittest.TestCase):
 
     def test_final_prerequisite_drift_after_resume_repauses_and_rolls_back(self):
         ops = FakeOps()
-        ops.fail_prerequisites_after = 3
+        ops.fail_prerequisites_after = 4
         rollout, _ = self.make_rollout(ops)
         with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
             rollout.apply()
@@ -548,8 +767,303 @@ class StaticSafetyTests(unittest.TestCase):
         self.assertNotIn("/process-user", string_values)
         self.assertFalse(any(value.startswith("/process-user?") for value in string_values))
 
+    def test_orphan_clear_cli_binds_exact_packet_without_printing_nonce(self):
+        head = "1" * 40
+        nonce = "a" * 64
+        update_time = "2026-08-12T00:00:00Z"
+        observed = []
+
+        class FakeRollout:
+            def __init__(self, *, ops, head_sha):
+                del ops
+                self.head_sha = head_sha
+
+            def clear_orphan_lock_old_state(self, lock):
+                observed.append(lock)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(phase1_rollout, "_current_head", return_value=head), patch.object(
+            phase1_rollout, "SubprocessOps", return_value=object()
+        ), patch.object(phase1_rollout, "Phase1Rollout", FakeRollout), redirect_stdout(
+            stdout
+        ), redirect_stderr(stderr):
+            result = phase1_rollout.main(
+                ["--clear-orphan-lock-old-state", head, nonce, update_time]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            [phase1_rollout.RolloutLock(nonce, head, update_time)], observed
+        )
+        self.assertNotIn(nonce, stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
 
 class AdapterContractTests(unittest.TestCase):
+    def test_lock_permissions_are_exact_before_create(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        exact = json.dumps(
+            {"permissions": list(phase1_rollout.LOCK_PERMISSIONS)}
+        ).encode()
+        with patch.object(
+            ops, "_firestore_exchange", return_value=(200, exact)
+        ):
+            ops.verify_lock_permissions()
+        reordered = json.dumps(
+            {"permissions": list(reversed(phase1_rollout.LOCK_PERMISSIONS))}
+        ).encode()
+        with patch.object(
+            ops, "_firestore_exchange", return_value=(200, reordered)
+        ):
+            ops.verify_lock_permissions()
+        for value in (
+            {"permissions": list(phase1_rollout.LOCK_PERMISSIONS[:-1])},
+            {"permissions": [*phase1_rollout.LOCK_PERMISSIONS, "extra"]},
+            {"permissions": [phase1_rollout.LOCK_PERMISSIONS[0]] * 3},
+            {"permissions": [{"unexpected": "shape"}] * 3},
+        ):
+            with self.subTest(value=value), patch.object(
+                ops,
+                "_firestore_exchange",
+                return_value=(200, json.dumps(value).encode()),
+            ):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    ops.verify_lock_permissions()
+
+    def test_ambiguous_create_retries_once_only_after_canonical_not_found(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            side_effect=[
+                phase1_rollout.FirestoreExchangeError(None),
+                (404, firestore_error(404, "NOT_FOUND")),
+                (200, json.dumps(lock_document()).encode()),
+            ],
+        ) as exchange:
+            lock = ops.acquire_lock("1" * 40, "a" * 64)
+        self.assertEqual("a" * 64, lock.owner_nonce)
+        self.assertEqual(3, exchange.call_count)
+
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            side_effect=[
+                phase1_rollout.FirestoreExchangeError(None),
+                (404, b""),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                phase1_rollout.RolloutError, "acquisition unverified"
+            ):
+                ops.acquire_lock("1" * 40, "a" * 64)
+
+    def test_ambiguous_create_never_treats_competing_owner_as_safe(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        competitor = (200, json.dumps(lock_document(nonce="b" * 64)).encode())
+        cases = (
+            [phase1_rollout.FirestoreExchangeError(None), competitor],
+            [
+                phase1_rollout.FirestoreExchangeError(None),
+                (404, firestore_error(404, "NOT_FOUND")),
+                phase1_rollout.FirestoreExchangeError(None),
+                competitor,
+            ],
+            [KeyboardInterrupt(), competitor],
+        )
+        for outcomes in cases:
+            with self.subTest(outcomes=outcomes), patch.object(
+                ops, "_firestore_exchange", side_effect=outcomes
+            ):
+                with self.assertRaisesRegex(
+                    phase1_rollout.RolloutError,
+                    "MANUAL_RECOVERY: rollout lock acquisition unverified",
+                ):
+                    ops.acquire_lock("1" * 40, "a" * 64)
+
+    def test_authoritative_first_conflict_never_adopts_same_nonce(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            return_value=(409, firestore_error(409, "ALREADY_EXISTS")),
+        ) as exchange:
+            with self.assertRaises(phase1_rollout.RolloutLockHeld):
+                ops.acquire_lock("1" * 40, "a" * 64)
+        self.assertEqual(1, exchange.call_count)
+
+    def test_lock_document_contract_is_closed_and_update_time_fenced(self):
+        exact = lock_document()
+        lock = phase1_rollout.validate_lock_document(
+            exact, owner_nonce="a" * 64, head_sha="1" * 40
+        )
+        self.assertEqual("2026-08-12T00:00:00Z", lock.update_time)
+        for bad in (
+            {**exact, "extra": True},
+            {**exact, "name": exact["name"] + "-other"},
+            {**exact, "fields": {**exact["fields"], "extra": {"stringValue": "x"}}},
+            {**exact, "fields": {**exact["fields"], "ownerNonce": {"stringValue": "b" * 64}}},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_lock_document(
+                        bad, owner_nonce="a" * 64, head_sha="1" * 40
+                    )
+
+    def test_ambiguous_lock_create_adopts_only_exact_nonce_document(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            side_effect=[
+                phase1_rollout.FirestoreExchangeError(None),
+                (200, json.dumps(lock_document()).encode()),
+            ],
+        ):
+            lock = ops.acquire_lock("1" * 40, "a" * 64)
+        self.assertEqual("a" * 64, lock.owner_nonce)
+
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            side_effect=[
+                phase1_rollout.FirestoreExchangeError(None),
+                (200, json.dumps(lock_document(nonce="b" * 64)).encode()),
+            ],
+        ):
+            with self.assertRaises(phase1_rollout.RolloutError):
+                ops.acquire_lock("1" * 40, "a" * 64)
+
+        for invalid in (b"not-json", json.dumps({"name": "wrong"}).encode()):
+            with self.subTest(invalid=invalid):
+                with patch.object(
+                    ops,
+                    "_firestore_exchange",
+                    side_effect=[
+                        phase1_rollout.FirestoreExchangeError(None),
+                        (200, invalid),
+                    ],
+                ):
+                    with self.assertRaisesRegex(
+                        phase1_rollout.RolloutError, "acquisition unverified"
+                    ):
+                        ops.acquire_lock("1" * 40, "a" * 64)
+
+    def test_interrupted_lock_create_releases_exact_nonce_and_never_proceeds(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            side_effect=[
+                KeyboardInterrupt(),
+                (200, json.dumps(lock_document()).encode()),
+                (200, json.dumps(lock_document()).encode()),
+                (200, b"{}"),
+                (404, firestore_error(404, "NOT_FOUND")),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                phase1_rollout.RolloutError, "interrupted safely"
+            ):
+                ops.acquire_lock("1" * 40, "a" * 64)
+
+        for invalid in (b"not-json", json.dumps({"name": "wrong"}).encode()):
+            with self.subTest(invalid=invalid):
+                with patch.object(
+                    ops,
+                    "_firestore_exchange",
+                    side_effect=[KeyboardInterrupt(), (200, invalid)],
+                ):
+                    with self.assertRaisesRegex(
+                        phase1_rollout.RolloutError, "acquisition unverified"
+                    ):
+                        ops.acquire_lock("1" * 40, "a" * 64)
+
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            side_effect=[KeyboardInterrupt(), KeyboardInterrupt()],
+        ):
+            with self.assertRaisesRegex(
+                phase1_rollout.RolloutError, "acquisition unverified"
+            ):
+                ops.acquire_lock("1" * 40, "a" * 64)
+
+    def test_controller_interrupted_create_never_mutates_queue_tag_or_traffic(self):
+        ops = FakeOps()
+
+        def interrupt_acquire(head_sha, nonce):
+            del head_sha, nonce
+            raise phase1_rollout.RolloutError("rollout interrupted safely")
+
+        ops.acquire_lock = interrupt_acquire
+        rollout, _ = StateMachineTests().make_rollout(ops)
+        with self.assertRaisesRegex(
+            phase1_rollout.RolloutError, "interrupted safely"
+        ):
+            rollout.apply()
+        self.assertFalse(
+            {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+            & set(ops.events)
+        )
+
+    def test_lock_release_requires_conditional_delete_and_exact_reconciliation(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        lock = phase1_rollout.RolloutLock(
+            owner_nonce="a" * 64,
+            head_sha="1" * 40,
+            update_time="2026-08-12T00:00:00Z",
+        )
+        exchanges = [
+            (200, json.dumps(lock_document()).encode()),
+            (200, b"{}"),
+            (404, firestore_error(404, "NOT_FOUND")),
+        ]
+        with patch.object(ops, "_firestore_exchange", side_effect=exchanges) as exchange:
+            ops.release_lock(lock)
+        delete_call = exchange.call_args_list[1]
+        self.assertEqual("DELETE", delete_call.args[0])
+        self.assertIn("currentDocument.updateTime=", delete_call.args[1])
+
+    def test_lock_release_unknown_readback_is_manual_recovery(self):
+        ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
+        lock = phase1_rollout.RolloutLock(
+            owner_nonce="a" * 64,
+            head_sha="1" * 40,
+            update_time="2026-08-12T00:00:00Z",
+        )
+        with patch.object(
+            ops,
+            "_firestore_exchange",
+            side_effect=[
+                (200, json.dumps(lock_document()).encode()),
+                phase1_rollout.FirestoreExchangeError(None),
+                phase1_rollout.FirestoreExchangeError(None),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                phase1_rollout.RolloutError, "release unverified"
+            ):
+                ops.release_lock(lock)
+
+    def test_successful_rollout_release_interrupt_is_manual_recovery(self):
+        ops = FakeOps()
+        original_release = ops.release_lock
+
+        def interrupt_release(lock):
+            original_release(lock)
+            raise KeyboardInterrupt()
+
+        ops.release_lock = interrupt_release
+        rollout, _ = StateMachineTests().make_rollout(ops)
+        with self.assertRaisesRegex(
+            phase1_rollout.RolloutError, "lock release unverified"
+        ):
+            rollout.apply()
+        self.assertEqual("RUNNING", ops.queue["state"])
+        self.assertEqual(service(CANDIDATE, CANDIDATE), ops.service)
+
     def test_firestore_rules_source_is_exactly_one_closed_file(self):
         content = "rules_version = '2';\n"
         exact = {"files": [{"name": "firestore.rules", "content": content}]}

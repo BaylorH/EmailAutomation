@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -58,9 +59,35 @@ AUX_TAGS = {
 QUEUE_NAME = (
     "projects/email-automation-cache/locations/us-central1/queues/graph-process-user"
 )
+LOCK_DOCUMENT_ID = "processUserPhase1"
+LOCK_DOCUMENT_NAME = (
+    f"projects/{PROJECT}/databases/(default)/documents/"
+    f"releaseLocks/{LOCK_DOCUMENT_ID}"
+)
+LOCK_COLLECTION_URL = (
+    f"https://firestore.googleapis.com/v1/projects/{PROJECT}/"
+    "databases/(default)/documents/releaseLocks"
+)
+LOCK_DOCUMENT_URL = (
+    f"https://firestore.googleapis.com/v1/{LOCK_DOCUMENT_NAME}"
+)
+LOCK_PERMISSION_URL = (
+    f"https://cloudresourcemanager.googleapis.com/v1/projects/{PROJECT}:"
+    "testIamPermissions"
+)
+LOCK_PERMISSIONS = (
+    "datastore.entities.create",
+    "datastore.entities.delete",
+    "datastore.entities.get",
+)
 TAG_RE = re.compile(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+NONCE_RE = re.compile(r"[0-9a-f]{64}")
+UPDATE_TIME_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?Z"
+)
 EXPECTED_IAM = {
     "roles/run.invoker": (
         "serviceAccount:248289505828-compute@developer.gserviceaccount.com",
@@ -92,6 +119,29 @@ class RolloutError(RuntimeError):
     """A content-free, operator-safe rollout failure."""
 
 
+class RolloutLockLost(RolloutError):
+    """The durable rollout fencing record is absent, changed, or unreadable."""
+
+
+class RolloutLockHeld(RolloutError):
+    """Another exact invocation owns the durable rollout lock."""
+
+
+class FirestoreExchangeError(RolloutError):
+    """A Firestore HTTP exchange ended without an authoritative response."""
+
+    def __init__(self, status: int | None) -> None:
+        super().__init__("Firestore lock exchange failed")
+        self.status = status
+
+
+@dataclass(frozen=True)
+class RolloutLock:
+    owner_nonce: str
+    head_sha: str
+    update_time: str
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
         del request, fp, code, message, headers, new_url
@@ -118,6 +168,64 @@ def validate_rules_source(source: Any) -> None:
     content = row.get("content")
     if not isinstance(content, str) or hashlib.sha256(content.encode()).hexdigest() != RULES_HASH:
         raise RolloutError("live Firestore rules hash is wrong")
+
+
+def parse_lock_document(value: Any) -> RolloutLock:
+    value = _object(value, "rollout lock document")
+    if set(value) != {"name", "fields", "createTime", "updateTime"}:
+        raise RolloutError("rollout lock document shape is not closed")
+    if value.get("name") != LOCK_DOCUMENT_NAME:
+        raise RolloutError("rollout lock document name is wrong")
+    fields = _object(value.get("fields"), "rollout lock fields")
+    if set(fields) != {"schemaVersion", "service", "headSha", "ownerNonce"}:
+        raise RolloutError("rollout lock ownership packet is wrong")
+    if (
+        fields.get("schemaVersion") != {"integerValue": "1"}
+        or fields.get("service") != {"stringValue": SERVICE}
+    ):
+        raise RolloutError("rollout lock ownership packet is wrong")
+    head_value = fields.get("headSha")
+    nonce_value = fields.get("ownerNonce")
+    if not isinstance(head_value, dict) or not isinstance(nonce_value, dict):
+        raise RolloutError("rollout lock identity fields are invalid")
+    head_sha = head_value.get("stringValue")
+    owner_nonce = nonce_value.get("stringValue")
+    if (
+        set(head_value) != {"stringValue"}
+        or set(nonce_value) != {"stringValue"}
+        or not isinstance(head_sha, str)
+        or SHA_RE.fullmatch(head_sha) is None
+        or not isinstance(owner_nonce, str)
+        or NONCE_RE.fullmatch(owner_nonce) is None
+    ):
+        raise RolloutError("rollout lock identity is invalid")
+    create_time = value.get("createTime")
+    observed_update_time = value.get("updateTime")
+    if (
+        not isinstance(create_time, str)
+        or UPDATE_TIME_RE.fullmatch(create_time) is None
+        or not isinstance(observed_update_time, str)
+        or UPDATE_TIME_RE.fullmatch(observed_update_time) is None
+    ):
+        raise RolloutError("rollout lock timestamps are invalid")
+    return RolloutLock(owner_nonce, head_sha, observed_update_time)
+
+
+def validate_lock_document(
+    value: Any,
+    *,
+    owner_nonce: str,
+    head_sha: str,
+    update_time: str | None = None,
+) -> RolloutLock:
+    observed = parse_lock_document(value)
+    if (
+        observed.owner_nonce != owner_nonce
+        or observed.head_sha != head_sha
+        or (update_time is not None and observed.update_time != update_time)
+    ):
+        raise RolloutError("rollout lock ownership or updateTime changed")
+    return observed
 
 
 @dataclass(frozen=True)
@@ -421,6 +529,7 @@ class Phase1Rollout:
         ops: Any,
         head_sha: str,
         sleeper: Callable[[float], None] = time.sleep,
+        nonce_factory: Callable[[], str] | None = None,
     ) -> None:
         if SHA_RE.fullmatch(head_sha) is None:
             raise RolloutError("HEAD is not an exact lowercase SHA")
@@ -430,6 +539,7 @@ class Phase1Rollout:
         self.candidate = f"{SERVICE}-stage-{self.short_sha}"
         self.cert_tag = f"phase1-cert-{self.short_sha}"
         self.sleeper = sleeper
+        self.nonce_factory = nonce_factory or (lambda: secrets.token_hex(32))
         self.task_observed = False
 
     def dry_run(self) -> str:
@@ -438,8 +548,22 @@ class Phase1Rollout:
             "queue remains RUNNING; traffic and tags remain unchanged"
         )
 
+    def clear_orphan_lock_old_state(self, lock: RolloutLock) -> None:
+        if lock.head_sha != self.head_sha:
+            raise RolloutError("orphan lock HEAD does not equal checkout HEAD")
+        self._baseline()
+        if not self._tasks_are_empty():
+            raise RolloutError("orphan lock tasks are not empty")
+        self.ops.assert_lock(lock)
+        self._baseline()
+        if not self._tasks_are_empty():
+            raise RolloutError("orphan lock tasks are not empty")
+        self.ops.assert_lock(lock)
+        self.ops.release_lock(lock)
+
     def _baseline(self) -> tuple[Any, Any, str]:
         self.ops.preflight()
+        self.ops.verify_lock_permissions()
         self.ops.verify_rules_ui_switches()
         image = self.ops.artifact_image()
         if not isinstance(image, str) or not image.startswith(IMAGE_REPOSITORY + "@"):
@@ -476,31 +600,49 @@ class Phase1Rollout:
             return False
         return True
 
+    def _locked_mutation(
+        self, lock: RolloutLock, operation: Callable[[], None]
+    ) -> None:
+        self.ops.assert_lock(lock)
+        operation()
+        self.ops.assert_lock(lock)
+
     def _cleanup_failure(
         self,
         *,
         pause_attempted: bool,
         tag_attempted: bool,
         traffic_attempted: bool,
+        lock: RolloutLock,
     ) -> bool:
         if not pause_attempted:
             return True
         cleanup_ok = True
         try:
-            self.ops.pause_queue()
+            self._locked_mutation(lock, self.ops.pause_queue)
             validate_queue(self.ops.get_queue(), "PAUSED")
+        except RolloutLockLost:
+            raise
         except BaseException:
             raise RolloutError("MANUAL_RECOVERY: queue state unverified")
         if tag_attempted:
             try:
-                self.ops.remove_cert_tag(self.cert_tag)
+                self._locked_mutation(
+                    lock, lambda: self.ops.remove_cert_tag(self.cert_tag)
+                )
+            except RolloutLockLost:
+                raise
             except BaseException:
                 cleanup_ok = False
         if traffic_attempted:
             try:
-                self.ops.pause_queue()
+                self._locked_mutation(lock, self.ops.pause_queue)
                 validate_queue(self.ops.get_queue(), "PAUSED")
-                self.ops.rollback(OLD_REVISION, self.candidate)
+                self._locked_mutation(
+                    lock, lambda: self.ops.rollback(OLD_REVISION, self.candidate)
+                )
+            except RolloutLockLost:
+                raise
             except BaseException:
                 cleanup_ok = False
         try:
@@ -530,14 +672,18 @@ class Phase1Rollout:
             cleanup_ok = False
         if cleanup_ok:
             try:
-                self.ops.pause_queue()
+                self._locked_mutation(lock, self.ops.pause_queue)
                 validate_queue(self.ops.get_queue(), "PAUSED")
-                self.ops.resume_queue()
+                self._locked_mutation(lock, self.ops.resume_queue)
                 validate_queue(self.ops.get_queue(), "RUNNING")
+            except RolloutLockLost:
+                raise
             except BaseException:
                 try:
-                    self.ops.pause_queue()
+                    self._locked_mutation(lock, self.ops.pause_queue)
                     validate_queue(self.ops.get_queue(), "PAUSED")
+                except RolloutLockLost:
+                    raise
                 except BaseException as error:
                     raise RolloutError(
                         "MANUAL_RECOVERY: queue state unverified"
@@ -545,8 +691,10 @@ class Phase1Rollout:
                 return False
         else:
             try:
-                self.ops.pause_queue()
+                self._locked_mutation(lock, self.ops.pause_queue)
                 validate_queue(self.ops.get_queue(), "PAUSED")
+            except RolloutLockLost:
+                raise
             except BaseException as error:
                 raise RolloutError(
                     "MANUAL_RECOVERY: queue state unverified"
@@ -557,10 +705,25 @@ class Phase1Rollout:
         pause_attempted = False
         tag_attempted = False
         traffic_attempted = False
+        lock: RolloutLock | None = None
+        release_lock = False
         try:
             self._baseline()
+            nonce = self.nonce_factory()
+            if not isinstance(nonce, str) or NONCE_RE.fullmatch(nonce) is None:
+                raise RolloutError("rollout lock nonce is invalid")
+            prior_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+            )
+            try:
+                lock = self.ops.acquire_lock(self.head_sha, nonce)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+            self.ops.assert_lock(lock)
+            self._baseline()
+            self.ops.assert_lock(lock)
             pause_attempted = True
-            self.ops.pause_queue()
+            self._locked_mutation(lock, self.ops.pause_queue)
             validate_queue(self.ops.get_queue(), "PAUSED")
             for index in range(3):
                 validate_queue(self.ops.get_queue(), "PAUSED")
@@ -570,7 +733,9 @@ class Phase1Rollout:
                     self.sleeper(5)
 
             tag_attempted = True
-            self.ops.add_cert_tag(self.cert_tag, self.candidate)
+            self._locked_mutation(
+                lock, lambda: self.ops.add_cert_tag(self.cert_tag, self.candidate)
+            )
             validate_queue(self.ops.get_queue(), "PAUSED")
             if not self._tasks_are_empty():
                 raise RolloutError("task appeared while queue was paused")
@@ -591,7 +756,9 @@ class Phase1Rollout:
                 self.ops.identity_get(cert_url, tagged.service_url), self.candidate
             )
 
-            self.ops.remove_cert_tag(self.cert_tag)
+            self._locked_mutation(
+                lock, lambda: self.ops.remove_cert_tag(self.cert_tag)
+            )
             validate_topology(
                 self.ops.get_service(),
                 expected_positive=OLD_REVISION,
@@ -602,12 +769,14 @@ class Phase1Rollout:
             if not self._tasks_are_empty():
                 raise RolloutError("task appeared before promotion")
             self.ops.verify_rules_ui_switches()
-            self.ops.pause_queue()
+            self._locked_mutation(lock, self.ops.pause_queue)
             validate_queue(self.ops.get_queue(), "PAUSED")
             if not self._tasks_are_empty():
                 raise RolloutError("task appeared immediately before promotion")
             traffic_attempted = True
-            self.ops.promote(self.candidate, OLD_REVISION)
+            self._locked_mutation(
+                lock, lambda: self.ops.promote(self.candidate, OLD_REVISION)
+            )
             promoted = validate_topology(
                 self.ops.get_service(),
                 expected_positive=self.candidate,
@@ -647,29 +816,58 @@ class Phase1Rollout:
             if not self._tasks_are_empty():
                 raise RolloutError("task appeared before queue resume")
             self.ops.verify_rules_ui_switches()
-            self.ops.pause_queue()
+            self._locked_mutation(lock, self.ops.pause_queue)
             validate_queue(self.ops.get_queue(), "PAUSED")
             if not self._tasks_are_empty():
                 raise RolloutError("task appeared immediately before queue resume")
-            self.ops.resume_queue()
+            self._locked_mutation(lock, self.ops.resume_queue)
             validate_queue(self.ops.get_queue(), "RUNNING")
             self.ops.verify_rules_ui_switches()
+            self.ops.assert_lock(lock)
+            release_lock = True
+        except RolloutLockLost as error:
+            raise RolloutError(
+                "MANUAL_RECOVERY: rollout lock ownership lost; queue state unverified"
+            ) from error
         except BaseException as error:
+            if lock is not None:
+                try:
+                    self.ops.assert_lock(lock)
+                except RolloutLockLost as lock_error:
+                    raise RolloutError(
+                        "MANUAL_RECOVERY: rollout lock ownership lost; "
+                        "queue state unverified"
+                    ) from lock_error
             try:
                 cleanup_ok = self._cleanup_failure(
                     pause_attempted=pause_attempted,
                     tag_attempted=tag_attempted,
                     traffic_attempted=traffic_attempted,
+                    lock=lock,
                 )
+            except RolloutLockLost as lock_error:
+                raise RolloutError(
+                    "MANUAL_RECOVERY: rollout lock ownership lost; "
+                    "queue state unverified"
+                ) from lock_error
             except RolloutError:
                 raise
             if not cleanup_ok:
                 raise RolloutError("MANUAL_RECOVERY: queue left paused") from error
+            release_lock = lock is not None
             if isinstance(error, RolloutError):
                 raise
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise RolloutError("rollout interrupted safely") from error
             raise RolloutError("rollout failed safely") from error
+        finally:
+            if lock is not None and release_lock:
+                try:
+                    self.ops.release_lock(lock)
+                except BaseException as error:
+                    raise RolloutError(
+                        "MANUAL_RECOVERY: rollout lock release unverified"
+                    ) from error
 
 
 class SubprocessOps:
@@ -752,6 +950,309 @@ class SubprocessOps:
             return json.loads(self._http_bytes(url, token=token))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise RolloutError("HTTP read returned invalid JSON") from error
+
+    def _firestore_exchange(
+        self, method: str, url: str, body: bytes | None = None
+    ) -> tuple[int, bytes]:
+        if method not in {"GET", "POST", "DELETE"}:
+            raise RolloutError("Firestore lock method is invalid")
+        headers = {
+            "Authorization": f"Bearer {self._token()}",
+            "Cache-Control": "no-cache",
+            "x-goog-user-project": PROJECT,
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            url, headers=headers, data=body, method=method
+        )
+        try:
+            with urllib.request.build_opener(_NoRedirect()).open(
+                request, timeout=20
+            ) as response:
+                if response.geturl() != url:
+                    raise FirestoreExchangeError(response.status)
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read()
+        except (OSError, urllib.error.URLError) as error:
+            raise FirestoreExchangeError(None) from error
+
+    @staticmethod
+    def _decode_firestore_document(raw: bytes) -> Any:
+        try:
+            return json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RolloutError("Firestore lock document is invalid JSON") from error
+
+    @staticmethod
+    def _is_google_error(
+        status: int, raw: bytes, *, code: int, name: str
+    ) -> bool:
+        if status != code:
+            return False
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(value, dict) or set(value) != {"error"}:
+            return False
+        error = value.get("error")
+        return (
+            isinstance(error, dict)
+            and set(error) == {"code", "message", "status"}
+            and error.get("code") == code
+            and isinstance(error.get("message"), str)
+            and error.get("status") == name
+        )
+
+    def verify_lock_permissions(self) -> None:
+        body = json.dumps(
+            {"permissions": list(LOCK_PERMISSIONS)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        try:
+            status, raw = self._firestore_exchange(
+                "POST", LOCK_PERMISSION_URL, body
+            )
+            value = json.loads(raw) if status == 200 else None
+        except (FirestoreExchangeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RolloutError("rollout lock permissions are unverified") from error
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"permissions"}
+            or not isinstance(value.get("permissions"), list)
+            or len(value["permissions"]) != len(LOCK_PERMISSIONS)
+            or not all(isinstance(item, str) for item in value["permissions"])
+            or set(value["permissions"]) != set(LOCK_PERMISSIONS)
+        ):
+            raise RolloutError("rollout lock permissions are not exact")
+
+    def _observe_lock(
+        self, *, owner_nonce: str, head_sha: str
+    ) -> RolloutLock | None:
+        try:
+            status, raw = self._firestore_exchange("GET", LOCK_DOCUMENT_URL)
+        except BaseException as error:
+            raise RolloutError(
+                "MANUAL_RECOVERY: rollout lock acquisition unverified"
+            ) from error
+        if self._is_google_error(status, raw, code=404, name="NOT_FOUND"):
+            return None
+        if status != 200:
+            raise RolloutError(
+                "MANUAL_RECOVERY: rollout lock acquisition unverified"
+            )
+        try:
+            observed = parse_lock_document(self._decode_firestore_document(raw))
+        except RolloutError as error:
+            raise RolloutError(
+                "MANUAL_RECOVERY: rollout lock acquisition unverified"
+            ) from error
+        if observed.owner_nonce == owner_nonce and observed.head_sha == head_sha:
+            return observed
+        raise RolloutLockHeld("rollout lock is held by another invocation")
+
+    def _resolve_ambiguous_lock_create(
+        self,
+        *,
+        body: bytes,
+        create_url: str,
+        owner_nonce: str,
+        head_sha: str,
+    ) -> RolloutLock:
+        try:
+            observed = self._observe_lock(
+                owner_nonce=owner_nonce, head_sha=head_sha
+            )
+        except RolloutLockHeld as error:
+            raise RolloutError(
+                "MANUAL_RECOVERY: rollout lock acquisition unverified"
+            ) from error
+        if observed is not None:
+            return observed
+        try:
+            status, raw = self._firestore_exchange("POST", create_url, body)
+        except BaseException:
+            status, raw = -1, b""
+        if status == 200:
+            try:
+                return validate_lock_document(
+                    self._decode_firestore_document(raw),
+                    owner_nonce=owner_nonce,
+                    head_sha=head_sha,
+                )
+            except RolloutError:
+                pass
+        elif self._is_google_error(status, raw, code=409, name="ALREADY_EXISTS"):
+            pass
+        try:
+            observed = self._observe_lock(
+                owner_nonce=owner_nonce, head_sha=head_sha
+            )
+        except RolloutLockHeld as error:
+            raise RolloutError(
+                "MANUAL_RECOVERY: rollout lock acquisition unverified"
+            ) from error
+        if observed is not None:
+            return observed
+        raise RolloutError("MANUAL_RECOVERY: rollout lock acquisition unverified")
+
+    def _reconcile_interrupted_lock_create(
+        self,
+        *,
+        body: bytes,
+        create_url: str,
+        owner_nonce: str,
+        head_sha: str,
+    ) -> None:
+        lock = self._resolve_ambiguous_lock_create(
+            body=body,
+            create_url=create_url,
+            owner_nonce=owner_nonce,
+            head_sha=head_sha,
+        )
+        try:
+            self.release_lock(lock)
+        except BaseException as error:
+            raise RolloutError(
+                "MANUAL_RECOVERY: rollout lock acquisition unverified"
+            ) from error
+        raise RolloutError("rollout interrupted safely")
+
+    def acquire_lock(self, head_sha: str, owner_nonce: str) -> RolloutLock:
+        if SHA_RE.fullmatch(head_sha) is None or NONCE_RE.fullmatch(owner_nonce) is None:
+            raise RolloutError("rollout lock identity is invalid")
+        body = json.dumps(
+            {
+                "fields": {
+                    "schemaVersion": {"integerValue": "1"},
+                    "service": {"stringValue": SERVICE},
+                    "headSha": {"stringValue": head_sha},
+                    "ownerNonce": {"stringValue": owner_nonce},
+                }
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        create_url = LOCK_COLLECTION_URL + "?" + urllib.parse.urlencode(
+            {"documentId": LOCK_DOCUMENT_ID}
+        )
+        try:
+            status, raw = self._firestore_exchange("POST", create_url, body)
+            if status == 200:
+                try:
+                    return validate_lock_document(
+                        self._decode_firestore_document(raw),
+                        owner_nonce=owner_nonce,
+                        head_sha=head_sha,
+                    )
+                except RolloutError:
+                    return self._resolve_ambiguous_lock_create(
+                        body=body,
+                        create_url=create_url,
+                        owner_nonce=owner_nonce,
+                        head_sha=head_sha,
+                    )
+            if self._is_google_error(status, raw, code=409, name="ALREADY_EXISTS"):
+                raise RolloutLockHeld("rollout lock is held by another invocation")
+            if status in {400, 401, 403, 404} and self._is_google_error(
+                status,
+                raw,
+                code=status,
+                name={
+                    400: "INVALID_ARGUMENT",
+                    401: "UNAUTHENTICATED",
+                    403: "PERMISSION_DENIED",
+                    404: "NOT_FOUND",
+                }[status],
+            ):
+                raise RolloutError("rollout lock create was rejected")
+            return self._resolve_ambiguous_lock_create(
+                body=body,
+                create_url=create_url,
+                owner_nonce=owner_nonce,
+                head_sha=head_sha,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            self._reconcile_interrupted_lock_create(
+                body=body,
+                create_url=create_url,
+                owner_nonce=owner_nonce,
+                head_sha=head_sha,
+            )
+            raise AssertionError("interrupted lock reconciliation returned")
+        except FirestoreExchangeError:
+            return self._resolve_ambiguous_lock_create(
+                body=body,
+                create_url=create_url,
+                owner_nonce=owner_nonce,
+                head_sha=head_sha,
+            )
+
+    def assert_lock(self, lock: RolloutLock) -> None:
+        try:
+            status, raw = self._firestore_exchange("GET", LOCK_DOCUMENT_URL)
+            if status != 200:
+                raise RolloutLockLost("rollout lock is absent or unreadable")
+            validate_lock_document(
+                self._decode_firestore_document(raw),
+                owner_nonce=lock.owner_nonce,
+                head_sha=lock.head_sha,
+                update_time=lock.update_time,
+            )
+        except (FirestoreExchangeError, RolloutError) as error:
+            if isinstance(error, RolloutLockLost):
+                raise
+            raise RolloutLockLost("rollout lock is absent, changed, or unreadable") from error
+
+    def release_lock(self, lock: RolloutLock) -> None:
+        self.assert_lock(lock)
+        delete_url = LOCK_DOCUMENT_URL + "?" + urllib.parse.urlencode(
+            {"currentDocument.updateTime": lock.update_time}
+        )
+        for attempt in range(2):
+            try:
+                status, raw = self._firestore_exchange("DELETE", delete_url)
+            except BaseException:
+                status, raw = -1, b""
+            if status not in {200, -1} and not self._is_google_error(
+                status, raw, code=404, name="NOT_FOUND"
+            ):
+                raise RolloutError(
+                    "MANUAL_RECOVERY: rollout lock release unverified"
+                )
+            try:
+                read_status, read_raw = self._firestore_exchange(
+                    "GET", LOCK_DOCUMENT_URL
+                )
+            except BaseException as error:
+                raise RolloutError(
+                    "MANUAL_RECOVERY: rollout lock release unverified"
+                ) from error
+            if self._is_google_error(
+                read_status, read_raw, code=404, name="NOT_FOUND"
+            ):
+                return
+            if read_status != 200:
+                raise RolloutError(
+                    "MANUAL_RECOVERY: rollout lock release unverified"
+                )
+            try:
+                validate_lock_document(
+                    self._decode_firestore_document(read_raw),
+                    owner_nonce=lock.owner_nonce,
+                    head_sha=lock.head_sha,
+                    update_time=lock.update_time,
+                )
+            except RolloutError as error:
+                raise RolloutError(
+                    "MANUAL_RECOVERY: rollout lock release unverified"
+                ) from error
+            if attempt == 1:
+                break
+        raise RolloutError("MANUAL_RECOVERY: rollout lock release unverified")
 
     def preflight(self) -> None:
         validate_auth_environment(os.environ)
@@ -1037,8 +1538,13 @@ def _current_head(repo_root: Path) -> str:
 
 
 def main(argv: list[str]) -> int:
-    if argv not in (["--dry-run"], ["--apply"], []):
-        print("Usage: rollout_process_user_phase1.sh [--dry-run|--apply]", file=sys.stderr)
+    clear_mode = len(argv) == 4 and argv[0] == "--clear-orphan-lock-old-state"
+    if argv not in (["--dry-run"], ["--apply"], []) and not clear_mode:
+        print(
+            "Usage: rollout_process_user_phase1.sh [--dry-run|--apply|"
+            "--clear-orphan-lock-old-state HEAD NONCE UPDATE_TIME]",
+            file=sys.stderr,
+        )
         return 64
     mode = argv[0] if argv else "--dry-run"
     repo_root = Path(__file__).resolve().parents[1]
@@ -1061,14 +1567,34 @@ def main(argv: list[str]) -> int:
         try:
             for signum in previous_handlers:
                 signal.signal(signum, interrupt_rollout)
-            rollout.apply()
+            if clear_mode:
+                lock = RolloutLock(
+                    owner_nonce=argv[2],
+                    head_sha=argv[1],
+                    update_time=argv[3],
+                )
+                if (
+                    NONCE_RE.fullmatch(lock.owner_nonce) is None
+                    or SHA_RE.fullmatch(lock.head_sha) is None
+                    or UPDATE_TIME_RE.fullmatch(lock.update_time) is None
+                ):
+                    raise RolloutError("orphan lock arguments are invalid")
+                rollout.clear_orphan_lock_old_state(lock)
+            else:
+                rollout.apply()
         finally:
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
-        print(
-            f"Phase 1 rollout verified: candidate={rollout.candidate}; "
-            "queue=RUNNING; switches=false,false; provider-canary=not-run"
-        )
+        if clear_mode:
+            print(
+                "Phase 1 orphan lock cleared after exact old-state proof; "
+                "queue=RUNNING; switches=false,false; provider-canary=not-run"
+            )
+        else:
+            print(
+                f"Phase 1 rollout verified: candidate={rollout.candidate}; "
+                "queue=RUNNING; switches=false,false; provider-canary=not-run"
+            )
         return 0
     except RolloutError as error:
         print(str(error), file=sys.stderr)
