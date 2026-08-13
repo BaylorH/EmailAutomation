@@ -23,7 +23,7 @@ service-account JSON to `$RUNNER_TEMP/sa.json`).
 | `../Dockerfile` | Container image: `python:3.12-slim`, installs `requirements.txt`, non-root `appuser`, entrypoint `python main.py`. |
 | `cloudrun-job.yaml` | Cloud Run Job spec — task timeout, service-account placeholder, env vars (parameterized bucket + launch-safety scope), Secret Manager references. |
 | `cloudrun-service.yaml` | **Phase-1 webhook** Cloud Run *Service* spec — same image, gunicorn entrypoint serving `service.py` (`POST /process-user`), per-user lease, `PROCESS_USER_AUTH` gate. |
-| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user` + `GET /health` with legacy `/healthz`. |
+| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user`, exact legacy `/health` + `/healthz`, and versioned `/health/identity/v1`. |
 | `../email_automation/app_config.py` | `FIREBASE_BUCKET` now reads env, defaults to historical value. |
 | `../firebase_helpers.py` | Same env parameterization on the bucket that actually drives the token-cache round-trip. |
 | `../main.py` | SIGTERM→`sys.exit` bridge so the atexit token-cache upload runs on container shutdown. |
@@ -203,6 +203,7 @@ Contract:
 | `POST /process-user` | JSON `{"uid": "<firebase-uid>"}` | `200 {"status":"processed"}` ran · `503 {"status":"skipped_locked"}` same-uid already running (Cloud Tasks retries) · `400` missing/blank uid or non-JSON · `401` auth required + missing/wrong secret · `500 {"error":...}` pipeline raised (Cloud Tasks retries) |
 | `GET /health` | — | `200` (never auth-gated; use this for external Cloud Run canaries because Cloud Run reserves some paths ending in `z`) |
 | `GET /healthz` | — | `200` legacy/local alias |
+| `GET /health/identity/v1` | — | `200 {"status":"ok","service":"process-user","revision":"<K_REVISION>"}`; rollout-only identity readback while `/health` and `/healthz` retain their exact legacy body |
 
 **Auth.** Optional in-app shared secret via `PROCESS_USER_AUTH`; when set, requests
 must send it as `Authorization: Bearer <secret>` or `X-Process-User-Auth: <secret>`
@@ -296,6 +297,37 @@ certification tag, promote a revision, or execute rollback. Those are separate
 bounded rollout steps. Both global campaign switches must remain false, and
 staging must not call `POST /process-user` or perform a provider or mailbox
 canary.
+
+### Closed Phase 1 promotion controller
+
+After the exact final backend HEAD has been staged by the tagless gate and both
+prerequisite surfaces are already live, run
+`scripts/rollout_process_user_phase1.sh --dry-run` for a zero-command summary.
+The reviewed `--apply` mode is the only Phase 1 promotion path. It pins the
+rules, Hosting version/assets, both false campaign switches, exact private
+Cloud Run IAM policy, prior revision/digest, all existing traffic tags, candidate
+digest/config/readiness, and the exact `graph-process-user` queue configuration.
+
+The controller pauses the queue and requires three empty task snapshots over at
+least ten seconds before creating a unique temporary certification tag. It
+requires unauthenticated Cloud Run rejection, exact legacy `/health`, and exact
+`/health/identity/v1` service/revision identity. The user-account development ID
+token is minted without a custom audience; requests remain restricted to the
+validated canonical service/tag hosts. Redirects are rejected for authenticated
+reads. The tag is removed and read back before promotion. Immediately before
+each traffic or queue-state mutation, the controller reasserts PAUSED state,
+zero tasks, and the closed prerequisites. It then pins the exact candidate at
+100 percent plus `release-a`, repeats digest/config/health/topology checks, and
+resumes only after every proof passes.
+
+On any failure after pausing, the controller re-pauses, removes the temporary
+tag, restores the prior revision at 100 percent plus `release-a` when traffic may
+have changed, and resumes only after the old topology, digest, health, private
+IAM, false switches, and empty task list are proven. An observed task is sticky
+and leaves the queue paused. If queue state itself cannot be proved, the command
+reports `MANUAL_RECOVERY: queue state unverified` instead of claiming
+containment. Neither mode invokes the worker route, changes campaign switches,
+or performs a provider/mailbox canary.
 
 ### Prove rollback and guaranteed Release A restoration
 

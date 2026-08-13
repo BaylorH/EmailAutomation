@@ -12,6 +12,24 @@ Only after both prerequisite surfaces are certified may operators stage the back
 
 Both global campaign switches remain false throughout this milestone. Operators must not call `POST /process-user` or perform a provider or mailbox canary.
 
+Promotion uses the versioned `GET /health/identity/v1` route while preserving
+the exact legacy `GET /health` and `/healthz` body. The controller must re-prove
+the deployed rules, Hosting version/assets, both false switches, exact private
+Cloud Run IAM binding, prior revision/digest and routing, candidate immutable
+digest/config/readiness, exact queue configuration, and zero listed tasks before
+mutation. It pauses the queue, requires three empty snapshots over at least ten
+seconds, assigns one HEAD-derived temporary tag, rejects unauthenticated access
+and redirects, proves both health contracts on the exact candidate, removes the
+tag, then reasserts PAUSED plus empty tasks immediately before promotion. It
+revalidates candidate identity/digest/config and both health contracts after
+promotion, reasserts the closed prerequisites and PAUSED/empty queue immediately
+before resume, then performs a final closed-prerequisite readback. Any observed
+task is sticky and forbids resume. Failure restores the old 100-percent target
+and `release-a` only while PAUSED, and resumes only after exact old topology,
+digest, health, IAM, switches, and zero tasks are proven; otherwise the state is
+manual recovery and the controller must never claim that an unproved queue is
+paused.
+
 For rollback, roll back or disable the backend producer first. Operators must retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain. Operators must never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row.
 
 ## Outcome
@@ -359,8 +377,12 @@ It is not part of this implementation or rollout.
 - A legacy conversion happens before all provider and attempt-count effects.
 - Logs use stable failure codes and shortened opaque IDs; they do not log draft
   bodies or recipient addresses.
-- No deployment, live mailbox action, gate change, or external communication is
-  performed by this milestone.
+- Historical implementation boundary: the original source milestone performed
+  no deployment, live mailbox action, gate change, or external communication.
+  The later 2026-08-12 Option A approval supersedes only its no-deployment
+  clause for the closed rules -> passive UI -> tagless backend Phase 1 rollout.
+  It does not authorize a mailbox/provider canary, either global switch, Phase
+  2 actions, or any external communication.
 
 ## Verification
 

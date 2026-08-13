@@ -19,6 +19,9 @@ POST /process-user   body {"uid": "<firebase-uid>"}
       * 500 {"status": "error", "error"}  — pipeline raised (so Cloud Tasks retries)
 GET  /health         — Cloud Run-safe liveness probe, always 200
 GET  /healthz        — legacy liveness alias, always 200 (never auth-gated)
+GET  /health/identity/v1
+                     — versioned service/revision identity for authenticated
+                       rollout certification; always 200 at the app boundary
 
 Auth
 ----

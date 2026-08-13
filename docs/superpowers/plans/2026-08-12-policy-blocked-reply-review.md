@@ -22,6 +22,21 @@ Only after both prerequisite surfaces are certified may operators stage the back
 
 Both global campaign switches remain false throughout this milestone. Operators must not call `POST /process-user` or perform a provider or mailbox canary.
 
+The final promotion controller uses versioned `GET /health/identity/v1` without
+changing the exact legacy `/health` or `/healthz` body. It must pin and repeatedly
+re-read rules, Hosting assets/version, false switches, private Cloud Run IAM,
+old and candidate revision/digest/config/readiness, full routing/tag topology,
+and the exact queue configuration. Pause first; require three empty task lists
+over at least ten seconds; add one HEAD-derived temporary tag; prove
+unauthenticated rejection plus exact legacy and identity health; remove the tag;
+then reassert PAUSED and zero tasks immediately before promotion. Repeat exact
+candidate and health proof after promotion, reassert prerequisites and
+PAUSED/zero tasks immediately before resume, and read the prerequisites again
+after resume. Any task observation is sticky. On failure, re-pause before tag or
+traffic cleanup, restore the old revision and `release-a`, and resume only after
+old topology/digest/health/IAM/switch/task proofs pass. If PAUSED itself is not
+proved, report queue state as unverified rather than claiming containment.
+
 For rollback, roll back or disable the backend producer first. Operators must retain the hardened UI and server-write-only rules while any reply-review projection or projection-recovery row may remain. Operators must never restore client write access to processingFailures without a separately reviewed migration or removal of every affected row.
 
 Campaign suppression never replaces a reply-review recovery status. Temporary suppression preserves pending retryability for direct recovery after automation resumes; terminal suppression sets `retryable=false` while retaining the pending or manual status and writing only separate `automationSuppressed*` metadata.
@@ -606,11 +621,13 @@ Review prompts must explicitly inspect:
 
 - [ ] **Step 4: Record final receipts**
 
-Capture exact branch heads, commits, test counts, diff scope, clean status, and
-review verdicts. Do not create a deployment claim or alter readiness evidence;
-this code has not been deployed or live-certified.
+Historical source-build step: capture exact branch heads, commits, test counts,
+diff scope, clean status, and review verdicts without creating a deployment
+claim or altering readiness evidence. The later 2026-08-12 Option A approval
+supersedes this no-deployment boundary only for the closed Phase 1 rollout
+specified at the top of this plan.
 
-### Task 7: Push durable branches without deploying
+### Task 7: Historical source durability before the Option A rollout
 
 - [ ] **Step 1: Fetch and verify fast-forward safety**
 
@@ -624,9 +641,11 @@ git push -u origin codex/policy-blocked-reply-review-20260812
 git push -u origin codex/policy-blocked-reply-review-ui-20260812
 ```
 
-Expected: normal non-force pushes. Read back both remote SHAs and compare to
-local. Do not open a PR, merge, deploy, call a provider, or mutate production
-gates.
+Historical expectation: normal non-force pushes, with both remote SHAs read
+back and compared to local, before any deployment approval existed. The later
+Option A approval supersedes the no-deploy clause only for rules -> passive UI
+-> tagless backend. No provider/mailbox call, global-switch mutation, Phase 2
+action, broad launch, or external communication is authorized.
 
 - [ ] **Step 3: Handoff**
 

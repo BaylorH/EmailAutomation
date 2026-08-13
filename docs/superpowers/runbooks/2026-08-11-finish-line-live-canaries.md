@@ -1,5 +1,13 @@
 # Finish-Line Live Canary Runbook
 
+> **Not applicable to the 2026-08-12 policy-blocked reply-review Phase 1
+> rollout.** This older runbook pins obsolete revision `process-user-00092-som`,
+> assumes a candidate initially receives `release-a`, and includes live mailbox
+> canaries. The approved Phase 1 controller is documented in `deploy/README.md`;
+> it uses tagless staging, a temporary health-only tag, keeps both global
+> campaign switches false, and forbids provider/mailbox canaries. Do not combine
+> these procedures.
+
 ## Scope
 
 This runbook proves only three bounded supervised capabilities on existing
