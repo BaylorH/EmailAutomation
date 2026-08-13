@@ -421,8 +421,10 @@ declare arbitrary multi-suite extraction qualified from address-only matching.
 ### Coverage closure
 
 The sealed scorer bundle has `coverage-contract.json` whose closed records are
-`{variantId, scenarioId, layers, sabotageId, promotionClass,
-expectedVerdict, nonClaims}`. `promotionClass` is exactly `required` or
+`{variantId, scenarioId, layers, responseClass, voiceEligibility, oracleHash,
+sabotageId, promotionClass, expectedVerdict, nonClaims}`. This superset is the
+authoritative closed schema; it resolves the shorter summary above without
+exposing scorer-only fields to the SUT. `promotionClass` is exactly `required` or
 `diagnostic`. The validator requires exact set equality with the variant keys
 below, verifies that every referenced scenario and sabotage case executed in
 every named layer, and emits the count and sorted contract hash. One scenario
@@ -788,21 +790,22 @@ previously described as “sanitized” is not admitted without both checks.
    constructor-blocked collection contract.
 3. Validate manifest closure, sanitization, family coverage, and source hashes.
 4. Run oracle sabotage tests and require the expected RED reasons.
-5. Run all mandatory L1 semantic replays with no skip, xfail, filtering, or
-   missing scenario ID.
-6. Start a fresh L2 namespace and run all state-unit replays.
-7. Start a fresh task-owned L3 emulator and run the mandatory persistence deck.
-8. Rerun every case in reversed order and require identical structured digests.
-9. Run each case three times and report any variance; deterministic replay must
-   have one digest.
-10. Generate the blinded voice packet from only hard-pass final rendered
-    bodies.
-11. Produce the sanitized report and independently review the exact commit and
-    frozen evidence.
+5. In canonical mode, run mandatory L1, L2, and L3 variants forward, then in
+   reverse order, then in three fresh-process repetitions, followed by the
+   declared diagnostic variants. The frozen schedule permits no skip, xfail,
+   filtering, or missing scenario ID and stops at the first non-pass, sealing
+   that authoritative gate verdict. A fully green future candidate must finish
+   this entire canonical schedule before `PASS_OFFLINE` is possible.
+6. Only after a non-pass canonical report is sealed, an explicit diagnostic
+   continuation may run the unexecuted remainder of that same schedule. It
+   reports coverage and variance but cannot issue or replace a gate verdict.
+7. Generate the blinded voice packet from only hard-pass final rendered bodies.
+8. Produce the sanitized canonical and diagnostic reports and independently
+   review the exact commit and frozen evidence.
 
-The first non-pass stops promotion. Remaining cases may continue only in an
-explicit diagnostic mode whose output is labeled incomplete and cannot produce
-a gate verdict.
+The first non-pass stops promotion. Remaining cases may continue only in the
+explicit diagnostic continuation whose output is labeled incomplete and cannot
+produce a gate verdict.
 
 ## Gate verdicts
 

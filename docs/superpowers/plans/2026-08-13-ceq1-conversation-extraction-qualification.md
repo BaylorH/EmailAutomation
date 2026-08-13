@@ -6,7 +6,7 @@
 
 **Architecture:** A host supervisor creates capability-separated SUT, scorer, mutation, audit-proxy, and Firestore-emulator processes. The SUT receives only a generated product-source projection, one minimal descriptor, a synthetic input bundle, and a hash-bound frozen response bundle; it never receives the oracle. L1 drives real deterministic extraction seams, L2 drives the real `process_inbox_message()` orchestration with strict in-memory adapters, and L3 replaces only Firestore with a task-owned loopback emulator behind a namespace wrapper and an independently reconciled gRPC audit proxy.
 
-**Tech Stack:** Python 3.14 test interpreter, `unittest`/`pytest`, standard-library JSON/dataclasses/hashing/process control, PyMuPDF/pdfplumber for native PDFs, `google-cloud-firestore` and `grpcio` already present through `requirements.lock`, macOS `/usr/bin/sandbox-exec`, pinned OpenJDK 25.0.2, and cached Firestore emulator 1.19.8.
+**Tech Stack:** CPython 3.12.13, `unittest`/`pytest`, standard-library JSON/dataclasses/hashing/process control, PyMuPDF/pdfplumber for native PDFs, `google-cloud-firestore` and `grpcio` pinned through `requirements.lock`, macOS `/usr/bin/sandbox-exec`, a task-owned verified OpenJDK 25.0.2 copy, and a task-owned verified Firestore emulator 1.19.8 JAR.
 
 **Deliverable:** both
 
@@ -47,13 +47,19 @@ Important import detail: `processing.py` and `ai_processing.py` import dependenc
 | Path | Responsibility |
 | --- | --- |
 | `.gitignore` | Ignore task-owned runtime/quarantine state only |
+| `requirements-ceq1.in` | Qualification-only pytest input constrained by the production lock |
+| `requirements-ceq1.lock` | Offline hash-pinned qualification test dependencies |
 | `docs/release-safety/ceq1-execution-manifest.json` | Public scenario registry and input/response/owner hashes; no oracle or expected verdict |
+| `docs/release-safety/ceq1-execution-schedule.json` | Public oracle-free scenario/variant/layer schedule and input/response hashes |
+| `docs/release-safety/ceq1-toolchain-manifest.json` | Closed full-tree Python/JDK/JAR/venv dependency manifest and digests |
 | `docs/release-safety/evidence/ceq1/README.md` | Evidence semantics and non-claims |
 | `docs/release-safety/evidence/ceq1/baseline-report.json` | Final sanitized machine-readable baseline finding |
 | `docs/release-safety/evidence/ceq1/baseline-report.md` | Final sanitized operator summary |
+| `tests/fixtures/ceq1/schemas/` | Closed JSON Schemas for public, sealed, fixture, and runtime records |
 | `tests/fixtures/ceq1/inputs/` | Synthetic runtime bundles plus generation-provenance declaration |
 | `tests/fixtures/ceq1/responses/` | Hash-addressed frozen model response bundles |
 | `tests/fixtures/ceq1/oracles/` | Sealed expected records and `coverage-contract.json` |
+| `tests/fixtures/ceq1/runtime-binding-contract.json` | Reviewed transitive by-value/effect alias inventory |
 | `tests/ceq1/contracts.py` | Closed schemas, canonical JSON/hashes, statuses, verdict precedence |
 | `tests/ceq1/manifest.py` | Closed manifest/coverage validation and owner-hash verification |
 | `tests/ceq1/privacy.py` | Mechanical privacy/credential scanner and provenance validation |
@@ -71,57 +77,106 @@ Important import detail: `processing.py` and `ai_processing.py` import dependenc
 | `tests/ceq1/score_worker.py` | Product-free scorer child entrypoint |
 | `tests/ceq1/mutation_worker.py` | Oracle-free/product-free mutation child entrypoint |
 | `tests/ceq1/fixture_builder.py` | Deterministically renders authored native PDF bytes and verifies fixture hashes |
+| `tests/ceq1/voice.py` | Closed frozen-draft packet and blinded-review contract |
 | `tests/test_ceq1_manifest.py` | Contracts, closure, privacy, capability separation, calibration, dependency direction |
 | `tests/test_ceq1_sandbox.py` | Filesystem/network/process capability and cleanup proof |
 | `tests/test_ceq1_semantic_replay.py` | L1 replay and exact semantic scoring |
 | `tests/test_ceq1_stateful_replay.py` | L2 real-entrypoint state/effect/replay scoring |
 | `tests/test_ceq1_emulator_replay.py` | L3 preflight, namespace, transport audit, persistence, interruption, cleanup |
+| `tests/test_ceq1_voice.py` | Frozen-draft eligibility and blinded-review instrument calibration |
 | `scripts/run_ceq1.py` | Thin CLI over the host supervisor |
+| `scripts/run_ceq1_env.py` | Empty-environment Python/test launcher used before the full supervisor exists |
 
 Do not create a production package for CE-Q1. No production module may import `tests.ceq1`, `scripts.run_ceq1`, or `tests/fixtures/ceq1`.
 
 ## Canonical local test environment
 
-Run every Python command from the worktree root. Use the already-installed isolated interpreter:
+Run every command from the worktree root. Never use the symlinked environment
+from another worktree and never copy the ambient environment then unset a
+partial variable list. Task 1 creates a local ignored `.ceq1-venv` offline from
+the already-installed CPython 3.12.13 tree:
 
-```bash
-CEQ_PY=/Users/baylorharrison/.config/superpowers/worktrees/EmailAutomation/backend-lazy-init-implementation-20260813/.venv/bin/python
+```text
+/Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12
+launcher sha256 e2605291e058fdbe3102e8185d0ac5fe0e063398de617010a6af3a42a78f05e3
+full regular-file tree digest 71d5b02f92bb3e27876b9345196b94dcd96d817205eda8d685d3823f65c3bd9d
 ```
 
-For direct pytest commands, remove ambient credentials and disable third-party plugin loading:
+The pinned `uv` executable is `/Users/baylorharrison/.local/bin/uv`, SHA-256
+`4424f8430c3cb3990daaa68268af640bdc61190f2e5c276197e3473358b1e4e8`.
+It is invoked with `--offline --no-python-downloads --require-hashes` only.
+`requirements.lock` pins product dependencies; `requirements-ceq1.lock` pins
+pytest and its constrained transitive test dependencies. The preflight hashes
+the interpreter tree, both locks, `pyvenv.cfg`, every installed distribution
+`RECORD`, native library, and executable in `.ceq1-venv`; the canonical report
+binds that frozen environment digest.
+
+The ignored `.ceq1-venv` is only the development/test bootstrap. A canonical
+run does not execute from the user-writable source runtime in place. Task 5
+first validates a closed toolchain manifest containing `uv` plus every Python and JDK
+entry's relative path, file type, mode, symlink target, and content hash; copies
+the verified `uv`, Python runtime, JDK, and Firestore JAR into the task-owned runtime
+root without following undeclared links; verifies exact manifest equality;
+makes the copy read-only; builds a fresh task-owned venv from that copied
+interpreter; installs both locks offline; and hashes `pyvenv.cfg`, every
+distribution `RECORD`, executable, and native library before and after the run.
+The source and copied manifests, code-signature status where present, ownership,
+realpaths, and aggregate digests are recorded. Source reads and copies use
+`openat(O_NOFOLLOW)` plus matching pre/post `fstat`; hard links, special files,
+absolute/escaping links, size/content/mode drift, and an unexpected executable
+bit are rejected. Runtime preparation itself runs inside a no-network Seatbelt
+profile with an empty environment, read access only to verified sources, locks,
+and the offline uv cache, and write access only to the task runtime. Any drift is `BLOCKED` before a
+product or emulator child starts. The emulator JAR is executed only from the
+verified task-owned copy.
+
+Every direct Python/pytest command below is executed through this literal
+empty-environment wrapper; “canonical pytest prefix” means:
 
 ```bash
-env -u OPENAI_API_KEY \
-    -u GOOGLE_APPLICATION_CREDENTIALS \
-    -u AZURE_API_APP_ID \
-    -u AZURE_API_CLIENT_SECRET \
-    -u FIREBASE_API_KEY \
-    -u GOOGLE_OAUTH_CLIENT_ID \
-    -u GOOGLE_OAUTH_CLIENT_SECRET \
-    -u GOOGLE_REFRESH_TOKEN \
-    -u CLOUDSDK_CONFIG \
-    -u GMAIL_ADDRESS \
-    -u GMAIL_APP_PASSWORD \
-    E2E_TEST_MODE=true \
-    SITESIFT_OUTBOUND_MODE=paused \
-    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    "$CEQ_PY" -m pytest -q -p no:cacheprovider <test-paths>
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest -q \
+  -p no:cacheprovider <test-paths>
 ```
 
-The host supervisor must build an even smaller child environment from an allowlist; it must not copy the host environment.
+`run_ceq1_env.py` calls `os.execve()` with a newly constructed environment
+mapping whose common Python keys are exactly `HOME`, `TMPDIR`,
+`XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `PATH`, `LANG`, `LC_ALL`,
+`PYTHONDONTWRITEBYTECODE`, `PYTHONNOUSERSITE`,
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `E2E_TEST_MODE`,
+`SITESIFT_OUTBOUND_MODE`, `CEQ1_TASK_ROOT`, `FIREBASE_BUCKET`,
+`FRONTEND_EMAIL_ACCESS_URL`, and `OPENAI_ASSISTANT_MODEL`. Values point only to
+`.ceq1-runtime/direct/*`, `/usr/bin`, and `/bin`; outbound mode is `paused`;
+the bucket, frontend URL, and model are explicit synthetic `.invalid`/frozen
+sentinels. `PYTHONPATH` and every `DYLD_*`, `JAVA_TOOL_OPTIONS`, proxy, SSL
+override, SSH agent, Cloud SDK, provider, mailbox, credential, token, key,
+user-config, `.env`, or ambient API variable are absent. Tests assert exact
+key/value equality in the child even when the parent contains conflicting
+garbage. After Seatbelt is active, the bootstrap inserts only the exact hashed
+venv and role projection paths into `sys.path`. L3 roles add only their exact
+synthetic project and emulator target keys described in Task 9.
+
+The exact synthetic values are
+`FIREBASE_BUCKET=demo-ceq1.invalid`,
+`FRONTEND_EMAIL_ACCESS_URL=https://ceq1.invalid/email-access`, and
+`OPENAI_ASSISTANT_MODEL=ceq1-frozen-proposal`; locale is `C.UTF-8`.
+`E2E_TEST_MODE=true` is a declared fixture-mode switch, not a credential, and
+any attempt to use a generated sentinel at a client boundary is fatal.
 
 ### Task 1: Freeze the qualification-only dependency boundary
 
 **Files:**
 - Create: `tests/ceq1/__init__.py`
 - Create: `tests/test_ceq1_manifest.py`
+- Create: `requirements-ceq1.in`
+- Create: `requirements-ceq1.lock`
+- Create: `scripts/run_ceq1_env.py`
+- Create: `docs/release-safety/ceq1-toolchain-manifest.json`
 - Create: `docs/release-safety/evidence/ceq1/README.md`
 - Modify: `.gitignore`
 
 - [ ] **Step 1: Write the failing one-way dependency and runtime-artifact tests**
 
-Add tests that scan `email_automation/**/*.py`, `main.py`, `service.py`, `scheduler_runner.py`, and `app.py` with `ast`. They must reject imports whose module begins with `tests.ceq1` or `scripts.run_ceq1`, and reject literal references to `tests/fixtures/ceq1`. Add a second assertion that `.ceq1-runtime/` is ignored while committed evidence files are not ignored.
+Add tests that scan `email_automation/**/*.py`, `main.py`, `service.py`, `scheduler_runner.py`, and `app.py` with `ast`. They must reject imports whose module begins with `tests.ceq1` or `scripts.run_ceq1`, and reject literal references to `tests/fixtures/ceq1`. Add assertions that `.ceq1-runtime/` and `.ceq1-venv/` are ignored while committed evidence files are not ignored. Add a fresh-child test for `run_ceq1_env.py` that prints only sorted environment key names and require exact equality with the closed allowlist above, even when the parent injects `OBSIDIAN_REST_API_KEY`, `SSH_AUTH_SOCK`, proxy, credential, and token variables.
 
 ```python
 class Ceq1DependencyDirectionTests(unittest.TestCase):
@@ -133,18 +188,26 @@ class Ceq1DependencyDirectionTests(unittest.TestCase):
     def test_runtime_quarantine_is_ignored_but_evidence_is_versioned(self):
         ignore_text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".ceq1-runtime/", ignore_text.splitlines())
+        self.assertIn(".ceq1-venv/", ignore_text.splitlines())
         self.assertNotIn("docs/release-safety/evidence/ceq1/", ignore_text.splitlines())
 ```
 
 - [ ] **Step 2: Run the test to verify RED**
 
-Run the canonical pytest prefix with `tests/test_ceq1_manifest.py`.
+Before the wrapper exists, run the pinned CPython directly with the standard
+library `unittest` runner only for this RED bootstrap:
 
-Expected: FAIL because `tests.ceq1` and `.ceq1-runtime/` do not exist.
+```bash
+/Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12 \
+  -m unittest tests.test_ceq1_manifest
+```
+
+Expected: FAIL because the ignore/evidence/runtime-wrapper contracts are absent.
 
 - [ ] **Step 3: Add the minimal package marker, ignore rule, and evidence contract**
 
-`tests/ceq1/__init__.py` contains only a module docstring. Append exactly `.ceq1-runtime/` to `.gitignore`. The evidence README must state:
+`tests/ceq1/__init__.py` contains only a module docstring. Append exactly
+`.ceq1-runtime/` and `.ceq1-venv/` to `.gitignore`. The evidence README must state:
 
 - CE-Q1A is offline deterministic evidence only;
 - `baseline-report.*` never certifies production, a model, a mailbox, delivery, Google Sheets persistence, or cross-store atomicity;
@@ -152,6 +215,65 @@ Expected: FAIL because `tests.ceq1` and `.ceq1-runtime/` do not exist.
 - any relevant owner-module or fixture hash change invalidates the report.
 
 Implement `scan_production_imports()` in the test itself for this bootstrap task; move no code into production.
+
+Create `requirements-ceq1.in` containing exactly `pytest==9.1.1`, then generate
+the lock from the offline cache and production constraints:
+
+```bash
+mkdir -p .ceq1-runtime/bootstrap/home .ceq1-runtime/bootstrap/cache
+test "$(shasum -a 256 /Users/baylorharrison/.local/bin/uv | awk '{print $1}')" = \
+  4424f8430c3cb3990daaa68268af640bdc61190f2e5c276197e3473358b1e4e8
+env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
+  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
+  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
+  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /Users/baylorharrison/.local/bin/uv pip compile --offline --generate-hashes \
+  --python-version 3.12 --constraint requirements.lock \
+  --output-file requirements-ceq1.lock requirements-ceq1.in
+```
+
+Assert the generated lock contains exactly pytest `9.1.1`, pluggy `1.6.0`,
+iniconfig `2.3.0`, pygments `2.20.0`, and production-constrained packaging
+`26.2`, all with hashes and no URL/path source. Create the local environment:
+
+```bash
+env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
+  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
+  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
+  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /Users/baylorharrison/.local/bin/uv venv --offline --no-python-downloads \
+  --python /Users/baylorharrison/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12 \
+  .ceq1-venv
+env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
+  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
+  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
+  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /Users/baylorharrison/.local/bin/uv pip install --offline --require-hashes \
+  --python .ceq1-venv/bin/python -r requirements.lock
+env -i HOME="$PWD/.ceq1-runtime/bootstrap/home" \
+  XDG_CACHE_HOME="$PWD/.ceq1-runtime/bootstrap/cache" \
+  UV_CACHE_DIR=/Users/baylorharrison/.cache/uv UV_OFFLINE=true \
+  UV_PYTHON_DOWNLOADS=never PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /Users/baylorharrison/.local/bin/uv pip install --offline --require-hashes \
+  --python .ceq1-venv/bin/python -r requirements-ceq1.lock
+```
+
+`scripts/run_ceq1_env.py` resolves and verifies the local interpreter and
+worktree root, creates the task-owned direct-run directories with mode `0700`,
+sets umask `077`, closes all non-stdio descriptors, constructs the exact new
+environment mapping, and uses `os.execve()`; it never reads `.env`, shell
+profiles, keychains, or the parent environment values.
+
+Generate `ceq1-toolchain-manifest.json` with a closed schema and symbolic
+artifact IDs only—no absolute path. For CPython 3.12.13 and OpenJDK 25.0.2,
+compute a deterministic tree digest over the sorted sequence
+`{relativePath,type,mode,uidClass,gidClass,symlinkTarget,contentSha256}` for
+every entry; reject sockets/devices/FIFOs and links escaping the artifact root.
+Record entry count, tree digest, launcher hash, version output hash, and the
+digest algorithm version. Record the Firestore 1.19.8 JAR byte hash and the
+two lockfile hashes. A test recomputes exact equality and a one-byte, mode, path,
+or symlink-target mutation must fail. Independent review of this manifest is a
+canonical preflight prerequisite.
 
 - [ ] **Step 4: Run the test to verify GREEN**
 
@@ -162,7 +284,10 @@ Expected: PASS and no provider/network output.
 - [ ] **Step 5: Commit the boundary**
 
 ```bash
-git add .gitignore tests/ceq1/__init__.py tests/test_ceq1_manifest.py docs/release-safety/evidence/ceq1/README.md
+git add .gitignore requirements-ceq1.in requirements-ceq1.lock \
+  docs/release-safety/ceq1-toolchain-manifest.json \
+  scripts/run_ceq1_env.py tests/ceq1/__init__.py \
+  tests/test_ceq1_manifest.py docs/release-safety/evidence/ceq1/README.md
 git commit -m "test: establish CE-Q1 qualification boundary"
 ```
 
@@ -253,7 +378,14 @@ Tests must prove:
 - the public manifest has only `schemaVersion`, `productionAncestor`, `implementationBase`, and `scenarios`;
 - each public scenario has only `id`, `family`, `purpose`, `provenanceLabel`, `inputBundle`, `inputHash`, `responseBundle`, `responseHash`, and `ownerModuleHashes`;
 - public records reject `expectedVerdict`, `oracleHash`, `expectedState`, and `sabotageId` anywhere;
-- coverage records have exactly `variantId`, `scenarioId`, `layers`, `sabotageId`, `promotionClass`, `expectedVerdict`, and `nonClaims`;
+- the public execution schedule has only `schemaVersion`,
+  `productionAncestor`, `implementationBase`, and `entries`; each entry has
+  exactly `scenarioId`, `variantId`, `layers`, `inputHash`, and `responseHash`;
+  it rejects response class, voice eligibility, oracle, sabotage, expected
+  outcome, promotion class, and non-claim fields;
+- coverage records have exactly `variantId`, `scenarioId`, `layers`,
+  `responseClass`, `voiceEligibility`, `oracleHash`, `sabotageId`,
+  `promotionClass`, `expectedVerdict`, and `nonClaims`;
 - the 19 stable scenario IDs and 55 mandatory variant IDs are exact sets with no duplicate, skip, filter, or xfail field;
 - hashes are lowercase 64-character SHA-256 strings and match file bytes;
 - absolute paths, `file://`, production-shaped IDs, undeclared identities, and non-`.invalid` mailboxes are rejected without echoing the matched value;
@@ -282,13 +414,21 @@ MANDATORY_SCENARIO_IDS = frozenset({
 })
 ```
 
-Define `MANDATORY_VARIANT_IDS` as the exact 55 strings in the approved spec. Return typed `ValidatedManifest` and `ValidatedCoverage` objects only after exact set equality, path containment, byte-hash, owner-module-hash, and privacy validation all pass.
+Define `MANDATORY_VARIANT_IDS` as the exact 55 strings in the approved spec.
+Return typed `ValidatedManifest`, `ValidatedExecutionSchedule`, and
+`ValidatedCoverage` objects only after exact set equality, path containment,
+byte-hash, owner-module-hash, privacy validation, and equality of public
+schedule versus sealed coverage `{scenarioId, variantId, layers}` all pass.
+The trusted host scheduler may read the public schedule but not the sealed
+coverage or oracle. It emits one child descriptor with exactly
+`{scenarioId, variantId, layer, inputHash, responseHash}`; the SUT never reads
+the public schedule itself.
 
 `privacy.py` must expose `scan_bytes()`, `scan_json()`, `scan_tree()`, and `validate_generation_provenance()`. Errors contain only a rule ID and logical artifact ID, never the matched text. Recognize declared synthetic identities/addresses and `.invalid` domains; do not claim detection of arbitrary copied prose or numbers.
 
 - [ ] **Step 4: Add the generation-provenance declaration**
 
-Create a closed JSON record with a synthetic template version, declared fictional people/properties/domains, seeded forbidden tokens used only by scanner unit tests, no raw-source access, and `independentReviewStatus: pending`. The pending review state is allowed while authoring but makes a canonical gate run `BLOCKED` until an independent reviewer changes it to `approved` after reviewing the exact fixture diff.
+Create a closed JSON record with a synthetic template version, declared fictional people/properties/domains, scanner rule IDs and hashes only, no raw-source access, and `independentReviewStatus: pending`. Seeded forbidden values exist only in isolated temporary unit-test trees and are never committed. The pending review state is allowed while authoring but makes a canonical gate run `BLOCKED` until an independent reviewer changes it to `approved` after reviewing the exact fixture diff.
 
 - [ ] **Step 5: Run validator tests to verify GREEN**
 
@@ -344,7 +484,11 @@ Expected: FAIL because scorer and mutator are absent.
 
 Run the canonical pytest prefix with `tests/test_ceq1_manifest.py`.
 
-Expected: all 18 mutants are caught for their intended reason and the control remains green.
+Expected: all 18 mutation primitives are caught for their intended reason and
+the synthetic control remains green. This proves only generic scorer/mutator
+mechanics. It cannot authorize a product verdict; Task 7 must separately run
+the referenced sabotage against every variant's own control in every declared
+layer.
 
 - [ ] **Step 5: Commit scorer calibration**
 
@@ -353,84 +497,151 @@ git add tests/ceq1/scorer.py tests/ceq1/mutator.py tests/test_ceq1_manifest.py
 git commit -m "test: calibrate exact CE-Q1 scoring"
 ```
 
-### Task 5: Extend the temporal no-effect guard through interpreter exit
-
-**Files:**
-- Create: `tests/ceq1/guards.py`
-- Modify: `tests/test_ceq1_manifest.py`
-
-- [ ] **Step 1: Write failing subprocess tests for every forbidden boundary**
-
-Use fresh Python subprocesses and a task-owned JSONL ledger. Install the guard before importing product code. Probes must show the guard records and raises on:
-
-- Firestore/Firebase/OpenAI/MSAL/Google discovery client construction unless the exact object identity is registered as a local adapter;
-- DNS, socket construction/connect, `requests`, `urllib`, `http.client`, and `httpx` non-loopback work;
-- subprocesses invoking `gcloud`, `firebase`, mailbox helpers, scheduler/manual-live scripts, or any unregistered executable;
-- credential/keychain/Cloud SDK path reads;
-- writes outside the task temp root;
-- imports of effectful manual scripts;
-- Drive, Tasks, follow-up claim/send/retry, outbox/send, and pending-send calls outside the one baseline recorder;
-- replacement or deletion of a protected guard function.
-
-Add positive probes for ordinary imports, reads from the projection, writes under the task temp root, a registered frozen-response client, and registered loopback Firestore transport in L3 mode.
-
-- [ ] **Step 2: Run guard tests to verify RED**
-
-Run the canonical pytest prefix with `tests/test_ceq1_manifest.py`.
-
-Expected: FAIL because `guards.install_temporal_guard` is absent.
-
-- [ ] **Step 3: Implement the execution-long guard**
-
-Extract and generalize the proven approach in `tests/test_test_collection_contract.py`: preload SDK modules before the socket-construction measurement boundary, add the socket audit hook, replace watched attributes, protect module attributes against reassignment, and verify identity in `atexit`.
-
-The public API is:
-
-```python
-@dataclass(frozen=True)
-class GuardPolicy:
-    task_root: Path
-    ledger_path: Path
-    allow_loopback: bool
-    allowed_constructor_ids: frozenset[int]
-    allowed_callable_ids: frozenset[int]
-
-
-def install_temporal_guard(policy: GuardPolicy) -> "GuardHandle":
-    """Install once before product imports and remain active through exit."""
-```
-
-Every attempted effect appends `{sequence, boundary, outcome}` without arguments or sensitive values. The handle's `close()` checks protected identity and exact expected allowed-call counts; it never removes the guards.
-
-- [ ] **Step 4: Run guard tests to verify GREEN**
-
-Run the canonical pytest prefix with `tests/test_ceq1_manifest.py`.
-
-Expected: PASS; forbidden probes fail inside their child without making a request, and the test process reports only stable reason codes.
-
-- [ ] **Step 5: Commit the temporal guard**
-
-```bash
-git add tests/ceq1/guards.py tests/test_ceq1_manifest.py
-git commit -m "test: enforce CE-Q1 no-effect boundaries"
-```
-
-### Task 6: Enforce filesystem capability separation and OS sandbox cleanup
+### Task 5: Build the deny-default OS sandbox and durable process ownership
 
 **Files:**
 - Create: `tests/ceq1/supervisor.py`
+- Create: `tests/ceq1/capability_probe.py`
+- Create: `tests/test_ceq1_sandbox.py`
+
+- [ ] **Step 1: Write failing deny-default sandbox and ownership tests**
+
+Before any Python guard probe exists, require Seatbelt itself to deny these inert
+probes: non-loopback DNS/socket/HTTP, access to the oracle/repository/credential
+and keychain/Mach/XPC surfaces, writes outside one task tmp root, and worker
+fork/exec. Positive probes may read only an allowlisted projection, write under
+the task root, and—only in L3 role—connect to one exact loopback port. Build
+every child environment from a new mapping and assert exact key equality; record
+and reject any inherited descriptor other than stdio and the named bootstrap,
+release, result, and ledger descriptors.
+
+Add lifecycle tests requiring a durably fsynced `PREPARING` receipt before
+spawn, a child stopped on an inherited readiness pipe, PID/PGID/start-time and
+ancestry capture, atomically fsynced `STARTED`, and release only afterward.
+Workers must have exactly stdio plus declared one-shot control descriptors
+until release and exactly stdio afterward. TERM cleanup uses bounded TERM→KILL,
+closes all parent control descriptors and quarantine files, proves group/
+descendant absence and socket/port closure, and only then removes temp/receipt. An unproved cleanup or outer
+SIGKILL retains a durable receipt and blocks the next run pending exact
+reconciliation.
+
+- [ ] **Step 2: Run sandbox tests to verify RED**
+
+Run the canonical pytest prefix with `tests/test_ceq1_sandbox.py`.
+
+Expected: FAIL because the supervisor and capability probes are absent.
+
+- [ ] **Step 3: Implement the minimal Seatbelt supervisor and start barrier**
+
+Generate role profiles with `deny default`, exact read/write subpaths, explicit
+Mach/XPC/keychain denials, no general network, and no worker fork/exec after the
+single initial worker exec. L1/L2 roles receive no network permission. The
+single task-owned worker bootstrap starts normally from the outer supervisor,
+closes undeclared FDs, loads and applies its one final role profile directly via
+the macOS sandbox API **before** reading case data or importing harness/product
+code, reports `STRICT_READY`, and blocks on the release pipe. Do not nest
+`sandbox_init()` under `sandbox-exec`; this host rejects nested initialization.
+The final profile denies all later fork/exec. The parent independently verifies
+the PID/PGID/start identity and strict-profile receipt, atomically writes and
+fsyncs `STARTED`, then sends one release byte. Tests deliberately attempt
+`fork`, same-interpreter exec, shell exec, and a spawned descendant after
+`STRICT_READY`; all must be OS-denied.
+
+Before profile generation, validate the closed toolchain manifest, copy `uv`,
+the Python runtime, JDK tree, and emulator JAR into the task root, verify exact
+entry-set/digest equality, reject escaping links/special files, and remove
+write bits. Build/install the task venv offline from the copied Python and
+copied `uv` with `--no-config --no-project --relocatable`; package installation
+uses `--require-hashes --only-binary :all: --link-mode copy --exact` and never
+downloads. Reject any venv link resolving outside the task runtime. Hash the resulting interpreter, `pyvenv.cfg`, every installed
+distribution `RECORD`, executable, and native library before release and after
+cleanup. No role reads the original user-writable runtime/JDK/JAR after this
+copy step.
+
+The fixed runtime-preparation bootstrap itself runs once via
+`/usr/bin/sandbox-exec` under a no-network profile before copied role runtimes
+exist. It receives an empty environment and may read only the hash-verified
+source Python/JDK/uv/JAR, committed toolchain/lock files, and offline uv cache;
+it may write only `<task>/runtime`. It copies `uv` first, verifies the copy, and
+uses only that copied binary for the offline venv/install commands. A missing
+wheel/cache entry is `BLOCKED`, never a download or ambient fallback.
+
+```text
+<task>/runtime/uv venv --offline --no-python-downloads --no-config \
+  --no-project --relocatable \
+  --python <task>/runtime/python/bin/python3.12 <task>/runtime/venv
+<task>/runtime/uv pip install --offline --no-python-downloads --no-config \
+  --require-hashes --only-binary :all: --link-mode copy --exact \
+  --python <task>/runtime/venv/bin/python \
+  -r requirements.lock -r requirements-ceq1.lock
+```
+
+The outer unsandboxed supervisor never consumes case data or oracles. It owns
+only process setup, profiles, receipts, quarantine, and cleanup. It writes and
+fsyncs receipts through an open directory FD with atomic rename. It independently
+snapshots the task process tree before release and after termination. Receipt
+states are exactly `PREPARING`, `STARTED`, `CLEANING`, and `CLEAN`; every
+transition is a same-directory atomic rename followed by file and directory
+`fsync`. The parent records start identity and ancestry, not PID alone. Unknown
+cleanup retains the task tree and receipt and blocks the next run.
+
+The task-owned role command is exactly
+`<task-python> -I -S -B <verified-bootstrap.py> ...`. The bootstrap disables
+core dumps and uses only the standard library before applying its final role
+profile. `PREPARING` is durably created before `Popen`; it contains no invented
+child identity. Launch uses `start_new_session=True`, `close_fds=True`,
+`stdin=/dev/null`, pre-opened `O_NOFOLLOW` regular quarantine files for stdout
+and stderr, and `pass_fds` limited to readiness/release plus a declared one-shot
+service-ready FD for infrastructure roles. After Seatbelt, the child inventories
+its FDs and requires that exact set, emits a bounded `STRICT_READY` receipt,
+closes readiness, and blocks for exactly byte `0x01`. The parent independently
+verifies kernel PID/PGID/start identity and ancestry, fsyncs `STARTED`, and then
+releases it. EOF, extra bytes, timeout, or parent death exits before imports.
+The child closes the release FD before case/product import, leaving only
+descriptors 0/1/2; infrastructure closes service-ready after its receipt.
+
+- [ ] **Step 4: Run sandbox tests to verify GREEN**
+
+Expected: every inert forbidden probe is blocked by Seatbelt with
+`SANDBOX_BACKSTOP_BLOCKED`; allowed projection/tmp operations pass; no probe
+payload is displayed before quarantine scan; receipts and cleanup are exact.
+
+- [ ] **Step 5: Commit the containment prerequisite**
+
+```bash
+git add tests/ceq1/supervisor.py tests/ceq1/capability_probe.py \
+  tests/test_ceq1_sandbox.py
+git commit -m "test: contain CE-Q1 child processes"
+```
+
+### Task 6: Add temporal guards inside the proven OS backstop
+
+**Files:**
+- Create: `tests/ceq1/guards.py`
 - Create: `tests/ceq1/sut_worker.py`
 - Create: `tests/ceq1/score_worker.py`
 - Create: `tests/ceq1/mutation_worker.py`
-- Create: `tests/test_ceq1_sandbox.py`
+- Modify: `tests/ceq1/supervisor.py`
+- Modify: `tests/ceq1/capability_probe.py`
+- Modify: `tests/test_ceq1_sandbox.py`
 
-- [ ] **Step 1: Write failing sandbox and capability tests**
+- [ ] **Step 1: Write failing dual-layer boundary tests**
 
-Build each test from a temporary projection and temporary bundle tree. Require
-these negative probes before running product cases:
+Run every forbidden-effect probe inside the already-proven deny-default role
+sandbox. Install the Python temporal guard before product imports. Probes cover
+Firestore/Firebase/OpenAI/MSAL/discovery construction; DNS/socket/requests/
+urllib/http.client/httpx; credential/keychain paths; outside writes; manual-live
+imports/subprocesses; Drive/Tasks/follow-up/outbox/send/pending boundaries; and
+guard replacement/deletion. Use inert synthetic addresses/data, while relying
+on Seatbelt—not inertness—as the backstop.
 
-The test table is closed. For each row, call `run_capability_probe()` with the
-named role/action and compare the returned stable reason code exactly:
+For each probe require `GUARD_BLOCKED` and one named guard ledger entry. Then run
+the same probe with the Python guard deliberately disabled and require
+`SANDBOX_BACKSTOP_BLOCKED`. A guard miss that Seatbelt catches is a test RED,
+not a pass. Positive adapter calls run in separate children.
+
+Build capability-separation tests from temporary projections and bundles. The
+closed role/action reasons include:
 
 | Role/action | Expected reason |
 | --- | --- |
@@ -449,9 +660,10 @@ The SUT projection test must prove exact allowlist generation: every projected
 file is a regular file beneath the projection root, matches its recorded hash,
 and is read-only. It must not contain `docs/`, the full execution manifest,
 coverage contract, oracle, `.git`, a credential file, or a manual/live script.
-The worker receives only `{scenarioId, layer, inputHash, responseHash}`.
+The worker receives only
+`{scenarioId, variantId, layer, inputHash, responseHash}`.
 
-- [ ] **Step 2: Run sandbox tests to verify RED**
+- [ ] **Step 2: Run guard/capability tests to verify RED**
 
 Run the canonical pytest prefix with:
 
@@ -459,9 +671,9 @@ Run the canonical pytest prefix with:
 tests/test_ceq1_manifest.py tests/test_ceq1_sandbox.py
 ```
 
-Expected: FAIL because `tests.ceq1.supervisor` and worker entrypoints are absent.
+Expected: FAIL because `guards.install_temporal_guard` and workers are absent.
 
-- [ ] **Step 3: Implement the minimal host supervisor and workers**
+- [ ] **Step 3: Implement execution-long guards and capability-separated workers**
 
 Expose these closed interfaces:
 
@@ -470,31 +682,20 @@ Implement the frozen `ChildMounts` record with `projection`, `descriptor`,
 `build_source_projection(repo_root, destination, relative_paths)` to return a
 sorted `relative_path -> sha256` mapping after copying only regular allowlisted
 files and making them read-only. Implement keyword-only
-`run_sandboxed_child(role, argv, mounts, task_root, loopback_ports=())` to return
+`run_sandboxed_child(role, argv, mounts, task_root,
+unix_socket_paths=(), loopback_ports=())` to return
 a closed `ChildReceipt`; it raises `CapabilityError` with one of the stable
 reason codes above for denied or ambiguous outcomes.
 
-The supervisor builds child environments from an empty mapping and an explicit
-name allowlist. It sets task-owned `HOME`, `TMPDIR`, `XDG_*`, Cloud SDK, cache,
-and Python cache paths; deliberately sets declared synthetic `E2E_TEST_MODE`
-sentinels and `SITESIFT_OUTBOUND_MODE=paused`; removes proxy, credential,
-token, keychain, `.netrc`, and provider variables; and hashes non-secret values
-without recording them.
+The supervisor builds child environments from the exact empty-environment
+builder in Task 1 and asserts key equality, FD inventory, umask, cwd, and task
+paths before releasing each child. No parent environment is copied.
 
-Generate one `/usr/bin/sandbox-exec` profile per role. SUT may read only its
-projection/descriptor/input/response and Python runtime, write only its output
-and tmp roots, and use no network for L1/L2. Scorer may read only sealed result
-and oracle and cannot read/import product. Mutator may read only the result
-schema and input result. L3 adds only the exact task-owned loopback proxy port.
-Profiles deny process execution except the exact Python worker or pinned L3
-Java/proxy child registered by the outer supervisor.
-
-Write a durable task receipt before child startup containing schema, random
-task ID, parent PID/start identity, child PID/PGID/start identity, realpaths,
-hashes, ports, and lifecycle state. On `INT`/`TERM`, use bounded TERM then KILL,
-wait for process group absence, close both pipes, prove ports closed, then
-remove temp. If cleanup is unknown or interrupted, retain the receipt/temp and
-return `INSTRUMENT_FAILURE`. On a later run, refuse an unreconciled receipt.
+`guards.py` generalizes the proven collection guard: preload SDK imports before
+the socket-construction measurement boundary while network is already denied,
+install audit hooks, protect watched module/class attributes, write argument-free
+attempt records, and verify identity through `atexit`. Registered local adapter
+identities are exact and count-bound; guards never uninstall.
 
 Workers read only their own capability paths. `sut_worker.py` installs the
 temporal guard before importing the projected harness. `score_worker.py`
@@ -503,16 +704,23 @@ scoring projection. `mutation_worker.py` imports only contracts and mutator.
 All stdout/stderr/result bytes remain quarantined until `privacy.scan_tree()`
 passes; the parent returns only an opaque quarantine ID on failure.
 
+Quarantine promotion is fd-based and race-closed: `lstat` accepts only regular
+single-link files under the task root, rejects symlinks/hardlinks/devices/FIFOs,
+opens with `O_NOFOLLOW`, hashes before and after scanning the same FD, and
+atomically promotes only those exact bytes through a fsynced directory FD.
+
 - [ ] **Step 4: Run sandbox tests to verify GREEN**
 
-Run the Task 6 command again. Expected: every deny probe is rejected for its
-named reason, positive capability reads/writes succeed, cleanup is proven, and
-the parent terminal output contains no probe payload.
+Run the Task 6 command again. Expected: every canonical probe is
+`GUARD_BLOCKED`; disabled-guard mutants are `SANDBOX_BACKSTOP_BLOCKED`; positive
+capability operations succeed; cleanup is proven; terminal output contains no
+probe payload.
 
 - [ ] **Step 5: Commit the containment layer**
 
 ```bash
-git add tests/ceq1/supervisor.py tests/ceq1/sut_worker.py \
+git add tests/ceq1/guards.py tests/ceq1/supervisor.py \
+  tests/ceq1/capability_probe.py tests/ceq1/sut_worker.py \
   tests/ceq1/score_worker.py tests/ceq1/mutation_worker.py \
   tests/test_ceq1_sandbox.py
 git commit -m "test: isolate CE-Q1 execution capabilities"
@@ -529,11 +737,14 @@ git commit -m "test: isolate CE-Q1 execution capabilities"
 - Create: `tests/test_ceq1_semantic_replay.py`
 - Create: `tests/test_ceq1_stateful_replay.py`
 - Create: `docs/release-safety/ceq1-execution-manifest.json`
+- Create: `docs/release-safety/ceq1-execution-schedule.json`
 - Create: `tests/fixtures/ceq1/inputs/*.json`
+- Create: `tests/fixtures/ceq1/schemas/*.json`
 - Create: `tests/fixtures/ceq1/inputs/ceq-pdf-01.pdf`
 - Create: `tests/fixtures/ceq1/responses/*.json`
 - Create: `tests/fixtures/ceq1/oracles/*.json`
 - Create: `tests/fixtures/ceq1/oracles/coverage-contract.json`
+- Create: `tests/fixtures/ceq1/runtime-binding-contract.json`
 - Modify: `tests/fixtures/ceq1/inputs/provenance.json`
 
 - [ ] **Step 1: Write failing replay-client and adapter tests**
@@ -580,9 +791,30 @@ Replace the whole `ai_processing.client` alias before any `.responses` access.
 `RuntimeBindings` pins every patched module attribute by identity, fails on
 replacement, restores it on exit, and records exact use counts. Bind the aliases
 used by `processing.py`, not only their owner modules: `processing._fs`,
-`processing._sheets_client`, `processing.requests`,
-`processing.build_conversation_payload`, and
-`processing.queue_pending_response`, plus the exact `ai_processing` aliases.
+`processing._sheets_client`, `processing.requests`, and
+`processing.queue_pending_response`, plus `ai_processing.client`,
+`ai_processing._fs`, `ai_processing._sheets_client`, and
+`ai_processing.build_conversation_payload`. `processing.py` has no
+`build_conversation_payload` alias.
+
+Do not rely on this illustrative list as the binding inventory. Before writing
+`RuntimeBindings`, generate `tests/fixtures/ceq1/runtime-binding-contract.json`
+from an AST/call-graph inventory rooted at `process_inbox_message`,
+`propose_sheet_updates`, `apply_proposal_to_sheet`,
+`build_conversation_payload`, and `process_pdf_for_ai`. The closed records are
+`{module, attribute, ownerModule, effectClass, allowedReplacementKind}` and
+must include every by-value/global provider, Firestore, Sheets, HTTP, Drive,
+Tasks, follow-up, notification, logging, message-index, pending-response,
+outbox/send, attachment, and dynamic-import boundary transitively reachable in
+the declared cases. At minimum this includes provider/effect aliases in
+`processing`, `ai_processing`, `messaging`, `clients`, `sheets`,
+`sheet_operations`, `notifications`, `followup`, `file_handling`,
+`campaign_safety`, and dynamically imported follow-up functions. The test
+recomputes exact set equality from the frozen owner-module hashes. An uncovered
+effect-capable alias is `INSTRUMENT_FAILURE`; it may not be discovered and
+patched ad hoc during execution. In L3, every Firestore alias in this contract
+must be the exact same identity-pinned namespace-wrapper root (or a bound child
+derived from it); no owner module may retain or receive a raw emulator client.
 Leave `process_inbox_message`, `propose_sheet_updates`,
 `apply_proposal_to_sheet`, `_select_automatic_response_body`, and
 `send_reply_in_thread` real.
@@ -641,16 +873,132 @@ scoring. A direct full-history proposal diagnostic is labeled
 - [ ] **Step 6: Author and validate the full synthetic deck**
 
 Create the 19 exact scenario IDs and all 55 exact coverage variants from the
-approved spec. Every identity uses a declared `.invalid` domain and every
+closed table in this task. First create only closed JSON Schemas for the public
+manifest, public schedule, input bundle, frozen response queue, oracle,
+coverage record, sabotage receipt, and runtime result. Every schema sets
+`additionalProperties: false`, rejects duplicate JSON keys and non-finite
+numbers at parse time, constrains logical IDs to closed patterns, and forbids
+filesystem paths. Write RED validator tests for one complete temporary row and
+every missing/extra/type/hash/layer failure. Only after those tests are GREEN
+author committed fixture content. Every identity uses a declared `.invalid` domain and every
 property/person/value is newly fictional. Input, response, and oracle are in
 separate files. The public manifest contains no layer, expected state/verdict,
-oracle hash, or sabotage mapping. The sealed coverage contract owns those.
+oracle hash, or sabotage mapping. The public execution schedule contains only
+scenario/variant/layer and input/response hashes. The sealed coverage contract
+owns all oracle, sabotage, expected-outcome, voice, promotion, and non-claim
+fields. Exact schedule-versus-coverage equality is validated before a child is
+created.
 
-Each variant contains a positive/near-miss execution and a sabotage ID. Every
-required safety/state variant executes in its named layer. Image-only PDF and
-all five voice variants execute as diagnostics with exact `UNVERIFIED`
-non-claims. Voice scoring rejects raw `proposal.response_email` and the current
-missing-field selected template as proof of a shared final rendered draft.
+Each authored input bundle has a closed common envelope—synthetic clock,
+scenario/variant ID, source identity, chronological message records, target and
+sibling rows/formulas, thread/messages/indexes, configured field modes,
+attachments, expected runtime path class, and declared fictional identities—
+plus only family-specific typed payload permitted by its JSON Schema. Frozen
+response bundles are ordered closed `responses.create` returns with exact
+prompt/config/call hashes and typed proposal shapes. Oracles enumerate every
+expected and forbidden fact with canonical field/value/unit/basis, exact
+supporting source segment/message identity, target property/suite, freshness
+rule, allowed transform, response obligations, operation order, complete first-
+run/replay state, allowed/forbidden effects, and sabotage reason. No fixture
+uses prose-only or substring expectations.
+
+The table below is also the exact authoring assignment. Each row receives a
+positive and near-miss case within its named scenario bundle, its own frozen
+response call(s), oracle section, and sabotage control; no implementer may
+collapse two variant rows into one undifferentiated assertion. The Schemas and
+matrix are reviewed and committed before bulk fixture bytes are authored, and
+the fixture diff receives its separate privacy/provenance review before any
+canonical product run.
+
+Each sealed coverage record is exactly
+`{variantId, scenarioId, layers, responseClass, voiceEligibility, oracleHash,
+sabotageId, promotionClass, expectedVerdict, nonClaims}`. The validator must
+reject a missing/extra field and must verify that `oracleHash` matches the
+separately mounted oracle bytes. These fields never enter the public manifest
+or SUT descriptor.
+
+The closed response classes are exactly `missing_field_reply`, `terminal_reply`,
+`review_no_reply`, `correction_close_reply`, `alternate_reply`, `no_reply`,
+`monitored_continuation_reply`, `reply_all_draft`, `launch_draft`,
+`missing_field_draft`, `correction_close_draft`, `followup_draft`, and
+`continuation_draft`.
+`voiceEligibility` is `false` for every current row: non-voice rows are outside
+blinded review, and voice rows lack a shared production finalizer. Every
+required row's sealed oracle `expectedVerdict` is `PASS_OFFLINE`; diagnostic
+rows use `UNVERIFIED`. The authored `sabotageId`, reason, and response class are
+closed data and must be reviewed before canonical execution. The `baseline`
+column is plan-only review metadata and is never copied into a fixture,
+schedule, SUT descriptor, or scorer oracle: `VERIFY` means
+no baseline failure is predeclared, while `FAIL` or `UNVERIFIED` must still be
+executed and an unexpected pass triggers adversarial review rather than silent
+promotion.
+
+| variantId | scenarioId | layers | sabotageId | expected sabotage reason | responseClass | voiceEligibility | promotion | baseline |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `known-filled` | `CEQ-MEM-01` | `L1+L2+L3` | `SAB-EXT01-01` | `KNOWN_FACT_REASKED` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `explicit-decline` | `CEQ-MEM-01` | `L1+L2+L3` | `SAB-EXT01-02` | `DECLINED_FACT_REASKED` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `correction-after-window` | `CEQ-LONG-01` | `L1+L2+L3` | `SAB-EXT01-03` | `STALE_CORRECTION_WON` | `correction_close_reply` | `false` | `required` | `FAIL` |
+| `acknowledgement-not-question` | `CEQ-MEM-01` | `L1+L2+L3` | `SAB-EXT01-04` | `ACK_MISCLASSIFIED_AS_QUESTION` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `fresh-target-terminal` | `CEQ-TERM-01` | `L1+L2+L3` | `SAB-EXT02-01` | `CITED_TERMINAL_NOT_APPLIED` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `stale-quoted-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-02` | `QUOTED_ONLY_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `wrong-property-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-03` | `CROSS_ENTITY_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `addressless-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-04` | `UNCITED_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `ambiguous-terminal` | `CEQ-TERM-02` | `L1+L2+L3` | `SAB-EXT02-05` | `AMBIGUOUS_TERMINAL_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `same-address-two-suites` | `CEQ-SUITE-01` | `L1+L2+L3` | `SAB-EXT03-01` | `CROSS_SUITE_FACT_ACCEPTED` | `review_no_reply` | `false` | `required` | `FAIL` |
+| `mixed-property-pdf` | `CEQ-PDF-01` | `L1+L2+L3` | `SAB-EXT03-02` | `CROSS_PROPERTY_PDF_FACT_ACCEPTED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `mixed-suite-pdf` | `CEQ-SUITE-01` | `L1+L2+L3` | `SAB-EXT03-03` | `CROSS_SUITE_PDF_FACT_ACCEPTED` | `review_no_reply` | `false` | `required` | `FAIL` |
+| `exact-target-attachment` | `CEQ-PDF-01` | `L1+L2+L3` | `SAB-EXT03-04` | `SUPPORTED_TARGET_FACT_DROPPED` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `rent14-opex4` | `CEQ-OPEX-01` | `L1+L2+L3` | `SAB-EXT04-01` | `RENT_OPEX_CONFLATED` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `monthly-annual` | `CEQ-OPEX-01` | `L1+L2+L3` | `SAB-EXT04-02` | `BASIS_CONVERSION_WRONG` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `latest-correction` | `CEQ-OPEX-01` | `L1+L2+L3` | `SAB-EXT04-03` | `STALE_NUMERIC_VALUE_WON` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `numeric-range` | `CEQ-OPEX-01` | `L1+L2+L3` | `SAB-EXT04-04` | `NUMERIC_RANGE_TRANSFORM_WRONG` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `digit-decoy` | `CEQ-OPEX-01` | `L1+L2+L3` | `SAB-EXT04-05` | `DIGIT_DECOY_ACCEPTED` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `unsupported-opex` | `CEQ-OPEX-02` | `L1+L2+L3` | `SAB-EXT04-06` | `INVENTED_OPEX_ACCEPTED` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `ordered-success` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-01` | `TERMINAL_OPERATION_ORDER_WRONG` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `move-failure` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-02` | `MOVE_FAILURE_HIDDEN` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `comment-failure` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-03` | `COMMENT_FAILURE_HIDDEN` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `highlight-failure` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-04` | `HIGHLIGHT_FAILURE_HIDDEN` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `audit-write-failure` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-05` | `AUDIT_FAILURE_HIDDEN` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `terminal-state-failure` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-06` | `FALSE_TERMINAL_COMPLETION` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `column-beyond-z` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-07` | `COMMENT_COLUMN_ADDRESS_TRUNCATED` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `retry-after-partial-attempt` | `CEQ-TERM-01` | `L2+L3` | `SAB-EXT05-08` | `PARTIAL_RETRY_DUPLICATED_EFFECT` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `viable-alternate` | `CEQ-ALT-01` | `L1+L2+L3` | `SAB-EXT06-01` | `ALTERNATE_ACTION_MISSING` | `alternate_reply` | `false` | `required` | `FAIL` |
+| `alternate-unavailable` | `CEQ-ALT-01` | `L1+L2+L3` | `SAB-EXT06-02` | `UNAVAILABLE_ALTERNATE_ACTIONED` | `terminal_reply` | `false` | `required` | `FAIL` |
+| `two-alternates` | `CEQ-ALT-01` | `L1+L2+L3` | `SAB-EXT06-03` | `ALTERNATE_CARDINALITY_WRONG` | `alternate_reply` | `false` | `required` | `FAIL` |
+| `same-event-replay` | `CEQ-ALT-01` | `L1+L2+L3` | `SAB-EXT06-04` | `DUPLICATE_ALTERNATE_ACTION` | `alternate_reply` | `false` | `required` | `FAIL` |
+| `direct-broker-question` | `CEQ-IN-09` | `L1+L2+L3` | `SAB-IN09-01` | `UNSAFE_BROKER_QUESTION_ANSWERED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `confidential-identity-question` | `CEQ-IN-09` | `L1+L2+L3` | `SAB-IN09-02` | `CONFIDENTIAL_IDENTITY_DISCLOSED` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `question-plus-partial-specs` | `CEQ-IN-09` | `L1+L2+L3` | `SAB-IN09-03` | `SAFE_FACTS_DROPPED_ON_REVIEW` | `review_no_reply` | `false` | `required` | `FAIL` |
+| `unrelated-mail` | `CEQ-IN-10` | `L2+L3` | `SAB-IN10-01` | `UNTRACKED_MAIL_MUTATED_STATE` | `no_reply` | `false` | `required` | `VERIFY` |
+| `quoted-cre-nearmiss` | `CEQ-IN-10` | `L2+L3` | `SAB-IN10-02` | `QUOTED_CRE_NEARMISS_PROCESSED` | `no_reply` | `false` | `required` | `VERIFY` |
+| `tracked-reply-nearmiss` | `CEQ-IN-10` | `L2+L3` | `SAB-IN10-03` | `TRACKED_NEARMISS_PROCESSED` | `no_reply` | `false` | `required` | `VERIFY` |
+| `thirteen-message-window` | `CEQ-LONG-01` | `L1+L2+L3` | `SAB-CHR-01` | `HISTORY_WINDOW_BYPASSED` | `correction_close_reply` | `false` | `required` | `FAIL` |
+| `delayed-inbound-order` | `CEQ-LONG-01` | `L1+L2+L3` | `SAB-CHR-02` | `DELAYED_INBOUND_ORDER_WRONG` | `missing_field_reply` | `false` | `required` | `FAIL` |
+| `pause-hold` | `CEQ-LONG-01` | `L2+L3` | `SAB-CHR-03` | `PAUSED_THREAD_CONTINUED` | `no_reply` | `false` | `required` | `VERIFY` |
+| `monitored-resume` | `CEQ-LONG-01` | `L2+L3` | `SAB-CHR-04` | `UNSUPPORTED_RESUME` | `monitored_continuation_reply` | `false` | `required` | `FAIL` |
+| `settled-replay` | `CEQ-LONG-01` | `L2+L3` | `SAB-CHR-05` | `SETTLED_REPLAY_STATE_DELTA` | `no_reply` | `false` | `required` | `FAIL` |
+| `dated-ooo` | `CEQ-OOO-01` | `L2+L3` | `SAB-AUTO-01` | `OOO_EXTRACTED_OR_REPLIED` | `no_reply` | `false` | `required` | `VERIFY` |
+| `generic-auto-ack` | `CEQ-OOO-01` | `L2+L3` | `SAB-AUTO-02` | `AUTOACK_EXTRACTED_OR_REPLIED` | `no_reply` | `false` | `required` | `VERIFY` |
+| `quoted-cre-ooo` | `CEQ-OOO-01` | `L2+L3` | `SAB-AUTO-03` | `QUOTED_CRE_OOO_PROCESSED` | `no_reply` | `false` | `required` | `VERIFY` |
+| `copied-party-reply-all` | `CEQ-AUDIENCE-01` | `L2+L3` | `SAB-AUD-01` | `CC_DROPPED_OR_MISROUTED` | `reply_all_draft` | `false` | `required` | `UNVERIFIED` |
+| `display-name-ambiguity` | `CEQ-AUDIENCE-01` | `L2+L3` | `SAB-AUD-02` | `AMBIGUOUS_AUDIENCE_GUESSED` | `reply_all_draft` | `false` | `required` | `UNVERIFIED` |
+| `wrong-tenant-signature-decoy` | `CEQ-AUDIENCE-01` | `L2+L3` | `SAB-AUD-03` | `SIGNATURE_IDENTITY_DRIFT` | `reply_all_draft` | `false` | `required` | `UNVERIFIED` |
+| `native-text-three-page` | `CEQ-PDF-01` | `L1+L2+L3` | `SAB-PDF-01` | `NATIVE_PDF_PAGE_BINDING_WRONG` | `review_no_reply` | `false` | `required` | `VERIFY` |
+| `image-only-explicitly-unverified` | `CEQ-PDF-01` | `L1` | `SAB-PDF-02` | `OCR_CAPABILITY_OVERCLAIMED` | `no_reply` | `false` | `diagnostic` | `UNVERIFIED` |
+| `launch` | `VOICE-LAUNCH` | `L1` | `SAB-VOICE-01` | `VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER` | `launch_draft` | `false` | `diagnostic` | `UNVERIFIED` |
+| `missing-field` | `VOICE-MISSING` | `L1` | `SAB-VOICE-02` | `VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER` | `missing_field_draft` | `false` | `diagnostic` | `UNVERIFIED` |
+| `correction-close` | `VOICE-CORRECTION-CLOSE` | `L1` | `SAB-VOICE-03` | `VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER` | `correction_close_draft` | `false` | `diagnostic` | `UNVERIFIED` |
+| `followup` | `VOICE-FOLLOWUP` | `L1` | `SAB-VOICE-04` | `VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER` | `followup_draft` | `false` | `diagnostic` | `UNVERIFIED` |
+| `continuation` | `VOICE-CONTINUATION` | `L1` | `SAB-VOICE-05` | `VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER` | `continuation_draft` | `false` | `diagnostic` | `UNVERIFIED` |
+
+Each variant contains a positive/near-miss execution and a sabotage ID. For
+every `{scenarioId, variantId, layer}` record, calibration executes that
+sabotage against the variant's own synthetic known-good control and requires
+its exact stable reason. Missing, extra, or duplicate calibration tuples are
+`INSTRUMENT_FAILURE`. Image-only PDF and all five voice variants execute as
+diagnostics with exact `UNVERIFIED` non-claims. Voice scoring rejects raw
+`proposal.response_email` and the current missing-field selected template as
+proof of a shared final rendered draft.
 
 Run `fixture_builder.py` only over newly authored templates to create the
 native three-page PDF. The provenance receipt starts as `pending`; after a
@@ -663,7 +1011,7 @@ to `approved` in a separate commit before a canonical baseline run.
 Run:
 
 ```bash
-<canonical-env> "$CEQ_PY" -m pytest -q -p no:cacheprovider \
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_semantic_replay.py \
   tests/test_ceq1_stateful_replay.py
 ```
@@ -681,11 +1029,77 @@ git add tests/ceq1/frozen_provider.py tests/ceq1/adapters.py \
   tests/ceq1/runtime_bindings.py tests/ceq1/fixture_builder.py \
   tests/ceq1/harness.py tests/test_ceq1_semantic_replay.py \
   tests/test_ceq1_stateful_replay.py \
-  docs/release-safety/ceq1-execution-manifest.json tests/fixtures/ceq1
+  docs/release-safety/ceq1-execution-manifest.json \
+  docs/release-safety/ceq1-execution-schedule.json tests/fixtures/ceq1
 git commit -m "test: exercise CE-Q1 semantic and state replays"
 ```
 
-### Task 8: Prove L3 persistence with a pinned task-owned Firestore emulator
+### Task 8: Build the frozen-draft voice review instrument
+
+**Files:**
+- Create: `tests/ceq1/voice.py`
+- Create: `tests/test_ceq1_voice.py`
+- Modify: `tests/ceq1/contracts.py`
+- Modify: `tests/ceq1/manifest.py`
+
+- [ ] **Step 1: Write failing voice eligibility and blinded-review tests**
+
+Define a closed `FinalDraft` record with exactly `subject`, `plainBody`,
+`htmlBody`, `to`, `cc`, `replyMode`, `signatureIdentity`, `scenarioId`,
+`variantId`, `productionFinalizer`, and `productionFinalizerHash`. Tests reject
+raw `proposal.response_email`, `_select_automatic_response_body()` output, a
+missing-field template, harness-reconstructed metadata, or a draft without one
+of the five production-owned finalizer identities required by the spec.
+
+Define five scored dimensions—context continuity, directness, professional
+human voice, grammar/punctuation, and sequence-level phrase variety—and hard
+faults for semantic/grounding error, known/declined-field re-ask, invented
+commitment, audience/signature drift, duplicate greeting/signoff, and AI-tell
+or broken punctuation. A synthetic instrument-only packet tests exact scores,
+two blinded independent reviewers, a third reviewer when any dimension differs
+by more than one point, zero hard faults, median at least four on every
+dimension for at least 90% of drafts, and no score below three. At least one
+reviewer must have role `human_operator`; reviewer IDs are opaque role-local
+codes and contain no name, email, or other PII.
+
+Tests require the closed statuses `review_ready`, `partial`,
+`pass_frozen_drafts`, and `fail`; a voice status never upgrades or suppresses a
+hard-safety verdict. The current `b400ee5` cases must all be ineligible because
+the shared production finalizers do not exist, produce no blinded packet, and
+remain diagnostic `UNVERIFIED`—not a fake voice failure or pass.
+
+- [ ] **Step 2: Run voice tests to verify RED**
+
+Run the canonical pytest prefix with `tests/test_ceq1_voice.py`.
+
+Expected: FAIL because the closed voice instrument is absent.
+
+- [ ] **Step 3: Implement only the qualification-side instrument**
+
+`voice.py` validates eligible production-owned `FinalDraft` records, generates
+a randomized opaque packet without scenario expectation/oracle/failure reason,
+validates reviewer forms, applies the fixed rubric and tie-break rule, and
+emits a redacted structured receipt. It imports no product module and cannot
+render, rewrite, repair, or choose product copy. Calibration uses newly authored
+synthetic `FinalDraft` controls only to prove the rubric detects each hard fault
+and score threshold; those controls are labeled `INSTRUMENT_ONLY` and never
+count toward product voice evidence.
+
+- [ ] **Step 4: Run voice tests to verify GREEN**
+
+Expected: instrument controls PASS, every product `VOICE-*` context is exactly
+`UNVERIFIED_NO_SHARED_FINALIZER`, and no reviewer packet requiring human work is
+generated for the current baseline.
+
+- [ ] **Step 5: Commit the voice instrument**
+
+```bash
+git add tests/ceq1/voice.py tests/test_ceq1_voice.py \
+  tests/ceq1/contracts.py tests/ceq1/manifest.py
+git commit -m "test: add CE-Q1 frozen draft review contract"
+```
+
+### Task 9: Prove L3 persistence with a pinned task-owned Firestore emulator
 
 **Files:**
 - Create: `tests/ceq1/firestore_audit_proxy.py`
@@ -697,8 +1111,9 @@ git commit -m "test: exercise CE-Q1 semantic and state replays"
 
 - [ ] **Step 1: Write failing pinned-prerequisite and lifecycle tests**
 
-Require these exact local prerequisites and reject realpath/hash/mode/owner
-drift before spawning anything:
+Require the exact closed toolchain manifest from Task 1 and reject
+entry-set/type/symlink/mode/owner/content/version drift before spawning
+anything. The current source prerequisites include:
 
 ```text
 /opt/homebrew/Cellar/openjdk/25.0.2/libexec/openjdk.jdk/Contents/Home/bin/java
@@ -708,11 +1123,13 @@ sha256 370ef109f74f859afc8cfe0300b2da782d60698160b8a48f19731d6d2e3012ea
 sha256 9d43599ed6151199e8d604dc87fac51218e49e5f3a48519b1ae560bbe5e3382d
 ```
 
-Verify `java -jar <jar> --version` without download/update behavior. Test a
-fresh task-owned loopback port/proxy/emulator process group, startup receipt,
-bounded TERM-to-KILL cleanup, both pipe terminals, port closure, and temp
-retention on unproved cleanup. No test may invoke Firebase CLI or download an
-emulator/JDK.
+Verify the full JDK tree, not only `bin/java`; verify the JAR byte hash; copy
+both to the task root; verify the copies; make them read-only; and run
+`java -jar <copied-jar> --version` inside the emulator sandbox without
+download/update behavior. Test a fresh task-owned loopback
+proxy/emulator process group, startup receipt, bounded TERM-to-KILL cleanup,
+quarantine-file closure, port/socket closure, and temp retention on unproved cleanup. No
+test may invoke Firebase CLI or download an emulator/JDK.
 
 - [ ] **Step 2: Write failing namespace-wrapper and independent-audit tests**
 
@@ -720,13 +1137,86 @@ Require a fluent wrapper over collection/document/query/batch/transaction
 references. It canonicalizes and checks every read/query/create/update/delete
 path before transport. Batch and transaction child references remain wrapped.
 
-Run a separate loopback gRPC forwarding process between the Python SDK and the
-emulator. It parses the Firestore request messages used by the harness, records
-method plus canonical resource paths without document values, and forwards to
-the emulator. Calibration deliberately bypasses the wrapper and attempts a
-create/delete outside the namespace through the proxy; the independent audit
-must detect it and produce `INSTRUMENT_FAILURE`. The normal out-of-namespace
-mutant must be rejected by the wrapper before proxy transport.
+Run a separate gRPC forwarding process between the Python SDK and the emulator.
+The SUT-to-proxy hop uses an exact task-owned Unix-domain socket; the proxy-to-
+emulator hop uses one exact loopback TCP port. The SUT-facing `RPC_SPEC_V1`
+registers exactly `BatchGetDocuments` (unary-stream), `RunQuery`
+(unary-stream), `BeginTransaction`, `Commit`, and `Rollback` (unary-unary).
+Complete-inventory routines inside the proxy may separately call
+`ListCollectionIds` and `ListDocuments` through its private upstream channel
+when commanded over the supervisor-only control FD; those methods are not
+registered on the SUT socket. `GetDocument`, direct create/update/delete,
+`BatchWrite`, `Write`, `Listen`, aggregation/partition/pipeline/long-running
+operations, and every unknown RPC are rejected before upstream transport.
+
+Each registered method binds the generated Firestore 2.28 request/response
+classes, serializers, and cardinality. After parse, clone the protobuf, discard
+unknown fields, deterministically serialize both copies, and reject any
+difference. Extract and validate database/name/parent, batch-get documents and
+found/missing responses, query parent/from collections, Commit update/delete/
+transform document names, field masks, preconditions, transaction IDs, and
+response document names. Record method, canonical paths, attempt ordinal,
+stream request/response/close cardinalities, status code, and transaction/token
+hashes without field values or raw error bodies. Unknown fields, methods, stream
+shapes, resource-bearing responses, or cardinalities are
+`INSTRUMENT_FAILURE`.
+
+A client interceptor injects one opaque `x-ceq1-operation-id` from the wrapper
+`ContextVar`; the proxy strips it before upstream forwarding. Every RPC must
+reconcile to one wrapper ledger operation by operation ID, method, ordered
+attempt, and canonical resource set. Transaction retries reuse the operation ID
+with an exact attempt ordinal; one wrapper operation need not equal one RPC.
+
+The topology is exact and independently attacked:
+
+- SUT Seatbelt permits file read/write-connect only to the exact task-owned
+  proxy Unix socket and denies all TCP networking;
+- proxy Seatbelt permits only the exact Unix socket plus remote TCP to
+  `localhost:<emulatorPort>`;
+- emulator Seatbelt permits local TCP on `<emulatorPort>` and no outbound
+  network;
+- SDK endpoint is exactly `unix:<proxySocket>` with `grpc.insecure_channel`,
+  `AnonymousCredentials`, synthetic project `demo-ceq1-<taskId>`, and database
+  `(default)`; TLS, ADC, default endpoint discovery, alternate targets, and
+  channel reconstruction are rejected;
+- a SUT `connect_ex` directly to `<emulatorPort>` must fail with OS `EPERM`,
+  while the same SUT reaches the proxy Unix socket successfully.
+
+The generated profiles use literal Unix-socket and port filters, never a broad
+loopback allow. The SUT allows only `network-outbound` to the proxy
+`remote unix-socket path-literal`; proxy allows only inbound on that exact
+`local unix-socket` and outbound `remote ip localhost:<emulatorPort>`;
+emulator allows only inbound `local ip localhost:<emulatorPort>`. All TCP binds
+use numeric `127.0.0.1`; IPv6 and DNS remain denied. Mutants cover every other
+TCP/Unix destination and emulator outbound access.
+
+The proxy alone creates the Unix socket at a nonce-bearing path inside its
+private task directory with mode `0600`; the parent verifies lstat type,
+ownership, mode, inode, and proxy PID/start identity before releasing SUT. For
+Java, the supervisor reserves the selected loopback port until immediately
+before the gated emulator spawn, then proves the listener belongs to the exact
+recorded Java PID/start identity and the unique synthetic project responds
+before it releases the proxy or SUT. Any race, owner ambiguity, unexpected
+listener/socket replacement, or readiness mismatch is `INSTRUMENT_FAILURE`;
+no random check-then-use port is accepted as proof. Python gRPC inherited-TCP-
+listener FD handoff is not assumed or required.
+
+Only the L3 SUT environment adds
+`FIRESTORE_EMULATOR_HOST=unix:<proxySocket>`,
+`GOOGLE_CLOUD_PROJECT=demo-ceq1-<taskId>`, and the equal `GCLOUD_PROJECT`.
+Java alone adds task-owned `JAVA_HOME`. Proxy/emulator coordinates otherwise
+arrive through bounded control records, not ambient environment.
+
+Calibration uses its own fresh proxy/emulator/process group. Raw Commit messages
+containing out-of-namespace update, delete, and transform paths must be parsed,
+recorded, and rejected `PERMISSION_DENIED` **before** upstream transport;
+missing operation metadata is `UNATTRIBUTED_RPC`, an unknown method is
+`UNIMPLEMENTED`, and direct SUT-to-emulator transport is OS-denied. Upstream
+mutation count and before/after inventory remain zero-delta—do not create then
+delete an outside document to prove detection. Tear down calibration completely
+and start a fresh canonical proxy/emulator with no calibration capability. The
+ordinary out-of-namespace mutant remains rejected by the wrapper before proxy
+transport.
 
 - [ ] **Step 3: Run L3 tests to verify RED**
 
@@ -736,18 +1226,21 @@ Expected: FAIL because emulator/proxy/wrapper implementations are absent.
 
 - [ ] **Step 4: Implement the pinned launcher, proxy, and namespace wrapper**
 
-The launcher uses direct Java argv only:
+The launcher uses the task-owned copied Java/JAR with direct argv only:
 
 ```text
-<java> -jar <jar> --host 127.0.0.1 --port <emulatorPort>
+<java> -XX:-UsePerfData -Djava.io.tmpdir=<task>/tmp \
+  -jar <jar> --host 127.0.0.1 --port <emulatorPort>
   --project_id demo-ceq1-<taskId> --single_project_mode true
   --single_project_mode_error true
 ```
 
-It stores exact argv, realpaths/hashes, PID/PGID/start identity, child tree,
-ports, and pipe state. The SUT talks only to the proxy port. The proxy talks
-only to the emulator port. Sandbox profiles allow those exact directions and
-deny every other network endpoint.
+It stores exact argv, copied-tree/JAR hashes, PID/PGID/start identity, child
+tree, Unix-socket identity, port owner identities, strict-profile receipt, and
+pipe state. The SUT talks only to the proxy Unix socket. The proxy talks only to
+the emulator loopback port.
+Sandbox profiles allow those exact directions and deny every other network
+endpoint.
 
 Use two independent raw inventories before the first mutation, after each
 transition, and after replay. Reconcile wrapper ledger, proxy audit ledger, and
@@ -757,7 +1250,7 @@ namespace is `INSTRUMENT_FAILURE` even if final state is empty.
 
 - [ ] **Step 5: Run mandatory L3 scenarios, interruption, replay, and cleanup**
 
-Run the Task 8 test again. Expected: required state scenarios exercise actual
+Run the Task 9 test again. Expected: required state scenarios exercise actual
 Firestore transactions/timestamps/readbacks, switches remain false in the
 synthetic namespace, same source identity replay is zero-delta, injected
 transaction/interruption state is visibly retryable, no pending/outbox/send or
@@ -773,7 +1266,7 @@ git add tests/ceq1/firestore_audit_proxy.py tests/ceq1/firestore_emulator.py \
 git commit -m "test: prove CE-Q1 emulator persistence"
 ```
 
-### Task 9: Orchestrate the fixed schedule and commit the honest baseline finding
+### Task 10: Orchestrate the fixed schedule and commit the honest baseline finding
 
 **Files:**
 - Create: `scripts/run_ceq1.py`
@@ -784,27 +1277,64 @@ git commit -m "test: prove CE-Q1 emulator persistence"
 - Modify: `tests/test_ceq1_semantic_replay.py`
 - Modify: `tests/test_ceq1_stateful_replay.py`
 - Modify: `tests/test_ceq1_emulator_replay.py`
+- Modify: `tests/test_ceq1_voice.py`
 
 - [ ] **Step 1: Write failing CLI, schedule, and report-schema tests**
 
 Require exact subcommands `preflight`, `calibrate`, `run`, and
-`verify-report`. `run` has only declared tiers `l1`, `l2`, `l3`, or `all`, and
-canonical mode always executes forward once, reverse once, then three fresh
-process repeats per case. No retry-until-green, case filter, xfail, skip, or
-best-of-N option exists. Diagnostic mode may continue after first product
-failure but can never issue a gate verdict.
+`verify-report`. `run` has only declared tiers `l1`, `l2`, `l3`, or `all`.
+The frozen full schedule is required variants forward once, required variants
+in reverse once, three fresh-process repetitions, then declared diagnostic
+variants. No retry-until-green, case filter, xfail, skip, or best-of-N option
+exists.
 
-Report tests require candidate/source/dependency/manifest/fixture/owner hashes;
-19 scenarios/55 variants and attempt cardinality; separate historical/current
-source labels; per-layer structured results; before/after/replay hashes;
-effect/constructor/network counters; non-claims; deterministic verdict
-precedence; privacy scan receipt; complete cleanup receipt; and an exact
-next-gate eligibility record. Raw messages, fixture bodies, recipient values,
-credentials, absolute paths, and unredacted failure payloads are forbidden.
+“Forward” is the exact 55-row matrix order in Task 7, expanding each row's
+layers in `L1`, `L2`, `L3` order and omitting undeclared layers. “Reverse” is
+the exact reverse tuple sequence. Repetitions 1, 2, and 3 each restart at the
+forward first tuple with a new task ID, process tree, adapter state, and L3
+namespace. Diagnostic rows retain their table positions but run only after all
+required repetition tuples. The public schedule stores this ordinal explicitly;
+the validator recomputes it from the matrix and rejects reordering, duplication,
+or omission.
+
+Canonical promotion mode stops on the first non-pass and seals that authoritative
+gate verdict. Because the approved `b400ee5` baseline is expected to fail,
+Task 10 runs that full canonical schedule with stop-on-first-nonpass. Only a
+fully green future candidate may finish the schedule and reach `PASS_OFFLINE`.
+After a non-pass report is sealed, a separate explicit diagnostic continuation
+may execute the unexecuted remainder; it reports coverage and future work but
+cannot replace, widen, or issue a gate verdict. Tests require the canonical
+verdict source and diagnostic coverage receipt to be separately labeled and
+prove the report reducer never derives a verdict from diagnostic attempts.
+
+Report tests require separate `executionHead` and `evidenceCarrierHead`, product
+source/production ancestor, toolchain/dependency/public-manifest/public-schedule/
+sealed-coverage/fixture/oracle/owner/projection hashes; the planned exact 19
+scenarios/55 variants; canonical attempted cardinality through its first
+non-pass; diagnostic full closure and attempt cardinality; separate
+historical/current source labels; per-layer structured results;
+before/after/replay hashes; and exact zero counts for successful external
+effects. Forbidden **attempts** are separately counted and must be zero in
+product execution; deliberate calibration attempts appear only in the named
+contained calibration ledger with `GUARD_BLOCKED` or
+`SANDBOX_BACKSTOP_BLOCKED` and zero successful effect.
+
+Reports also include per-field exact-accuracy and exact-abstention counts by
+family; named counts for wrong-row/cross-entity writes, known/declined re-asks,
+uncited terminal decisions, duplicate actions, forbidden events, provider
+construction, network, pending/outbox/send/follow-up, and replay deltas; voice
+eligibility/status, dimension scores, hard-fault counts, reviewer-role
+provenance, and tie-break status; non-claims; deterministic verdict precedence;
+privacy scan receipt; complete process/port/toolchain cleanup receipt; and an
+exact next-gate eligibility record. Raw messages, fixture bodies, recipient
+values, credentials, absolute paths, and unredacted failure payloads are
+forbidden. The report may say only that the profiled CE-Q1 processes were
+restricted and their wrapper/proxy/inventory ledgers reconciled; it may not
+claim a macOS network namespace or exclusion of unrelated host processes.
 
 - [ ] **Step 2: Run CLI/report tests to verify RED**
 
-Run the canonical pytest prefix with all four CE-Q test modules.
+Run the canonical pytest prefix with all six CE-Q test modules.
 
 Expected: FAIL because `scripts/run_ceq1.py` and report assembly are absent.
 
@@ -816,30 +1346,41 @@ ancestry from `6caa8ec`, implementation-base product-file equality with
 `b400ee5`, owner/transitive projection/dependency hashes, fixture hashes,
 sandbox probes, pinned Java/JAR, and no unreconciled task receipt.
 
-The source identity is `{candidateHead, productSourceBase, productionAncestor}`;
-never claim candidate HEAD equals `b400ee5`. Any product-file drift requires a
-separately reviewed successor identity.
+The execution source identity is
+`{executionHead, productSourceBase, productionAncestor}`; never claim execution
+HEAD equals `b400ee5`. The later report-only commit is
+`evidenceCarrierHead` and may differ only by the two generated evidence files.
+Any product-file drift requires a separately reviewed successor identity.
 
-`calibrate` runs the known-good synthetic control and all 18 mutations in
-separate scorer/mutator children before any product verdict. `run --tier all`
-uses only the supervisor, new process/state/namespace per attempt, synthetic
-clock, forward/reverse/three-repeat schedule, and typed digests that omit only
-declared volatile process/time/path receipt fields.
+`calibrate` first runs the known-good synthetic control and all 18 generic
+mutation primitives in separate scorer/mutator children. It then runs every
+sealed coverage record's own sabotage against that variant's own known-good
+control in every declared layer and requires exact set equality over
+`{scenarioId, variantId, layer, sabotageId, expectedReason}`. Guard, provider,
+network, filesystem, process, and transport sabotages are actual OS-contained
+probes, never ledger-only mutations. `run --tier all` uses only the supervisor,
+new process/state/namespace per attempt, and a synthetic clock. Canonical mode
+follows the full frozen schedule and stops at the first non-pass; the explicit
+diagnostic continuation runs only the unexecuted suffix after a non-pass
+canonical report. Typed digests omit only declared volatile process/time/path
+receipt fields.
 
 - [ ] **Step 4: Run fresh preflight and calibration**
 
 Run:
 
 ```bash
-<canonical-env> "$CEQ_PY" scripts/run_ceq1.py preflight \
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py preflight \
   --output .ceq1-runtime/preflight.json
-<canonical-env> "$CEQ_PY" scripts/run_ceq1.py calibrate \
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py calibrate \
   --output .ceq1-runtime/calibration.json
 ```
 
-Expected: preflight `PASS`; calibration control `VERIFIED`; all 18 mutants
-`REFUTED` for their exact intended reasons; zero forbidden attempts; quarantined
-artifacts privacy-clean. If a local prerequisite is absent, preflight returns
+Expected: preflight `PASS`; the generic calibration control is `VERIFIED`; all
+18 primitive mutants and every variant/layer sabotage are `REFUTED` for their
+exact intended reasons with exact tuple-set equality; deliberate forbidden
+attempts are contained and zero effects succeed; quarantined artifacts are
+privacy-clean. If a local prerequisite is absent, preflight returns
 `BLOCKED` before starting product/emulator children and the plan stops without
 claiming L3 evidence.
 
@@ -853,7 +1394,8 @@ creating canonical evidence:
 ```bash
 git add scripts/run_ceq1.py tests/ceq1/supervisor.py \
   tests/test_ceq1_manifest.py tests/test_ceq1_semantic_replay.py \
-  tests/test_ceq1_stateful_replay.py tests/test_ceq1_emulator_replay.py
+  tests/test_ceq1_stateful_replay.py tests/test_ceq1_emulator_replay.py \
+  tests/test_ceq1_voice.py
 git commit -m "test: orchestrate the CE-Q1 qualification gate"
 test -z "$(git status --short)"
 ```
@@ -863,44 +1405,52 @@ test -z "$(git status --short)"
 Run:
 
 ```bash
-<canonical-env> "$CEQ_PY" scripts/run_ceq1.py run --tier all \
-  --output .ceq1-runtime/canonical
-<canonical-env> "$CEQ_PY" scripts/run_ceq1.py verify-report \
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py run --tier all \
+  --mode canonical --output .ceq1-runtime/canonical
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py verify-report \
   .ceq1-runtime/canonical/report.json
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py scripts/run_ceq1.py run --tier all \
+  --mode diagnostic-continuation --canonical-report \
+  .ceq1-runtime/canonical/report.json --output .ceq1-runtime/diagnostic
 ```
 
-Expected instrument outcome: all scheduled cases/attempts execute with stable
-digests and zero forbidden effects. Expected product outcome on `b400ee5`:
-`FAIL`, with exact evidence for the paused-send pending projection and other
-promotion-required product gaps, plus declared diagnostic `UNVERIFIED` voice/
-image-only/non-atomicity records. `PASS_OFFLINE` would be unexpected at this
+Expected canonical product outcome on `b400ee5`: stop at the first required
+non-pass and seal `FAIL` with its exact evidence. Expected diagnostic outcome:
+all remaining declared cases/attempts execute with stable digests and zero
+forbidden effects, exposing the paused-send pending projection and other
+promotion-required gaps plus declared `UNVERIFIED` voice/image-only/non-atomicity
+records, but issue no gate verdict. `PASS_OFFLINE` would be unexpected at this
 baseline and triggers adversarial review rather than promotion.
 
 - [ ] **Step 7: Generate sanitized committed evidence from the verified report**
 
 Only after the quarantine and output tree pass `privacy.scan_tree()`, render
 `baseline-report.json` and `.md` from the structured report. Include stable
-reason codes and redacted diffs, never raw fixture bodies. Run
-`verify-report` again on the committed form and compare its semantic digest to
-the quarantined canonical report.
+reason codes and redacted diffs, never raw fixture bodies. Before rendering,
+`lstat` every candidate output, reject links/special files/multiple hard links,
+open with `O_NOFOLLOW`, scan and hash through that FD, rehash without closing,
+then atomically copy the exact scanned bytes through a fsynced evidence-
+directory FD. Run `verify-report` again on the committed form and compare its
+semantic digest to the quarantined canonical report.
 
 - [ ] **Step 8: Run the final affected and broad regression gates**
 
 Run:
 
 ```bash
-<canonical-env> "$CEQ_PY" -m pytest -q -p no:cacheprovider \
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest -q -p no:cacheprovider \
   tests/test_ceq1_manifest.py tests/test_ceq1_sandbox.py \
   tests/test_ceq1_semantic_replay.py tests/test_ceq1_stateful_replay.py \
-  tests/test_ceq1_emulator_replay.py \
+  tests/test_ceq1_emulator_replay.py tests/test_ceq1_voice.py \
   tests/test_test_collection_contract.py \
   tests/test_runtime_provider_initialization.py \
   tests/test_process_user_service.py
 
-<canonical-env> "$CEQ_PY" -m pytest --noconftest --collect-only -q \
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m pytest --noconftest --collect-only -q \
   -p no:cacheprovider
 
-"$CEQ_PY" -m py_compile tests/ceq1/*.py scripts/run_ceq1.py
+./.ceq1-venv/bin/python scripts/run_ceq1_env.py -m py_compile \
+  tests/ceq1/*.py scripts/run_ceq1.py scripts/run_ceq1_env.py
 git diff --check b400ee5..HEAD
 git status --short
 ```
@@ -925,7 +1475,7 @@ model/mailbox/provider, or begin a product fix in this implementation plan.
 
 ## Final review and completion gate
 
-After Task 9, perform independent reviews in this order:
+After Task 10, perform independent reviews in this order:
 
 1. exact-SHA specification/data-flow review against the approved design;
 2. exact-SHA security/no-effect/privacy review, including deliberate sandbox,
