@@ -1465,6 +1465,14 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertFalse(forbidden & set(env))
         self.assertEqual("paused", env["SITESIFT_OUTBOUND_MODE"])
 
+    def test_direct_wrapper_validation_never_executes_a_probe(self):
+        with mock.patch.object(
+            subprocess,
+            "run",
+            side_effect=AssertionError("direct wrapper executed a subprocess probe"),
+        ):
+            self.wrapper._validate_sealed_boundary(REPO_ROOT)
+
     def test_wrapper_uses_a_true_execve_boundary_and_rejects_symlinked_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = Path(tmp) / "task"
