@@ -16,14 +16,16 @@ Both global campaign switches remain false throughout this milestone. Operators 
 
 Promotion uses the versioned `GET /health/identity/v1` route while preserving
 the exact legacy `GET /health` and `/healthz` body. The controller must re-prove
-the deployed rules, Hosting version/assets, both false switches, exact private
-Cloud Run service and project-level invoker bindings on the parentless project,
+the deployed rules, Hosting version/assets, both false switches, exact direct
+Cloud Run service and project-level `roles/run.invoker` bindings on the parentless project,
 with no broad principal, plus the exact named operator credential with every
 Cloud SDK token/file/impersonation/account/project override absent, prior
-revision/digest and routing, candidate immutable
-digest/config/readiness, exact queue configuration, and zero listed tasks before
-mutation. It pauses the queue, requires three empty snapshots over at least ten
-seconds, assigns one HEAD-derived temporary tag, rejects unauthenticated access
+revision/digest and routing, candidate immutable digest/spec/functional-metadata/
+readiness, exact queue configuration, and zero listed tasks before
+mutation. Queue-level HTTP URI/method/header/OAuth/OIDC and App Engine routing
+overrides must all be absent. It pauses the queue, requires three empty
+snapshots over at least ten seconds, assigns one HEAD-derived temporary tag,
+rejects unauthenticated access
 and redirects, proves both health contracts on the exact candidate, removes the
 tag, then reasserts PAUSED plus empty tasks immediately before promotion. It
 revalidates candidate identity/digest/config and both health contracts after

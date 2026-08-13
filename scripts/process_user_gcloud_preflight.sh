@@ -6,7 +6,7 @@ PROCESS_USER_PROJECT_NUMBER="248289505828"
 
 process_user_gcloud_preflight() {
   local mode="${1:-apply}"
-  local configured_impersonation auth_accounts auth_count project_info
+  local configured_override override_name auth_accounts auth_count project_info
   local actual_project_number lifecycle_state
 
   if [[ "${GCLOUD_ACCOUNT:-}" != "$PROCESS_USER_APPROVED_ACCOUNT" ]]; then
@@ -14,13 +14,19 @@ process_user_gcloud_preflight() {
       "$PROCESS_USER_APPROVED_ACCOUNT" >&2
     return 65
   fi
-  export CLOUDSDK_CORE_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
-
-  if [[ -n "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}" ]]; then
-    printf 'Refusing: gcloud service-account impersonation must be disabled.\n' >&2
-    return 66
-  fi
-
+  for override_name in \
+    CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  do
+    if [[ -n "${!override_name:-}" ]]; then
+      printf 'Refusing: Cloud SDK authentication/project override must be unset.\n' >&2
+      return 66
+    fi
+  done
   if [[ "$mode" == "dry-run" || "$mode" == "local" ]]; then
     return 0
   fi
@@ -29,15 +35,21 @@ process_user_gcloud_preflight() {
     return 64
   fi
 
-  configured_impersonation="$(
-    gcloud config get-value auth/impersonate_service_account \
-      --account "$PROCESS_USER_APPROVED_ACCOUNT" \
-      --project "$PROCESS_USER_PROJECT"
-  )"
-  if [[ -n "$configured_impersonation" && "$configured_impersonation" != "(unset)" ]]; then
-    printf 'Refusing: gcloud auth/impersonate_service_account must be unset.\n' >&2
-    return 69
-  fi
+  for override_name in \
+    auth/impersonate_service_account \
+    auth/access_token_file \
+    auth/credential_file_override
+  do
+    configured_override="$(
+      gcloud config get-value "$override_name" \
+        --account "$PROCESS_USER_APPROVED_ACCOUNT" \
+        --project "$PROCESS_USER_PROJECT"
+    )"
+    if [[ -n "$configured_override" && "$configured_override" != "(unset)" ]]; then
+      printf 'Refusing: Cloud SDK authentication config override must be unset.\n' >&2
+      return 69
+    fi
+  done
 
   auth_accounts="$(
     gcloud auth list \

@@ -304,12 +304,16 @@ After the exact final backend HEAD has been staged by the tagless gate and both
 prerequisite surfaces are already live, run
 `scripts/rollout_process_user_phase1.sh --dry-run` for a zero-command summary.
 The reviewed `--apply` mode is the only Phase 1 promotion path. It pins the
-rules, Hosting version/assets, both false campaign switches, exact private
-Cloud Run service and project-level invoker policies on the verified parentless
-project, the exact named operator account with no Cloud SDK access-token,
+rules, Hosting version/assets, both false campaign switches, exact direct Cloud
+Run service and project-level `roles/run.invoker` bindings with no public
+principal on the verified parentless project, the exact named operator account
+with no Cloud SDK access-token,
 credential-file, impersonation, account, or project override, prior
-revision/digest, all existing traffic tags, candidate
-digest/config/readiness, and the exact `graph-process-user` queue configuration.
+revision/digest, all existing traffic tags, candidate digest/spec/functional
+metadata/readiness, and the exact `graph-process-user` queue configuration.
+The exact queue contract also requires the whole queue-level `httpTarget` and
+App Engine routing override surfaces to be absent; URI, method, header,
+OAuth, or OIDC overrides all fail closed.
 
 The controller pauses the queue and requires three empty task snapshots over at
 least ten seconds before creating a unique temporary certification tag. It
@@ -318,10 +322,10 @@ requires unauthenticated Cloud Run rejection, exact legacy `/health`, and exact
 token is minted without a custom audience; requests remain restricted to the
 validated canonical service/tag hosts. Redirects are rejected for authenticated
 reads. The tag is removed and read back before promotion. Immediately before
-each traffic or queue-state mutation, the controller reasserts PAUSED state,
-zero tasks, and the closed prerequisites. It then pins the exact candidate at
-100 percent plus `release-a`, repeats digest/config/health/topology checks, and
-resumes only after every proof passes.
+promotion and again before queue resume, the controller reasserts PAUSED state,
+zero tasks, and the applicable closed prerequisites. It then pins the exact
+candidate at 100 percent plus `release-a`, repeats digest/config/functional-
+metadata/health/topology checks, and resumes only after every proof passes.
 
 On any failure after pausing, the controller re-pauses, removes the temporary
 tag, restores the prior revision at 100 percent plus `release-a` when traffic may

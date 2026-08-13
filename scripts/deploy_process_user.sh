@@ -494,6 +494,35 @@ if annotations.get("autoscaling.knative.dev/maxScale") != "10":
 if annotations.get("autoscaling.knative.dev/minScale") not in (None, "0"):
     refuse("candidate revision minScale is not 0")
 
+
+def canonical_metadata(document):
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        refuse("revision metadata is missing")
+    result = {}
+    ignored = {
+        "annotations": {"run.googleapis.com/operation-id"},
+        "labels": {
+            "serving.knative.dev/configurationGeneration",
+            "serving.knative.dev/route",
+        },
+    }
+    for field, ignored_keys in ignored.items():
+        values = metadata.get(field, {})
+        if not isinstance(values, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in values.items()
+        ):
+            refuse(f"revision {field} shape is invalid")
+        result[field] = {
+            key: value for key, value in values.items() if key not in ignored_keys
+        }
+    return result
+
+
+if canonical_metadata(revision) != canonical_metadata(baseline_revision):
+    refuse("candidate functional revision metadata differs from baseline")
+
 spec = revision.get("spec")
 if not isinstance(spec, dict):
     refuse("candidate revision spec is missing")

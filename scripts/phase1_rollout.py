@@ -79,6 +79,13 @@ AUTH_OVERRIDE_PROPERTIES = (
     "auth/access_token_file",
     "auth/credential_file_override",
 )
+REVISION_NONFUNCTIONAL_ANNOTATIONS = frozenset({
+    "run.googleapis.com/operation-id",
+})
+REVISION_NONFUNCTIONAL_LABELS = frozenset({
+    "serving.knative.dev/configurationGeneration",
+    "serving.knative.dev/route",
+})
 
 
 class RolloutError(RuntimeError):
@@ -96,6 +103,21 @@ def validate_auth_environment(environment: Mapping[str, str]) -> None:
         raise RolloutError("GCLOUD_ACCOUNT is not the approved account")
     if any(environment.get(name) not in (None, "") for name in AUTH_OVERRIDE_ENV):
         raise RolloutError("Cloud SDK authentication environment override is set")
+
+
+def validate_rules_source(source: Any) -> None:
+    source = _object(source, "Firestore rules source")
+    if set(source) != {"files"}:
+        raise RolloutError("Firestore rules source contains unexpected fields")
+    files = source.get("files")
+    if not isinstance(files, list) or len(files) != 1:
+        raise RolloutError("Firestore rules source is not exactly one file")
+    row = _object(files[0], "Firestore rules file")
+    if set(row) != {"name", "content"} or row.get("name") != "firestore.rules":
+        raise RolloutError("Firestore rules file identity or shape is wrong")
+    content = row.get("content")
+    if not isinstance(content, str) or hashlib.sha256(content.encode()).hexdigest() != RULES_HASH:
+        raise RolloutError("live Firestore rules hash is wrong")
 
 
 @dataclass(frozen=True)
@@ -238,8 +260,8 @@ def validate_queue(value: Any, expected_state: str) -> None:
         "minBackoff": "30s",
     }:
         raise RolloutError("queue retry configuration drifted")
-    if value.get("httpTarget", {}).get("uriOverride") is not None:
-        raise RolloutError("queue URI override is present")
+    if value.get("httpTarget") not in (None, {}):
+        raise RolloutError("queue HTTP target override is present")
     if value.get("appEngineRoutingOverride") is not None:
         raise RolloutError("queue App Engine override is present")
 
@@ -304,6 +326,25 @@ def _canonical_revision_spec(value: Any) -> dict[str, Any]:
     return result
 
 
+def _canonical_revision_metadata(value: Any) -> dict[str, dict[str, str]]:
+    metadata = _object(value, "revision metadata")
+    result: dict[str, dict[str, str]] = {}
+    for field, ignored in (
+        ("annotations", REVISION_NONFUNCTIONAL_ANNOTATIONS),
+        ("labels", REVISION_NONFUNCTIONAL_LABELS),
+    ):
+        raw = metadata.get(field, {})
+        if not isinstance(raw, dict) or not all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in raw.items()
+        ):
+            raise RolloutError(f"revision {field} shape is invalid")
+        result[field] = {
+            key: item for key, item in raw.items() if key not in ignored
+        }
+    return result
+
+
 def validate_candidate(
     candidate: Any,
     baseline: Any,
@@ -343,6 +384,10 @@ def validate_candidate(
         raise RolloutError("candidate is not exactly Ready")
     if _canonical_revision_spec(spec) != _canonical_revision_spec(baseline_spec):
         raise RolloutError("candidate config differs from baseline beyond image")
+    if _canonical_revision_metadata(metadata) != _canonical_revision_metadata(
+        _object(baseline.get("metadata"), "baseline metadata")
+    ):
+        raise RolloutError("candidate functional metadata differs from baseline")
 
 
 def validate_old_revision(value: Any) -> None:
@@ -561,7 +606,6 @@ class Phase1Rollout:
             validate_queue(self.ops.get_queue(), "PAUSED")
             if not self._tasks_are_empty():
                 raise RolloutError("task appeared immediately before promotion")
-
             traffic_attempted = True
             self.ops.promote(self.candidate, OLD_REVISION)
             promoted = validate_topology(
@@ -749,16 +793,7 @@ class SubprocessOps:
         rules = self._http_json(
             f"https://firebaserules.googleapis.com/v1/{ruleset}", token=token
         )
-        files = rules.get("source", {}).get("files", [])
-        matches = [
-            row.get("content")
-            for row in files
-            if isinstance(row, dict) and row.get("name") == "firestore.rules"
-        ]
-        if len(matches) != 1 or not isinstance(matches[0], str) or hashlib.sha256(
-            matches[0].encode()
-        ).hexdigest() != RULES_HASH:
-            raise RolloutError("live Firestore rules hash is wrong")
+        validate_rules_source(rules.get("source"))
 
         releases = self._http_json(
             "https://firebasehosting.googleapis.com/v1beta1/projects/-/sites/"

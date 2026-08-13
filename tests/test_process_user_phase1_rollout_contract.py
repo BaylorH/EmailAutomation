@@ -70,12 +70,25 @@ def service(positive_revision=OLD_REVISION, release_revision=OLD_REVISION, extra
 
 
 def revision(name, image):
+    is_candidate = name == CANDIDATE
     return {
         "metadata": {
             "name": name,
             "annotations": {
                 "autoscaling.knative.dev/maxScale": "10",
                 "autoscaling.knative.dev/minScale": "0",
+                "run.googleapis.com/operation-id": (
+                    "candidate-operation" if is_candidate else "baseline-operation"
+                ),
+                "run.googleapis.com/startup-cpu-boost": "true",
+            },
+            "labels": {
+                "cloud.googleapis.com/location": "us-central1",
+                "serving.knative.dev/configurationGeneration": (
+                    "98" if is_candidate else "97"
+                ),
+                **({} if is_candidate else {"serving.knative.dev/route": "process-user"}),
+                "serving.knative.dev/service": "process-user",
             },
         },
         "spec": {
@@ -290,10 +303,18 @@ class ValidatorTests(unittest.TestCase):
 
     def test_queue_contract_is_closed(self):
         phase1_rollout.validate_queue(queue(), "RUNNING")
-        bad = queue()
-        bad["httpTarget"] = {"uriOverride": {"uri": "https://wrong"}}
-        with self.assertRaises(phase1_rollout.RolloutError):
-            phase1_rollout.validate_queue(bad, "RUNNING")
+        for override in (
+            {"uriOverride": {"uri": "https://wrong"}},
+            {"httpMethod": "POST"},
+            {"headerOverrides": [{"header": {"key": "x", "value": "y"}}]},
+            {"oauthToken": {"serviceAccountEmail": "wrong@example.test"}},
+            {"oidcToken": {"serviceAccountEmail": "wrong@example.test"}},
+        ):
+            with self.subTest(override=override):
+                bad = queue()
+                bad["httpTarget"] = override
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_queue(bad, "RUNNING")
 
     def test_candidate_must_be_ready_and_exact_config_clone(self):
         phase1_rollout.validate_candidate(
@@ -308,6 +329,27 @@ class ValidatorTests(unittest.TestCase):
                 changed, revision(OLD_REVISION, OLD_IMAGE),
                 CANDIDATE, CANDIDATE_IMAGE,
             )
+
+    def test_candidate_functional_metadata_must_match_baseline(self):
+        baseline = revision(OLD_REVISION, OLD_IMAGE)
+        for mutate in (
+            lambda value: value["metadata"]["annotations"].update(
+                {"run.googleapis.com/startup-cpu-boost": "false"}
+            ),
+            lambda value: value["metadata"]["annotations"].update(
+                {"run.googleapis.com/vpc-access-connector": "other"}
+            ),
+            lambda value: value["metadata"]["labels"].update(
+                {"cloud.googleapis.com/location": "other"}
+            ),
+        ):
+            with self.subTest(mutate=mutate):
+                changed = revision(CANDIDATE, CANDIDATE_IMAGE)
+                mutate(changed)
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_candidate(
+                        changed, baseline, CANDIDATE, CANDIDATE_IMAGE
+                    )
 
 
 class StateMachineTests(unittest.TestCase):
@@ -508,6 +550,24 @@ class StaticSafetyTests(unittest.TestCase):
 
 
 class AdapterContractTests(unittest.TestCase):
+    def test_firestore_rules_source_is_exactly_one_closed_file(self):
+        content = "rules_version = '2';\n"
+        exact = {"files": [{"name": "firestore.rules", "content": content}]}
+        with patch.object(
+            phase1_rollout,
+            "RULES_HASH",
+            __import__("hashlib").sha256(content.encode()).hexdigest(),
+        ):
+            phase1_rollout.validate_rules_source(exact)
+            for bad in (
+                {"files": exact["files"] + [{"name": "extra.rules", "content": ""}]},
+                {"files": [{**exact["files"][0], "extra": True}]},
+                {"files": exact["files"], "extra": True},
+            ):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(phase1_rollout.RolloutError):
+                        phase1_rollout.validate_rules_source(bad)
+
     def test_cloud_sdk_auth_override_environment_is_closed(self):
         phase1_rollout.validate_auth_environment({"GCLOUD_ACCOUNT": phase1_rollout.ACCOUNT})
         for name in (

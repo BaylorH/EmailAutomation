@@ -126,6 +126,7 @@ class DeployScriptContractTests(unittest.TestCase):
         scenario: str = "ok",
         cwd: Path = REPO_ROOT,
         impersonation_env: str | None = None,
+        auth_override_env: tuple[str, str] | None = None,
     ):
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -143,6 +144,16 @@ class DeployScriptContractTests(unittest.TestCase):
             env.pop("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", None)
         else:
             env["CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT"] = impersonation_env
+        for name in (
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CORE_PROJECT",
+        ):
+            env.pop(name, None)
+        if auth_override_env is not None:
+            env[auth_override_env[0]] = auth_override_env[1]
         if account is None:
             env.pop("GCLOUD_ACCOUNT", None)
         else:
@@ -325,6 +336,22 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(self._gcloud_calls(), [])
         self.assertFalse(self.git_log.exists())
 
+    def test_cloud_sdk_auth_environment_overrides_stop_before_git_or_gcloud(self):
+        for name in (
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CORE_PROJECT",
+        ):
+            with self.subTest(name=name):
+                result = self._run(
+                    "--apply", auth_override_env=(name, "unexpected")
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._gcloud_calls(), [])
+                self.assertFalse(self.git_log.exists())
+
     def test_configured_impersonation_stops_before_auth_or_mutation(self):
         result = self._run("--apply", scenario="configured_impersonation")
         self.assertNotEqual(result.returncode, 0)
@@ -337,13 +364,15 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self._gcloud_calls()
         self.assertIn(self._deploy_call(), calls)
-        self.assertEqual(calls[6], self._build_call())
+        self.assertEqual(
+            calls[len(self._preflight_calls()) + 3], self._build_call()
+        )
 
     def test_auth_missing_stops_before_project_or_mutation(self):
         result = self._run("--apply", scenario="auth_missing")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self._gcloud_calls(), [
-            self._config_call(),
+            *self._config_calls(),
             [
                 "auth",
                 "list",
@@ -359,7 +388,7 @@ class DeployScriptContractTests(unittest.TestCase):
     def test_auth_duplicate_stops_before_project_or_mutation(self):
         result = self._run("--apply", scenario="auth_duplicate")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self._gcloud_calls()), 2)
+        self.assertEqual(len(self._gcloud_calls()), len(self._config_calls()) + 1)
 
     def test_wrong_project_number_stops_before_build(self):
         result = self._run("--apply", scenario="project_wrong_number")
@@ -387,19 +416,23 @@ class DeployScriptContractTests(unittest.TestCase):
         result = self._run("--apply", scenario="empty_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(calls[:3], self._preflight_calls())
-        self.assertEqual(calls[3], self._service_describe_call())
-        self.assertEqual(calls[4], self._revision_list_call())
-        self.assertEqual(calls[5], self._baseline_revision_describe_call())
-        self.assertEqual(calls[6], self._build_call())
-        self.assertEqual(calls[7], self._digest_call())
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(
+            calls,
+            [
+                *self._preflight_calls(),
+                self._service_describe_call(),
+                self._revision_list_call(),
+                self._baseline_revision_describe_call(),
+                self._build_call(),
+                self._digest_call(),
+            ],
+        )
 
     def test_invalid_digest_stops_before_deploy(self):
         result = self._run("--apply", scenario="invalid_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), len(self._preflight_calls()) + 5)
         self.assertEqual(calls[-1], self._digest_call())
         self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
 
@@ -489,9 +522,23 @@ class DeployScriptContractTests(unittest.TestCase):
         ]
 
     @staticmethod
+    def _config_calls() -> list[list[str]]:
+        return [
+            [
+                "config", "get-value", property_name,
+                "--account", ACCOUNT, "--project", PROJECT,
+            ]
+            for property_name in (
+                "auth/impersonate_service_account",
+                "auth/access_token_file",
+                "auth/credential_file_override",
+            )
+        ]
+
+    @staticmethod
     def _preflight_calls() -> list[list[str]]:
         return [
-            DeployScriptContractTests._config_call(),
+            *DeployScriptContractTests._config_calls(),
             [
                 "auth",
                 "list",
@@ -790,10 +837,6 @@ class RollbackRunbookContractTests(unittest.TestCase):
             log_path = Path(os.environ["FAKE_GCLOUD_LOG"])
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(args) + "\\n")
-
-            if os.environ.get("CLOUDSDK_CORE_ACCOUNT") != "{ACCOUNT}":
-                print("gcloud account override is not bound to the approved principal", file=sys.stderr)
-                raise SystemExit(70)
 
             state_path = Path(os.environ["FAKE_GCLOUD_STATE"])
             state = json.loads(state_path.read_text(encoding="utf-8"))

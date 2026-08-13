@@ -26,12 +26,13 @@ Both global campaign switches remain false throughout this milestone. Operators 
 
 The final promotion controller uses versioned `GET /health/identity/v1` without
 changing the exact legacy `/health` or `/healthz` body. It must pin and repeatedly
-re-read rules, Hosting assets/version, false switches, exact private Cloud Run
-service and project-level invoker IAM on the parentless project with no broad
+re-read rules, Hosting assets/version, false switches, exact direct Cloud Run
+service and project-level `roles/run.invoker` IAM on the parentless project with no broad
 principal, the exact named operator credential with no Cloud SDK token/file/
-impersonation/account/project override, old and candidate revision/digest/config/readiness, full routing/tag topology,
+impersonation/account/project override, old and candidate revision/digest/spec/functional-metadata/readiness, full routing/tag topology,
 and the exact queue configuration. Pause first; require three empty task lists
-over at least ten seconds; add one HEAD-derived temporary tag; prove
+over at least ten seconds; require all queue-level HTTP URI/method/header/
+OAuth/OIDC and App Engine routing overrides absent; add one HEAD-derived temporary tag; prove
 unauthenticated rejection plus exact legacy and identity health; remove the tag;
 then reassert PAUSED and zero tasks immediately before promotion. Repeat exact
 candidate and health proof after promotion, reassert prerequisites and

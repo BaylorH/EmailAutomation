@@ -112,6 +112,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         scenario: str = "ok",
         cwd: Path = REPO_ROOT,
         impersonation_env: str | None = None,
+        auth_override_env: tuple[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -129,6 +130,16 @@ class TaglessStagingContractTests(unittest.TestCase):
             env.pop("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", None)
         else:
             env["CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT"] = impersonation_env
+        for name in (
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CORE_PROJECT",
+        ):
+            env.pop(name, None)
+        if auth_override_env is not None:
+            env[auth_override_env[0]] = auth_override_env[1]
         if account is None:
             env.pop("GCLOUD_ACCOUNT", None)
         else:
@@ -266,9 +277,18 @@ class TaglessStagingContractTests(unittest.TestCase):
         result = self._run("--apply", scenario="ok")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("release-a", result.stdout)
-        self.assertEqual(self._gcloud_calls()[3], self._service_describe_call())
-        self.assertEqual(self._gcloud_calls()[4], self._revision_list_call())
-        self.assertEqual(self._gcloud_calls()[5], self._baseline_revision_describe_call())
+        self.assertEqual(
+            self._gcloud_calls()[len(self._preflight_calls())],
+            self._service_describe_call(),
+        )
+        preflight_len = len(self._preflight_calls())
+        self.assertEqual(
+            self._gcloud_calls()[preflight_len + 1], self._revision_list_call()
+        )
+        self.assertEqual(
+            self._gcloud_calls()[preflight_len + 2],
+            self._baseline_revision_describe_call(),
+        )
 
     def test_baseline_revision_read_failure_is_rejected_before_build(self):
         self._assert_baseline_revision_refused("baseline_revision_read_failure")
@@ -287,6 +307,24 @@ class TaglessStagingContractTests(unittest.TestCase):
 
     def test_candidate_other_config_drift_is_rejected(self):
         self._assert_revision_refused("candidate_other_config_drift")
+
+    def test_candidate_functional_annotation_drift_is_rejected(self):
+        self._assert_revision_refused("candidate_annotation_drift")
+
+    def test_cloud_sdk_auth_environment_overrides_stop_before_gcloud(self):
+        for name in (
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CORE_PROJECT",
+        ):
+            with self.subTest(name=name):
+                result = self._run(
+                    "--apply", auth_override_env=(name, "unexpected")
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual([], self._gcloud_calls())
 
     def test_candidate_must_remain_untagged(self):
         self._assert_post_readback_refused("candidate_tagged")
@@ -427,9 +465,23 @@ class TaglessStagingContractTests(unittest.TestCase):
         ]
 
     @staticmethod
+    def _config_calls() -> list[list[str]]:
+        return [
+            [
+                "config", "get-value", property_name,
+                "--account", ACCOUNT, "--project", PROJECT,
+            ]
+            for property_name in (
+                "auth/impersonate_service_account",
+                "auth/access_token_file",
+                "auth/credential_file_override",
+            )
+        ]
+
+    @staticmethod
     def _preflight_calls() -> list[list[str]]:
         return [
-            TaglessStagingContractTests._config_call(),
+            *TaglessStagingContractTests._config_calls(),
             [
                 "auth", "list",
                 "--account", ACCOUNT,
@@ -542,10 +594,6 @@ class TaglessStagingContractTests(unittest.TestCase):
             log_path = Path(os.environ["FAKE_GCLOUD_LOG"])
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(args) + "\\n")
-
-            if os.environ.get("CLOUDSDK_CORE_ACCOUNT") != "bp21harrison@gmail.com":
-                print("gcloud account override is not bound to the approved principal", file=sys.stderr)
-                raise SystemExit(70)
 
             scenario = os.environ.get("FAKE_GCLOUD_SCENARIO", "ok")
             state_path = Path(os.environ["FAKE_GCLOUD_STATE"])
@@ -687,6 +735,21 @@ class TaglessStagingContractTests(unittest.TestCase):
                         "annotations": {
                             "autoscaling.knative.dev/minScale": "0",
                             "autoscaling.knative.dev/maxScale": "10",
+                            "run.googleapis.com/operation-id": (
+                                "baseline-operation" if is_baseline else "candidate-operation"
+                            ),
+                            "run.googleapis.com/startup-cpu-boost": "true",
+                        },
+                        "labels": {
+                            "cloud.googleapis.com/location": "us-central1",
+                            "serving.knative.dev/configurationGeneration": (
+                                "97" if is_baseline else "98"
+                            ),
+                            **(
+                                {"serving.knative.dev/route": "process-user"}
+                                if is_baseline else {}
+                            ),
+                            "serving.knative.dev/service": "process-user",
                         },
                     },
                     "spec": {
@@ -712,6 +775,10 @@ class TaglessStagingContractTests(unittest.TestCase):
                 }
                 if not is_baseline and scenario == "candidate_other_config_drift":
                     document["spec"]["containers"][0]["resources"]["limits"]["cpu"] = "2"
+                elif not is_baseline and scenario == "candidate_annotation_drift":
+                    document["metadata"]["annotations"][
+                        "run.googleapis.com/startup-cpu-boost"
+                    ] = "false"
                 return document
 
             if args[:2] == ["config", "get-value"]:
