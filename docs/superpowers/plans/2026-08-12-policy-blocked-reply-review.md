@@ -20,6 +20,8 @@ The first prerequisite is Firestore rules that make processingFailures owner-rea
 
 Only after both prerequisite surfaces are certified may operators stage the backend producer as the deterministic `process-user-stage-<12-character-HEAD>` revision. Staging must use an immutable digest, `--no-traffic`, and no tag. Before building, the script must reject LATEST or implicit canonical `spec.traffic`, ambiguous routing or tags, a deterministic-candidate collision anywhere in the full service revision inventory, and an unreadable baseline positive revision. Readback must prove that the Ready candidate is untagged at 0 percent and matches the baseline revision configuration apart from immutable image and revision identity, while the prior sole 100 percent revision retains the stable `release-a` and every auxiliary pinned tag mapping with canonical `spec.traffic` unchanged. Staging does not pause or resume a queue, mutate traffic, certify an HTTP route, promote, or roll back.
 
+In short: deploy the backend producer with no traffic before promotion.
+
 Both global campaign switches remain false throughout this milestone. Operators must not call `POST /process-user` or perform a provider or mailbox canary.
 
 The final promotion controller uses versioned `GET /health/identity/v1` without
