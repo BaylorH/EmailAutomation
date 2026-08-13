@@ -58,23 +58,46 @@ class TestTestCollectionContract(unittest.TestCase):
         except ModuleNotFoundError:
             self.fail("root conftest.py does not define the collection-only provider boundary")
 
+        import firebase_admin
         from google.cloud import firestore
+        import msal
 
-        original_client = firestore.Client
+        original_firestore_client = firestore.Client
+        original_firebase_initialize_app = firebase_admin.initialize_app
+        original_msal_public_client = msal.PublicClientApplication
         normal_config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
         collection_config.pytest_configure(normal_config)
-        self.assertIs(original_client, firestore.Client)
+        self.assertIs(original_firestore_client, firestore.Client)
+        self.assertIs(original_firebase_initialize_app, firebase_admin.initialize_app)
+        self.assertIs(original_msal_public_client, msal.PublicClientApplication)
         collection_config.pytest_unconfigure(normal_config)
 
         collect_config = SimpleNamespace(option=SimpleNamespace(collectonly=True))
         collection_config.pytest_configure(collect_config)
         try:
-            self.assertIsNot(original_client, firestore.Client)
+            self.assertIsNot(original_firestore_client, firestore.Client)
+            self.assertIsNot(original_firebase_initialize_app, firebase_admin.initialize_app)
+            self.assertIsNot(original_msal_public_client, msal.PublicClientApplication)
             self.assertIs(firestore.Client(), firestore.Client())
         finally:
             collection_config.pytest_unconfigure(collect_config)
 
-        self.assertIs(original_client, firestore.Client)
+        self.assertIs(original_firestore_client, firestore.Client)
+        self.assertIs(original_firebase_initialize_app, firebase_admin.initialize_app)
+        self.assertIs(original_msal_public_client, msal.PublicClientApplication)
+
+        with self.subTest("partial setup failure restores earlier provider patches"):
+            failed_config = SimpleNamespace(option=SimpleNamespace(collectonly=True))
+            del msal.PublicClientApplication
+            try:
+                with self.assertRaises(AttributeError):
+                    collection_config.pytest_configure(failed_config)
+
+                self.assertIs(original_firestore_client, firestore.Client)
+                self.assertIs(original_firebase_initialize_app, firebase_admin.initialize_app)
+            finally:
+                msal.PublicClientApplication = original_msal_public_client
+                collection_config.pytest_unconfigure(failed_config)
 
     def test_manual_executables_are_outside_pytest_discovery(self):
         for discovered_relative, manual_relative in MANUAL_EXECUTABLE_MOVES:
@@ -220,9 +243,59 @@ class TestTestCollectionContract(unittest.TestCase):
         self.assertNotIn("Traceback", output)
 
     def test_whole_repo_collection_completes_with_credential_absent_inventory(self):
-        with tempfile.TemporaryDirectory(prefix="pytest-collection-home-") as temp_home:
+        with tempfile.TemporaryDirectory(prefix="pytest-collection-home-") as temp:
+            temp_root = Path(temp)
+            temp_home = temp_root / "empty_home"
+            import_guard = temp_root / "import_guard"
+            guard_ready = temp_root / "collection_guard.ready"
+            guard_log = temp_root / "collection_guard.log"
+            temp_home.mkdir()
+            import_guard.mkdir()
+            (import_guard / "sitecustomize.py").write_text(
+                textwrap.dedent(
+                    """
+                    import os
+                    from pathlib import Path
+                    import socket
+
+                    guard_log = Path(os.environ["COLLECTION_GUARD_LOG"])
+
+                    def _blocked_boundary(name):
+                        def blocked(*args, **kwargs):
+                            with guard_log.open("a", encoding="utf-8") as log_file:
+                                log_file.write(name + "\\n")
+                            raise RuntimeError("COLLECTION_EFFECT_ATTEMPTED:" + name)
+                        return blocked
+
+                    socket.socket.connect = _blocked_boundary("socket.socket.connect")
+                    socket.create_connection = _blocked_boundary(
+                        "socket.create_connection"
+                    )
+
+                    import firebase_admin
+                    from google.cloud import firestore
+                    import msal
+
+                    firestore.Client = _blocked_boundary("firestore.Client")
+                    firebase_admin.initialize_app = _blocked_boundary(
+                        "firebase_admin.initialize_app"
+                    )
+                    msal.PublicClientApplication = _blocked_boundary(
+                        "msal.PublicClientApplication"
+                    )
+                    Path(os.environ["COLLECTION_GUARD_READY"]).write_text(
+                        "ready", encoding="utf-8"
+                    )
+                    """
+                ),
+                encoding="utf-8",
+            )
+
             env = _credential_absent_env()
-            env["HOME"] = temp_home
+            env["HOME"] = str(temp_home)
+            env["PYTHONPATH"] = str(import_guard)
+            env["COLLECTION_GUARD_READY"] = str(guard_ready)
+            env["COLLECTION_GUARD_LOG"] = str(guard_log)
             completed = subprocess.run(
                 [
                     sys.executable,
@@ -241,8 +314,16 @@ class TestTestCollectionContract(unittest.TestCase):
                 timeout=180,
             )
 
+            self.assertEqual("ready", guard_ready.read_text(encoding="utf-8"))
+            boundary_calls = (
+                guard_log.read_text(encoding="utf-8").splitlines()
+                if guard_log.exists()
+                else []
+            )
+
         output = completed.stdout + completed.stderr
         failure_tail = output[-16000:]
+        self.assertEqual([], boundary_calls, failure_tail)
         self.assertEqual(0, completed.returncode, failure_tail)
         self.assertNotIn("INTERNALERROR", output)
         self.assertNotIn("mainloop: caught unexpected SystemExit", output)
