@@ -1050,6 +1050,23 @@ class Ceq1BootstrapTests(unittest.TestCase):
             with self.assertRaises(self.bootstrap.BootstrapBlocked):
                 self.bootstrap.validate_bundle_path_receipt(bundle, receipt)
 
+    def test_runtime_target_lifecycle_is_private_and_nonpreexisting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            candidate = root / "bootstrap/review-candidate/runtime"
+            (root / "bootstrap").mkdir()
+            self.bootstrap.create_runtime_target("derive-review-candidate", candidate)
+            self.assertEqual(0o700, stat.S_IMODE(candidate.parent.stat().st_mode))
+            self.assertEqual(0o700, stat.S_IMODE(candidate.stat().st_mode))
+            with self.assertRaises(self.bootstrap.BootstrapBlocked):
+                self.bootstrap.create_runtime_target("derive-review-candidate", candidate)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            canonical = root / ".ceq1-venv"
+            self.bootstrap.create_runtime_target("prepare", canonical)
+            self.assertEqual(0o700, stat.S_IMODE(canonical.stat().st_mode))
+
     def test_tree_receipt_rejects_relative_symlink_escape(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
