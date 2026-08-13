@@ -1328,7 +1328,7 @@ ordered/disjoint/complete, preserves the canonical verdict byte-for-byte, and
 deterministically produces the sole combined evidence view.
 
 Report tests require `executionHead` plus non-self-referential
-`evidenceCarrierParent` and `evidenceTreeDigest`, product
+`evidenceCarrierParent`, product
 source/production ancestor, toolchain/dependency/public-manifest/public-schedule/
 sealed-coverage/fixture/oracle/owner/projection hashes; the planned exact 19
 scenarios/55 variants; canonical attempted cardinality through its first
@@ -1371,11 +1371,10 @@ The execution source identity is
 `{executionHead, productSourceBase, productionAncestor}`; never claim execution
 HEAD equals `b400ee5`. The later report-only commit is
 verified externally after creation. Inside the report,
-`evidenceCarrierParent` equals `executionHead` and `evidenceTreeDigest` binds
-the two rendered evidence blobs plus their logical paths without containing the
-later commit SHA; this avoids a self-referential hash. The carrier commit may
+`evidenceCarrierParent` equals `executionHead`; neither the later commit SHA nor
+a digest of the blob containing itself is stored in the report. The carrier commit may
 differ only by the two generated evidence files, and final review records its
-exact SHA outside those files.
+exact commit/tree/blob SHAs outside those files.
 Any product-file drift requires a separately reviewed successor identity.
 
 `calibrate` first runs the known-good synthetic control and all 18 generic
