@@ -80,6 +80,19 @@ def healthz():
     return jsonify({"status": "ok"}), 200
 
 
+@app.get("/health/identity/v1")
+def health_identity_v1():
+    service_name = (os.getenv("K_SERVICE") or "").strip() or "process-user"
+    revision_name = (os.getenv("K_REVISION") or "").strip() or "local"
+    return jsonify(
+        {
+            "status": "ok",
+            "service": service_name,
+            "revision": revision_name,
+        }
+    ), 200
+
+
 @app.post("/process-user")
 def process_user():
     if not _auth_ok():
