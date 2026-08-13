@@ -316,9 +316,18 @@ path/type/mode/size/symlink target for clone comparison. It clones the cache
 once with the host-pinned `/bin/cp -cR` into the unique bootstrap root. Through
 held no-follow directory descriptors it then rewrites only absolute symlinks
 whose targets are strictly below the reviewed source cache to the corresponding
-path below the clone; every other absolute/escaping link is `BLOCKED`. The
-clone's complete logical topology must equal the source topology after applying
-that single root substitution. The worker takes the source identity receipt
+path below the clone. Real-cache characterization found a closed class of uv
+build-environment interpreter links whose targets are below the uv-managed
+Python-store root but outside both the cache and the manifest-bound CPython
+source. Those links may be copied verbatim only when each exact relative path
+and target is present in both source receipts; they are classified
+`DENIED_EXTERNAL_PYTHON_LINK`, are never followed during clone validation, and
+must fail an OS-contained read probe with `EPERM` because the Seatbelt profile
+does not grant their target roots. No lock-selected archive or wheel may depend
+on one. Any other absolute/escaping link, any changed target, or any readable
+denied link is `BLOCKED`. The clone's complete logical topology must equal the
+source topology after applying the internal-root substitution and retaining
+that exact denied-link class. The worker takes the source identity receipt
 again after the clone and after all `uv` work; any source change is `BLOCKED`.
 Every `uv` child receives only that unique task-owned clone as `UV_CACHE_DIR`;
 no `uv` argv, environment, or resolved cache link may name the reviewed source
@@ -326,8 +335,9 @@ cache. The builder remains a read-only RECORD-closed reader of the reviewed
 source archive and never invokes `uv`. Tests require the clone command to run
 inside the inherited outer Seatbelt, refuse a preexisting or symlinked
 destination, prove source-cache immutability, verify exact internal-link
-rebasing, and prove that a uv child pointed at any other cache fails contract
-validation.
+rebasing, exercise a seeded denied-external-link read probe, reject an external
+target outside the closed uv-managed Python-store root, and prove that a uv
+child pointed at any other cache fails contract validation.
 
 The reviewed uv cache contains extracted exact distributions but not every
 original wheel byte needed by hash-required offline installation. Before
