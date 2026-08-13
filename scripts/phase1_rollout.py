@@ -512,11 +512,6 @@ def validate_old_revision(value: Any) -> None:
         raise RolloutError("old revision digest is wrong")
 
 
-def _validate_identity(value: Any, candidate: str) -> None:
-    if value != {"status": "ok", "service": SERVICE, "revision": candidate}:
-        raise RolloutError("health identity does not match candidate")
-
-
 def _validate_legacy_health(value: Any) -> None:
     if value != {"status": "ok"}:
         raise RolloutError("legacy health response is not exact")
@@ -547,6 +542,31 @@ class Phase1Rollout:
             f"dry-run: zero gcloud or HTTP commands; candidate={self.candidate}; "
             "queue remains RUNNING; traffic and tags remain unchanged"
         )
+
+    def verify_staging_prerequisites(self) -> None:
+        """Prove the approved rules -> UI -> backend order before any build."""
+        self.ops.preflight()
+        self.ops.verify_lock_permissions()
+        self.ops.verify_rules_ui_switches()
+        topology = validate_topology(
+            self.ops.get_service(),
+            expected_positive=OLD_REVISION,
+            expected_release=OLD_REVISION,
+            expected_aux=AUX_TAGS,
+        )
+        self.ops.verify_service_access(topology)
+        validate_old_revision(self.ops.get_revision(OLD_REVISION))
+        _validate_legacy_health(
+            self.ops.legacy_health_get(topology.service_url, topology.service_url)
+        )
+        _validate_legacy_health(
+            self.ops.legacy_health_get(
+                topology.tag_urls["release-a"], topology.service_url
+            )
+        )
+        validate_queue(self.ops.get_queue(), "RUNNING")
+        if not self._tasks_are_empty():
+            raise RolloutError("staging prerequisite tasks are not empty")
 
     def clear_orphan_lock_old_state(self, lock: RolloutLock) -> None:
         if lock.head_sha != self.head_sha:
@@ -747,13 +767,8 @@ class Phase1Rollout:
                 expected_extra={self.cert_tag: self.candidate},
             )
             cert_url = tagged.tag_urls[self.cert_tag]
-            if self.ops.unauthenticated_status(cert_url, "/health") != 403:
-                raise RolloutError("temporary tag is not protected by Cloud Run IAM")
             _validate_legacy_health(
                 self.ops.legacy_health_get(cert_url, tagged.service_url)
-            )
-            _validate_identity(
-                self.ops.identity_get(cert_url, tagged.service_url), self.candidate
             )
 
             self._locked_mutation(
@@ -793,16 +808,6 @@ class Phase1Rollout:
             validate_queue(self.ops.get_queue(), "PAUSED")
             if not self._tasks_are_empty():
                 raise RolloutError("task appeared after promotion")
-            _validate_identity(
-                self.ops.identity_get(promoted.service_url, promoted.service_url),
-                self.candidate,
-            )
-            _validate_identity(
-                self.ops.identity_get(
-                    promoted.tag_urls["release-a"], promoted.service_url
-                ),
-                self.candidate,
-            )
             _validate_legacy_health(
                 self.ops.legacy_health_get(
                     promoted.service_url, promoted.service_url
@@ -1361,21 +1366,6 @@ class SubprocessOps:
                 60,
             )
         )
-        for base_url in (topology.service_url, *topology.tag_urls.values()):
-            if self.unauthenticated_status(base_url, "/health") != 403:
-                raise RolloutError("Cloud Run endpoint is not IAM-protected")
-
-    def unauthenticated_status(self, base_url: str, path: str) -> int:
-        request = urllib.request.Request(base_url.rstrip("/") + path, method="GET")
-        try:
-            with urllib.request.build_opener(_NoRedirect()).open(
-                request, timeout=20
-            ) as response:
-                return response.status
-        except urllib.error.HTTPError as error:
-            return error.code
-        except (OSError, urllib.error.URLError) as error:
-            raise RolloutError("unauthenticated HTTP probe failed") from error
 
     def artifact_image(self) -> str:
         digest = self._gcloud(
@@ -1512,9 +1502,6 @@ class SubprocessOps:
             raise RolloutError("identity token response is invalid")
         return self._http_json(base_url.rstrip("/") + path, token=identity_token)
 
-    def identity_get(self, base_url: str, audience: str) -> Any:
-        return self._health_get(base_url, audience, "/health/identity/v1")
-
     def legacy_health_get(self, base_url: str, audience: str) -> Any:
         return self._health_get(base_url, audience, "/health")
 
@@ -1539,9 +1526,15 @@ def _current_head(repo_root: Path) -> str:
 
 def main(argv: list[str]) -> int:
     clear_mode = len(argv) == 4 and argv[0] == "--clear-orphan-lock-old-state"
-    if argv not in (["--dry-run"], ["--apply"], []) and not clear_mode:
+    if argv not in (
+        ["--dry-run"],
+        ["--apply"],
+        ["--verify-staging-prerequisites"],
+        [],
+    ) and not clear_mode:
         print(
             "Usage: rollout_process_user_phase1.sh [--dry-run|--apply|"
+            "--verify-staging-prerequisites|"
             "--clear-orphan-lock-old-state HEAD NONCE UPDATE_TIME]",
             file=sys.stderr,
         )
@@ -1554,6 +1547,13 @@ def main(argv: list[str]) -> int:
         rollout = Phase1Rollout(ops=ops, head_sha=head)
         if mode == "--dry-run":
             print(rollout.dry_run())
+            return 0
+        if mode == "--verify-staging-prerequisites":
+            rollout.verify_staging_prerequisites()
+            print(
+                "Phase 1 staging prerequisites verified: rules=exact; "
+                "hosting=exact; switches=false,false; queue=RUNNING; tasks=0"
+            )
             return 0
         previous_handlers = {
             signum: signal.getsignal(signum)

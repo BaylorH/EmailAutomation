@@ -118,6 +118,21 @@ class DeployScriptContractTests(unittest.TestCase):
             self.bin_dir / "gcloud",
             tagless_contract.TaglessStagingContractTests._fake_gcloud_source(),
         )
+        _write_executable(
+            self.bin_dir / "python3",
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                if [ "$1" = "${FAKE_PHASE1_ROLLOUT_MODULE:?}" ]; then
+                  printf '%s\n' '["phase1-prerequisites"]' >> "$FAKE_GCLOUD_LOG"
+                  [ "${2:-}" = "--verify-staging-prerequisites" ] || exit 64
+                  [ "$FAKE_GCLOUD_SCENARIO" != "prerequisite_failure" ] || exit 78
+                  exit 0
+                fi
+                exec "${REAL_PYTHON3:?}" "$@"
+                """
+            ),
+        )
 
     def _run(
         self,
@@ -140,6 +155,10 @@ class DeployScriptContractTests(unittest.TestCase):
         env["FAKE_OLD_REVISION"] = OLD_REVISION
         env["FAKE_OTHER_REVISION"] = "process-user-00096-old"
         env["FAKE_CANONICAL_IMAGE"] = CANONICAL_IMAGE
+        env["FAKE_PHASE1_ROLLOUT_MODULE"] = str(
+            REPO_ROOT / "scripts" / "phase1_rollout.py"
+        )
+        env["REAL_PYTHON3"] = sys.executable
         if impersonation_env is None:
             env.pop("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", None)
         else:
@@ -365,7 +384,7 @@ class DeployScriptContractTests(unittest.TestCase):
         calls = self._gcloud_calls()
         self.assertIn(self._deploy_call(), calls)
         self.assertEqual(
-            calls[len(self._preflight_calls()) + 3], self._build_call()
+            calls[len(self._apply_gate_calls()) + 3], self._build_call()
         )
 
     def test_auth_missing_stops_before_project_or_mutation(self):
@@ -419,7 +438,7 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
@@ -432,7 +451,7 @@ class DeployScriptContractTests(unittest.TestCase):
         result = self._run("--apply", scenario="invalid_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(len(calls), len(self._preflight_calls()) + 5)
+        self.assertEqual(len(calls), len(self._apply_gate_calls()) + 5)
         self.assertEqual(calls[-1], self._digest_call())
         self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
 
@@ -442,7 +461,7 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
@@ -495,6 +514,8 @@ class DeployScriptContractTests(unittest.TestCase):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
         for call in self._gcloud_calls():
+            if call == ["phase1-prerequisites"]:
+                continue
             self.assertIn("--account", call)
             self.assertEqual(call[call.index("--account") + 1], ACCOUNT)
             if call[:2] != ["projects", "describe"]:
@@ -559,6 +580,13 @@ class DeployScriptContractTests(unittest.TestCase):
                 PROJECT,
                 "--format=value(projectNumber,lifecycleState)",
             ],
+        ]
+
+    @staticmethod
+    def _apply_gate_calls() -> list[list[str]]:
+        return [
+            *DeployScriptContractTests._preflight_calls(),
+            ["phase1-prerequisites"],
         ]
 
     @staticmethod

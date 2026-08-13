@@ -71,7 +71,7 @@ class ProcessUserServiceTests(unittest.TestCase):
         self.assertEqual(200, resp.status_code)
         self.assertEqual({"status": "ok"}, resp.get_json())
 
-    def test_versioned_identity_health_reports_exact_runtime_identity(self):
+    def test_unapproved_identity_health_route_is_absent(self):
         with patch.dict(
             os.environ,
             {
@@ -81,24 +81,7 @@ class ProcessUserServiceTests(unittest.TestCase):
         ):
             resp = self.client.get("/health/identity/v1")
 
-        self.assertEqual(200, resp.status_code)
-        self.assertEqual(
-            {
-                "status": "ok",
-                "service": "process-user",
-                "revision": "process-user-stage-1234567890ab",
-            },
-            resp.get_json(),
-        )
-
-    def test_health_identity_falls_back_for_blank_cloud_run_values(self):
-        with patch.dict(os.environ, {"K_SERVICE": "  ", "K_REVISION": ""}):
-            resp = self.client.get("/health/identity/v1")
-
-        self.assertEqual(
-            {"status": "ok", "service": "process-user", "revision": "local"},
-            resp.get_json(),
-        )
+        self.assertEqual(404, resp.status_code)
 
     def test_process_user_runs_pipeline_under_lease(self):
         with patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
@@ -252,10 +235,10 @@ class ProcessUserAuthTests(unittest.TestCase):
             resp = self.client.get("/health")
         self.assertEqual(200, resp.status_code)
 
-    def test_versioned_identity_health_open_even_when_auth_required(self):
+    def test_unapproved_identity_health_stays_absent_when_auth_required(self):
         with patch.dict(os.environ, {"PROCESS_USER_AUTH": "s3cret"}):
             resp = self.client.get("/health/identity/v1")
-        self.assertEqual(200, resp.status_code)
+        self.assertEqual(404, resp.status_code)
 
 
 if __name__ == "__main__":

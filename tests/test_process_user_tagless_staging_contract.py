@@ -6,6 +6,7 @@ import os
 import shlex
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -104,6 +105,21 @@ class TaglessStagingContractTests(unittest.TestCase):
             ),
         )
         _write_executable(self.bin_dir / "gcloud", self._fake_gcloud_source())
+        _write_executable(
+            self.bin_dir / "python3",
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                if [ "$1" = "${FAKE_PHASE1_ROLLOUT_MODULE:?}" ]; then
+                  printf '%s\n' '["phase1-prerequisites"]' >> "$FAKE_GCLOUD_LOG"
+                  [ "${2:-}" = "--verify-staging-prerequisites" ] || exit 64
+                  [ "$FAKE_GCLOUD_SCENARIO" != "prerequisite_failure" ] || exit 78
+                  exit 0
+                fi
+                exec "${REAL_PYTHON3:?}" "$@"
+                """
+            ),
+        )
 
     def _run(
         self,
@@ -126,6 +142,10 @@ class TaglessStagingContractTests(unittest.TestCase):
         env["FAKE_OLD_REVISION"] = OLD_REVISION
         env["FAKE_OTHER_REVISION"] = OTHER_REVISION
         env["FAKE_CANONICAL_IMAGE"] = CANONICAL_IMAGE
+        env["FAKE_PHASE1_ROLLOUT_MODULE"] = str(
+            REPO_ROOT / "scripts" / "phase1_rollout.py"
+        )
+        env["REAL_PYTHON3"] = sys.executable
         if impersonation_env is None:
             env.pop("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", None)
         else:
@@ -185,7 +205,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
@@ -199,6 +219,14 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertIn("verified", result.stdout.lower())
         self.assertIn("untagged", result.stdout.lower())
         self.assertIn("0%", result.stdout)
+
+    def test_prerequisite_failure_stops_before_service_build_or_deploy(self):
+        result = self._run("--apply", scenario="prerequisite_failure")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(
+            self._apply_gate_calls(),
+            self._gcloud_calls(),
+        )
 
     def test_deploy_is_digest_pinned_no_traffic_and_has_no_tag(self):
         result = self._run("--apply")
@@ -278,10 +306,10 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("release-a", result.stdout)
         self.assertEqual(
-            self._gcloud_calls()[len(self._preflight_calls())],
+            self._gcloud_calls()[len(self._apply_gate_calls())],
             self._service_describe_call(),
         )
-        preflight_len = len(self._preflight_calls())
+        preflight_len = len(self._apply_gate_calls())
         self.assertEqual(
             self._gcloud_calls()[preflight_len + 1], self._revision_list_call()
         )
@@ -371,7 +399,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
@@ -386,7 +414,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(
             self._gcloud_calls(),
-            [*self._preflight_calls(), self._service_describe_call()],
+            [*self._apply_gate_calls(), self._service_describe_call()],
         )
 
     def _assert_post_readback_refused(self, scenario: str) -> None:
@@ -395,7 +423,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
@@ -412,7 +440,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
@@ -430,7 +458,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
             ],
@@ -442,7 +470,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [
-                *self._preflight_calls(),
+                *self._apply_gate_calls(),
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
@@ -496,6 +524,17 @@ class TaglessStagingContractTests(unittest.TestCase):
                 "--format=value(projectNumber,lifecycleState)",
             ],
         ]
+
+    @staticmethod
+    def _apply_gate_calls() -> list[list[str]]:
+        return [
+            *TaglessStagingContractTests._preflight_calls(),
+            TaglessStagingContractTests._prerequisite_call(),
+        ]
+
+    @staticmethod
+    def _prerequisite_call() -> list[str]:
+        return ["phase1-prerequisites"]
 
     @staticmethod
     def _service_describe_call() -> list[str]:

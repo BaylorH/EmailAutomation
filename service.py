@@ -19,9 +19,6 @@ POST /process-user   body {"uid": "<firebase-uid>"}
       * 500 {"status": "error", "error"}  — pipeline raised (so Cloud Tasks retries)
 GET  /health         — Cloud Run-safe liveness probe, always 200
 GET  /healthz        — legacy liveness alias, always 200 (never auth-gated)
-GET  /health/identity/v1
-                     — versioned service/revision identity for authenticated
-                       rollout certification; always 200 at the app boundary
 
 Auth
 ----
@@ -81,19 +78,6 @@ def _auth_ok() -> bool:
 @app.get("/healthz")
 def healthz():
     return jsonify({"status": "ok"}), 200
-
-
-@app.get("/health/identity/v1")
-def health_identity_v1():
-    service_name = (os.getenv("K_SERVICE") or "").strip() or "process-user"
-    revision_name = (os.getenv("K_REVISION") or "").strip() or "local"
-    return jsonify(
-        {
-            "status": "ok",
-            "service": service_name,
-            "revision": revision_name,
-        }
-    ), 200
 
 
 @app.post("/process-user")

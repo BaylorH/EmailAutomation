@@ -166,9 +166,6 @@ class FakeOps:
         self.candidate_revision = revision(CANDIDATE, CANDIDATE_IMAGE)
         self.queue = queue()
         self.task_snapshots = [[], [], [], [], [], []]
-        self.identity = {
-            "status": "ok", "service": "process-user", "revision": CANDIDATE
-        }
         self.fail_remove = False
         self.fail_promote = False
         self.fail_prerequisites = False
@@ -176,7 +173,8 @@ class FakeOps:
         self.fail_resume_after_change = False
         self.legacy_health_calls = 0
         self.fail_legacy_health_after = None
-        self.identity_interrupt = False
+        self.fail_legacy_health_on = None
+        self.interrupt_legacy_health_on = None
         self.prerequisite_calls = 0
         self.lock_held = False
         self.lock_nonce = None
@@ -286,25 +284,19 @@ class FakeOps:
         self.events.append("rollback")
         self.service = service()
 
-    def identity_get(self, base_url, audience):
-        self.events.append(f"identity:{base_url}|aud:{audience}")
-        if self.identity_interrupt:
-            raise KeyboardInterrupt()
-        return dict(self.identity)
-
     def legacy_health_get(self, base_url, audience):
         self.legacy_health_calls += 1
         self.events.append(f"legacy:{base_url}|aud:{audience}")
+        if self.interrupt_legacy_health_on == self.legacy_health_calls:
+            raise KeyboardInterrupt()
+        if self.fail_legacy_health_on == self.legacy_health_calls:
+            return {"status": "wrong"}
         if (
             self.fail_legacy_health_after is not None
             and self.legacy_health_calls > self.fail_legacy_health_after
         ):
             return {"status": "wrong"}
         return {"status": "ok"}
-
-    def unauthenticated_status(self, base_url, path):
-        self.events.append(f"unauth:{base_url}{path}")
-        return 403
 
 
 class ValidatorTests(unittest.TestCase):
@@ -434,19 +426,19 @@ class StateMachineTests(unittest.TestCase):
             ),
             ops.events.index("pause"),
         )
-        tag_identity = next(
+        tag_health = next(
             event for event in ops.events
-            if event.startswith("identity:https://phase1-cert-")
+            if event.startswith("legacy:https://phase1-cert-")
+        )
+        self.assertEqual(
+            1,
+            sum(
+                event.startswith("legacy:https://phase1-cert-")
+                for event in ops.events
+            ),
         )
         self.assertTrue(
-            tag_identity.endswith("|aud:https://process-user-example.run.app")
-        )
-        release_identity = next(
-            event for event in ops.events
-            if event.startswith("identity:https://release-a---")
-        )
-        self.assertTrue(
-            release_identity.endswith("|aud:https://process-user-example.run.app")
+            tag_health.endswith("|aud:https://process-user-example.run.app")
         )
         self.assertLess(ops.events.index("pause"), ops.events.index("tag:add"))
         self.assertLess(ops.events.index("tag:add"), ops.events.index("tag:remove"))
@@ -465,6 +457,28 @@ class StateMachineTests(unittest.TestCase):
                     self.assertEqual("lock:assert", ops.events[index - 1])
                     self.assertEqual("lock:assert", ops.events[index + 1])
         self.assertEqual("RUNNING", ops.queue["state"])
+
+    def test_staging_prerequisites_prove_old_running_empty_without_mutation(self):
+        ops = FakeOps()
+        rollout, _ = self.make_rollout(ops)
+        rollout.verify_staging_prerequisites()
+        self.assertIn("preflight", ops.events)
+        self.assertIn("prerequisites", ops.events)
+        self.assertIn("service-access", ops.events)
+        self.assertIn("revision:process-user-00097-yus", ops.events)
+        self.assertIn("tasks", ops.events)
+        self.assertNotIn("artifact", ops.events)
+        self.assertNotIn(f"revision:{CANDIDATE}", ops.events)
+        self.assertFalse(
+            {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+            & set(ops.events)
+        )
+
+        blocked = FakeOps()
+        blocked.task_snapshots = [[{"name": "opaque-task"}]]
+        blocked_rollout, _ = self.make_rollout(blocked)
+        with self.assertRaisesRegex(phase1_rollout.RolloutError, "tasks are not empty"):
+            blocked_rollout.verify_staging_prerequisites()
 
     def test_competing_lock_stops_after_read_only_baseline(self):
         ops = FakeOps()
@@ -542,7 +556,6 @@ class StateMachineTests(unittest.TestCase):
 
     def test_manual_recovery_keeps_owned_lock_and_queue_paused(self):
         ops = FakeOps()
-        ops.identity["revision"] = OLD_REVISION
         ops.fail_remove = True
         rollout, _ = self.make_rollout(ops)
         with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
@@ -613,9 +626,9 @@ class StateMachineTests(unittest.TestCase):
                     & set(ops.events)
                 )
 
-    def test_wrong_identity_removes_tag_and_resumes_without_traffic_mutation(self):
+    def test_wrong_tag_health_removes_tag_and_resumes_without_traffic_mutation(self):
         ops = FakeOps()
-        ops.identity["revision"] = OLD_REVISION
+        ops.fail_legacy_health_on = 5
         rollout, _ = self.make_rollout(ops)
         with self.assertRaises(phase1_rollout.RolloutError):
             rollout.apply()
@@ -626,7 +639,6 @@ class StateMachineTests(unittest.TestCase):
 
     def test_cleanup_ambiguity_leaves_queue_paused(self):
         ops = FakeOps()
-        ops.identity["revision"] = OLD_REVISION
         ops.fail_remove = True
         rollout, _ = self.make_rollout(ops)
         with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
@@ -635,7 +647,6 @@ class StateMachineTests(unittest.TestCase):
 
     def test_failed_old_health_during_cleanup_keeps_queue_paused(self):
         ops = FakeOps()
-        ops.identity["revision"] = OLD_REVISION
         ops.fail_legacy_health_after = 5
         rollout, _ = self.make_rollout(ops)
         with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
@@ -695,7 +706,6 @@ class StateMachineTests(unittest.TestCase):
 
     def test_prerequisite_drift_during_cleanup_keeps_queue_paused(self):
         ops = FakeOps()
-        ops.identity["revision"] = OLD_REVISION
         ops.fail_prerequisites_after = 2
         rollout, _ = self.make_rollout(ops)
         with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
@@ -704,7 +714,7 @@ class StateMachineTests(unittest.TestCase):
 
     def test_keyboard_interrupt_after_tag_runs_cleanup_and_resumes_old(self):
         ops = FakeOps()
-        ops.identity_interrupt = True
+        ops.interrupt_legacy_health_on = 5
         rollout, _ = self.make_rollout(ops)
         with self.assertRaises(phase1_rollout.RolloutError):
             rollout.apply()
@@ -766,6 +776,9 @@ class StaticSafetyTests(unittest.TestCase):
         }
         self.assertNotIn("/process-user", string_values)
         self.assertFalse(any(value.startswith("/process-user?") for value in string_values))
+        service_source = (ROOT / "service.py").read_text()
+        self.assertNotIn("/health/identity/v1", service_source)
+        self.assertNotIn("unauthenticated_status", module)
 
     def test_orphan_clear_cli_binds_exact_packet_without_printing_nonce(self):
         head = "1" * 40
@@ -1149,7 +1162,7 @@ class AdapterContractTests(unittest.TestCase):
                 with self.assertRaises(phase1_rollout.RolloutError):
                     phase1_rollout.validate_project_iam(bad)
 
-    def test_user_identity_token_omits_custom_audience_but_request_stays_split(self):
+    def test_user_identity_token_omits_custom_audience_but_health_target_stays_split(self):
         ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
         calls = []
 
@@ -1160,14 +1173,14 @@ class AdapterContractTests(unittest.TestCase):
         with patch.object(ops, "_gcloud", side_effect=fake_gcloud), patch.object(
             ops, "_http_json", return_value={"status": "ok"}
         ) as http:
-            ops.identity_get(
+            ops.legacy_health_get(
                 "https://phase1-cert-111111111111---process-user-example.run.app",
                 SERVICE_URL,
             )
 
         self.assertEqual([["auth", "print-identity-token"]], calls)
         http.assert_called_once_with(
-            "https://phase1-cert-111111111111---process-user-example.run.app/health/identity/v1",
+            "https://phase1-cert-111111111111---process-user-example.run.app/health",
             token="opaque-token",
         )
 
@@ -1175,7 +1188,7 @@ class AdapterContractTests(unittest.TestCase):
         ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
         with patch.object(ops, "_gcloud") as gcloud:
             with self.assertRaises(phase1_rollout.RolloutError):
-                ops.identity_get(
+                ops.legacy_health_get(
                     "https://phase1-cert-111111111111---process-user-other.run.app",
                     SERVICE_URL,
                 )

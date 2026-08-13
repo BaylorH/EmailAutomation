@@ -81,6 +81,12 @@ fi
 
 process_user_gcloud_preflight apply
 
+if ! GCLOUD_ACCOUNT="$ACCOUNT" \
+    python3 "$SCRIPT_DIR/phase1_rollout.py" --verify-staging-prerequisites; then
+  printf 'Refusing to stage: rules, passive UI, switches, or rollback prerequisites are not exact.\n' >&2
+  exit 78
+fi
+
 if ! baseline_service_json="$("${service_describe_command[@]}")"; then
   printf 'Refusing to stage: baseline service read failed.\n' >&2
   exit 73

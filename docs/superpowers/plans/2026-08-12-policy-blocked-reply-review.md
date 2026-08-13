@@ -18,22 +18,22 @@ Backend RC status: non-deployable on its own.
 
 The first prerequisite is Firestore rules that make processingFailures owner-readable and server-write-only and exclude that collection from every generic or owner-write catchall. The second prerequisite is the projection-only UI guard and passive review card. Operators must deploy and certify both prerequisites before the backend producer.
 
-Only after both prerequisite surfaces are certified may operators stage the backend producer as the deterministic `process-user-stage-<12-character-HEAD>` revision. Staging must use an immutable digest, `--no-traffic`, and no tag. Before building, the script must reject LATEST or implicit canonical `spec.traffic`, ambiguous routing or tags, a deterministic-candidate collision anywhere in the full service revision inventory, and an unreadable baseline positive revision. Readback must prove that the Ready candidate is untagged at 0 percent and matches the baseline revision configuration apart from immutable image and revision identity, while the prior sole 100 percent revision retains the stable `release-a` and every auxiliary pinned tag mapping with canonical `spec.traffic` unchanged. Staging does not pause or resume a queue, mutate traffic, certify an HTTP route, promote, or roll back.
+Only after both prerequisite surfaces are certified may operators stage the backend producer as the deterministic `process-user-stage-<12-character-HEAD>` revision. Before the first build, staging mechanically re-proves the exact live rules source/hash, Hosting version/assets, both false switches, old revision/digest/routing/IAM, exact RUNNING queue, and one empty task snapshot. Staging must use an immutable digest, `--no-traffic`, and no tag. Before building, the script must reject LATEST or implicit canonical `spec.traffic`, ambiguous routing or tags, a deterministic-candidate collision anywhere in the full service revision inventory, and an unreadable baseline positive revision. Readback must prove that the Ready candidate is untagged at 0 percent and matches the baseline revision configuration apart from immutable image and revision identity, while the prior sole 100 percent revision retains the stable `release-a` and every auxiliary pinned tag mapping with canonical `spec.traffic` unchanged. Staging does not pause or resume a queue, mutate traffic, certify an HTTP route, promote, or roll back.
 
 In short: deploy the backend producer with no traffic before promotion.
 
 Both global campaign switches remain false throughout this milestone. Operators must not call `POST /process-user` or perform a provider or mailbox canary.
 
-The final promotion controller uses versioned `GET /health/identity/v1` without
-changing the exact legacy `/health` or `/healthz` body. It must pin and repeatedly
+The final promotion controller uses only authenticated legacy `GET /health`
+without changing the exact `/health` or `/healthz` body. It must pin and repeatedly
 re-read rules, Hosting assets/version, false switches, exact direct Cloud Run
 service and project-level `roles/run.invoker` IAM on the parentless project with no broad
 principal, the exact named operator credential with no Cloud SDK token/file/
 impersonation/account/project override, old and candidate revision/digest/spec/functional-metadata/readiness, full routing/tag topology,
 and the exact queue configuration. Pause first; require three empty task lists
 over at least ten seconds; require all queue-level HTTP URI/method/header/
-OAuth/OIDC and App Engine routing overrides absent; add one HEAD-derived temporary tag; prove
-unauthenticated rejection plus exact legacy and identity health; remove the tag;
+OAuth/OIDC and App Engine routing overrides absent; add one HEAD-derived temporary tag; perform
+exactly one authenticated `GET /health`; remove the tag;
 then reassert PAUSED and zero tasks immediately before promotion. Repeat exact
 candidate and health proof after promotion, reassert prerequisites and
 PAUSED/zero tasks immediately before resume, and read the prerequisites again

@@ -23,7 +23,7 @@ service-account JSON to `$RUNNER_TEMP/sa.json`).
 | `../Dockerfile` | Container image: `python:3.12-slim`, installs `requirements.txt`, non-root `appuser`, entrypoint `python main.py`. |
 | `cloudrun-job.yaml` | Cloud Run Job spec — task timeout, service-account placeholder, env vars (parameterized bucket + launch-safety scope), Secret Manager references. |
 | `cloudrun-service.yaml` | **Phase-1 webhook** Cloud Run *Service* spec — same image, gunicorn entrypoint serving `service.py` (`POST /process-user`), per-user lease, `PROCESS_USER_AUTH` gate. |
-| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user`, exact legacy `/health` + `/healthz`, and versioned `/health/identity/v1`. |
+| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user` plus exact legacy `/health` and `/healthz`. |
 | `../email_automation/app_config.py` | `FIREBASE_BUCKET` now reads env, defaults to historical value. |
 | `../firebase_helpers.py` | Same env parameterization on the bucket that actually drives the token-cache round-trip. |
 | `../main.py` | SIGTERM→`sys.exit` bridge so the atexit token-cache upload runs on container shutdown. |
@@ -203,7 +203,6 @@ Contract:
 | `POST /process-user` | JSON `{"uid": "<firebase-uid>"}` | `200 {"status":"processed"}` ran · `503 {"status":"skipped_locked"}` same-uid already running (Cloud Tasks retries) · `400` missing/blank uid or non-JSON · `401` auth required + missing/wrong secret · `500 {"error":...}` pipeline raised (Cloud Tasks retries) |
 | `GET /health` | — | `200` (never auth-gated; use this for external Cloud Run canaries because Cloud Run reserves some paths ending in `z`) |
 | `GET /healthz` | — | `200` legacy/local alias |
-| `GET /health/identity/v1` | — | `200 {"status":"ok","service":"process-user","revision":"<K_REVISION>"}`; rollout-only identity readback while `/health` and `/healthz` retain their exact legacy body |
 
 **Auth.** Optional in-app shared secret via `PROCESS_USER_AUTH`; when set, requests
 must send it as `Authorization: Bearer <secret>` or `X-Process-User-Auth: <secret>`
@@ -315,6 +314,13 @@ The exact queue contract also requires the whole queue-level `httpTarget` and
 App Engine routing override surfaces to be absent; URI, method, header,
 OAuth, or OIDC overrides all fail closed.
 
+Before its first build or Cloud Run mutation, the tagless staging script invokes
+the same closed controller in `--verify-staging-prerequisites` mode. That
+read-only gate re-proves the exact one-file Firestore Rules source and hash,
+finalized Hosting version and served asset hashes, both false campaign switches,
+old revision/digest/routing/direct IAM, exact RUNNING queue contract, and one
+empty task snapshot. Any mismatch stops before build, image creation, or deploy.
+
 After a complete read-only baseline/preflight, `--apply` atomically creates the
 fixed root Firestore document `releaseLocks/processUserPhase1`. The pinned live
 rules expose no browser read or write path for that root collection. The closed
@@ -356,15 +362,17 @@ stale-age heuristic.
 
 The controller pauses the queue and requires three empty task snapshots over at
 least ten seconds before creating a unique temporary certification tag. It
-requires unauthenticated Cloud Run rejection, exact legacy `/health`, and exact
-`/health/identity/v1` service/revision identity. The user-account development ID
-token is minted without a custom audience; requests remain restricted to the
-validated canonical service/tag hosts. Redirects are rejected for authenticated
-reads. The tag is removed and read back before promotion. Immediately before
+performs exactly one authenticated `GET /health` against that temporary tag;
+revision identity remains bound by authenticated Cloud Run control-plane
+revision/tag readbacks. The user-account development ID token is minted without
+a custom audience; requests remain restricted to the validated canonical
+service/tag hosts, and redirects are rejected. The tag is removed and read back
+before promotion. Immediately before
 promotion and again before queue resume, the controller reasserts PAUSED state,
 zero tasks, and the applicable closed prerequisites. It then pins the exact
 candidate at 100 percent plus `release-a`, repeats digest/config/functional-
-metadata/health/topology checks, and resumes only after every proof passes.
+metadata, authenticated legacy-health, and topology checks, and resumes only
+after every proof passes.
 
 On any failure after pausing, the controller re-pauses, removes the temporary
 tag, restores the prior revision at 100 percent plus `release-a` when traffic may
