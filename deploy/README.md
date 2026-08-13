@@ -305,7 +305,8 @@ prerequisite surfaces are already live, run
 `scripts/rollout_process_user_phase1.sh --dry-run` for a zero-command summary.
 The reviewed `--apply` mode is the only Phase 1 promotion path. It pins the
 rules, Hosting version/assets, both false campaign switches, exact private
-Cloud Run IAM policy, prior revision/digest, all existing traffic tags, candidate
+Cloud Run service and project-level invoker policies on the verified parentless
+project, prior revision/digest, all existing traffic tags, candidate
 digest/config/readiness, and the exact `graph-process-user` queue configuration.
 
 The controller pauses the queue and requires three empty task snapshots over at

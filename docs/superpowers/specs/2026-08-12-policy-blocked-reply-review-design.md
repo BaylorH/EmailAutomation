@@ -17,7 +17,8 @@ Both global campaign switches remain false throughout this milestone. Operators 
 Promotion uses the versioned `GET /health/identity/v1` route while preserving
 the exact legacy `GET /health` and `/healthz` body. The controller must re-prove
 the deployed rules, Hosting version/assets, both false switches, exact private
-Cloud Run IAM binding, prior revision/digest and routing, candidate immutable
+Cloud Run service and project-level invoker bindings on the parentless project,
+with no broad principal, prior revision/digest and routing, candidate immutable
 digest/config/readiness, exact queue configuration, and zero listed tasks before
 mutation. It pauses the queue, requires three empty snapshots over at least ten
 seconds, assigns one HEAD-derived temporary tag, rejects unauthenticated access

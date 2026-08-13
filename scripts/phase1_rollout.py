@@ -248,6 +248,32 @@ def validate_iam(value: Any) -> None:
         raise RolloutError("service IAM policy is not the exact private contract")
 
 
+def validate_project_iam(value: Any) -> None:
+    value = _object(value, "project IAM policy")
+    bindings = value.get("bindings")
+    if not isinstance(bindings, list):
+        raise RolloutError("project IAM bindings are missing")
+    invokers: list[str] = []
+    for row in bindings:
+        row = _object(row, "project IAM binding")
+        role = row.get("role")
+        members = row.get("members")
+        if (
+            not isinstance(role, str)
+            or not isinstance(members, list)
+            or not all(isinstance(member, str) for member in members)
+        ):
+            raise RolloutError("project IAM binding shape is invalid")
+        if "allUsers" in members or "allAuthenticatedUsers" in members:
+            raise RolloutError("project IAM contains a broad principal")
+        if role == "roles/run.invoker":
+            if set(row) != {"role", "members"}:
+                raise RolloutError("project invoker binding contains unexpected fields")
+            invokers.extend(members)
+    if tuple(sorted(invokers)) != EXPECTED_IAM["roles/run.invoker"]:
+        raise RolloutError("project invoker policy is not the exact private contract")
+
+
 def _canonical_revision_spec(value: Any) -> dict[str, Any]:
     result = copy.deepcopy(_object(value, "revision spec"))
     containers = result.get("containers")
@@ -689,7 +715,7 @@ class SubprocessOps:
         project = self._json_command(["projects", "describe", PROJECT], 30)
         if str(project.get("projectNumber")) != PROJECT_NUMBER or project.get(
             "lifecycleState"
-        ) != "ACTIVE":
+        ) != "ACTIVE" or project.get("parent") not in (None, {}):
             raise RolloutError("gcloud project identity is wrong")
 
     def verify_rules_ui_switches(self) -> None:
@@ -764,6 +790,9 @@ class SubprocessOps:
             raise RolloutError("global campaign switches are not both false")
 
     def verify_service_access(self, topology: Topology) -> None:
+        validate_project_iam(
+            self._json_command(["projects", "get-iam-policy", PROJECT], 60)
+        )
         validate_iam(
             self._json_command(
                 [

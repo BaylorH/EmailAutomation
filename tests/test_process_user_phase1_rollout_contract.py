@@ -530,6 +530,25 @@ class AdapterContractTests(unittest.TestCase):
                 with self.assertRaises(phase1_rollout.RolloutError):
                     phase1_rollout.validate_iam(bad)
 
+    def test_project_iam_rejects_broad_or_inherited_invoker_principals(self):
+        exact_member = (
+            "serviceAccount:248289505828-compute@developer.gserviceaccount.com"
+        )
+        phase1_rollout.validate_project_iam({
+            "bindings": [
+                {"role": "roles/run.invoker", "members": [exact_member]},
+                {"role": "roles/viewer", "members": ["user:operator@example.test"]},
+            ]
+        })
+        for bad in (
+            {"bindings": [{"role": "roles/run.invoker", "members": ["allAuthenticatedUsers"]}]},
+            {"bindings": [{"role": "roles/run.invoker", "members": [exact_member, "user:extra@example.test"]}]},
+            {"bindings": [{"role": "roles/viewer", "members": ["allUsers"]}, {"role": "roles/run.invoker", "members": [exact_member]}]},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_project_iam(bad)
+
     def test_user_identity_token_omits_custom_audience_but_request_stays_split(self):
         ops = phase1_rollout.SubprocessOps(ROOT, "1" * 40)
         calls = []

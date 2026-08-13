@@ -26,8 +26,9 @@ Both global campaign switches remain false throughout this milestone. Operators 
 
 The final promotion controller uses versioned `GET /health/identity/v1` without
 changing the exact legacy `/health` or `/healthz` body. It must pin and repeatedly
-re-read rules, Hosting assets/version, false switches, private Cloud Run IAM,
-old and candidate revision/digest/config/readiness, full routing/tag topology,
+re-read rules, Hosting assets/version, false switches, exact private Cloud Run
+service and project-level invoker IAM on the parentless project with no broad
+principal, old and candidate revision/digest/config/readiness, full routing/tag topology,
 and the exact queue configuration. Pause first; require three empty task lists
 over at least ten seconds; add one HEAD-derived temporary tag; prove
 unauthenticated rejection plus exact legacy and identity health; remove the tag;
