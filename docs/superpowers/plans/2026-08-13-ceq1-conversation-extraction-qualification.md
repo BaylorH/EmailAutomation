@@ -261,12 +261,31 @@ memory, and immediately crosses one true `os.execve()` boundary:
 <pinned-python> -I -S -B scripts/bootstrap_ceq1_runtime.py <mode>
 --contained --bootstrap <opaque-id>`. It performs no mkdir, copy, hash, cache
 read, profile write, or other state mutation before that boundary. The
-contained worker first validates its exact environment/flags and all source and
-destination roots component-by-component, then creates the unique task root,
-writes the exact rendered-policy/receipt evidence there, and performs the
-entire Task 1 state machine. Every external child begins with a fresh literal
-`/usr/bin/env -i` argv and inherits the already-active Seatbelt; there is no
-nested `sandbox-exec` and no unsandboxed orchestration between children.
+outer argv and closed child environment carry the exact same rendered-policy
+bytes: `sandbox-exec -p` receives the text directly and the child receives its
+base64 encoding in `CEQ1_BOOTSTRAP_POLICY_B64`. The contained worker decodes
+that value, requires byte equality with its own canonical render, and binds its
+hash into the ignored receipt. Before it creates a directory, reads an input,
+or emits a receipt, the worker proves that Seatbelt is actually active by
+attempting to read the existing worktree `.git` control file, which the
+canonical policy deliberately denies while an unsandboxed process can read it.
+Only `EPERM`/`EACCES` is accepted. Consequently a directly forged
+`--contained --bootstrap ...` invocation fails before mutation even if its
+caller forges the expected environment and policy bytes. Tests spy on the
+outer `os.execve()` call to prove byte identity between the `-p` argument and
+the worker channel, and run the direct-contained bypass as a real subprocess.
+
+After that proof, the contained worker validates its exact environment/flags
+and all source and destination roots component-by-component, creates the unique
+task root, writes the exact rendered-policy/receipt evidence there, and
+performs the entire Task 1 state machine. Every external child begins with a
+fresh literal `/usr/bin/env -i` argv and inherits the already-active Seatbelt;
+there is no nested `sandbox-exec` and no unsandboxed orchestration between
+children. The Task 1 RED is amended before implementation so it requires
+exactly one outer sandbox exec, zero pre-boundary filesystem/cache actions,
+zero nested sandbox invocations, inherited denial in a contained child, policy
+byte identity, and direct-contained refusal; it no longer requires every child
+argv to contain `sandbox-exec`.
 
 Inside that boundary, the orchestrator validates the pinned interpreter and
 `uv` bytes with Python SHA-256 and creates task directories with no-follow
@@ -288,6 +307,27 @@ pinned `--python`, and `--constraint requirements.lock`. It requires exactly
 pytest `9.1.1`, pluggy `1.6.0`, iniconfig `2.3.0`, pygments `2.20.0`, and
 production-constrained packaging `26.2`. Upstream/cache hashes from that
 diagnostic file never enter the canonical qualification lock.
+
+`uv` requires a writable cache for local bookkeeping even in offline mode. The
+contained worker therefore takes two closed views of the reviewed source
+cache: an identity receipt over path/type/mode/device/inode/link count/size and
+mtime/ctime for before/after immutability, and a logical topology receipt over
+path/type/mode/size/symlink target for clone comparison. It clones the cache
+once with the host-pinned `/bin/cp -cR` into the unique bootstrap root. Through
+held no-follow directory descriptors it then rewrites only absolute symlinks
+whose targets are strictly below the reviewed source cache to the corresponding
+path below the clone; every other absolute/escaping link is `BLOCKED`. The
+clone's complete logical topology must equal the source topology after applying
+that single root substitution. The worker takes the source identity receipt
+again after the clone and after all `uv` work; any source change is `BLOCKED`.
+Every `uv` child receives only that unique task-owned clone as `UV_CACHE_DIR`;
+no `uv` argv, environment, or resolved cache link may name the reviewed source
+cache. The builder remains a read-only RECORD-closed reader of the reviewed
+source archive and never invokes `uv`. Tests require the clone command to run
+inside the inherited outer Seatbelt, refuse a preexisting or symlinked
+destination, prove source-cache immutability, verify exact internal-link
+rebasing, and prove that a uv child pointed at any other cache fails contract
+validation.
 
 The reviewed uv cache contains extracted exact distributions but not every
 original wheel byte needed by hash-required offline installation. Before
@@ -371,14 +411,17 @@ installed-provenance mismatch is `BLOCKED`, never a cache write, download,
 ambient fallback, or weakened hash check.
 
 The load-bearing order is: outer in-memory profile render and true execve;
-contained environment/root validation; create and bind the ignored local
-receipt; validate committed inputs; run diagnostic resolution; run builder
-stages A and B; compare,
+contained active-Seatbelt proof and policy-byte verification; contained
+environment/root validation; create and bind the ignored local receipt;
+validate committed inputs; take the source-cache receipt; clone and validate
+the unique writable task cache; run diagnostic resolution using only that
+clone; run builder stages A and B; compare,
 validate, seal, and promote; render and compare the derived lock; create the
 copied Python base and venv; install the product lock; force-reinstall the five
-derived packages; validate and seal the runtime bundle. Tests assert every
-literal argv/environment field, profile content/hash, inherited-sandbox state,
-state transition, and refusal path. The steps never rely
+derived packages; retake and compare the source-cache receipt; validate and
+seal the runtime bundle. Tests assert every literal argv/environment field,
+profile content/hash, inherited-sandbox state, cache-clone binding, state
+transition, and refusal path. The steps never rely
 on a network denial implemented by uv alone.
 
 `scripts/run_ceq1_env.py` resolves and verifies the local interpreter and
