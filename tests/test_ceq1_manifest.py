@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zipfile
@@ -30,12 +31,14 @@ TASK1_FILES = (
     ".gitignore",
     "requirements-ceq1.in",
     "requirements-ceq1.lock",
+    "docs/release-safety/ceq1-input-manifest.json",
     "docs/release-safety/ceq1-wheelhouse-manifest.json",
     "docs/release-safety/ceq1-toolchain-manifest.json",
     "docs/release-safety/evidence/ceq1/README.md",
     "scripts/bootstrap_ceq1_runtime.py",
     "scripts/build_ceq1_wheelhouse.py",
     "scripts/run_ceq1_env.py",
+    "scripts/verify_ceq1_entry.pl",
     "tests/ceq1/__init__.py",
 )
 EXPECTED_PACKAGES = {
@@ -184,6 +187,51 @@ class Ceq1BoundaryTests(unittest.TestCase):
         ):
             self.assertIn(phrase, text)
 
+    def test_static_entry_manifest_and_verifier_are_closed(self):
+        verifier = REPO_ROOT / "scripts/verify_ceq1_entry.pl"
+        manifest_path = REPO_ROOT / "docs/release-safety/ceq1-input-manifest.json"
+        self.assertTrue(verifier.is_file())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {
+                "schemaVersion",
+                "algorithmVersion",
+                "files",
+                "trees",
+                "portablePolicy",
+                "platformTrust",
+            },
+            set(manifest),
+        )
+        serialized = json.dumps(manifest, sort_keys=True)
+        self.assertNotIn("/Users/", serialized)
+        self.assertNotIn("file://", serialized)
+        files = manifest["files"]
+        for relative in (
+            "scripts/verify_ceq1_entry.pl",
+            "scripts/bootstrap_ceq1_runtime.py",
+            "scripts/build_ceq1_wheelhouse.py",
+            "scripts/run_ceq1_env.py",
+            "requirements.lock",
+            "requirements-ceq1.in",
+            "requirements-ceq1.lock",
+            "docs/release-safety/ceq1-wheelhouse-manifest.json",
+        ):
+            self.assertIn(relative, files)
+            self.assertEqual(
+                hashlib.sha256((REPO_ROOT / relative).read_bytes()).hexdigest(),
+                files[relative]["sha256"],
+            )
+        source = verifier.read_text(encoding="utf-8")
+        self.assertIn("sub verify_inputs", source)
+        self.assertIn("sub run_verified_python", source)
+        self.assertIn("__name__", source)
+        self.assertIn("__file__", source)
+        self.assertIn("sys.argv", source)
+        self.assertIn("waitpid", source)
+        self.assertNotIn("system(", source)
+        self.assertNotIn("qx/", source)
+
 
 class Ceq1WheelBuilderTests(unittest.TestCase):
     @classmethod
@@ -209,7 +257,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
 
     def test_record_allowlist_build_is_deterministic_and_record_is_physically_last(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source, package = _mini_distribution(root, extra_pyc=True)
             inspected = self.builder.inspect_source(source, package)
             self.assertEqual(package["members"], inspected["members"])
@@ -242,7 +290,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
+                root = Path(tmp).resolve()
                 source, package = _mini_distribution(root)
                 if mutation == "payload":
                     (source / "demo_pkg/__init__.py").write_bytes(b"VALUE = 8\n")
@@ -265,7 +313,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
 
     def test_finished_wheel_payload_and_record_tampering_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source, package = _mini_distribution(root)
             wheel = self.builder.build_wheel(source, package, root / "wheel", verify_output=False)
             for target in ("demo_pkg/__init__.py", "demo_pkg-1.2.3.dist-info/RECORD"):
@@ -303,7 +351,7 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
         )
         for unsafe in cases:
             with self.subTest(path=unsafe), tempfile.TemporaryDirectory() as tmp:
-                source, package = _mini_distribution(Path(tmp))
+                source, package = _mini_distribution(Path(tmp).resolve())
                 package["members"][0]["path"] = unsafe
                 with self.assertRaises(ValueError):
                     self.builder.inspect_source(source, package)
@@ -323,7 +371,8 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.builder._validate_manifest_value(changed)
         with tempfile.TemporaryDirectory() as tmp:
-            cache = Path(tmp)
+            cache = Path(tmp).resolve()
+            cache.chmod(0o755)
             package = json.loads(json.dumps(manifest["packages"][0]))
             archive = cache / "archive-v0" / package["archiveId"]
             archive.mkdir(parents=True)
@@ -340,6 +389,210 @@ class Ceq1WheelBuilderTests(unittest.TestCase):
             os.symlink(cache / "archive-v0/wrong", link)
             with self.assertRaises(ValueError):
                 self.builder.resolve_cache_source(cache, package)
+
+    def test_every_source_and_cache_component_is_opened_without_following_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real_root = root / "real"
+            source, package = _mini_distribution(real_root)
+            alias = root / "archive-alias"
+            os.symlink(real_root / "archive-v0", alias)
+            with self.assertRaises((ValueError, OSError)):
+                self.builder.inspect_source(alias / source.name, package)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cache = root / "cache"
+            cache.mkdir(mode=0o755)
+            archive = cache / "archive-v0" / "mini-archive"
+            archive.mkdir(parents=True)
+            real_wheels = cache / "real-wheels"
+            package_dir = real_wheels / "pypi/demo_pkg"
+            package_dir.mkdir(parents=True)
+            os.symlink(real_wheels, cache / "wheels-v6")
+            link = package_dir / "1.2.3-py3-none-any"
+            os.symlink(archive, link)
+            package = _mini_distribution(root / "fixture")[1]
+            with self.assertRaises((ValueError, OSError)):
+                self.builder.resolve_cache_source(cache, package)
+
+    def test_source_and_cache_tree_modes_are_canonical_and_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source, package = _mini_distribution(root)
+            source.chmod(0o700)
+            with self.assertRaises(ValueError):
+                self.builder.inspect_source(source, package)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source, package = _mini_distribution(root)
+            original_read = self.builder._read_no_follow
+            changed = False
+
+            def read_then_mutate(*args, **kwargs):
+                nonlocal changed
+                data = original_read(*args, **kwargs)
+                if not changed:
+                    (source / "demo_pkg").chmod(0o700)
+                    changed = True
+                return data
+
+            with mock.patch.object(self.builder, "_read_no_follow", side_effect=read_then_mutate):
+                with self.assertRaises(ValueError):
+                    self.builder.inspect_source(source, package)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cache = root / "cache"
+            cache.mkdir(mode=0o755)
+            archive = cache / "archive-v0" / "mini-archive"
+            archive.mkdir(parents=True)
+            package_dir = cache / "wheels-v6/pypi/demo_pkg"
+            package_dir.mkdir(parents=True)
+            os.symlink(archive, package_dir / "1.2.3-py3-none-any")
+            (cache / "wheels-v6/pypi").chmod(0o700)
+            package = _mini_distribution(root / "fixture")[1]
+            with self.assertRaises(ValueError):
+                self.builder.resolve_cache_source(cache, package)
+
+    def test_cache_link_identity_is_rechecked_after_readlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cache = root / "cache"
+            cache.mkdir(mode=0o755)
+            archive = cache / "archive-v0" / "mini-archive"
+            archive.mkdir(parents=True)
+            wrong = cache / "archive-v0" / "wrong-archive"
+            wrong.mkdir()
+            package_dir = cache / "wheels-v6/pypi/demo_pkg"
+            package_dir.mkdir(parents=True)
+            link = package_dir / "1.2.3-py3-none-any"
+            os.symlink(archive, link)
+            package = _mini_distribution(root / "fixture")[1]
+            real_readlink = os.readlink
+            swapped = False
+
+            def racing_readlink(*args, **kwargs):
+                nonlocal swapped
+                value = real_readlink(*args, **kwargs)
+                if not swapped:
+                    link.unlink()
+                    os.symlink(wrong, link)
+                    swapped = True
+                return value
+
+            with mock.patch.object(self.builder.os, "readlink", side_effect=racing_readlink):
+                with self.assertRaises((ValueError, OSError)):
+                    self.builder.resolve_cache_source(cache, package)
+
+    def test_package_and_dist_info_identities_are_canonical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, package = _mini_distribution(Path(tmp).resolve())
+            package["name"] = "../not-a-package"
+            with self.assertRaises(ValueError):
+                self.builder.inspect_source(source, package)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source, package = _mini_distribution(Path(tmp).resolve())
+            old_dist_info = source / "demo_pkg-1.2.3.dist-info"
+            new_dist_info = source / "alternate.dist-info"
+            old_dist_info.rename(new_dist_info)
+            record_path = "alternate.dist-info/RECORD"
+            payload_paths = sorted(
+                path.relative_to(source).as_posix()
+                for path in source.rglob("*")
+                if path.is_file() and path.name != "RECORD"
+            )
+            output = io.StringIO(newline="")
+            writer = csv.writer(output, lineterminator="\n")
+            for relative in payload_paths:
+                data = (source / relative).read_bytes()
+                writer.writerow((relative, f"sha256={_record_hash(data)}", str(len(data))))
+            writer.writerow((record_path, "", ""))
+            record = output.getvalue().encode("utf-8")
+            (source / record_path).write_bytes(record)
+            package["recordSha256"] = _sha256(record)
+            package["members"] = [
+                {
+                    "path": relative,
+                    "size": (source / relative).stat().st_size,
+                    "sha256": _sha256((source / relative).read_bytes()),
+                }
+                for relative in sorted((*payload_paths, record_path))
+            ]
+            package["wheel"]["memberCount"] = len(package["members"])
+            with self.assertRaises(ValueError):
+                self.builder.inspect_source(source, package)
+
+    def test_finished_wheel_is_sealed_and_path_identity_is_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source, package = _mini_distribution(root)
+            wheel = self.builder.build_wheel(source, package, root / "wheel", verify_output=False)
+            self.assertEqual(0o444, stat.S_IMODE(wheel.stat().st_mode))
+            symlink = root / "wheel-link.whl"
+            os.symlink(wheel, symlink)
+            with self.assertRaises((ValueError, OSError)):
+                self.builder.inspect_wheel(symlink)
+            hardlink = root / "wheel-hardlink.whl"
+            os.link(wheel, hardlink)
+            with self.assertRaises(ValueError):
+                self.builder.inspect_wheel(hardlink)
+
+    def test_finished_zip_rejects_prefix_suffix_and_noncanonical_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source, package = _mini_distribution(root)
+            wheel = self.builder.build_wheel(source, package, root / "wheel", verify_output=False)
+            original = wheel.read_bytes()
+            for label, data in (("prefix", b"junk" + original), ("suffix", original + b"junk")):
+                with self.subTest(label=label):
+                    changed = root / f"{label}.whl"
+                    changed.write_bytes(data)
+                    with self.assertRaises(ValueError):
+                        self.builder.inspect_wheel(changed)
+
+            changed = root / "low-external-attributes.whl"
+            with zipfile.ZipFile(wheel, "r") as source_archive:
+                members = [
+                    (info, source_archive.read(info.filename))
+                    for info in source_archive.infolist()
+                ]
+            with zipfile.ZipFile(changed, "w", compression=zipfile.ZIP_STORED) as output_archive:
+                for info, data in members:
+                    info.external_attr |= 1
+                    output_archive.writestr(info, data)
+            with self.assertRaises(ValueError):
+                self.builder.inspect_wheel(changed)
+
+    def test_finished_wheel_must_match_the_manifested_member_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source, package = _mini_distribution(root)
+            wheel = self.builder.build_wheel(source, package, root / "wheel", verify_output=False)
+            with zipfile.ZipFile(wheel, "r") as archive:
+                infos = archive.infolist()
+                payloads = {info.filename: archive.read(info.filename) for info in infos}
+            target = "demo_pkg/__init__.py"
+            payloads[target] = b"VALUE = 99\n"
+            record_name = "demo_pkg-1.2.3.dist-info/RECORD"
+            record_rows = list(csv.reader(payloads[record_name].decode("utf-8").splitlines()))
+            output = io.StringIO(newline="")
+            writer = csv.writer(output, lineterminator="\n")
+            for member, digest, size_text in record_rows:
+                if member == target:
+                    data = payloads[target]
+                    digest = f"sha256={_record_hash(data)}"
+                    size_text = str(len(data))
+                writer.writerow((member, digest, size_text))
+            payloads[record_name] = output.getvalue().encode("utf-8")
+            changed = root / "self-consistent-but-wrong.whl"
+            with zipfile.ZipFile(changed, "w", compression=zipfile.ZIP_STORED) as archive:
+                for info in infos:
+                    archive.writestr(info, payloads[info.filename])
+            with self.assertRaises(ValueError):
+                self.builder.inspect_wheel(changed, expected_members=package["members"])
 
 
 class Ceq1BootstrapTests(unittest.TestCase):
@@ -374,8 +627,6 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertIn("--contained", outer_argv)
         commands = self.bootstrap.command_contract(sandboxed=False)
         self.assertTrue(commands)
-        self.assertIn("/bin/cp", commands[0])
-        self.assertIn("-cR", commands[0])
         for command in commands:
             self.assertEqual("/usr/bin/env", command[0])
             self.assertEqual("-i", command[1])
@@ -431,6 +682,17 @@ class Ceq1BootstrapTests(unittest.TestCase):
         hash_file.assert_not_called()
         cache_receipt.assert_not_called()
         ensure_root.assert_not_called()
+
+    def test_outer_closes_inherited_descriptors_before_contained_exec(self):
+        sentinel = RuntimeError("execve boundary reached")
+        with (
+            mock.patch.object(self.bootstrap.secrets, "token_hex", return_value="b" * 32),
+            mock.patch.object(self.bootstrap, "_close_non_stdio_fds") as close_fds,
+            mock.patch.object(self.bootstrap.os, "execve", side_effect=sentinel),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "execve boundary reached"):
+                self.bootstrap._launch_contained("prepare")
+        close_fds.assert_called_once_with()
 
     def test_direct_contained_invocation_refuses_before_mutation_and_sandbox_inherits(self):
         bootstrap_name = "bootstrap-direct-contained-red"
@@ -498,7 +760,7 @@ class Ceq1BootstrapTests(unittest.TestCase):
 
     def test_task_cache_clone_rebases_only_internal_absolute_links(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source = root / "source-cache"
             destination = root / "task-cache"
             archive = source / "archive-v0/exact-archive"
@@ -560,9 +822,18 @@ class Ceq1BootstrapTests(unittest.TestCase):
             with self.assertRaises(self.bootstrap.BootstrapBlocked):
                 self.bootstrap.validate_bundle_path_receipt(bundle, receipt)
 
+    def test_tree_receipt_rejects_relative_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            inside = root / "inside"
+            inside.mkdir()
+            os.symlink("../outside", inside / "escape")
+            with self.assertRaises(self.bootstrap.BootstrapBlocked):
+                self.bootstrap.tree_receipt(inside)
+
     def test_canonical_wheelhouse_is_created_directly_then_sealed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             stage = root / "stage"
             package_dir = stage / "demo"
             package_dir.mkdir(parents=True)
@@ -653,6 +924,116 @@ class Ceq1BootstrapTests(unittest.TestCase):
             manifest["seatbeltTemplate"]["placeholders"],
         )
         self.bootstrap.validate_committed_toolchain(REPO_ROOT, manifest)
+
+    def test_static_input_validation_hashes_builder_before_import(self):
+        events: list[str] = []
+        original_hash = self.bootstrap._sha256_file
+
+        def hash_file(path):
+            if Path(path).name == "build_ceq1_wheelhouse.py":
+                events.append("builder-hash")
+            return original_hash(path)
+
+        original_load = self.bootstrap._load_builder
+
+        def load_builder(root):
+            events.append("builder-import")
+            return original_load(root)
+
+        with (
+            mock.patch.object(self.bootstrap, "_sha256_file", side_effect=hash_file),
+            mock.patch.object(self.bootstrap, "_load_builder", side_effect=load_builder),
+        ):
+            self.bootstrap._validate_static_inputs(REPO_ROOT)
+        self.assertLess(events.index("builder-hash"), events.index("builder-import"))
+
+    def _minimal_installed_bundle(self, root: Path) -> tuple[Path, object]:
+        bundle = root / "bundle"
+        venv = bundle / "venv"
+        site = venv / "lib/python3.12/site-packages"
+        dist_info = site / "demo-1.0.dist-info"
+        dist_info.mkdir(parents=True)
+        payload = site / "demo.py"
+        payload.write_bytes(b"VALUE = 1\n")
+        payload_digest = base64.urlsafe_b64encode(
+            hashlib.sha256(payload.read_bytes()).digest()
+        ).rstrip(b"=").decode("ascii")
+        record_relative = "demo-1.0.dist-info/RECORD"
+        record = dist_info / "RECORD"
+        record.write_text(
+            f"demo.py,sha256={payload_digest},{payload.stat().st_size}\n"
+            f"{record_relative},,\n",
+            encoding="utf-8",
+        )
+        files = ("demo.py", record_relative)
+        distribution = SimpleNamespace(
+            metadata={"Name": "demo"},
+            version="1.0",
+            _path=dist_info,
+            files=files,
+        )
+        regular_scaffold = {
+            ".gitignore",
+            ".lock",
+            "CACHEDIR.TAG",
+            "bin/activate",
+            "bin/activate.bat",
+            "bin/activate.fish",
+            "bin/activate.nu",
+            "bin/activate.ps1",
+            "bin/activate_this.py",
+            "bin/deactivate.bat",
+            "bin/pydoc.bat",
+            "lib/python3.12/site-packages/_virtualenv.pth",
+            "lib/python3.12/site-packages/_virtualenv.py",
+            "pyvenv.cfg",
+        }
+        for relative in regular_scaffold:
+            target = venv / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"")
+        python = venv / "bin/python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink("../../python/bin/python3.12", python)
+        os.symlink("python", venv / "bin/python3")
+        os.symlink("python", venv / "bin/python3.12")
+        return bundle, distribution
+
+    def test_installed_environment_rejects_scaffold_link_and_empty_directory_drift(self):
+        def requirements(path):
+            return {"demo": "1.0"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            bundle, distribution = self._minimal_installed_bundle(root)
+            python = bundle / "venv/bin/python"
+            python.unlink()
+            os.symlink("/private/etc/passwd", python)
+            with (
+                mock.patch.object(self.bootstrap, "parse_pinned_requirements", side_effect=requirements),
+                mock.patch.object(
+                    self.bootstrap.importlib.metadata,
+                    "distributions",
+                    return_value=[distribution],
+                ),
+            ):
+                with self.assertRaises(self.bootstrap.BootstrapBlocked):
+                    self.bootstrap.validate_installed_environment(bundle, root)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            bundle, distribution = self._minimal_installed_bundle(root)
+            (bundle / "venv/lib/python3.12/site-packages/undeclared-empty").mkdir()
+            with (
+                mock.patch.object(self.bootstrap, "parse_pinned_requirements", side_effect=requirements),
+                mock.patch.object(
+                    self.bootstrap.importlib.metadata,
+                    "distributions",
+                    return_value=[distribution],
+                ),
+            ):
+                with self.assertRaises(self.bootstrap.BootstrapBlocked):
+                    self.bootstrap.validate_installed_environment(bundle, root)
 
     def test_fast_path_requires_exact_ignored_receipt_and_wheelhouse(self):
         receipt_path = REPO_ROOT / ".ceq1-runtime/bootstrap-receipt.json"
@@ -748,6 +1129,7 @@ class Ceq1BootstrapTests(unittest.TestCase):
         self.assertNotIn("CEQ1_FORBIDDEN_SECRET", result.stdout + result.stderr)
         receipt = json.loads(result.stdout)
         self.assertEqual([0, 1, 2], receipt["fds"])
+        self.assertNotIn("execBoundary", receipt)
         self.assertEqual(sorted(self.wrapper.CLOSED_ENV_KEYS), receipt["environmentKeys"])
         root = str((REPO_ROOT / ".ceq1-venv").resolve())
         for key in ("executable", "prefix", "basePrefix", "stdlib", "platstdlib"):
