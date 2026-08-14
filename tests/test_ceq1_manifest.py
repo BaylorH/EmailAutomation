@@ -1440,7 +1440,24 @@ class Ceq1BootstrapTests(unittest.TestCase):
             sorted(self.bootstrap.SEATBELT_PLACEHOLDERS),
             manifest["seatbeltTemplate"]["placeholders"],
         )
-        self.bootstrap.validate_committed_toolchain(REPO_ROOT, manifest)
+        with mock.patch.object(
+            subprocess,
+            "run",
+            side_effect=AssertionError("toolchain recomputation executed a probe"),
+        ):
+            self.bootstrap.validate_committed_toolchain_without_probes(REPO_ROOT, manifest)
+        call_sites = [
+            line.strip()
+            for line in inspect.getsource(self.bootstrap).splitlines()
+            if "validate_committed_toolchain(root" in line
+        ]
+        self.assertEqual(
+            [
+                "def validate_committed_toolchain(root: Path, manifest: dict[str, object]) -> None:",
+                "validate_committed_toolchain(root, committed)",
+            ],
+            call_sites,
+        )
 
     def test_static_input_validation_hashes_builder_before_import(self):
         events: list[str] = []
