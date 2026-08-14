@@ -11,6 +11,7 @@ from email_automation.utils import (
     format_email_body_with_footer,
     get_signature_attachments,
     get_email_footer,
+    normalize_outbound_message_text,
     resolve_signature_settings,
     needs_signature_attachments,
 )
@@ -271,12 +272,24 @@ class SignatureFooterTests(unittest.TestCase):
             "none",
         )
 
-        self.assertIn("I'll send the tour packet-please review \"Suite B\" - NNN.", html)
+        self.assertIn("I'll send the tour packet - please review \"Suite B\" - NNN.", html)
         self.assertNotIn("\u2019", html)
         self.assertNotIn("\u2014", html)
         self.assertNotIn("\u201c", html)
         self.assertNotIn("\u201d", html)
         self.assertNotIn("\u2022", html)
+
+    def test_outbound_clause_dashes_remain_readable(self):
+        cases = [
+            ("Everything I needed—I’ll follow up.", "Everything I needed - I'll follow up."),
+            ("Everything I needed–I’ll follow up.", "Everything I needed - I'll follow up."),
+            ("Everything I needed — I’ll follow up.", "Everything I needed - I'll follow up."),
+            ("A well-known property", "A well-known property"),
+        ]
+
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(expected, normalize_outbound_message_text(source))
 
     def test_format_body_strips_broker_signoff_before_user_signature(self):
         html = format_email_body_with_footer(

@@ -61,7 +61,12 @@ def _normalize_email(s: str) -> str:
 
 def normalize_outbound_message_text(text: str) -> str:
     """Normalize generated copy before handing HTML to mail transports."""
-    return (text or "").translate(_OUTBOUND_TEXT_TRANSLATION)
+    readable_dashes = re.sub(
+        r"[ \t]*[\u2013\u2014\u2015][ \t]*",
+        " - ",
+        text or "",
+    )
+    return readable_dashes.translate(_OUTBOUND_TEXT_TRANSLATION)
 
 
 def strip_outbound_body_signoff(text: str) -> str:

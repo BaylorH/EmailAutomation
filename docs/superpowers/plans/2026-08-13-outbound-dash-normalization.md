@@ -16,7 +16,7 @@
 - Modify: `email_automation/utils.py:35-64`
 - Test: `tests/test_signature_footer.py`
 
-- [ ] **Step 1: Write the failing regression test**
+- [x] **Step 1: Write the failing regression test**
 
 Import `normalize_outbound_message_text`, then add a `unittest` method covering unspaced em/en dashes, an already-spaced dash, and an ordinary intra-word hyphen:
 
@@ -33,7 +33,7 @@ def test_outbound_clause_dashes_remain_readable(self):
             self.assertEqual(expected, normalize_outbound_message_text(source))
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -47,11 +47,11 @@ tests/test_signature_footer.py::SignatureFooterTests::test_outbound_clause_dashe
 
 Expected: three clause-dash cases fail because the current translation produces unspaced or double-spaced ASCII hyphens; the ordinary hyphen case passes.
 
-- [ ] **Step 3: Implement the minimal normalization**
+- [x] **Step 3: Implement the minimal normalization**
 
 In `normalize_outbound_message_text`, normalize any optional horizontal whitespace surrounding `\u2013`, `\u2014`, or `\u2015` to exactly `" - "`, then apply `_OUTBOUND_TEXT_TRANSLATION` for quotes and remaining punctuation.
 
-- [ ] **Step 4: Run focused verification**
+- [x] **Step 4: Run focused verification**
 
 Run the regression test, then:
 
