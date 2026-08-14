@@ -1,0 +1,89 @@
+{
+  "fictionalDomains": [
+    "example.invalid"
+  ],
+  "fictionalMailboxes": [
+    "avery@example.invalid"
+  ],
+  "fictionalPeople": [
+    "Avery Example"
+  ],
+  "fictionalProperties": [
+    "100 Example Plaza"
+  ],
+  "generationMethod": "newly_authored_synthetic_template",
+  "independentReviewStatus": "pending",
+  "independentReviewerRole": null,
+  "rawCustomerSourcesAccessed": false,
+  "reviewedArtifactSetSha256": null,
+  "reviewedCommit": null,
+  "scannerNonClaim": "This mechanical scanner does not detect arbitrary copied prose or arbitrary numbers; it recognizes only the declared synthetic identities and the closed credential, path, mailbox, identifier, and clock rules listed here.",
+  "scannerRules": [
+    {
+      "ruleId": "CEQ_PRIV_ABSOLUTE_PATH",
+      "sha256": "feef3eb2bf079ffb1a3f8079ca8effe8b511e133a0312213278591efd8011ec6"
+    },
+    {
+      "ruleId": "CEQ_PRIV_ARTIFACT_ID",
+      "sha256": "a099670ee9b777bf6a457d4bc8838a41b9fe51352a2c791f559ea312a1c0b2c8"
+    },
+    {
+      "ruleId": "CEQ_PRIV_CLOCK_RANGE",
+      "sha256": "41e8368cf428f1e0e1dcdae10a2c269d347a03673f97c6d5fff29ed3dcb51a36"
+    },
+    {
+      "ruleId": "CEQ_PRIV_CREDENTIAL",
+      "sha256": "e0c70ec40072726e139ff6b21978f2304895cef77023d580d49bfcbbdf06c857"
+    },
+    {
+      "ruleId": "CEQ_PRIV_FILE_URI",
+      "sha256": "b92b60137649052ff2de133fe2299ec9326324f5a2477eae46dba7dad7fa71b7"
+    },
+    {
+      "ruleId": "CEQ_PRIV_FORBIDDEN_TOKEN",
+      "sha256": "d52f6084f2ae12b8d0e2cac0c30b71811f0a5fc58bf9a496bf699662cbcf3174"
+    },
+    {
+      "ruleId": "CEQ_PRIV_JSON_SECRET_FIELD",
+      "sha256": "2d98a8ad7aba0c2aed5c998b74c6b854bf716c1d7ed975ac7322016d7e42c134"
+    },
+    {
+      "ruleId": "CEQ_PRIV_NON_INVALID_MAILBOX",
+      "sha256": "a42a98d73c444fd1d464155a1744774bb293ecb68f7c17047e51d39552f1b3df"
+    },
+    {
+      "ruleId": "CEQ_PRIV_OBFUSCATED_IDENTITY",
+      "sha256": "853dd8c2f2dc7478fa58951952d98f34e126f82ef2e2f654056a84b0ccd33479"
+    },
+    {
+      "ruleId": "CEQ_PRIV_OPAQUE_BINARY",
+      "sha256": "a73392e938b1c876f0233a8c1a62011d3e13323ea768b4bf3abc143ea81cfc74"
+    },
+    {
+      "ruleId": "CEQ_PRIV_PRODUCTION_ID",
+      "sha256": "1fd54d8d371f27ee27634d36ad70f181b3a57aab899a339e3de57724ed4df2dd"
+    },
+    {
+      "ruleId": "CEQ_PRIV_RAW_MESSAGE_ID",
+      "sha256": "47c6a58cd7cca1f6d5e9c3d6a6c070a76bf2441198d6584bdbaf332006120d99"
+    },
+    {
+      "ruleId": "CEQ_PRIV_TREE_LINK",
+      "sha256": "bd9f1b5f35ea34794ea0846320d49a1a7df27053eee86f031caa7a5dcbc69120"
+    },
+    {
+      "ruleId": "CEQ_PRIV_TREE_SPECIAL",
+      "sha256": "6bc400783ef49fb98bf4d4bac27753e301ef593015aa10ea3a5a48141755ad09"
+    },
+    {
+      "ruleId": "CEQ_PRIV_UNDECLARED_IDENTITY",
+      "sha256": "cd996fc9017cd4f9fd1d45ab7911ee03cd8ef0d1317988ddb201086edde61313"
+    }
+  ],
+  "schemaVersion": 1,
+  "syntheticClock": {
+    "end": "2040-12-31T23:59:59Z",
+    "start": "2040-01-01T00:00:00Z"
+  },
+  "syntheticTemplateVersion": "ceq1-synthetic-v1"
+}
