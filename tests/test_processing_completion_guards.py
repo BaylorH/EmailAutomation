@@ -59,11 +59,12 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         ))
 
     def test_runtime_missing_field_selection_is_always_deterministic(self):
-        missing_fields = ["Ops Ex /SF", "Docks"]
+        missing_fields = ["Total SF", "Ops Ex /SF", "Drive Ins", "Power"]
+        config = get_default_column_config()
         llm_bodies = (
-            "Thanks for the update. Could you confirm Ops Ex /SF and Docks?",
-            "Please reconfirm asking rent, along with Ops Ex /SF and Docks.",
-            "Could you confirm the property address, Ops Ex /SF, and Docks?",
+            "Thanks for the update. Could you confirm Total SF, Ops Ex /SF, Drive Ins, and Power?",
+            "Please reconfirm asking rent, Docks, and Ceiling Ht along with the remaining fields.",
+            "Could you confirm the property address and every building detail again?",
         )
         selected_bodies = []
 
@@ -73,8 +74,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                     selected = processing._select_automatic_response_body(
                         "missing_fields",
                         llm_body,
-                        get_default_column_config(),
-                        "Taylor",
+                        config,
+                        "Baylor",
                         missing_fields=missing_fields,
                     )
                     selected_bodies.append(selected)
@@ -83,12 +84,24 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertEqual(1, len(set(selected_bodies)))
         selected = selected_bodies[0]
         self.assertEqual(
-            missing_fields,
-            [line[2:] for line in selected.splitlines() if line.startswith("- ")],
+            "Hi Baylor,\n\n"
+            "Thanks for the details. When you have a moment, could you also confirm:\n\n"
+            "- Total available square footage\n"
+            "- Operating expenses (NNN/CAM) per SF per year\n"
+            "- Number of drive-in doors\n"
+            "- Electrical service (amps/voltage/phase)",
+            selected,
         )
+        self.assertTrue(processing._response_mentions_missing_fields(
+            selected,
+            missing_fields,
+            config,
+        ))
         self.assertNotIn("Thanks for the update.", selected)
         self.assertNotIn("asking rent", selected.lower())
         self.assertNotIn("property address", selected.lower())
+        self.assertNotIn("Docks", selected)
+        self.assertNotIn("Ceiling Ht", selected)
 
     def test_all_info_close_event_requires_complete_required_fields(self):
         event = {"type": "close_conversation", "notes": "all_info_gathered"}
