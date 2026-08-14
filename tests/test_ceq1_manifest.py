@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zipfile
+import zlib
 
 from tests.ceq1.contracts import (
     EffectAttempt,
@@ -4063,6 +4064,49 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
             )
         self.assertEqual(("CEQ_PRIV_FILE_URI", "file-uri"), raised.exception.args)
 
+    def test_text_scanner_distinguishes_sentence_punctuation_and_slash_operator(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        for payload in (
+            b"Contact avery@example.invalid.",
+            b"rent / opex",
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    (),
+                    self.privacy.scan_bytes(
+                        payload,
+                        artifact_id="text-boundary-safe",
+                        provenance=provenance,
+                    ),
+                )
+        with self.assertRaises(ValueError) as raised:
+            self.privacy.scan_bytes(
+                b"Contact broker@outside.example.",
+                artifact_id="punctuated-mailbox",
+                provenance=provenance,
+            )
+        self.assertEqual(
+            ("CEQ_PRIV_NON_INVALID_MAILBOX", "punctuated-mailbox"),
+            raised.exception.args,
+        )
+        for payload in (
+            b"/",
+            b"label:/Users",
+            b"/Users",
+            b"//server",
+            b"///usr",
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError) as raised:
+                self.privacy.scan_bytes(
+                    payload,
+                    artifact_id="absolute-path-control",
+                    provenance=provenance,
+                )
+            self.assertEqual(
+                ("CEQ_PRIV_ABSOLUTE_PATH", "absolute-path-control"),
+                raised.exception.args,
+            )
+
     def test_seeded_forbidden_token_is_quarantined_without_committing_or_echoing_it(self):
         provenance = self.privacy.validate_generation_provenance(self._provenance())
         forbidden = hashlib.sha256(os.urandom(32)).hexdigest().encode("ascii")
@@ -4097,6 +4141,38 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                 )
             self.assertIn("CEQ_PRIV_UNDECLARED_IDENTITY", str(raised.exception))
             self.assertNotIn(value, str(raised.exception))
+        safe_metadata = (
+            ("file-name", {"fileName": "synthetic.pdf"}),
+            ("campaign-name", {"campaignName": "Synthetic Campaign"}),
+            ("email-address", {"emailAddress": "avery@example.invalid"}),
+            (
+                "nested-attachment",
+                {
+                    "attachments": [
+                        {"name": "synthetic.pdf", "fileName": "synthetic.pdf"}
+                    ]
+                },
+            ),
+            (
+                "nested-mailbox",
+                {
+                    "mailbox": {
+                        "name": "Synthetic Mailbox",
+                        "address": "avery@example.invalid",
+                    }
+                },
+            ),
+        )
+        for label, value in safe_metadata:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    (),
+                    self.privacy.scan_json(
+                        value,
+                        artifact_id="metadata-control",
+                        provenance=provenance,
+                    ),
+                )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "safe.json").write_bytes(self._json_bytes({"name": "Avery Example"}))
@@ -4186,15 +4262,14 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
             with self.assertRaises(ValueError) as raised:
                 self.privacy.scan_tree(root, artifact_id="pdf-tree", provenance=provenance)
             self.assertEqual(("CEQ_PRIV_OPAQUE_BINARY", "pdf-tree"), raised.exception.args)
-            self.assertEqual(
-                (),
+            with self.assertRaises(ValueError) as raised:
                 self.privacy.scan_tree(
                     root,
                     artifact_id="pdf-tree",
                     provenance=provenance,
                     decoded_text_by_path={"synthetic.pdf": "Avery Example at 100 Example Plaza"},
-                ),
-            )
+                )
+            self.assertEqual(("CEQ_PRIV_OPAQUE_BINARY", "pdf-tree"), raised.exception.args)
 
     def test_pdf_raw_metadata_is_scanned_before_opaque_tolerance(self):
         provenance = self.privacy.validate_generation_provenance(self._provenance())
@@ -4203,8 +4278,7 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
             (root / "synthetic.pdf").write_bytes(
                 b"%PDF-1.7\x00 1 0 obj << /Type /Catalog >>"
             )
-            self.assertEqual(
-                (),
+            with self.assertRaises(ValueError) as raised:
                 self.privacy.scan_tree(
                     root,
                     artifact_id="pdf-standard-names",
@@ -4212,7 +4286,10 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                     decoded_text_by_path={
                         "synthetic.pdf": "Avery Example at 100 Example Plaza"
                     },
-                ),
+                )
+            self.assertEqual(
+                ("CEQ_PRIV_OPAQUE_BINARY", "pdf-standard-names"),
+                raised.exception.args,
             )
         cases = (
             ("CEQ_PRIV_NON_INVALID_MAILBOX", b"broker@outside.example"),
@@ -4256,6 +4333,27 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                 )
                 self.assertNotIn(raw_metadata.decode("utf-8"), str(raised.exception))
 
+    def test_opaque_pdf_caller_decoded_map_cannot_forge_privacy_pass(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "synthetic.pdf").write_bytes(
+                b"%PDF-1.7\x00stream\n" + zlib.compress(b"broker@outside.example")
+            )
+            with self.assertRaises(ValueError) as raised:
+                self.privacy.scan_tree(
+                    root,
+                    artifact_id="pdf-compressed-forgery",
+                    provenance=provenance,
+                    decoded_text_by_path={
+                        "synthetic.pdf": "Avery Example at 100 Example Plaza"
+                    },
+                )
+            self.assertEqual(
+                ("CEQ_PRIV_OPAQUE_BINARY", "pdf-compressed-forgery"),
+                raised.exception.args,
+            )
+
     def test_generation_provenance_is_closed_newly_authored_and_review_gating_is_explicit(self):
         valid = self._provenance()
         parsed = self.privacy.validate_generation_provenance(valid)
@@ -4268,6 +4366,14 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
         self.assertIsNone(parsed.reviewedCommit)
         self.assertEqual(self.privacy.SCANNER_NONCLAIM, parsed.scannerNonClaim)
         self.assertEqual(self.privacy.SCANNER_NONCLAIM, parsed.scannerNonClaim)
+        self.assertIn(
+            "PDF decoded-text privacy remains unverified", parsed.scannerNonClaim
+        )
+        self.assertIn("Task 7 verified parser receipt", parsed.scannerNonClaim)
+        self.assertIn(
+            "caller-supplied decoded-text map cannot produce a privacy gate pass",
+            parsed.scannerNonClaim,
+        )
         artifact_digest = hashlib.sha256(os.urandom(32)).hexdigest()
         reviewed_commit = "3" * 40
         approved = json.loads(json.dumps(valid))

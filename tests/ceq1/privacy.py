@@ -17,25 +17,28 @@ from tests.ceq1.contracts import sha256_json
 SCANNER_NONCLAIM = (
     "This mechanical scanner does not detect arbitrary copied prose or arbitrary "
     "numbers; it recognizes only the declared synthetic identities and the closed "
-    "credential, path, mailbox, identifier, and clock rules listed here."
+    "credential, path, mailbox, identifier, and clock rules listed here. PDF "
+    "decoded-text privacy remains unverified until the Task 7 verified parser "
+    "receipt is bound; a caller-supplied decoded-text map cannot produce a privacy "
+    "gate pass."
 )
 
 SCANNER_RULE_SPECS: dict[str, object] = {
-    "CEQ_PRIV_ABSOLUTE_PATH": {"kind": "absolute-path", "version": 4},
+    "CEQ_PRIV_ABSOLUTE_PATH": {"kind": "absolute-path", "version": 5},
     "CEQ_PRIV_ARTIFACT_ID": {"kind": "logical-artifact-id", "version": 1},
     "CEQ_PRIV_CLOCK_RANGE": {"kind": "strict-utc-z-clock", "version": 1},
     "CEQ_PRIV_CREDENTIAL": {"kind": "credential-shape", "version": 1},
     "CEQ_PRIV_FILE_URI": {"kind": "file-uri", "version": 1},
     "CEQ_PRIV_FORBIDDEN_TOKEN": {"kind": "seeded-token", "version": 2},
     "CEQ_PRIV_JSON_SECRET_FIELD": {"kind": "secret-json-field", "version": 1},
-    "CEQ_PRIV_NON_INVALID_MAILBOX": {"kind": "non-invalid-mailbox", "version": 1},
+    "CEQ_PRIV_NON_INVALID_MAILBOX": {"kind": "non-invalid-mailbox", "version": 2},
     "CEQ_PRIV_OBFUSCATED_IDENTITY": {"kind": "encoded-identity", "version": 1},
-    "CEQ_PRIV_OPAQUE_BINARY": {"kind": "opaque-binary", "version": 2},
+    "CEQ_PRIV_OPAQUE_BINARY": {"kind": "opaque-binary", "version": 3},
     "CEQ_PRIV_PRODUCTION_ID": {"kind": "production-shaped-id", "version": 4},
     "CEQ_PRIV_RAW_MESSAGE_ID": {"kind": "raw-message-id", "version": 1},
     "CEQ_PRIV_TREE_LINK": {"kind": "tree-link", "version": 1},
     "CEQ_PRIV_TREE_SPECIAL": {"kind": "tree-special-file", "version": 4},
-    "CEQ_PRIV_UNDECLARED_IDENTITY": {"kind": "undeclared-identity", "version": 1},
+    "CEQ_PRIV_UNDECLARED_IDENTITY": {"kind": "undeclared-identity", "version": 3},
 }
 SCANNER_RULE_HASHES = {
     rule_id: sha256_json(specification)
@@ -71,7 +74,11 @@ _MAILBOX = re.compile(
     r"^[a-z0-9](?:[a-z0-9.!#$%&'*+/=?^_`{|}~-]*[a-z0-9])?@"
     r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.invalid$"
 )
-_EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
+_EMAIL = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
+    r"(?=$|[\s\"'<>),;:!?]|\.(?:$|[\s\"'<>),;:!?]))"
+)
 _OBFUSCATED_IDENTITY_CHARACTERS = ("＠", "\u200b", "\u200c", "\u200d", "\ufeff")
 _UTF8_OBFUSCATED_IDENTITY_SIGNATURES = tuple(
     character.encode("utf-8") for character in _OBFUSCATED_IDENTITY_CHARACTERS
@@ -109,6 +116,8 @@ _SECRET_KEYS = frozenset(
         "token",
     }
 )
+_PERSON_IDENTITY_KEYS = frozenset({"brokername", "sendername"})
+_PROPERTY_IDENTITY_KEYS = frozenset({"propertyaddress"})
 _PLATFORM_ID_KEYS = frozenset(
     {
         "bucket",
@@ -383,6 +392,16 @@ def _contains_posix_absolute_path(
     pattern: re.Pattern[str] = _POSIX_ABSOLUTE_PATH,
 ) -> bool:
     for match in pattern.finditer(text):
+        if (
+            match.group(0) == "/"
+            and match.start() > 0
+            and match.end() < len(text)
+            and text[match.start() - 1].isspace()
+            and text[match.end()].isspace()
+            and text[: match.start()].strip()
+            and text[match.end() :].strip()
+        ):
+            continue
         if match.group(0).startswith("//") and _URI_SCHEME_SUFFIX.search(
             text[: match.start()]
         ):
@@ -511,10 +530,10 @@ def _scan_json_value(
         )
         if is_platform_id and not value.lower().startswith(("ceq1-", "synthetic-")):
             _raise("CEQ_PRIV_PRODUCTION_ID", artifact_id)
-        if parent_key is not None and parent_key.endswith("name"):
+        if parent_key in _PERSON_IDENTITY_KEYS:
             if value not in provenance.fictionalPeople:
                 _raise("CEQ_PRIV_UNDECLARED_IDENTITY", artifact_id)
-        if parent_key is not None and parent_key.endswith("address"):
+        if parent_key in _PROPERTY_IDENTITY_KEYS:
             if value not in provenance.fictionalProperties:
                 _raise("CEQ_PRIV_UNDECLARED_IDENTITY", artifact_id)
         return
@@ -761,6 +780,7 @@ def _scan_tree_directory(
                 if error.args != ("CEQ_PRIV_OPAQUE_BINARY", artifact):
                     raise
                 _scan_pdf_raw_patterns(data, artifact, provenance)
+                _raise("CEQ_PRIV_OPAQUE_BINARY", artifact)
             if relative not in decoded or type(decoded[relative]) is not str:
                 _raise("CEQ_PRIV_OPAQUE_BINARY", artifact)
             seen_decoded.add(relative)
