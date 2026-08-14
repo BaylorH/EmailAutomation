@@ -67,7 +67,9 @@ def normalize_outbound_message_text(text: str) -> str:
         text or "",
     )
     readable_dashes = re.sub(
-        r"(?<=\S)\u2013(?=(?:i|we|you|they|he|she|it|this|that|there)[’'][a-z]+\b)",
+        r"(?<=\S)\u2013(?=(?:i|we|you|they|he|she|it|this|that|there|please|let|"
+        r"thanks?|thank|will|would|can|could|should|do|does|did|but|and|so|if|"
+        r"when|while|because)\b)",
         " - ",
         readable_dashes,
         flags=re.IGNORECASE,
