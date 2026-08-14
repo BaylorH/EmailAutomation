@@ -24,6 +24,21 @@ import unittest
 from unittest import mock
 import zipfile
 
+from tests.ceq1.contracts import (
+    EffectAttempt,
+    EvidenceResult,
+    ExecutionResult,
+    FactRecord,
+    GateReport,
+    GateVerdict,
+    Layer,
+    ScoreRecord,
+    StateSnapshot,
+    canonical_json,
+    classify_gate,
+    sha256_json,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PINNED_PYTHON = Path(
@@ -1915,6 +1930,188 @@ class Ceq1BootstrapTests(unittest.TestCase):
         for key in ("executable", "prefix", "basePrefix", "stdlib", "platstdlib"):
             self.assertTrue(receipt[key].startswith(root), (key, receipt[key]))
         self.assertTrue(all(path.startswith(root) for path in receipt["loadedPaths"]))
+
+
+class Ceq1ClosedContractTests(unittest.TestCase):
+    def _effect(self) -> EffectAttempt:
+        return EffectAttempt.from_mapping(
+            {
+                "operationId": "op-001",
+                "attemptOrdinal": 0,
+                "method": "set",
+                "target": "row:target-001",
+                "outcome": "BLOCKED",
+            }
+        )
+
+    def _fact(self) -> FactRecord:
+        return FactRecord.from_mapping(
+            {
+                "field": "opex",
+                "value": 4,
+                "unit": "USD_PER_SF",
+                "basis": "ANNUAL",
+                "sourceMessageId": "msg-003",
+                "sourceSpan": [11, 17],
+                "targetPropertyId": "property-001",
+                "targetSuiteId": "suite-100",
+                "freshness": "CURRENT",
+                "evidenceRef": "segment-msg-003-01",
+            }
+        )
+
+    def _snapshot(self, reverse: bool = False) -> StateSnapshot:
+        pairs = (("rows", [{"id": "target-001", "status": "OPEN"}]), ("pending", []))
+        return StateSnapshot.from_mapping({"state": dict(reversed(pairs) if reverse else pairs)})
+
+    def _score(
+        self,
+        result: EvidenceResult,
+        *,
+        scenario_id: str = "CEQ-MEM-01",
+        variant_id: str = "explicit-decline",
+    ) -> ScoreRecord:
+        before = self._snapshot()
+        return ScoreRecord.from_mapping(
+            {
+                "scenarioId": scenario_id,
+                "variantId": variant_id,
+                "layer": "L2",
+                "evidenceResult": result.value,
+                "failureReasons": [] if result is EvidenceResult.VERIFIED else ["FACT_PROVENANCE_MISSING"],
+                "diff": {"facts": []},
+                "stateBeforeDigest": before.digest,
+                "stateAfterDigest": before.digest,
+                "nonClaims": ["NO_LIVE_PROVIDER_EVIDENCE"],
+            }
+        )
+
+    def test_closed_enums_have_only_approved_values(self):
+        self.assertEqual(["L1", "L2", "L3"], [item.value for item in Layer])
+        self.assertEqual(
+            ["BLOCKED", "INSTRUMENT_FAILURE", "FAIL", "UNVERIFIED", "PASS_OFFLINE"],
+            [item.value for item in GateVerdict],
+        )
+        self.assertEqual(
+            ["VERIFIED", "REFUTED", "UNVERIFIED"],
+            [item.value for item in EvidenceResult],
+        )
+
+    def test_canonical_json_and_hash_are_order_independent_and_finite(self):
+        left = {"z": [3, 2, 1], "a": {"two": 2, "one": 1}}
+        right = {"a": {"one": 1, "two": 2}, "z": [3, 2, 1]}
+        expected = b'{"a":{"one":1,"two":2},"z":[3,2,1]}'
+        self.assertEqual(expected, canonical_json(left))
+        self.assertEqual(expected, canonical_json(right))
+        self.assertEqual(sha256_json(left), sha256_json(right))
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
+                canonical_json({"value": value})
+
+    def test_every_record_rejects_missing_and_extra_keys(self):
+        valid_records = (
+            (EffectAttempt, self._effect().to_mapping()),
+            (FactRecord, self._fact().to_mapping()),
+            (StateSnapshot, self._snapshot().to_mapping()),
+            (
+                ExecutionResult,
+                {
+                    "scenarioId": "CEQ-MEM-01",
+                    "variantId": "explicit-decline",
+                    "layer": "L2",
+                    "sourceIdentity": "source-001",
+                    "facts": [self._fact().to_mapping()],
+                    "events": [{"kind": "PROPOSAL", "ordinal": 0}],
+                    "draft": None,
+                    "stateBefore": self._snapshot().to_mapping(),
+                    "stateAfter": self._snapshot(reverse=True).to_mapping(),
+                    "effectLedger": [self._effect().to_mapping()],
+                    "providerLedger": [],
+                    "runtimeProjectionDigest": "1" * 64,
+                    "nonClaims": ["NO_LIVE_PROVIDER_EVIDENCE"],
+                },
+            ),
+            (ScoreRecord, self._score(EvidenceResult.VERIFIED).to_mapping()),
+            (
+                GateReport,
+                GateReport.from_scores(
+                    required_scores=(self._score(EvidenceResult.VERIFIED),),
+                    diagnostic_scores=(),
+                ).to_mapping(),
+            ),
+        )
+        for record_type, mapping in valid_records:
+            with self.subTest(record=record_type.__name__, case="extra"):
+                with self.assertRaises(ValueError):
+                    record_type.from_mapping({**mapping, "unexpected": True})
+            with self.subTest(record=record_type.__name__, case="missing"):
+                missing = dict(mapping)
+                missing.pop(next(iter(missing)))
+                with self.assertRaises(ValueError):
+                    record_type.from_mapping(missing)
+
+    def test_state_and_execution_digests_are_stable_and_records_are_deeply_frozen(self):
+        before = self._snapshot()
+        after = self._snapshot(reverse=True)
+        self.assertEqual(before.digest, after.digest)
+        result = ExecutionResult.from_mapping(
+            {
+                "scenarioId": "CEQ-MEM-01",
+                "variantId": "explicit-decline",
+                "layer": "L2",
+                "sourceIdentity": "source-001",
+                "facts": [self._fact().to_mapping()],
+                "events": [{"kind": "PROPOSAL", "ordinal": 0}],
+                "draft": {"plainBody": "Synthetic draft."},
+                "stateBefore": before.to_mapping(),
+                "stateAfter": after.to_mapping(),
+                "effectLedger": [self._effect().to_mapping()],
+                "providerLedger": [],
+                "runtimeProjectionDigest": "1" * 64,
+                "nonClaims": ["NO_LIVE_PROVIDER_EVIDENCE"],
+            }
+        )
+        self.assertEqual(sha256_json(result), sha256_json(ExecutionResult.from_mapping(result.to_mapping())))
+        with self.assertRaises(TypeError):
+            result.draft["plainBody"] = "changed"
+        with self.assertRaises((AttributeError, TypeError)):
+            result.nonClaims += ("changed",)
+
+    def test_gate_verdict_precedence_is_closed(self):
+        self.assertEqual(GateVerdict.BLOCKED, classify_gate(prerequisite_missing=True))
+        self.assertEqual(
+            GateVerdict.INSTRUMENT_FAILURE,
+            classify_gate(instrument_faults=["guard_identity"], required_refutations=["wrong_value"]),
+        )
+        self.assertEqual(
+            GateVerdict.FAIL,
+            classify_gate(
+                required_refutations=["wrong_value"],
+                missing_required_evidence=["fact_provenance"],
+            ),
+        )
+        self.assertEqual(
+            GateVerdict.UNVERIFIED,
+            classify_gate(missing_required_evidence=["fact_provenance"]),
+        )
+        self.assertEqual(GateVerdict.PASS_OFFLINE, classify_gate())
+        with self.assertRaises(TypeError):
+            classify_gate(False)
+
+    def test_diagnostic_unverified_does_not_downgrade_hard_gate(self):
+        required = self._score(EvidenceResult.VERIFIED)
+        diagnostic = self._score(
+            EvidenceResult.UNVERIFIED,
+            scenario_id="VOICE-LAUNCH",
+            variant_id="launch",
+        )
+        report = GateReport.from_scores(
+            required_scores=(required,),
+            diagnostic_scores=(diagnostic,),
+        )
+        self.assertIs(GateVerdict.PASS_OFFLINE, report.verdict)
+        self.assertEqual((diagnostic,), report.nextGateEligibility)
+        self.assertIn("NO_LIVE_PROVIDER_EVIDENCE", report.nextGateEligibility[0].nonClaims)
 
 
 if __name__ == "__main__":
