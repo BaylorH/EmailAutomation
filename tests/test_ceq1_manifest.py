@@ -27,6 +27,7 @@ import zipfile
 from tests.ceq1.contracts import (
     EffectAttempt,
     EvidenceResult,
+    EventRecord,
     ExecutionResult,
     FactRecord,
     FutureGate,
@@ -2046,7 +2047,11 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 canonical_json({"value": value})
         with self.assertRaises(TypeError):
             canonical_json(GateVerdict.PASS_OFFLINE)
-        for value in ((1, 2), ForeignEnum.VALUE):
+        class ForeignRecord:
+            def to_mapping(self):
+                return {"forged": True}
+
+        for value in ((1, 2), ForeignEnum.VALUE, ForeignRecord()):
             with self.subTest(raw_type=type(value).__name__), self.assertRaises(TypeError):
                 canonical_json(value)
         self.assertNotEqual(sha256_json({"values": [1, 2]}), sha256_json({"values": [2, 1]}))
@@ -2066,7 +2071,9 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                     "layer": "L2",
                     "sourceIdentity": "source-001",
                     "facts": [self._fact().to_mapping()],
-                    "events": [{"kind": "PROPOSAL", "ordinal": 0}],
+                    "events": [
+                        {"kind": "PROPOSAL", "ordinal": 0, "payload": {"safe": True}}
+                    ],
                     "draft": None,
                     "stateBefore": self._snapshot().to_mapping(),
                     "stateAfter": self._snapshot(reverse=True).to_mapping(),
@@ -2081,6 +2088,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 NextGateEligibility,
                 {
                     "gateId": "CE-Q1B-TEXT",
+                    "ceq1aVerdict": "PASS_OFFLINE",
                     "eligible": True,
                     "blockingDiagnostics": [],
                     "nonClaims": ["NO_MODEL_CALL_AUTHORIZED", "SEPARATE_AUTHORIZATION_REQUIRED"],
@@ -2115,7 +2123,9 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 "layer": "L2",
                 "sourceIdentity": "source-001",
                 "facts": [self._fact().to_mapping()],
-                "events": [{"kind": "PROPOSAL", "ordinal": 0}],
+                "events": [
+                    {"kind": "PROPOSAL", "ordinal": 0, "payload": {"safe": True}}
+                ],
                 "draft": {"plainBody": "Synthetic draft."},
                 "stateBefore": before.to_mapping(),
                 "stateAfter": after.to_mapping(),
@@ -2138,8 +2148,28 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         with self.assertRaises((AttributeError, TypeError)):
             result.nonClaims += ("changed",)
 
+    def test_event_record_is_closed_and_ordinal_is_exact(self):
+        event = EventRecord.from_mapping(
+            {"kind": "PROPOSAL", "ordinal": 0, "payload": {"safe": True}}
+        )
+        self.assertEqual(
+            {"kind": "PROPOSAL", "ordinal": 0, "payload": {"safe": True}},
+            event.to_mapping(),
+        )
+        for key, value in (("ordinal", True), ("ordinal", -1), ("payload", [])):
+            wire = event.to_mapping()
+            wire[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises((TypeError, ValueError)):
+                EventRecord.from_mapping(wire)
+
     def test_nested_json_and_scalar_fields_reject_ambiguous_or_unsafe_values(self):
         from decimal import Decimal
+
+        class DictSubclass(dict):
+            pass
+
+        class ListSubclass(list):
+            pass
 
         nested_cycle: list[object] = []
         nested_cycle.append(nested_cycle)
@@ -2150,11 +2180,15 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             {"value": {"set"}},
             {"value": Decimal("1.5")},
             {"value": nested_cycle},
+            DictSubclass(value=1),
+            {"value": ListSubclass([1])},
         )
         for value in invalid_json:
             with self.subTest(value_type=type(next(iter(value.values()))).__name__):
                 with self.assertRaises((TypeError, ValueError)):
                     canonical_json(value)
+        with self.assertRaises(TypeError):
+            EffectAttempt.from_mapping(DictSubclass(self._effect().to_mapping()))
         malformed_effect = self._effect().to_mapping()
         malformed_effect["attemptOrdinal"] = True
         with self.assertRaises(TypeError):
@@ -2206,7 +2240,10 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 StateSnapshot.from_mapping({"state": invalid})
 
     def test_gate_verdict_precedence_is_closed(self):
-        self.assertEqual(GateVerdict.BLOCKED, classify_gate(prerequisite_missing=True))
+        self.assertEqual(
+            GateVerdict.BLOCKED,
+            classify_gate(execution_started=False, prerequisite_missing=True),
+        )
         self.assertEqual(
             GateVerdict.INSTRUMENT_FAILURE,
             classify_gate(instrument_faults=["guard_identity"], required_refutations=["wrong_value"]),
@@ -2257,9 +2294,12 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         self.assertEqual({"CE-Q1B-TEXT", "CE-Q1B-VOICE"}, set(eligibility))
         self.assertTrue(eligibility["CE-Q1B-TEXT"].eligible)
         self.assertFalse(eligibility["CE-Q1B-VOICE"].eligible)
-        self.assertIn(
-            "UNVERIFIED_NO_SHARED_FINALIZER", eligibility["CE-Q1B-VOICE"].nonClaims
+        observed = next(
+            item
+            for item in eligibility["CE-Q1B-VOICE"].blockingDiagnostics
+            if item.scenarioId == "VOICE-LAUNCH"
         )
+        self.assertIn("UNVERIFIED_NO_SHARED_FINALIZER", observed.nonClaims)
 
     def test_score_and_report_reject_reason_and_promotion_laundering(self):
         verified = self._score(EvidenceResult.VERIFIED).to_mapping()
@@ -2308,7 +2348,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             promotion_class=PromotionClass.DIAGNOSTIC,
         )
         report = GateReport.from_scores(required_scores=(), diagnostic_scores=(diagnostic,))
-        self.assertIs(GateVerdict.FAIL, report.verdict)
+        self.assertIs(GateVerdict.INSTRUMENT_FAILURE, report.verdict)
 
     def test_gate_report_refuses_vacuous_or_incomplete_score_partition(self):
         with self.assertRaises(ValueError):
@@ -2329,6 +2369,15 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             GateReport.from_mapping(forged)
+        with self.assertRaises(ValueError):
+            GateReport.from_scores(required_scores=(), diagnostic_scores=(), instrument_faults=())
+        blocked = GateReport.from_scores(
+            required_scores=(),
+            diagnostic_scores=(),
+            execution_started=False,
+            missing_prerequisites=("EMULATOR_MISSING",),
+        )
+        self.assertIs(GateVerdict.BLOCKED, blocked.verdict)
 
     def test_gate_report_recomputes_verdict_and_next_gate_projection(self):
         required = self._score(EvidenceResult.REFUTED)
@@ -2356,6 +2405,9 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         eligibility = {item.gateId: item for item in report.nextGateEligibility}
         self.assertFalse(eligibility["CE-Q1B-TEXT"].eligible)
         self.assertFalse(eligibility["CE-Q1B-VOICE"].eligible)
+        self.assertTrue(
+            all(item.ceq1aVerdict is GateVerdict.FAIL for item in eligibility.values())
+        )
         voice_blockers = eligibility["CE-Q1B-VOICE"].blockingDiagnostics
         self.assertEqual(5, len(voice_blockers))
         self.assertEqual(
