@@ -4,7 +4,7 @@
 
 **Goal:** Prevent generated clause dashes such as `needed—I’ll` from becoming the visibly jammed outbound text `needed-I'll`.
 
-**Architecture:** Keep the existing ASCII outbound transport boundary in `normalize_outbound_message_text`. Replace clause-level en/em dashes with a single spaced ASCII hyphen before applying the existing smart punctuation translation; preserve ordinary intra-word hyphens and already-spaced dashes. This patch does not change extraction, response selection, signatures, recipients, or provider behavior.
+**Architecture:** Keep the existing ASCII outbound transport boundary in `normalize_outbound_message_text`. Replace content-delimited em dashes and horizontal bars with a single spaced ASCII hyphen. Treat an unspaced en dash as a clause separator only before the closed conversational starter set used in generated replies; preserve numeric ranges, proper-name pairs, indentation, and ordinary intra-word hyphens. This patch does not change extraction, response selection, signatures, recipients, or provider behavior.
 
 **Tech Stack:** Python 3.12, pytest, existing `email_automation.utils` outbound formatter.
 
@@ -49,7 +49,7 @@ Expected: three clause-dash cases fail because the current translation produces 
 
 - [x] **Step 3: Implement the minimal normalization**
 
-In `normalize_outbound_message_text`, normalize any optional horizontal whitespace surrounding `\u2013`, `\u2014`, or `\u2015` to exactly `" - "`, then apply `_OUTBOUND_TEXT_TRANSLATION` for quotes and remaining punctuation.
+In `normalize_outbound_message_text`, normalize content-delimited `\u2014` and `\u2015` to exactly `" - "`. Normalize an unspaced `\u2013` only when it precedes the closed conversational clause-starter set, then apply `_OUTBOUND_TEXT_TRANSLATION` for quotes and remaining punctuation. Pin unchanged behavior for numeric ranges, proper-name pairs, leading indentation, and ASCII hyphens.
 
 - [x] **Step 4: Run focused verification**
 
