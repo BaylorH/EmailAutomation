@@ -18,11 +18,11 @@ sys.modules[SPEC.name] = phase1_rollout
 SPEC.loader.exec_module(phase1_rollout)
 
 
-OLD_REVISION = "process-user-00097-yus"
+OLD_REVISION = "process-user-stage-6caa8ec14cc5"
 CANDIDATE = "process-user-stage-1234567890ab"
 OLD_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
-    "process-user@sha256:cd49af55848b7d9fe481d501e087626240d9dc273d0dee663f5c82e04fb62780"
+    "process-user@sha256:c49d13d07309b0a39565af5fa617c65fa10d79f970a827e1b047f4a5b0baf053"
 )
 CANDIDATE_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
@@ -300,6 +300,14 @@ class FakeOps:
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_controller_pins_current_promoted_production_baseline(self):
+        self.assertEqual("process-user-stage-6caa8ec14cc5", phase1_rollout.OLD_REVISION)
+        self.assertEqual(
+            "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
+            "process-user@sha256:c49d13d07309b0a39565af5fa617c65fa10d79f970a827e1b047f4a5b0baf053",
+            phase1_rollout.OLD_IMAGE,
+        )
+
     def test_baseline_topology_accepts_exact_auxiliary_tags(self):
         topology = phase1_rollout.validate_topology(
             service(), expected_positive=OLD_REVISION,
@@ -465,7 +473,7 @@ class StateMachineTests(unittest.TestCase):
         self.assertIn("preflight", ops.events)
         self.assertIn("prerequisites", ops.events)
         self.assertIn("service-access", ops.events)
-        self.assertIn("revision:process-user-00097-yus", ops.events)
+        self.assertIn("revision:process-user-stage-6caa8ec14cc5", ops.events)
         self.assertIn("tasks", ops.events)
         self.assertNotIn("artifact", ops.events)
         self.assertNotIn(f"revision:{CANDIDATE}", ops.events)
