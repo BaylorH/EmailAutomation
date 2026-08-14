@@ -77,10 +77,17 @@ _TIMESTAMP_CANDIDATE = re.compile(
 )
 _STRICT_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _POSIX_ABSOLUTE_PATH = re.compile(
-    r"(?<![A-Za-z0-9._~%+:/-])/{1,}"
+    r"(?<![A-Za-z0-9._~%+/-])/{1,}"
     r"(?:[^\x00\s\"'<>/]+(?:/[^\x00\s\"'<>/]+)*)?"
     r"(?=$|[\s\"'<>),;])"
 )
+_PDF_RAW_POSIX_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9._~%+/-])/{1,}"
+    r"[^\x00\s\"'<>/]+/[^\x00\s\"'<>/]+"
+    r"(?:/[^\x00\s\"'<>/]+)*"
+    r"(?=$|[\s\"'<>),;])"
+)
+_URI_SCHEME_SUFFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:$")
 _WINDOWS_ABSOLUTE_PATH = re.compile(
     r"(?:^|(?<=[\s\"'=:,(]))(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+)"
 )
@@ -367,11 +374,24 @@ def _clock_bounds(provenance: GenerationProvenance) -> tuple[datetime, datetime]
     )
 
 
+def _contains_posix_absolute_path(
+    text: str,
+    pattern: re.Pattern[str] = _POSIX_ABSOLUTE_PATH,
+) -> bool:
+    for match in pattern.finditer(text):
+        if match.group(0).startswith("//") and _URI_SCHEME_SUFFIX.search(
+            text[: match.start()]
+        ):
+            continue
+        return True
+    return False
+
+
 def _scan_text(text: str, artifact_id: str, provenance: GenerationProvenance) -> None:
     lowered = text.lower()
     if "file://" in lowered:
         _raise("CEQ_PRIV_FILE_URI", artifact_id)
-    if _POSIX_ABSOLUTE_PATH.search(text) or _WINDOWS_ABSOLUTE_PATH.search(text):
+    if _contains_posix_absolute_path(text) or _WINDOWS_ABSOLUTE_PATH.search(text):
         _raise("CEQ_PRIV_ABSOLUTE_PATH", artifact_id)
     if re.search(r"\bprojects/[A-Za-z0-9._-]+/databases/", text) or re.search(
         r"(?:\bgs://[A-Za-z0-9._-]+|\b(?:AAMk|AAQk|AQMk)[A-Za-z0-9+/=_-]{16,})",
@@ -412,6 +432,40 @@ def _scan_text(text: str, artifact_id: str, provenance: GenerationProvenance) ->
                 invalid = True
         if invalid or parsed is None or not (clock_start <= parsed <= clock_end):
             _raise("CEQ_PRIV_CLOCK_RANGE", artifact_id)
+
+
+def _scan_pdf_raw_patterns(
+    data: bytes,
+    artifact_id: str,
+    provenance: GenerationProvenance,
+) -> None:
+    text = data.decode("latin-1")
+    lowered = text.lower()
+    if "file://" in lowered:
+        _raise("CEQ_PRIV_FILE_URI", artifact_id)
+    if _contains_posix_absolute_path(
+        text, _PDF_RAW_POSIX_ABSOLUTE_PATH
+    ) or _WINDOWS_ABSOLUTE_PATH.search(text):
+        _raise("CEQ_PRIV_ABSOLUTE_PATH", artifact_id)
+    if re.search(r"\bprojects/[A-Za-z0-9._-]+/databases/", text) or re.search(
+        r"(?:\bgs://[A-Za-z0-9._-]+|\b(?:AAMk|AAQk|AQMk)[A-Za-z0-9+/=_-]{16,})",
+        text,
+    ):
+        _raise("CEQ_PRIV_PRODUCTION_ID", artifact_id)
+    if re.search(
+        r"(?:\bsk-[A-Za-z0-9_-]{16,}|\bghp_[A-Za-z0-9]{16,}|"
+        r"\bAKIA[A-Z0-9]{16}\b|\bAIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]+PRIVATE KEY-----)",
+        text,
+    ):
+        _raise("CEQ_PRIV_CREDENTIAL", artifact_id)
+    declared_mailboxes = set(provenance.fictionalMailboxes)
+    for mailbox_match in _EMAIL.finditer(text):
+        mailbox = mailbox_match.group(0)
+        domain = mailbox.rsplit("@", 1)[1]
+        if not domain.endswith(".invalid"):
+            _raise("CEQ_PRIV_NON_INVALID_MAILBOX", artifact_id)
+        if mailbox not in declared_mailboxes:
+            _raise("CEQ_PRIV_UNDECLARED_IDENTITY", artifact_id)
 
 
 def _scan_json_value(
@@ -702,6 +756,7 @@ def _scan_tree_directory(
             except PrivacyViolation as error:
                 if error.args != ("CEQ_PRIV_OPAQUE_BINARY", artifact):
                     raise
+                _scan_pdf_raw_patterns(data, artifact, provenance)
             if relative not in decoded or type(decoded[relative]) is not str:
                 _raise("CEQ_PRIV_OPAQUE_BINARY", artifact)
             seen_decoded.add(relative)

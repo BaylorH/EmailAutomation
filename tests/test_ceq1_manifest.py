@@ -4036,6 +4036,33 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
         )
         self.assertNotIn(unsafe_artifact_id, str(raised.exception))
 
+    def test_colon_labeled_absolute_path_does_not_bypass_uri_handling(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        with self.assertRaises(ValueError) as raised:
+            self.privacy.scan_bytes(
+                b"label:/Users/private/customer.json",
+                artifact_id="colon-path",
+                provenance=provenance,
+            )
+        self.assertEqual(
+            ("CEQ_PRIV_ABSOLUTE_PATH", "colon-path"), raised.exception.args
+        )
+        self.assertEqual(
+            (),
+            self.privacy.scan_bytes(
+                b"https://example.invalid/synthetic/input.json",
+                artifact_id="https-uri",
+                provenance=provenance,
+            ),
+        )
+        with self.assertRaises(ValueError) as raised:
+            self.privacy.scan_bytes(
+                b"file:///Users/private/customer.json",
+                artifact_id="file-uri",
+                provenance=provenance,
+            )
+        self.assertEqual(("CEQ_PRIV_FILE_URI", "file-uri"), raised.exception.args)
+
     def test_seeded_forbidden_token_is_quarantined_without_committing_or_echoing_it(self):
         provenance = self.privacy.validate_generation_provenance(self._provenance())
         forbidden = hashlib.sha256(os.urandom(32)).hexdigest().encode("ascii")
@@ -4168,6 +4195,52 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                     decoded_text_by_path={"synthetic.pdf": "Avery Example at 100 Example Plaza"},
                 ),
             )
+
+    def test_pdf_raw_metadata_is_scanned_before_opaque_tolerance(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "synthetic.pdf").write_bytes(
+                b"%PDF-1.7\x00 1 0 obj << /Type /Catalog >>"
+            )
+            self.assertEqual(
+                (),
+                self.privacy.scan_tree(
+                    root,
+                    artifact_id="pdf-standard-names",
+                    provenance=provenance,
+                    decoded_text_by_path={
+                        "synthetic.pdf": "Avery Example at 100 Example Plaza"
+                    },
+                ),
+            )
+        cases = (
+            ("CEQ_PRIV_NON_INVALID_MAILBOX", b"broker@outside.example"),
+            ("CEQ_PRIV_ABSOLUTE_PATH", b"/Users/private/customer.json"),
+            (
+                "CEQ_PRIV_PRODUCTION_ID",
+                b"projects/production-project/databases/(default)",
+            ),
+        )
+        for rule_id, raw_metadata in cases:
+            with self.subTest(rule_id=rule_id), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "synthetic.pdf").write_bytes(
+                    b"%PDF-1.7\x00" + raw_metadata
+                )
+                with self.assertRaises(ValueError) as raised:
+                    self.privacy.scan_tree(
+                        root,
+                        artifact_id="pdf-raw-metadata",
+                        provenance=provenance,
+                        decoded_text_by_path={
+                            "synthetic.pdf": "Avery Example at 100 Example Plaza"
+                        },
+                    )
+                self.assertEqual(
+                    (rule_id, "pdf-raw-metadata"), raised.exception.args
+                )
+                self.assertNotIn(raw_metadata.decode("ascii"), str(raised.exception))
 
     def test_generation_provenance_is_closed_newly_authored_and_review_gating_is_explicit(self):
         valid = self._provenance()
