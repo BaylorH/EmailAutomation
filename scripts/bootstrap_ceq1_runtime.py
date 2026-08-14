@@ -902,10 +902,15 @@ def _logical_cache_target(cache_root: Path, relative: str, target: str | None) -
             within = target_path.relative_to(cache_root)
         except ValueError:
             try:
-                pinned = target_path.relative_to(PINNED_PYTHON_ROOT)
+                pinned_text = target_path.relative_to(PINNED_PYTHON_ROOT)
             except ValueError:
                 pass
             else:
+                try:
+                    resolved = target_path.resolve(strict=True)
+                    pinned = resolved.relative_to(PINNED_PYTHON_ROOT)
+                except (OSError, ValueError):
+                    return "@DENIED_EXTERNAL_PYTHON/" + pinned_text.as_posix()
                 return "@PINNED_PYTHON/" + pinned.as_posix()
             try:
                 denied = target_path.relative_to(UV_PYTHON_STORE)
@@ -1136,6 +1141,7 @@ def clone_cache_to_task(
                 while view:
                     written = os.write(destination_file_fd, view)
                     view = view[written:]
+            os.fchmod(destination_file_fd, mode)
         finally:
             os.close(destination_file_fd)
 
@@ -1880,7 +1886,46 @@ def _write_runtime_receipt(root: Path, receipt: dict[str, object]) -> Path:
     return path
 
 
-def _expected_toolchain(root: Path, runtime: Path, manifest: dict[str, object]) -> dict[str, object]:
+_VERSION_OUTPUT_ARTIFACTS = frozenset(
+    {"cpythonSource", "openjdkSource", "firestoreJar", "uv"}
+)
+
+
+def _recorded_version_output_hashes(toolchain: dict[str, object]) -> dict[str, str]:
+    artifacts = toolchain.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise BootstrapBlocked("toolchain artifact records are absent")
+    result: dict[str, str] = {}
+    for name in sorted(_VERSION_OUTPUT_ARTIFACTS):
+        record = artifacts.get(name)
+        value = record.get("versionOutputSha256") if isinstance(record, dict) else None
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise BootstrapBlocked(f"toolchain {name} version receipt is invalid")
+        result[name] = value
+    return result
+
+
+def _expected_toolchain(
+    root: Path,
+    runtime: Path,
+    manifest: dict[str, object],
+    *,
+    version_output_hashes: dict[str, str] | None = None,
+) -> dict[str, object]:
+    if version_output_hashes is None:
+        version_output_hashes = {
+            "cpythonSource": _version_output_sha([str(PINNED_PYTHON), "--version"]),
+            "openjdkSource": _version_output_sha([str(JDK_ROOT / "bin/java"), "-version"]),
+            "firestoreJar": _version_output_sha(
+                [str(JDK_ROOT / "bin/java"), "-jar", str(FIRESTORE_JAR), "--version"]
+            ),
+            "uv": _version_output_sha([str(PINNED_UV), "--version"]),
+        }
+    if set(version_output_hashes) != _VERSION_OUTPUT_ARTIFACTS or any(
+        not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in version_output_hashes.values()
+    ):
+        raise BootstrapBlocked("toolchain version receipt mapping drift")
     zipfile_path = Path(__import__("zipfile").__file__)
     artifacts = {
         "entryVerifier": {
@@ -1893,25 +1938,23 @@ def _expected_toolchain(root: Path, runtime: Path, manifest: dict[str, object]) 
             **tree_receipt(PINNED_PYTHON_ROOT),
             "launcherSha256": PYTHON_SHA256,
             "version": "3.12.13",
-            "versionOutputSha256": _version_output_sha([str(PINNED_PYTHON), "--version"]),
+            "versionOutputSha256": version_output_hashes["cpythonSource"],
         },
         "openjdkSource": {
             **tree_receipt(JDK_ROOT),
             "version": "25.0.2",
-            "versionOutputSha256": _version_output_sha([str(JDK_ROOT / "bin/java"), "-version"]),
+            "versionOutputSha256": version_output_hashes["openjdkSource"],
         },
         "firestoreJar": {
             "version": "1.19.8",
             "sha256": _sha256_file(FIRESTORE_JAR),
             "size": FIRESTORE_JAR.stat().st_size,
-            "versionOutputSha256": _version_output_sha(
-                [str(JDK_ROOT / "bin/java"), "-jar", str(FIRESTORE_JAR), "--version"]
-            ),
+            "versionOutputSha256": version_output_hashes["firestoreJar"],
         },
         "uv": {
             "version": "0.11.3",
             "sha256": UV_SHA256,
-            "versionOutputSha256": _version_output_sha([str(PINNED_UV), "--version"]),
+            "versionOutputSha256": version_output_hashes["uv"],
         },
         "zipfile": {"sha256": _sha256_file(zipfile_path)},
     }
@@ -1937,14 +1980,35 @@ def _expected_toolchain(root: Path, runtime: Path, manifest: dict[str, object]) 
     }
 
 
-def validate_committed_toolchain(root: Path, manifest: dict[str, object]) -> None:
+def _validate_toolchain_envelope(manifest: dict[str, object]) -> None:
     if not isinstance(manifest, dict) or set(manifest) != _TOOLCHAIN_KEYS:
         raise BootstrapBlocked("toolchain manifest closed keys mismatch")
     serialized = json.dumps(manifest, sort_keys=True)
     if "/Users/" in serialized or "file://" in serialized:
         raise BootstrapBlocked("absolute path leaked into toolchain manifest")
+
+
+def validate_committed_toolchain(root: Path, manifest: dict[str, object]) -> None:
+    _validate_toolchain_envelope(manifest)
     runtime = root / ".ceq1-venv"
     expected = _expected_toolchain(root, runtime, _validate_static_inputs(root))
+    if expected != manifest:
+        raise BootstrapBlocked("committed toolchain manifest mismatch")
+
+
+def validate_committed_toolchain_without_probes(
+    root: Path, manifest: dict[str, object]
+) -> None:
+    """Recompute static/runtime bindings using already verified version receipts."""
+
+    _validate_toolchain_envelope(manifest)
+    runtime = root / ".ceq1-venv"
+    expected = _expected_toolchain(
+        root,
+        runtime,
+        _validate_static_inputs(root),
+        version_output_hashes=_recorded_version_output_hashes(manifest),
+    )
     if expected != manifest:
         raise BootstrapBlocked("committed toolchain manifest mismatch")
 

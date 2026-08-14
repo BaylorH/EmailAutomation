@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import base64
 import csv
+import ctypes
+import errno
 import hashlib
 import importlib.util
 import io
@@ -1071,6 +1073,106 @@ class Ceq1BootstrapTests(unittest.TestCase):
                     expected_topology,
                 )
 
+    def test_task_cache_clone_byte_fallback_preserves_manifested_mode(self):
+        class FallbackClone:
+            argtypes = None
+            restype = None
+
+            def __call__(self, *_args):
+                ctypes.set_errno(errno.ENOTSUP)
+                return -1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = root / "source-cache"
+            destination = root / "task-cache"
+            archive = source / "archive-v0/exact-archive"
+            archive.mkdir(parents=True)
+            payload = archive / "payload.py"
+            payload.write_text("VALUE = 1\n", encoding="utf-8")
+            _set_fixture_modes(source, regular_files=True)
+            before_identity = self.bootstrap.cache_identity_receipt(source)
+            expected_topology = self.bootstrap.cache_logical_receipt(source)
+            previous_umask = os.umask(0o077)
+            try:
+                with mock.patch.object(
+                    self.bootstrap.ctypes,
+                    "CDLL",
+                    return_value=SimpleNamespace(fclonefileat=FallbackClone()),
+                ):
+                    self.bootstrap.clone_cache_to_task(
+                        source,
+                        destination,
+                        before_identity,
+                        expected_topology,
+                    )
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(
+                0o644,
+                stat.S_IMODE((destination / payload.relative_to(source)).stat().st_mode),
+            )
+
+    def test_task_cache_clone_rejects_swap_restore_before_open(self):
+        for kind in ("directory", "file"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                source = root / "source-cache"
+                source.mkdir()
+                victim = source / ("victim" if kind == "directory" else "victim.txt")
+                replacement = root / "replacement"
+                if kind == "directory":
+                    victim.mkdir()
+                    replacement.mkdir()
+                else:
+                    victim.write_text("reviewed\n", encoding="utf-8")
+                    replacement.write_text("substituted\n", encoding="utf-8")
+                _set_fixture_modes(source, regular_files=True)
+                _set_fixture_modes(replacement, regular_files=True) if replacement.is_dir() else replacement.chmod(0o644)
+                original_info = victim.lstat()
+                expected_identity = self.bootstrap.cache_identity_receipt(source)
+                expected_logical = self.bootstrap.cache_logical_receipt(source)
+                expected_entries = self.bootstrap._cache_identity_index(source)
+                real_open = os.open
+                swapped = False
+                saved = root / "reviewed-saved"
+
+                def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+                    nonlocal swapped
+                    if not swapped and dir_fd is not None and os.fspath(path) == victim.name:
+                        victim.rename(saved)
+                        replacement.rename(victim)
+                        try:
+                            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                        finally:
+                            victim.rename(replacement)
+                            saved.rename(victim)
+                        swapped = True
+                        return descriptor
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                with (
+                    mock.patch.object(
+                        self.bootstrap,
+                        "_cache_identity_index",
+                        return_value=expected_entries,
+                    ),
+                    mock.patch.object(self.bootstrap.os, "open", side_effect=racing_open),
+                ):
+                    with self.assertRaisesRegex(
+                        self.bootstrap.BootstrapBlocked,
+                        "raced|identity drift",
+                    ):
+                        self.bootstrap.clone_cache_to_task(
+                            source,
+                            root / "task-cache",
+                            expected_identity,
+                            expected_logical,
+                        )
+                self.assertTrue(swapped)
+                self.assertEqual(original_info.st_ino, victim.lstat().st_ino)
+                self.assertFalse(saved.exists())
+
     def test_external_python_alias_is_pinned_only_by_manifest_bound_realpath(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -1118,7 +1220,7 @@ class Ceq1BootstrapTests(unittest.TestCase):
                 dangling = pinned / "missing/bin/python3.12"
                 self.assertEqual(
                     "@DENIED_EXTERNAL_PYTHON/"
-                    "cpython-3.12.13-test/missing/bin/python3.12",
+                    "missing/bin/python3.12",
                     self.bootstrap._logical_cache_target(
                         root / "cache",
                         "archive-v0/example/bin/python",
@@ -1131,7 +1233,7 @@ class Ceq1BootstrapTests(unittest.TestCase):
                 os.symlink(escaped_root, pinned / "escape")
                 self.assertEqual(
                     "@DENIED_EXTERNAL_PYTHON/"
-                    "cpython-3.12.13-test/escape/bin/python3.12",
+                    "escape/bin/python3.12",
                     self.bootstrap._logical_cache_target(
                         root / "cache",
                         "archive-v0/example/bin/python",

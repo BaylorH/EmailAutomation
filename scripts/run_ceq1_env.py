@@ -227,7 +227,7 @@ def _validate_sealed_boundary(root: Path) -> None:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    module.validate_committed_toolchain(root, toolchain)
+    module.validate_committed_toolchain_without_probes(root, toolchain)
     module.validate_runtime_receipt(
         root,
         root / ".ceq1-runtime/bootstrap-receipt.json",
