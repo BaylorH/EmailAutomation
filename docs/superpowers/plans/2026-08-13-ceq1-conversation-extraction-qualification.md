@@ -621,7 +621,10 @@ Test all five gate verdicts, all three evidence layers, canonical hashing indepe
 
 ```python
 def test_gate_verdict_precedence_is_closed(self):
-    self.assertEqual(GateVerdict.BLOCKED, classify_gate(prerequisite_missing=True))
+    self.assertEqual(
+        GateVerdict.BLOCKED,
+        classify_gate(execution_started=False, prerequisite_missing=True),
+    )
     self.assertEqual(
         GateVerdict.INSTRUMENT_FAILURE,
         classify_gate(instrument_faults=["guard_identity"], required_refutations=["wrong_value"]),
@@ -666,7 +669,7 @@ def sha256_json(value: object) -> str:
 
 Use dataclasses for `EffectAttempt`, `FactRecord`, `StateSnapshot`, `ExecutionResult`, `ScoreRecord`, and `GateReport`. Each `from_mapping()` must compare `set(value)` to an explicit key set before coercion. `ExecutionResult` must carry `scenarioId`, `variantId`, `layer`, `sourceIdentity`, `facts`, `events`, `draft`, `stateBefore`, `stateAfter`, `effectLedger`, `providerLedger`, `runtimeProjectionDigest`, and `nonClaims`.
 
-Implement `classify_gate()` in the exact order `BLOCKED → INSTRUMENT_FAILURE → FAIL → UNVERIFIED → PASS_OFFLINE`. It must accept only named keyword arguments and return an enum.
+Implement `classify_gate()` in the exact order `BLOCKED → INSTRUMENT_FAILURE → FAIL → UNVERIFIED → PASS_OFFLINE`. It must accept only named keyword arguments, require every caller to state or accept the explicit execution phase, reject a missing prerequisite after execution has started, and return an enum.
 
 - [ ] **Step 4: Run contract tests to verify GREEN**
 

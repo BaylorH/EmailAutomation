@@ -36,6 +36,7 @@ from tests.ceq1.contracts import (
     Layer,
     NextGateEligibility,
     PromotionClass,
+    SatisfiedDiagnostic,
     ScoreRecord,
     StateSnapshot,
     canonical_json,
@@ -2091,6 +2092,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                     "ceq1aVerdict": "PASS_OFFLINE",
                     "eligible": True,
                     "blockingDiagnostics": [],
+                    "satisfiedDiagnostics": [],
                     "nonClaims": ["NO_MODEL_CALL_AUTHORIZED", "SEPARATE_AUTHORIZATION_REQUIRED"],
                 },
             ),
@@ -2132,7 +2134,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 "effectLedger": [self._effect().to_mapping()],
                 "providerLedger": [],
                 "runtimeProjectionDigest": "1" * 64,
-                "nonClaims": ["NO_LIVE_PROVIDER_EVIDENCE"],
+                "nonClaims": ["NOT_FINAL_DRAFT_UNVERIFIED", "NO_LIVE_PROVIDER_EVIDENCE"],
             }
         )
         wire = result.to_mapping()
@@ -2142,7 +2144,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         wire["facts"][0]["value"] = 99
         wire["events"][0]["kind"] = "MUTATED"
         self.assertEqual(4, result.facts[0].value)
-        self.assertEqual("PROPOSAL", result.events[0]["kind"])
+        self.assertEqual("PROPOSAL", result.events[0].kind)
         with self.assertRaises(TypeError):
             result.draft["plainBody"] = "changed"
         with self.assertRaises((AttributeError, TypeError)):
@@ -2189,6 +2191,14 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                     canonical_json(value)
         with self.assertRaises(TypeError):
             EffectAttempt.from_mapping(DictSubclass(self._effect().to_mapping()))
+        tuple_fact = self._fact().to_mapping()
+        tuple_fact["value"] = (1, 2)
+        with self.assertRaises(TypeError):
+            FactRecord.from_mapping(tuple_fact)
+        subclass_state = self._snapshot().to_mapping()
+        subclass_state["state"]["messages"] = ListSubclass([])
+        with self.assertRaises(TypeError):
+            StateSnapshot.from_mapping(subclass_state)
         malformed_effect = self._effect().to_mapping()
         malformed_effect["attemptOrdinal"] = True
         with self.assertRaises(TypeError):
@@ -2238,6 +2248,11 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 invalid["unexpected"] = []
             with self.subTest(case=case), self.assertRaises(ValueError):
                 StateSnapshot.from_mapping({"state": invalid})
+        for key, invalid_value in (("targetRow", []), ("indexes", []), ("messages", {})):
+            invalid = self._snapshot().to_mapping()["state"]
+            invalid[key] = invalid_value
+            with self.subTest(key=key), self.assertRaises(TypeError):
+                StateSnapshot.from_mapping({"state": invalid})
 
     def test_gate_verdict_precedence_is_closed(self):
         self.assertEqual(
@@ -2274,6 +2289,8 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             classify_gate(instrument_faults="guard_identity")
         with self.assertRaises(ValueError):
             classify_gate(instrument_faults=["same", "same"])
+        with self.assertRaises(ValueError):
+            classify_gate(execution_started=False, prerequisite_missing=True, instrument_faults=["late"])
 
     def test_diagnostic_unverified_does_not_downgrade_hard_gate(self):
         required = self._score(EvidenceResult.VERIFIED)
@@ -2310,6 +2327,22 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         refuted["failureReasons"] = []
         with self.assertRaises(ValueError):
             ScoreRecord.from_mapping(refuted)
+        unverified = self._score(EvidenceResult.UNVERIFIED).to_mapping()
+        unverified["nonClaims"] = []
+        with self.assertRaises(ValueError):
+            ScoreRecord.from_mapping(unverified)
+        verified_nonclaim = self._score(EvidenceResult.VERIFIED).to_mapping()
+        verified_nonclaim.update(
+            {
+                "scenarioId": "VOICE-LAUNCH",
+                "variantId": "launch",
+                "promotionClass": "diagnostic",
+                "layer": "L1",
+                "nonClaims": ["UNVERIFIED_NO_SHARED_FINALIZER"],
+            }
+        )
+        with self.assertRaises(ValueError):
+            ScoreRecord.from_mapping(verified_nonclaim)
         invalid_digest = self._score(EvidenceResult.VERIFIED).to_mapping()
         invalid_digest["stateReplayDigest"] = "A" * 64
         with self.assertRaises(ValueError):
@@ -2349,6 +2382,10 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         )
         report = GateReport.from_scores(required_scores=(), diagnostic_scores=(diagnostic,))
         self.assertIs(GateVerdict.INSTRUMENT_FAILURE, report.verdict)
+        self.assertEqual(
+            ("DIAGNOSTIC_CONTRACT_MISMATCH:CEQ-MEM-01/explicit-decline/L2",),
+            report.instrumentFaults,
+        )
 
     def test_gate_report_refuses_vacuous_or_incomplete_score_partition(self):
         with self.assertRaises(ValueError):
@@ -2378,6 +2415,115 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             missing_prerequisites=("EMULATOR_MISSING",),
         )
         self.assertIs(GateVerdict.BLOCKED, blocked.verdict)
+        for score_kind in ("required", "diagnostic"):
+            with self.subTest(score_kind=score_kind), self.assertRaises(ValueError):
+                GateReport.from_scores(
+                    required_scores=(required,) if score_kind == "required" else (),
+                    diagnostic_scores=(diagnostic,) if score_kind == "diagnostic" else (),
+                    execution_started=False,
+                    missing_prerequisites=("EMULATOR_MISSING",),
+                )
+        instrument_failure = GateReport.from_scores(
+            required_scores=(),
+            diagnostic_scores=(),
+            instrument_faults=("GUARD_IDENTITY",),
+        )
+        self.assertIs(GateVerdict.INSTRUMENT_FAILURE, instrument_failure.verdict)
+        with self.assertRaises(ValueError):
+            GateReport.from_scores(
+                required_scores=(required,),
+                diagnostic_scores=(),
+                instrument_faults=("same", "same"),
+            )
+
+    def test_standalone_next_gate_projection_is_semantically_closed(self):
+        report = GateReport.from_scores(
+            required_scores=(self._score(EvidenceResult.VERIFIED),),
+            diagnostic_scores=(),
+        )
+        text, voice = report.nextGateEligibility
+        for mutation in ("text-blocker", "voice-verified", "voice-resolution"):
+            wire = (text if mutation == "text-blocker" else voice).to_mapping()
+            blocker = voice.to_mapping()["blockingDiagnostics"][0]
+            if mutation == "text-blocker":
+                wire["blockingDiagnostics"] = [blocker]
+                wire["eligible"] = False
+            elif mutation == "voice-verified":
+                blocker["observedResult"] = "VERIFIED"
+                wire["blockingDiagnostics"][0] = blocker
+            else:
+                blocker["requiredResolution"] = "ARBITRARY_RESOLUTION"
+                wire["blockingDiagnostics"][0] = blocker
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                NextGateEligibility.from_mapping(wire)
+        pass_with_refutation = voice.to_mapping()
+        pass_with_refutation["ceq1aVerdict"] = "PASS_OFFLINE"
+        pass_with_refutation["blockingDiagnostics"][0]["observedResult"] = "REFUTED"
+        with self.assertRaises(ValueError):
+            NextGateEligibility.from_mapping(pass_with_refutation)
+        forged_voice = voice.to_mapping()
+        forged_voice["blockingDiagnostics"] = []
+        forged_voice["satisfiedDiagnostics"] = []
+        forged_voice["eligible"] = True
+        with self.assertRaises(ValueError):
+            NextGateEligibility.from_mapping(forged_voice)
+        all_satisfied = GateReport.from_scores(
+            required_scores=(self._score(EvidenceResult.VERIFIED),),
+            diagnostic_scores=tuple(
+                self._score(
+                    EvidenceResult.VERIFIED,
+                    scenario_id=scenario_id,
+                    variant_id=variant_id,
+                    promotion_class=PromotionClass.DIAGNOSTIC,
+                    layer=Layer.L1,
+                )
+                for scenario_id, variant_id in (
+                    ("VOICE-CONTINUATION", "continuation"),
+                    ("VOICE-CORRECTION-CLOSE", "correction-close"),
+                    ("VOICE-FOLLOWUP", "followup"),
+                    ("VOICE-LAUNCH", "launch"),
+                    ("VOICE-MISSING", "missing-field"),
+                )
+            ),
+        ).nextGateEligibility[1].to_mapping()
+        all_satisfied["satisfiedDiagnostics"][0]["nonClaims"] = [
+            "UNVERIFIED_NO_SHARED_FINALIZER"
+        ]
+        with self.assertRaises(ValueError):
+            NextGateEligibility.from_mapping(all_satisfied)
+
+    def test_all_verified_voice_dependencies_make_voice_gate_eligible(self):
+        dependencies = (
+            ("VOICE-CONTINUATION", "continuation"),
+            ("VOICE-CORRECTION-CLOSE", "correction-close"),
+            ("VOICE-FOLLOWUP", "followup"),
+            ("VOICE-LAUNCH", "launch"),
+            ("VOICE-MISSING", "missing-field"),
+        )
+        diagnostics = tuple(
+            self._score(
+                EvidenceResult.VERIFIED,
+                scenario_id=scenario_id,
+                variant_id=variant_id,
+                promotion_class=PromotionClass.DIAGNOSTIC,
+                layer=Layer.L1,
+            )
+            for scenario_id, variant_id in dependencies
+        )
+        report = GateReport.from_scores(
+            required_scores=(self._score(EvidenceResult.VERIFIED),),
+            diagnostic_scores=diagnostics,
+        )
+        voice = next(
+            item for item in report.nextGateEligibility if item.gateId is FutureGate.CE_Q1B_VOICE
+        )
+        self.assertTrue(voice.eligible)
+        self.assertEqual((), voice.blockingDiagnostics)
+        self.assertEqual(
+            dependencies,
+            tuple((item.scenarioId, item.variantId) for item in voice.satisfiedDiagnostics),
+        )
+        self.assertTrue(all(type(item) is SatisfiedDiagnostic for item in voice.satisfiedDiagnostics))
 
     def test_gate_report_recomputes_verdict_and_next_gate_projection(self):
         required = self._score(EvidenceResult.REFUTED)
@@ -2424,7 +2570,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             },
         )
         observed = next(item for item in voice_blockers if item.scenarioId == "VOICE-LAUNCH")
-        self.assertIs(EvidenceResult.UNVERIFIED, observed.evidenceResult)
+        self.assertIs(EvidenceResult.UNVERIFIED, observed.observedResult)
         self.assertEqual("SHARED_PRODUCTION_FINALIZER_REQUIRED", observed.requiredResolution)
         missing = [item for item in voice_blockers if item.scenarioId != "VOICE-LAUNCH"]
         self.assertTrue(
