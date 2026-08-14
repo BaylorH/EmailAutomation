@@ -72,6 +72,10 @@ _MAILBOX = re.compile(
     r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.invalid$"
 )
 _EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
+_OBFUSCATED_IDENTITY_CHARACTERS = ("＠", "\u200b", "\u200c", "\u200d", "\ufeff")
+_UTF8_OBFUSCATED_IDENTITY_SIGNATURES = tuple(
+    character.encode("utf-8") for character in _OBFUSCATED_IDENTITY_CHARACTERS
+)
 _TIMESTAMP_CANDIDATE = re.compile(
     r"\b\d{4}-\d{1,2}-\d{1,2}T\d{1,2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b"
 )
@@ -414,8 +418,8 @@ def _scan_raw_applicable_text(
         text,
     ):
         _raise("CEQ_PRIV_CREDENTIAL", artifact_id)
-    if "%40" in lowered or "＠" in text or any(
-        character in text for character in ("\u200b", "\u200c", "\u200d", "\ufeff")
+    if "%40" in lowered or any(
+        character in text for character in _OBFUSCATED_IDENTITY_CHARACTERS
     ):
         _raise("CEQ_PRIV_OBFUSCATED_IDENTITY", artifact_id)
     declared_mailboxes = set(provenance.fictionalMailboxes)
@@ -456,6 +460,10 @@ def _scan_pdf_raw_patterns(
     artifact_id: str,
     provenance: GenerationProvenance,
 ) -> None:
+    if any(
+        signature in data for signature in _UTF8_OBFUSCATED_IDENTITY_SIGNATURES
+    ):
+        _raise("CEQ_PRIV_OBFUSCATED_IDENTITY", artifact_id)
     _scan_raw_applicable_text(
         data.decode("latin-1"),
         artifact_id,

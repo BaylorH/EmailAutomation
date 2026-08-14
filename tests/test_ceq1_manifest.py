@@ -4227,6 +4227,14 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
             ),
             ("CEQ_PRIV_CLOCK_RANGE", b"2032-01-01T00:00:00Z"),
             ("CEQ_PRIV_OBFUSCATED_IDENTITY", b"broker%40outside.example"),
+            (
+                "CEQ_PRIV_OBFUSCATED_IDENTITY",
+                "broker\uff20outside.example".encode("utf-8"),
+            ),
+            (
+                "CEQ_PRIV_OBFUSCATED_IDENTITY",
+                "broker\u200b@outside.example".encode("utf-8"),
+            ),
         )
         for rule_id, raw_metadata in cases:
             with self.subTest(rule_id=rule_id), tempfile.TemporaryDirectory() as tmp:
@@ -4246,7 +4254,7 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                 self.assertEqual(
                     (rule_id, "pdf-raw-metadata"), raised.exception.args
                 )
-                self.assertNotIn(raw_metadata.decode("ascii"), str(raised.exception))
+                self.assertNotIn(raw_metadata.decode("utf-8"), str(raised.exception))
 
     def test_generation_provenance_is_closed_newly_authored_and_review_gating_is_explicit(self):
         valid = self._provenance()
