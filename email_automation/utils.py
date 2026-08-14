@@ -32,6 +32,10 @@ _OUTBOUND_BODY_SIGNOFF_RX = re.compile(
     r"[,!]?(?:\s*\n[\s\S]*)?\s*$",
     re.IGNORECASE,
 )
+_OUTBOUND_TERMINAL_COURTESY_RX = re.compile(
+    r"(?:\r?\n){2,}[ \t]*thanks again[,!]?[ \t]*\Z",
+    re.IGNORECASE,
+)
 _OUTBOUND_TEXT_TRANSLATION = str.maketrans({
     "\u2018": "'",
     "\u2019": "'",
@@ -1167,6 +1171,7 @@ def format_email_body_with_footer(
     # user's configured signature is the only signoff that can be sent.
     body = normalize_outbound_message_text(body).rstrip()
     if footer_html:
+        body = _OUTBOUND_TERMINAL_COURTESY_RX.sub("", body).rstrip()
         body = strip_outbound_body_signoff(body)
 
     # Convert plain text to HTML

@@ -14,6 +14,7 @@ from email_automation.utils import (
     normalize_outbound_message_text,
     resolve_signature_settings,
     needs_signature_attachments,
+    strip_outbound_body_signoff,
 )
 
 
@@ -310,6 +311,77 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertIn("John Doe", html)
         self.assertIn("Example Realty Advisors", html)
         self.assertNotIn("BP21", html)
+
+    def test_format_body_strips_thanks_again_before_configured_signature(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\nCould you confirm:\n- Rent\n- Opex\n\nThanks again,",
+            "Best,\nJohn Doe\nExample Realty Advisors",
+            "professional",
+            user_email="owner@example.com",
+        )
+
+        self.assertIn("Could you confirm:<br>- Rent<br>- Opex", html)
+        self.assertNotIn("Thanks again,", html)
+        self.assertIn("Best,<br>John Doe<br>Example Realty Advisors", html)
+
+    def test_format_body_keeps_thanks_again_sentence_before_configured_signature(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\nThanks again for sending those details.",
+            "John Doe\nExample Realty Advisors",
+            "professional",
+            user_email="owner@example.com",
+        )
+
+        self.assertIn("Thanks again for sending those details.", html)
+        self.assertIn("John Doe", html)
+
+    def test_format_body_keeps_thanks_again_when_request_follows(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\nThanks again,\n\nCould you confirm:\n- Rent\n- Opex",
+            "Best,\nJohn Doe\nExample Realty Advisors",
+            "professional",
+            user_email="owner@example.com",
+        )
+
+        self.assertIn("Thanks again,<br><br>Could you confirm:<br>- Rent<br>- Opex", html)
+        self.assertIn("Best,<br>John Doe<br>Example Realty Advisors", html)
+
+    def test_format_body_keeps_quoted_thanks_again_tail(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\n> Thanks again,",
+            "Best,\nJohn Doe\nExample Realty Advisors",
+            "professional",
+            user_email="owner@example.com",
+        )
+
+        self.assertIn("> Thanks again,", html)
+        self.assertIn("Best,<br>John Doe<br>Example Realty Advisors", html)
+
+    def test_format_body_keeps_thanks_again_without_preceding_body_paragraph(self):
+        html = format_email_body_with_footer(
+            "Thanks again,",
+            "Best,\nJohn Doe\nExample Realty Advisors",
+            "professional",
+            user_email="owner@example.com",
+        )
+
+        self.assertIn("Thanks again,", html)
+        self.assertIn("Best,<br>John Doe<br>Example Realty Advisors", html)
+
+    def test_format_body_preserves_thanks_again_without_configured_signature(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\nThat gives me everything I need.\n\nThanks again,",
+            "",
+            "none",
+        )
+
+        self.assertIn("That gives me everything I need.", html)
+        self.assertIn("Thanks again,", html)
+
+    def test_shared_signoff_stripper_keeps_thanks_again_without_footer_context(self):
+        body = "Hi Casey,\n\nThat gives me everything I need.\n\nThanks again,"
+
+        self.assertEqual(body, strip_outbound_body_signoff(body))
 
     def test_format_body_preserves_manual_signoff_without_configured_signature(self):
         html = format_email_body_with_footer(
