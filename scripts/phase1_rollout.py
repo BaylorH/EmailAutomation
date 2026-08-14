@@ -33,15 +33,15 @@ PROJECT_NUMBER = "248289505828"
 REGION = "us-central1"
 SERVICE = "process-user"
 QUEUE = "graph-process-user"
-BRANCH = "fix/terminal-no-reask-20260814"
+BRANCH = "fix/terminal-signoff-finalizer-20260814"
 IMAGE_REPOSITORY = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     "cloud-run-source-deploy/process-user"
 )
-OLD_REVISION = "process-user-stage-4a21c93d7bbb"
+OLD_REVISION = "process-user-stage-8080887ea059"
 OLD_IMAGE = (
     IMAGE_REPOSITORY
-    + "@sha256:64dbcfd0e35fdb518f6567151f343511d39345106aeea8238e7d256e8fd40403"
+    + "@sha256:cf5a5c26a96f0492252402a7cf9beacdc68da872ef8e370c772dc0d74498bf8d"
 )
 RULES_HASH = "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
 HOSTING_VERSION = "33dd8acbe4e909c8"
