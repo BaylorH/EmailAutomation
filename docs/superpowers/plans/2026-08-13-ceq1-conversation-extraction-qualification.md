@@ -362,7 +362,11 @@ attempting to read the existing worktree `.git` control file, which the
 canonical policy deliberately denies while an unsandboxed process can read it.
 Only `EPERM`/`EACCES` is accepted. Consequently a directly forged
 `--contained --bootstrap ...` invocation fails before mutation even if its
-caller forges the expected environment and policy bytes. Tests spy on the
+caller merely copies the canonical environment without entering Seatbelt.
+This active-state probe is not an attestation of arbitrary caller-supplied
+Seatbelt policy: a same-user adversary deliberately replacing the outer
+launcher/profile is excluded by the declared exclusive-run host threat model,
+and CE-Q1 makes no stronger claim. Tests spy on the
 outer `os.execve()` call to prove byte identity between the `-p` argument and
 the worker channel, and run the direct-contained bypass as a real subprocess.
 
