@@ -29,6 +29,7 @@ from tests.ceq1.contracts import (
     EvidenceResult,
     ExecutionResult,
     FactRecord,
+    FutureGate,
     GateReport,
     GateVerdict,
     Layer,
@@ -1994,13 +1995,14 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         variant_id: str = "explicit-decline",
         promotion_class: PromotionClass = PromotionClass.REQUIRED,
         non_claims: list[str] | None = None,
+        layer: Layer = Layer.L2,
     ) -> ScoreRecord:
         before = self._snapshot()
         return ScoreRecord.from_mapping(
             {
                 "scenarioId": scenario_id,
                 "variantId": variant_id,
-                "layer": "L2",
+                "layer": layer.value,
                 "promotionClass": promotion_class.value,
                 "evidenceResult": result.value,
                 "failureReasons": [] if result is EvidenceResult.VERIFIED else ["FACT_PROVENANCE_MISSING"],
@@ -2023,8 +2025,16 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             [item.value for item in EvidenceResult],
         )
         self.assertEqual(["required", "diagnostic"], [item.value for item in PromotionClass])
+        self.assertEqual(
+            ["CE-Q1B-TEXT", "CE-Q1B-VOICE"], [item.value for item in FutureGate]
+        )
 
     def test_canonical_json_and_hash_are_order_independent_and_finite(self):
+        from enum import Enum
+
+        class ForeignEnum(str, Enum):
+            VALUE = "VALUE"
+
         left = {"z": [3, 2, 1], "a": {"two": 2, "one": 1}}
         right = {"a": {"one": 1, "two": 2}, "z": [3, 2, 1]}
         expected = b'{"a":{"one":1,"two":2},"z":[3,2,1]}'
@@ -2036,7 +2046,12 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 canonical_json({"value": value})
         with self.assertRaises(TypeError):
             canonical_json(GateVerdict.PASS_OFFLINE)
+        for value in ((1, 2), ForeignEnum.VALUE):
+            with self.subTest(raw_type=type(value).__name__), self.assertRaises(TypeError):
+                canonical_json(value)
         self.assertNotEqual(sha256_json({"values": [1, 2]}), sha256_json({"values": [2, 1]}))
+        self.assertNotEqual(sha256_json(True), sha256_json(1))
+        self.assertNotEqual(sha256_json(1), sha256_json(1.0))
 
     def test_every_record_rejects_missing_and_extra_keys(self):
         valid_records = (
@@ -2067,8 +2082,8 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 {
                     "gateId": "CE-Q1B-TEXT",
                     "eligible": True,
-                    "blockingDiagnosticIds": [],
-                    "nonClaims": [],
+                    "blockingDiagnostics": [],
+                    "nonClaims": ["NO_MODEL_CALL_AUTHORIZED", "SEPARATE_AUTHORIZATION_REQUIRED"],
                 },
             ),
             (
@@ -2110,7 +2125,14 @@ class Ceq1ClosedContractTests(unittest.TestCase):
                 "nonClaims": ["NO_LIVE_PROVIDER_EVIDENCE"],
             }
         )
-        self.assertEqual(sha256_json(result), sha256_json(ExecutionResult.from_mapping(result.to_mapping())))
+        wire = result.to_mapping()
+        roundtrip = ExecutionResult.from_mapping(wire)
+        self.assertEqual(wire, roundtrip.to_mapping())
+        self.assertEqual(sha256_json(result), sha256_json(roundtrip))
+        wire["facts"][0]["value"] = 99
+        wire["events"][0]["kind"] = "MUTATED"
+        self.assertEqual(4, result.facts[0].value)
+        self.assertEqual("PROPOSAL", result.events[0]["kind"])
         with self.assertRaises(TypeError):
             result.draft["plainBody"] = "changed"
         with self.assertRaises((AttributeError, TypeError)):
@@ -2137,6 +2159,15 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         malformed_effect["attemptOrdinal"] = True
         with self.assertRaises(TypeError):
             EffectAttempt.from_mapping(malformed_effect)
+        for key, value in (
+            ("attemptOrdinal", -1),
+            ("succeeded", 1),
+            ("outcome", "UNKNOWN"),
+        ):
+            malformed_effect = self._effect().to_mapping()
+            malformed_effect[key] = value
+            with self.subTest(key=key), self.assertRaises((TypeError, ValueError)):
+                EffectAttempt.from_mapping(malformed_effect)
         malformed_fact = self._fact().to_mapping()
         malformed_fact["sourceSpan"] = [11, 11]
         with self.assertRaises(ValueError):
@@ -2200,6 +2231,12 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             classify_gate(execution_started=False)
         with self.assertRaises(TypeError):
             classify_gate(prerequisite_missing=True, instrument_faults=[1])
+        with self.assertRaises(TypeError):
+            classify_gate(execution_started=1)
+        with self.assertRaises(TypeError):
+            classify_gate(instrument_faults="guard_identity")
+        with self.assertRaises(ValueError):
+            classify_gate(instrument_faults=["same", "same"])
 
     def test_diagnostic_unverified_does_not_downgrade_hard_gate(self):
         required = self._score(EvidenceResult.VERIFIED)
@@ -2209,6 +2246,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             variant_id="launch",
             promotion_class=PromotionClass.DIAGNOSTIC,
             non_claims=["UNVERIFIED_NO_SHARED_FINALIZER"],
+            layer=Layer.L1,
         )
         report = GateReport.from_scores(
             required_scores=(required,),
@@ -2246,6 +2284,51 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             GateReport.from_scores(required_scores=(), diagnostic_scores=(required,))
         with self.assertRaises(ValueError):
             GateReport.from_scores(required_scores=(required, required), diagnostic_scores=())
+        diagnostic = self._score(
+            EvidenceResult.VERIFIED,
+            promotion_class=PromotionClass.DIAGNOSTIC,
+        )
+        with self.assertRaises(ValueError):
+            GateReport.from_scores(required_scores=(diagnostic,), diagnostic_scores=())
+        with self.assertRaises(ValueError):
+            GateReport.from_scores(required_scores=(required,), diagnostic_scores=(diagnostic,))
+
+    def test_required_unknown_and_refuted_scores_reduce_hard_gate(self):
+        for result, expected in (
+            (EvidenceResult.UNVERIFIED, GateVerdict.UNVERIFIED),
+            (EvidenceResult.REFUTED, GateVerdict.FAIL),
+        ):
+            with self.subTest(result=result.value):
+                report = GateReport.from_scores(
+                    required_scores=(self._score(result),), diagnostic_scores=()
+                )
+                self.assertIs(expected, report.verdict)
+        diagnostic = self._score(
+            EvidenceResult.REFUTED,
+            promotion_class=PromotionClass.DIAGNOSTIC,
+        )
+        report = GateReport.from_scores(required_scores=(), diagnostic_scores=(diagnostic,))
+        self.assertIs(GateVerdict.FAIL, report.verdict)
+
+    def test_gate_report_refuses_vacuous_or_incomplete_score_partition(self):
+        with self.assertRaises(ValueError):
+            GateReport.from_scores(required_scores=(), diagnostic_scores=())
+        required = self._score(EvidenceResult.VERIFIED)
+        diagnostic_wire = required.to_mapping()
+        diagnostic_wire["scenarioId"] = "CEQ-PDF-01"
+        diagnostic_wire["variantId"] = "image-only-explicitly-unverified"
+        diagnostic_wire["promotionClass"] = "diagnostic"
+        diagnostic = ScoreRecord.from_mapping(diagnostic_wire)
+        report = GateReport.from_scores(
+            required_scores=(required,), diagnostic_scores=(diagnostic,)
+        )
+        forged = report.to_mapping()
+        forged["requiredScores"], forged["diagnosticScores"] = (
+            forged["diagnosticScores"],
+            forged["requiredScores"],
+        )
+        with self.assertRaises(ValueError):
+            GateReport.from_mapping(forged)
 
     def test_gate_report_recomputes_verdict_and_next_gate_projection(self):
         required = self._score(EvidenceResult.REFUTED)
@@ -2255,6 +2338,7 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             variant_id="launch",
             promotion_class=PromotionClass.DIAGNOSTIC,
             non_claims=["UNVERIFIED_NO_SHARED_FINALIZER"],
+            layer=Layer.L1,
         ).to_mapping()
         diagnostic = ScoreRecord.from_mapping(diagnostic_mapping)
         ocr_diagnostic = self._score(
@@ -2270,11 +2354,29 @@ class Ceq1ClosedContractTests(unittest.TestCase):
         self.assertIs(GateVerdict.FAIL, report.verdict)
         self.assertEqual((ocr_diagnostic, diagnostic), report.diagnosticScores)
         eligibility = {item.gateId: item for item in report.nextGateEligibility}
-        self.assertTrue(eligibility["CE-Q1B-TEXT"].eligible)
+        self.assertFalse(eligibility["CE-Q1B-TEXT"].eligible)
         self.assertFalse(eligibility["CE-Q1B-VOICE"].eligible)
+        voice_blockers = eligibility["CE-Q1B-VOICE"].blockingDiagnostics
+        self.assertEqual(5, len(voice_blockers))
         self.assertEqual(
-            ("VOICE-LAUNCH/launch/L2",),
-            eligibility["CE-Q1B-VOICE"].blockingDiagnosticIds,
+            {
+                "VOICE-LAUNCH/launch/L1",
+                "VOICE-MISSING/missing-field/L1",
+                "VOICE-CORRECTION-CLOSE/correction-close/L1",
+                "VOICE-FOLLOWUP/followup/L1",
+                "VOICE-CONTINUATION/continuation/L1",
+            },
+            {
+                f"{item.scenarioId}/{item.variantId}/{item.layer.value}"
+                for item in voice_blockers
+            },
+        )
+        observed = next(item for item in voice_blockers if item.scenarioId == "VOICE-LAUNCH")
+        self.assertIs(EvidenceResult.UNVERIFIED, observed.evidenceResult)
+        self.assertEqual("SHARED_PRODUCTION_FINALIZER_REQUIRED", observed.requiredResolution)
+        missing = [item for item in voice_blockers if item.scenarioId != "VOICE-LAUNCH"]
+        self.assertTrue(
+            all(item.nonClaims == ("MISSING_DIAGNOSTIC_EVIDENCE",) for item in missing)
         )
         self.assertNotIn(
             "UNVERIFIED_NO_EFFECT_FREE_OCR", eligibility["CE-Q1B-TEXT"].nonClaims
