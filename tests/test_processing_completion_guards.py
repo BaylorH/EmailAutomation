@@ -151,7 +151,10 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             "Baylor",
             missing_fields=["Rail Access"],
         )
-        self.assertIn("\n- Rail Access", custom_body)
+        self.assertEqual(
+            ["Rail Access"],
+            [line[2:] for line in custom_body.splitlines() if line.startswith("- ")],
+        )
         self.assertTrue(processing._response_mentions_missing_fields(
             custom_body,
             ["Rail Access"],
