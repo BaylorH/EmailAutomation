@@ -38,10 +38,10 @@ IMAGE_REPOSITORY = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     "cloud-run-source-deploy/process-user"
 )
-OLD_REVISION = "process-user-stage-6caa8ec14cc5"
+OLD_REVISION = "process-user-stage-11b86417590f"
 OLD_IMAGE = (
     IMAGE_REPOSITORY
-    + "@sha256:c49d13d07309b0a39565af5fa617c65fa10d79f970a827e1b047f4a5b0baf053"
+    + "@sha256:8f2c6157c23ef77bfbb2dcd02809d8a97403d4d6114c33f605559c8f6263d001"
 )
 RULES_HASH = "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
 HOSTING_VERSION = "33dd8acbe4e909c8"
