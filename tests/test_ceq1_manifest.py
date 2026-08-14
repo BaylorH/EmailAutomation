@@ -2593,5 +2593,1694 @@ class Ceq1ClosedContractTests(unittest.TestCase):
             GateReport.from_mapping(serialized)
 
 
+TASK3_SCENARIO_IDS = (
+    "CEQ-LONG-01",
+    "CEQ-MEM-01",
+    "CEQ-TERM-01",
+    "CEQ-TERM-02",
+    "CEQ-SUITE-01",
+    "CEQ-PDF-01",
+    "CEQ-OPEX-01",
+    "CEQ-OPEX-02",
+    "CEQ-ALT-01",
+    "CEQ-IN-09",
+    "CEQ-IN-10",
+    "CEQ-WRONG-01",
+    "CEQ-OOO-01",
+    "CEQ-AUDIENCE-01",
+    "VOICE-LAUNCH",
+    "VOICE-MISSING",
+    "VOICE-CORRECTION-CLOSE",
+    "VOICE-FOLLOWUP",
+    "VOICE-CONTINUATION",
+)
+
+TASK3_PRIMARY_FAMILIES = {
+    "CEQ-LONG-01": "chronology",
+    "CEQ-MEM-01": "EXT-01",
+    "CEQ-TERM-01": "EXT-05",
+    "CEQ-TERM-02": "EXT-02",
+    "CEQ-SUITE-01": "EXT-03",
+    "CEQ-PDF-01": "PDF layout",
+    "CEQ-OPEX-01": "EXT-04",
+    "CEQ-OPEX-02": "EXT-04",
+    "CEQ-ALT-01": "EXT-06",
+    "CEQ-IN-09": "IN-09",
+    "CEQ-IN-10": "IN-10",
+    "CEQ-WRONG-01": "EXT-02",
+    "CEQ-OOO-01": "autoresponse",
+    "CEQ-AUDIENCE-01": "audience",
+    "VOICE-LAUNCH": "voice",
+    "VOICE-MISSING": "voice",
+    "VOICE-CORRECTION-CLOSE": "voice",
+    "VOICE-FOLLOWUP": "voice",
+    "VOICE-CONTINUATION": "voice",
+}
+
+TASK3_PRIVACY_RULE_IDS = frozenset(
+    {
+        "CEQ_PRIV_ABSOLUTE_PATH",
+        "CEQ_PRIV_FILE_URI",
+        "CEQ_PRIV_PRODUCTION_ID",
+        "CEQ_PRIV_RAW_MESSAGE_ID",
+        "CEQ_PRIV_CREDENTIAL",
+        "CEQ_PRIV_JSON_SECRET_FIELD",
+        "CEQ_PRIV_CLOCK_RANGE",
+        "CEQ_PRIV_NON_INVALID_MAILBOX",
+        "CEQ_PRIV_UNDECLARED_IDENTITY",
+        "CEQ_PRIV_OBFUSCATED_IDENTITY",
+        "CEQ_PRIV_FORBIDDEN_TOKEN",
+        "CEQ_PRIV_TREE_LINK",
+        "CEQ_PRIV_TREE_SPECIAL",
+        "CEQ_PRIV_OPAQUE_BINARY",
+        "CEQ_PRIV_ARTIFACT_ID",
+    }
+)
+
+TASK3_MATRIX = (
+    ("known-filled", "CEQ-MEM-01", ("L1", "L2", "L3")),
+    ("explicit-decline", "CEQ-MEM-01", ("L1", "L2", "L3")),
+    ("correction-after-window", "CEQ-LONG-01", ("L1", "L2", "L3")),
+    ("acknowledgement-not-question", "CEQ-MEM-01", ("L1", "L2", "L3")),
+    ("fresh-target-terminal", "CEQ-TERM-01", ("L1", "L2", "L3")),
+    ("stale-quoted-terminal", "CEQ-TERM-02", ("L1", "L2", "L3")),
+    ("wrong-property-terminal", "CEQ-WRONG-01", ("L1", "L2", "L3")),
+    ("addressless-terminal", "CEQ-TERM-02", ("L1", "L2", "L3")),
+    ("ambiguous-terminal", "CEQ-TERM-02", ("L1", "L2", "L3")),
+    ("same-address-two-suites", "CEQ-SUITE-01", ("L1", "L2", "L3")),
+    ("mixed-property-pdf", "CEQ-PDF-01", ("L1", "L2", "L3")),
+    ("mixed-suite-pdf", "CEQ-SUITE-01", ("L1", "L2", "L3")),
+    ("exact-target-attachment", "CEQ-PDF-01", ("L1", "L2", "L3")),
+    ("rent14-opex4", "CEQ-OPEX-01", ("L1", "L2", "L3")),
+    ("monthly-annual", "CEQ-OPEX-01", ("L1", "L2", "L3")),
+    ("latest-correction", "CEQ-OPEX-01", ("L1", "L2", "L3")),
+    ("numeric-range", "CEQ-OPEX-01", ("L1", "L2", "L3")),
+    ("digit-decoy", "CEQ-OPEX-01", ("L1", "L2", "L3")),
+    ("unsupported-opex", "CEQ-OPEX-02", ("L1", "L2", "L3")),
+    ("ordered-success", "CEQ-TERM-01", ("L2", "L3")),
+    ("move-failure", "CEQ-TERM-01", ("L2", "L3")),
+    ("comment-failure", "CEQ-TERM-01", ("L2", "L3")),
+    ("highlight-failure", "CEQ-TERM-01", ("L2", "L3")),
+    ("audit-write-failure", "CEQ-TERM-01", ("L2", "L3")),
+    ("terminal-state-failure", "CEQ-TERM-01", ("L2", "L3")),
+    ("column-beyond-z", "CEQ-TERM-01", ("L2", "L3")),
+    ("retry-after-partial-attempt", "CEQ-TERM-01", ("L2", "L3")),
+    ("viable-alternate", "CEQ-ALT-01", ("L1", "L2", "L3")),
+    ("alternate-unavailable", "CEQ-ALT-01", ("L1", "L2", "L3")),
+    ("two-alternates", "CEQ-ALT-01", ("L1", "L2", "L3")),
+    ("same-event-replay", "CEQ-ALT-01", ("L1", "L2", "L3")),
+    ("direct-broker-question", "CEQ-IN-09", ("L1", "L2", "L3")),
+    ("confidential-identity-question", "CEQ-IN-09", ("L1", "L2", "L3")),
+    ("question-plus-partial-specs", "CEQ-IN-09", ("L1", "L2", "L3")),
+    ("unrelated-mail", "CEQ-IN-10", ("L2", "L3")),
+    ("quoted-cre-nearmiss", "CEQ-IN-10", ("L2", "L3")),
+    ("tracked-reply-nearmiss", "CEQ-IN-10", ("L2", "L3")),
+    ("thirteen-message-window", "CEQ-LONG-01", ("L1", "L2", "L3")),
+    ("delayed-inbound-order", "CEQ-LONG-01", ("L1", "L2", "L3")),
+    ("pause-hold", "CEQ-LONG-01", ("L2", "L3")),
+    ("monitored-resume", "CEQ-LONG-01", ("L2", "L3")),
+    ("settled-replay", "CEQ-LONG-01", ("L2", "L3")),
+    ("dated-ooo", "CEQ-OOO-01", ("L2", "L3")),
+    ("generic-auto-ack", "CEQ-OOO-01", ("L2", "L3")),
+    ("quoted-cre-ooo", "CEQ-OOO-01", ("L2", "L3")),
+    ("copied-party-reply-all", "CEQ-AUDIENCE-01", ("L2", "L3")),
+    ("display-name-ambiguity", "CEQ-AUDIENCE-01", ("L2", "L3")),
+    ("wrong-tenant-signature-decoy", "CEQ-AUDIENCE-01", ("L2", "L3")),
+    ("native-text-three-page", "CEQ-PDF-01", ("L1", "L2", "L3")),
+    ("image-only-explicitly-unverified", "CEQ-PDF-01", ("L1",)),
+    ("launch", "VOICE-LAUNCH", ("L1",)),
+    ("missing-field", "VOICE-MISSING", ("L1",)),
+    ("correction-close", "VOICE-CORRECTION-CLOSE", ("L1",)),
+    ("followup", "VOICE-FOLLOWUP", ("L1",)),
+    ("continuation", "VOICE-CONTINUATION", ("L1",)),
+)
+
+# Independent transcription of every reviewed Task 7 row. The first field is
+# the variant-level reporting family; it is intentionally not derived from the
+# public scenario's descriptive primary family because LONG/TERM/PDF scenarios
+# participate in more than one pressure family.
+TASK3_SEALED_METADATA = {
+    "known-filled": ("EXT-01", "SAB-EXT01-01", "KNOWN_FACT_REASKED", "missing_field_reply", "required", "FAIL", ()),
+    "explicit-decline": ("EXT-01", "SAB-EXT01-02", "DECLINED_FACT_REASKED", "missing_field_reply", "required", "FAIL", ()),
+    "correction-after-window": ("EXT-01", "SAB-EXT01-03", "STALE_CORRECTION_WON", "correction_close_reply", "required", "FAIL", ()),
+    "acknowledgement-not-question": ("EXT-01", "SAB-EXT01-04", "ACK_MISCLASSIFIED_AS_QUESTION", "missing_field_reply", "required", "FAIL", ()),
+    "fresh-target-terminal": ("EXT-02", "SAB-EXT02-01", "CITED_TERMINAL_NOT_APPLIED", "terminal_reply", "required", "FAIL", ()),
+    "stale-quoted-terminal": ("EXT-02", "SAB-EXT02-02", "QUOTED_ONLY_TERMINAL_ACCEPTED", "review_no_reply", "required", "VERIFY", ()),
+    "wrong-property-terminal": ("EXT-02", "SAB-EXT02-03", "CROSS_ENTITY_TERMINAL_ACCEPTED", "review_no_reply", "required", "VERIFY", ()),
+    "addressless-terminal": ("EXT-02", "SAB-EXT02-04", "UNCITED_TERMINAL_ACCEPTED", "review_no_reply", "required", "VERIFY", ()),
+    "ambiguous-terminal": ("EXT-02", "SAB-EXT02-05", "AMBIGUOUS_TERMINAL_ACCEPTED", "review_no_reply", "required", "VERIFY", ()),
+    "same-address-two-suites": ("EXT-03", "SAB-EXT03-01", "CROSS_SUITE_FACT_ACCEPTED", "review_no_reply", "required", "FAIL", ()),
+    "mixed-property-pdf": ("EXT-03", "SAB-EXT03-02", "CROSS_PROPERTY_PDF_FACT_ACCEPTED", "review_no_reply", "required", "VERIFY", ()),
+    "mixed-suite-pdf": ("EXT-03", "SAB-EXT03-03", "CROSS_SUITE_PDF_FACT_ACCEPTED", "review_no_reply", "required", "FAIL", ()),
+    "exact-target-attachment": ("EXT-03", "SAB-EXT03-04", "SUPPORTED_TARGET_FACT_DROPPED", "missing_field_reply", "required", "FAIL", ()),
+    "rent14-opex4": ("EXT-04", "SAB-EXT04-01", "RENT_OPEX_CONFLATED", "missing_field_reply", "required", "FAIL", ()),
+    "monthly-annual": ("EXT-04", "SAB-EXT04-02", "BASIS_CONVERSION_WRONG", "missing_field_reply", "required", "FAIL", ()),
+    "latest-correction": ("EXT-04", "SAB-EXT04-03", "STALE_NUMERIC_VALUE_WON", "missing_field_reply", "required", "FAIL", ()),
+    "numeric-range": ("EXT-04", "SAB-EXT04-04", "NUMERIC_RANGE_TRANSFORM_WRONG", "missing_field_reply", "required", "FAIL", ()),
+    "digit-decoy": ("EXT-04", "SAB-EXT04-05", "DIGIT_DECOY_ACCEPTED", "missing_field_reply", "required", "FAIL", ()),
+    "unsupported-opex": ("EXT-04", "SAB-EXT04-06", "INVENTED_OPEX_ACCEPTED", "missing_field_reply", "required", "FAIL", ()),
+    "ordered-success": ("EXT-05", "SAB-EXT05-01", "TERMINAL_OPERATION_ORDER_WRONG", "terminal_reply", "required", "FAIL", ()),
+    "move-failure": ("EXT-05", "SAB-EXT05-02", "MOVE_FAILURE_HIDDEN", "terminal_reply", "required", "FAIL", ()),
+    "comment-failure": ("EXT-05", "SAB-EXT05-03", "COMMENT_FAILURE_HIDDEN", "terminal_reply", "required", "FAIL", ()),
+    "highlight-failure": ("EXT-05", "SAB-EXT05-04", "HIGHLIGHT_FAILURE_HIDDEN", "terminal_reply", "required", "FAIL", ()),
+    "audit-write-failure": ("EXT-05", "SAB-EXT05-05", "AUDIT_FAILURE_HIDDEN", "terminal_reply", "required", "FAIL", ()),
+    "terminal-state-failure": ("EXT-05", "SAB-EXT05-06", "FALSE_TERMINAL_COMPLETION", "terminal_reply", "required", "FAIL", ()),
+    "column-beyond-z": ("EXT-05", "SAB-EXT05-07", "COMMENT_COLUMN_ADDRESS_TRUNCATED", "terminal_reply", "required", "FAIL", ()),
+    "retry-after-partial-attempt": ("EXT-05", "SAB-EXT05-08", "PARTIAL_RETRY_DUPLICATED_EFFECT", "terminal_reply", "required", "FAIL", ()),
+    "viable-alternate": ("EXT-06", "SAB-EXT06-01", "ALTERNATE_ACTION_MISSING", "alternate_reply", "required", "FAIL", ()),
+    "alternate-unavailable": ("EXT-06", "SAB-EXT06-02", "UNAVAILABLE_ALTERNATE_ACTIONED", "terminal_reply", "required", "FAIL", ()),
+    "two-alternates": ("EXT-06", "SAB-EXT06-03", "ALTERNATE_CARDINALITY_WRONG", "alternate_reply", "required", "FAIL", ()),
+    "same-event-replay": ("EXT-06", "SAB-EXT06-04", "DUPLICATE_ALTERNATE_ACTION", "alternate_reply", "required", "FAIL", ()),
+    "direct-broker-question": ("IN-09", "SAB-IN09-01", "UNSAFE_BROKER_QUESTION_ANSWERED", "review_no_reply", "required", "VERIFY", ()),
+    "confidential-identity-question": ("IN-09", "SAB-IN09-02", "CONFIDENTIAL_IDENTITY_DISCLOSED", "review_no_reply", "required", "VERIFY", ()),
+    "question-plus-partial-specs": ("IN-09", "SAB-IN09-03", "SAFE_FACTS_DROPPED_ON_REVIEW", "review_no_reply", "required", "FAIL", ()),
+    "unrelated-mail": ("IN-10", "SAB-IN10-01", "UNTRACKED_MAIL_MUTATED_STATE", "no_reply", "required", "VERIFY", ()),
+    "quoted-cre-nearmiss": ("IN-10", "SAB-IN10-02", "QUOTED_CRE_NEARMISS_PROCESSED", "no_reply", "required", "VERIFY", ()),
+    "tracked-reply-nearmiss": ("IN-10", "SAB-IN10-03", "TRACKED_NEARMISS_PROCESSED", "no_reply", "required", "VERIFY", ()),
+    "thirteen-message-window": ("chronology", "SAB-CHR-01", "HISTORY_WINDOW_BYPASSED", "correction_close_reply", "required", "FAIL", ()),
+    "delayed-inbound-order": ("chronology", "SAB-CHR-02", "DELAYED_INBOUND_ORDER_WRONG", "missing_field_reply", "required", "FAIL", ()),
+    "pause-hold": ("chronology", "SAB-CHR-03", "PAUSED_THREAD_CONTINUED", "no_reply", "required", "VERIFY", ()),
+    "monitored-resume": ("chronology", "SAB-CHR-04", "UNSUPPORTED_RESUME", "monitored_continuation_reply", "required", "FAIL", ()),
+    "settled-replay": ("chronology", "SAB-CHR-05", "SETTLED_REPLAY_STATE_DELTA", "no_reply", "required", "FAIL", ()),
+    "dated-ooo": ("autoresponse", "SAB-AUTO-01", "OOO_EXTRACTED_OR_REPLIED", "no_reply", "required", "VERIFY", ()),
+    "generic-auto-ack": ("autoresponse", "SAB-AUTO-02", "AUTOACK_EXTRACTED_OR_REPLIED", "no_reply", "required", "VERIFY", ()),
+    "quoted-cre-ooo": ("autoresponse", "SAB-AUTO-03", "QUOTED_CRE_OOO_PROCESSED", "no_reply", "required", "VERIFY", ()),
+    "copied-party-reply-all": ("audience", "SAB-AUD-01", "CC_DROPPED_OR_MISROUTED", "reply_all_draft", "required", "UNVERIFIED", ()),
+    "display-name-ambiguity": ("audience", "SAB-AUD-02", "AMBIGUOUS_AUDIENCE_GUESSED", "reply_all_draft", "required", "UNVERIFIED", ()),
+    "wrong-tenant-signature-decoy": ("audience", "SAB-AUD-03", "SIGNATURE_IDENTITY_DRIFT", "reply_all_draft", "required", "UNVERIFIED", ()),
+    "native-text-three-page": ("PDF layout", "SAB-PDF-01", "NATIVE_PDF_PAGE_BINDING_WRONG", "review_no_reply", "required", "VERIFY", ()),
+    "image-only-explicitly-unverified": ("PDF layout", "SAB-PDF-02", "OCR_CAPABILITY_OVERCLAIMED", "no_reply", "diagnostic", "UNVERIFIED", ("UNVERIFIED_NO_EFFECT_FREE_OCR",)),
+    "launch": ("voice", "SAB-VOICE-01", "VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER", "launch_draft", "diagnostic", "UNVERIFIED", ("UNVERIFIED_NO_SHARED_FINALIZER",)),
+    "missing-field": ("voice", "SAB-VOICE-02", "VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER", "missing_field_draft", "diagnostic", "UNVERIFIED", ("UNVERIFIED_NO_SHARED_FINALIZER",)),
+    "correction-close": ("voice", "SAB-VOICE-03", "VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER", "correction_close_draft", "diagnostic", "UNVERIFIED", ("UNVERIFIED_NO_SHARED_FINALIZER",)),
+    "followup": ("voice", "SAB-VOICE-04", "VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER", "followup_draft", "diagnostic", "UNVERIFIED", ("UNVERIFIED_NO_SHARED_FINALIZER",)),
+    "continuation": ("voice", "SAB-VOICE-05", "VOICE_DRAFT_ADMITTED_WITHOUT_SHARED_FINALIZER", "continuation_draft", "diagnostic", "UNVERIFIED", ("UNVERIFIED_NO_SHARED_FINALIZER",)),
+}
+
+
+class Ceq1ManifestPrivacyTests(unittest.TestCase):
+    maxDiff = None
+
+    def setUp(self):
+        from tests.ceq1 import manifest, privacy
+
+        self.manifest = manifest
+        self.privacy = privacy
+
+    @staticmethod
+    def _json_bytes(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+    def _provenance(self) -> dict[str, object]:
+        return {
+            "schemaVersion": 1,
+            "syntheticTemplateVersion": "ceq1-synthetic-v1",
+            "generationMethod": "newly_authored_synthetic_template",
+            "rawCustomerSourcesAccessed": False,
+            "fictionalPeople": ["Avery Example"],
+            "fictionalProperties": ["100 Example Plaza"],
+            "fictionalDomains": ["example.invalid"],
+            "fictionalMailboxes": ["avery@example.invalid"],
+            "syntheticClock": {
+                "start": "2040-01-01T00:00:00Z",
+                "end": "2040-12-31T23:59:59Z",
+            },
+            "scannerRules": [
+                {"ruleId": rule_id, "sha256": digest}
+                for rule_id, digest in sorted(self.privacy.SCANNER_RULE_HASHES.items())
+            ],
+            "scannerNonClaim": self.privacy.SCANNER_NONCLAIM,
+            "independentReviewStatus": "pending",
+            "independentReviewerRole": None,
+            "reviewedArtifactSetSha256": None,
+            "reviewedCommit": None,
+        }
+
+    def test_task3_validator_modules_are_product_free(self):
+        for name in ("manifest.py", "privacy.py"):
+            source = (REPO_ROOT / "tests/ceq1" / name).read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=name)
+            imports = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imports.extend(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports.append(node.module)
+            self.assertFalse(
+                any(item == "email_automation" or item.startswith("email_automation.") for item in imports),
+                name,
+            )
+
+    def test_privacy_rule_receipts_are_exact_and_recomputed_from_closed_specs(self):
+        self.assertEqual(TASK3_PRIVACY_RULE_IDS, frozenset(self.privacy.SCANNER_RULE_SPECS))
+        self.assertEqual(TASK3_PRIVACY_RULE_IDS, frozenset(self.privacy.SCANNER_RULE_HASHES))
+        self.assertEqual(
+            {
+                rule_id: sha256_json(self.privacy.SCANNER_RULE_SPECS[rule_id])
+                for rule_id in sorted(TASK3_PRIVACY_RULE_IDS)
+            },
+            self.privacy.SCANNER_RULE_HASHES,
+        )
+
+    def _fixture_contracts(self, root: Path):
+        public_root = root / "public"
+        input_root = public_root / "inputs"
+        response_root = public_root / "responses"
+        owner_root = root / "production-owners"
+        oracle_root = root / "sealed-oracles"
+        input_root.mkdir(parents=True)
+        response_root.mkdir()
+        owner_root.mkdir()
+        oracle_root.mkdir()
+        refs = {
+            "schemaVersion": 1,
+            "productionAncestor": "6caa8ec14cc525299cfb8ed13bdd219f35c4322b",
+            "implementationBase": "b400ee5ad55ac75203da6a53730c4a134cad79e5",
+        }
+        scenarios = []
+        expected_owner_paths = {}
+        scenario_hashes = {}
+        for index, scenario_id in enumerate(TASK3_SCENARIO_IDS):
+            stem = scenario_id.lower()
+            input_bytes = self._json_bytes(
+                {
+                    "scenarioId": scenario_id,
+                    "senderName": "Avery Example",
+                    "senderEmail": "avery@example.invalid",
+                    "propertyAddress": "100 Example Plaza",
+                    "receivedAt": "2040-02-03T04:05:06Z",
+                }
+            )
+            response_bytes = self._json_bytes(
+                {"scenarioId": scenario_id, "response": f"synthetic response {index}"}
+            )
+            owner_bytes = f"# synthetic owner {scenario_id}\nOWNER = 'ceq1'\n".encode("ascii")
+            input_path = f"{stem}-input.json"
+            response_path = f"{stem}-response.json"
+            owner_path = f"{stem}.py"
+            (input_root / input_path).write_bytes(input_bytes)
+            (response_root / response_path).write_bytes(response_bytes)
+            (owner_root / owner_path).write_bytes(owner_bytes)
+            input_hash = _sha256(input_bytes)
+            response_hash = _sha256(response_bytes)
+            scenario_hashes[scenario_id] = (input_hash, response_hash)
+            expected_owner_paths[scenario_id] = frozenset({owner_root / owner_path})
+            scenarios.append(
+                {
+                    "id": scenario_id,
+                    "family": TASK3_PRIMARY_FAMILIES[scenario_id],
+                    "purpose": f"Synthetic pressure case {index}",
+                    "provenanceLabel": "newly-authored-synthetic",
+                    "inputBundle": input_path,
+                    "inputHash": input_hash,
+                    "responseBundle": response_path,
+                    "responseHash": response_hash,
+                    "ownerModuleHashes": {owner_path: _sha256(owner_bytes)},
+                }
+            )
+        manifest = {**refs, "scenarios": scenarios}
+        schedule_entries = []
+        coverage_records = []
+        for ordinal, (variant_id, scenario_id, layers) in enumerate(TASK3_MATRIX):
+            input_hash, response_hash = scenario_hashes[scenario_id]
+            oracle_bytes = self._json_bytes(
+                {"scenarioId": scenario_id, "variantId": variant_id, "synthetic": True}
+            )
+            (oracle_root / f"{variant_id}.json").write_bytes(oracle_bytes)
+            schedule_entries.append(
+                {
+                    "ordinal": ordinal,
+                    "scenarioId": scenario_id,
+                    "variantId": variant_id,
+                    "layers": list(layers),
+                    "inputHash": input_hash,
+                    "responseHash": response_hash,
+                }
+            )
+            (
+                _variant_family,
+                sabotage_id,
+                _sabotage_reason,
+                response_class,
+                promotion_class,
+                _baseline,
+                non_claims,
+            ) = TASK3_SEALED_METADATA[variant_id]
+            coverage_records.append(
+                {
+                    "variantId": variant_id,
+                    "scenarioId": scenario_id,
+                    "layers": list(layers),
+                    "responseClass": response_class,
+                    "voiceEligibility": False,
+                    "oracleHash": _sha256(oracle_bytes),
+                    "sabotageId": sabotage_id,
+                    "promotionClass": promotion_class,
+                    "expectedVerdict": (
+                        "UNVERIFIED" if promotion_class == "diagnostic" else "PASS_OFFLINE"
+                    ),
+                    "nonClaims": list(non_claims),
+                }
+            )
+        schedule = {**refs, "entries": schedule_entries}
+        coverage = {**refs, "records": coverage_records}
+        return SimpleNamespace(
+            public_root=public_root,
+            input_root=input_root,
+            response_root=response_root,
+            owner_root=owner_root,
+            oracle_root=oracle_root,
+            manifest=manifest,
+            schedule=schedule,
+            coverage=coverage,
+            provenance=self._provenance(),
+            expected_owner_paths=expected_owner_paths,
+        )
+
+    def _validate(self, root: Path):
+        fixture = self._fixture_contracts(root)
+        controls = root / "controls"
+        controls.mkdir()
+        document_paths = {}
+        for name in ("manifest", "schedule", "coverage", "provenance"):
+            path = controls / f"{name}.json"
+            path.write_bytes(self._json_bytes(getattr(fixture, name)))
+            document_paths[name] = path
+        return self.manifest.validate_fixture_contract_files(
+            manifest_path=document_paths["manifest"],
+            schedule_path=document_paths["schedule"],
+            coverage_path=document_paths["coverage"],
+            provenance_path=document_paths["provenance"],
+            input_root=fixture.input_root,
+            response_root=fixture.response_root,
+            owner_root=fixture.owner_root,
+            oracle_root=fixture.oracle_root,
+            expected_owner_paths=fixture.expected_owner_paths,
+        )
+
+    def test_exact_mandatory_scenario_and_variant_sets_are_independent_constants(self):
+        self.assertEqual(frozenset(TASK3_SCENARIO_IDS), self.manifest.MANDATORY_SCENARIO_IDS)
+        self.assertEqual(
+            frozenset(item[0] for item in TASK3_MATRIX),
+            self.manifest.MANDATORY_VARIANT_IDS,
+        )
+        self.assertEqual(19, len(self.manifest.MANDATORY_SCENARIO_IDS))
+        self.assertEqual(55, len(self.manifest.MANDATORY_VARIANT_IDS))
+        self.assertEqual(TASK3_PRIMARY_FAMILIES, self.manifest.SCENARIO_PRIMARY_FAMILIES)
+
+    def test_reviewed_matrix_freezes_every_row_and_variant_reporting_family(self):
+        expected = []
+        for ordinal, (variant_id, scenario_id, layers) in enumerate(TASK3_MATRIX):
+            (
+                variant_family,
+                sabotage_id,
+                sabotage_reason,
+                response_class,
+                promotion_class,
+                baseline,
+                non_claims,
+            ) = TASK3_SEALED_METADATA[variant_id]
+            expected.append(
+                {
+                    "ordinal": ordinal,
+                    "variantFamily": variant_family,
+                    "variantId": variant_id,
+                    "scenarioId": scenario_id,
+                    "layers": list(layers),
+                    "sabotageId": sabotage_id,
+                    "sabotageReason": sabotage_reason,
+                    "responseClass": response_class,
+                    "voiceEligibility": False,
+                    "promotionClass": promotion_class,
+                    "expectedVerdict": (
+                        "UNVERIFIED" if promotion_class == "diagnostic" else "PASS_OFFLINE"
+                    ),
+                    "nonClaims": list(non_claims),
+                    "baseline": baseline,
+                }
+            )
+        self.assertEqual(expected, [row.to_mapping() for row in self.manifest.REVIEWED_VARIANT_MATRIX])
+        self.assertEqual(55, len({row.sabotageId for row in self.manifest.REVIEWED_VARIANT_MATRIX}))
+        self.assertEqual(
+            6,
+            sum(row.promotionClass == "diagnostic" for row in self.manifest.REVIEWED_VARIANT_MATRIX),
+        )
+        self.assertEqual(
+            {1: 6, 2: 20, 3: 29},
+            {
+                width: sum(len(row.layers) == width for row in self.manifest.REVIEWED_VARIANT_MATRIX)
+                for width in (1, 2, 3)
+            },
+        )
+        by_variant = {row.variantId: row for row in self.manifest.REVIEWED_VARIANT_MATRIX}
+        self.assertEqual("EXT-01", by_variant["correction-after-window"].variantFamily)
+        self.assertEqual("chronology", by_variant["thirteen-message-window"].variantFamily)
+        self.assertEqual("EXT-02", by_variant["fresh-target-terminal"].variantFamily)
+        self.assertEqual("EXT-05", by_variant["ordered-success"].variantFamily)
+        self.assertEqual("EXT-03", by_variant["mixed-property-pdf"].variantFamily)
+        self.assertEqual("PDF layout", by_variant["native-text-three-page"].variantFamily)
+
+    def test_schema_version_refs_and_integer_ordinals_are_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            mutations = []
+            for surface in ("manifest", "schedule", "coverage"):
+                for field, value in (
+                    ("schemaVersion", True),
+                    ("schemaVersion", 2),
+                    ("productionAncestor", "0" * 40),
+                    ("implementationBase", "f" * 40),
+                ):
+                    documents = {
+                        name: json.loads(json.dumps(getattr(fixture, name)))
+                        for name in ("manifest", "schedule", "coverage")
+                    }
+                    documents[surface][field] = value
+                    mutations.append((f"{surface}:{field}:{value}", documents))
+            ordinal_bool = {
+                name: json.loads(json.dumps(getattr(fixture, name)))
+                for name in ("manifest", "schedule", "coverage")
+            }
+            ordinal_bool["schedule"]["entries"][0]["ordinal"] = True
+            mutations.append(("ordinal-bool", ordinal_bool))
+            for label, documents in mutations:
+                with self.subTest(label=label), self.assertRaises((TypeError, ValueError)):
+                    self.manifest.validate_fixture_contracts(
+                        documents["manifest"],
+                        documents["schedule"],
+                        documents["coverage"],
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        oracle_root=fixture.oracle_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=fixture.provenance,
+                    )
+
+    def test_strict_raw_json_loader_rejects_ambiguous_or_noncanonical_inputs(self):
+        invalid = (
+            ("duplicate", b'{"safe":1,"safe":2}'),
+            ("nan", b'{"value":NaN}'),
+            ("positive-infinity", b'{"value":Infinity}'),
+            ("negative-infinity", b'{"value":-Infinity}'),
+            ("bom", b'\xef\xbb\xbf{"safe":1}'),
+            ("utf8", b'{"safe":"\xff"}'),
+        )
+        for label, payload in invalid:
+            with self.subTest(label=label), self.assertRaises(ValueError) as raised:
+                self.manifest.load_json_bytes(payload, artifact_id="control-json")
+            self.assertEqual(("CEQ_JSON_INVALID", "control-json"), raised.exception.args)
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(
+            {"safe": [1, True, None]},
+            self.manifest.load_json_bytes(
+                b'{"safe":[1,true,null]}', artifact_id="control-json"
+            ),
+        )
+
+    def test_canonical_file_entry_rejects_control_document_links_and_duplicate_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._fixture_contracts(root)
+            controls = root / "controls"
+            controls.mkdir()
+            paths = {}
+            for name in ("manifest", "schedule", "coverage", "provenance"):
+                paths[name] = controls / f"{name}.json"
+                paths[name].write_bytes(self._json_bytes(getattr(fixture, name)))
+
+            real_manifest = controls / "real-manifest.json"
+            paths["manifest"].rename(real_manifest)
+            os.symlink(real_manifest.name, paths["manifest"])
+            with self.assertRaises(ValueError):
+                self.manifest.validate_fixture_contract_files(
+                    manifest_path=paths["manifest"],
+                    schedule_path=paths["schedule"],
+                    coverage_path=paths["coverage"],
+                    provenance_path=paths["provenance"],
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                )
+            paths["manifest"].unlink()
+            paths["manifest"].write_bytes(
+                real_manifest.read_bytes()[:-1] + b',"schemaVersion":1}'
+            )
+            with self.assertRaises(ValueError) as raised:
+                self.manifest.validate_fixture_contract_files(
+                    manifest_path=paths["manifest"],
+                    schedule_path=paths["schedule"],
+                    coverage_path=paths["coverage"],
+                    provenance_path=paths["provenance"],
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                )
+            self.assertEqual(("CEQ_JSON_INVALID", "public-manifest"), raised.exception.args)
+
+    def test_escaped_or_nested_sealed_fields_never_enter_public_capabilities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            secret = hashlib.sha256(os.urandom(32)).hexdigest()
+            base = self._json_bytes(fixture.manifest)
+            raw = base[:-1] + b',"or\\u0061cleHash":"' + secret.encode("ascii") + b'"}'
+            with self.assertRaises(ValueError) as raised:
+                self.manifest.validate_public_manifest_bytes(
+                    raw,
+                    artifact_id="public-manifest",
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+            self.assertNotIn(secret, str(raised.exception))
+            self.assertNotIn(secret, repr(raised.exception.args))
+            for location in (
+                ("top", lambda doc, field: doc.__setitem__(field, secret)),
+                (
+                    "nested",
+                    lambda doc, field: doc["scenarios"][0]["ownerModuleHashes"].__setitem__(
+                        field, secret
+                    ),
+                ),
+            ):
+                for field in (
+                    "oracleHash",
+                    "expectedVerdict",
+                    "expectedState",
+                    "sabotageId",
+                    "promotionClass",
+                    "nonClaims",
+                    "baseline",
+                    "variantFamily",
+                    "sabotageReason",
+                ):
+                    changed = json.loads(json.dumps(fixture.manifest))
+                    location[1](changed, field)
+                    with self.subTest(location=location[0], field=field), self.assertRaises(ValueError) as leak:
+                        self.manifest.validate_public_manifest(
+                            changed,
+                            input_root=fixture.input_root,
+                            response_root=fixture.response_root,
+                            owner_root=fixture.owner_root,
+                            expected_owner_paths=fixture.expected_owner_paths,
+                            provenance=fixture.provenance,
+                        )
+                    self.assertNotIn(secret, str(leak.exception))
+
+    def test_valid_temporary_contracts_return_capability_separated_typed_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            validated_manifest, validated_schedule, validated_coverage = self._validate(
+                Path(tmp)
+            )
+        self.assertIs(type(validated_manifest), self.manifest.ValidatedManifest)
+        self.assertIs(
+            type(validated_schedule), self.manifest.ValidatedExecutionSchedule
+        )
+        self.assertIs(type(validated_coverage), self.manifest.ValidatedCoverage)
+        self.assertFalse(hasattr(validated_manifest, "oracleHash"))
+        self.assertFalse(hasattr(validated_schedule, "coverage"))
+        self.assertFalse(hasattr(validated_schedule, "oracle"))
+        descriptors = self.manifest.emit_child_descriptors(validated_schedule)
+        expected_order = [
+            (scenario_id, variant_id, layer)
+            for variant_id, scenario_id, layers in TASK3_MATRIX
+            for layer in layers
+        ]
+        self.assertEqual(133, len(descriptors))
+        self.assertEqual(
+            expected_order,
+            [
+                (item["scenarioId"], item["variantId"], item["layer"])
+                for item in descriptors
+            ],
+        )
+        expected_keys = {
+            "scenarioId",
+            "variantId",
+            "layer",
+            "inputHash",
+            "responseHash",
+        }
+        self.assertTrue(all(set(descriptor) == expected_keys for descriptor in descriptors))
+        serialized = json.dumps(descriptors, sort_keys=True)
+        for forbidden in (
+            "expectedVerdict",
+            "oracleHash",
+            "sabotageId",
+            "responseClass",
+            "promotionClass",
+            "nonClaims",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertIn("semantic", self.manifest.DESCRIPTOR_SEPARATION_NONCLAIM.lower())
+        self.assertIn("Task 7", self.manifest.DESCRIPTOR_SEPARATION_NONCLAIM)
+        with self.assertRaises(TypeError):
+            self.manifest.emit_child_descriptors(validated_coverage)
+
+    def test_public_manifest_and_schedule_schemas_are_recursively_closed(self):
+        public_top = {
+            "schemaVersion",
+            "productionAncestor",
+            "implementationBase",
+            "scenarios",
+        }
+        scenario_keys = {
+            "id",
+            "family",
+            "purpose",
+            "provenanceLabel",
+            "inputBundle",
+            "inputHash",
+            "responseBundle",
+            "responseHash",
+            "ownerModuleHashes",
+        }
+        schedule_top = {
+            "schemaVersion",
+            "productionAncestor",
+            "implementationBase",
+            "entries",
+        }
+        schedule_keys = {
+            "ordinal",
+            "scenarioId",
+            "variantId",
+            "layers",
+            "inputHash",
+            "responseHash",
+        }
+        coverage_keys = {
+            "variantId",
+            "scenarioId",
+            "layers",
+            "responseClass",
+            "voiceEligibility",
+            "oracleHash",
+            "sabotageId",
+            "promotionClass",
+            "expectedVerdict",
+            "nonClaims",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._fixture_contracts(root)
+            self.assertEqual(public_top, set(fixture.manifest))
+            self.assertTrue(all(set(item) == scenario_keys for item in fixture.manifest["scenarios"]))
+            self.assertEqual(schedule_top, set(fixture.schedule))
+            self.assertTrue(all(set(item) == schedule_keys for item in fixture.schedule["entries"]))
+            self.assertTrue(all(set(item) == coverage_keys for item in fixture.coverage["records"]))
+            forbidden_fields = (
+                "expectedVerdict",
+                "oracleHash",
+                "expectedState",
+                "sabotageId",
+            )
+            for field in forbidden_fields:
+                changed = json.loads(json.dumps(fixture.manifest))
+                changed["scenarios"][0][field] = "forbidden"
+                with self.subTest(surface="manifest", field=field), self.assertRaises(ValueError):
+                    self.manifest.validate_public_manifest(
+                        changed,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=fixture.provenance,
+                    )
+            schedule_forbidden = (
+                "responseClass",
+                "voiceEligibility",
+                "oracleHash",
+                "sabotageId",
+                "expectedVerdict",
+                "expectedOutcome",
+                "promotionClass",
+                "nonClaims",
+            )
+            for field in schedule_forbidden:
+                changed = json.loads(json.dumps(fixture.schedule))
+                changed["entries"][0][field] = "forbidden"
+                with self.subTest(surface="schedule", field=field), self.assertRaises(ValueError):
+                    self.manifest.validate_execution_schedule(changed)
+            for field in ("skip", "filter", "xfail"):
+                changed = json.loads(json.dumps(fixture.coverage))
+                changed["records"][0][field] = True
+                with self.subTest(surface="coverage", field=field), self.assertRaises(ValueError):
+                    self.manifest.validate_coverage(
+                        changed,
+                        oracle_root=fixture.oracle_root,
+                        provenance=fixture.provenance,
+                    )
+
+    def test_exact_sets_duplicates_row_order_layers_and_public_sealed_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._fixture_contracts(root)
+            manifest, schedule, coverage = fixture.manifest, fixture.schedule, fixture.coverage
+            mutations = []
+            missing_scenario = json.loads(json.dumps(manifest))
+            missing_scenario["scenarios"].pop()
+            mutations.append(("scenario-missing", missing_scenario, schedule, coverage))
+            duplicate_scenario = json.loads(json.dumps(manifest))
+            duplicate_scenario["scenarios"][-1] = duplicate_scenario["scenarios"][0]
+            mutations.append(("scenario-duplicate", duplicate_scenario, schedule, coverage))
+            wrong_family = json.loads(json.dumps(manifest))
+            wrong_family["scenarios"][0]["family"] = "voice"
+            mutations.append(("scenario-primary-family", wrong_family, schedule, coverage))
+            missing_variant = json.loads(json.dumps(schedule))
+            missing_variant["entries"].pop()
+            mutations.append(("variant-missing", manifest, missing_variant, coverage))
+            duplicate_variant = json.loads(json.dumps(schedule))
+            duplicate_variant["entries"][-1]["variantId"] = duplicate_variant["entries"][0]["variantId"]
+            mutations.append(("variant-duplicate", manifest, duplicate_variant, coverage))
+            wrong_order = json.loads(json.dumps(schedule))
+            wrong_order["entries"][0], wrong_order["entries"][1] = (
+                wrong_order["entries"][1], wrong_order["entries"][0]
+            )
+            mutations.append(("row-order", manifest, wrong_order, coverage))
+            wrong_ordinal = json.loads(json.dumps(schedule))
+            wrong_ordinal["entries"][1]["ordinal"] = 7
+            mutations.append(("ordinal", manifest, wrong_ordinal, coverage))
+            wrong_mapping = json.loads(json.dumps(schedule))
+            wrong_mapping["entries"][0]["scenarioId"] = "CEQ-LONG-01"
+            mutations.append(("mapping", manifest, wrong_mapping, coverage))
+            wrong_layers = json.loads(json.dumps(schedule))
+            wrong_layers["entries"][0]["layers"] = ["L3", "L1", "L2"]
+            mutations.append(("layers", manifest, wrong_layers, coverage))
+            coverage_drift = json.loads(json.dumps(coverage))
+            coverage_drift["records"][0]["layers"] = ["L1"]
+            mutations.append(("sealed-public-drift", manifest, schedule, coverage_drift))
+            for label, changed_manifest, changed_schedule, changed_coverage in mutations:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    self.manifest.validate_fixture_contracts(
+                        changed_manifest,
+                        changed_schedule,
+                        changed_coverage,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        oracle_root=fixture.oracle_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=fixture.provenance,
+                    )
+
+    def test_reviewed_matrix_rejects_public_and_sealed_collusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+
+            def copies():
+                return (
+                    json.loads(json.dumps(fixture.schedule)),
+                    json.loads(json.dumps(fixture.coverage)),
+                )
+
+            collusions = []
+            schedule, coverage = copies()
+            schedule["entries"][0], schedule["entries"][1] = (
+                schedule["entries"][1],
+                schedule["entries"][0],
+            )
+            schedule["entries"][0]["ordinal"] = 0
+            schedule["entries"][1]["ordinal"] = 1
+            coverage["records"][0], coverage["records"][1] = (
+                coverage["records"][1],
+                coverage["records"][0],
+            )
+            collusions.append(("swap-renumber", schedule, coverage))
+
+            schedule, coverage = copies()
+            schedule["entries"][0]["scenarioId"] = "CEQ-LONG-01"
+            long_scenario = next(
+                item for item in fixture.manifest["scenarios"] if item["id"] == "CEQ-LONG-01"
+            )
+            schedule["entries"][0]["inputHash"] = long_scenario["inputHash"]
+            schedule["entries"][0]["responseHash"] = long_scenario["responseHash"]
+            coverage["records"][0]["scenarioId"] = "CEQ-LONG-01"
+            collusions.append(("scenario-both", schedule, coverage))
+
+            schedule, coverage = copies()
+            schedule["entries"][0]["layers"] = ["L1", "L2"]
+            coverage["records"][0]["layers"] = ["L1", "L2"]
+            collusions.append(("layer-downgrade-both", schedule, coverage))
+
+            schedule, coverage = copies()
+            first_schedule = schedule["entries"][0]
+            second_schedule = schedule["entries"][4]
+            for field in ("variantId", "scenarioId", "layers", "inputHash", "responseHash"):
+                first_schedule[field], second_schedule[field] = (
+                    second_schedule[field],
+                    first_schedule[field],
+                )
+            first_coverage = coverage["records"][0]
+            second_coverage = coverage["records"][4]
+            for field in set(first_coverage):
+                first_coverage[field], second_coverage[field] = (
+                    second_coverage[field],
+                    first_coverage[field],
+                )
+            collusions.append(("move-full-variant-metadata", schedule, coverage))
+
+            schedule, coverage = copies()
+            for field in ("sabotageId", "responseClass"):
+                coverage["records"][0][field], coverage["records"][4][field] = (
+                    coverage["records"][4][field],
+                    coverage["records"][0][field],
+                )
+            collusions.append(("swap-sealed-metadata", schedule, coverage))
+
+            schedule, coverage = copies()
+            coverage["records"][0].update(
+                {
+                    "promotionClass": "diagnostic",
+                    "expectedVerdict": "UNVERIFIED",
+                    "nonClaims": ["UNVERIFIED_NO_SHARED_FINALIZER"],
+                }
+            )
+            collusions.append(("promotion-verdict-together", schedule, coverage))
+
+            schedule, coverage = copies()
+            schedule["entries"][0]["layers"] = ["L3", "L2", "L1"]
+            coverage["records"][0]["layers"] = ["L3", "L2", "L1"]
+            collusions.append(("layer-permutation-both", schedule, coverage))
+
+            for label, schedule, coverage in collusions:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    self.manifest.validate_fixture_contracts(
+                        fixture.manifest,
+                        schedule,
+                        coverage,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        oracle_root=fixture.oracle_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=fixture.provenance,
+                    )
+
+    def test_sealed_metadata_invariants_and_sorted_contract_digest_are_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            original = self.manifest.validate_coverage(
+                fixture.coverage,
+                oracle_root=fixture.oracle_root,
+                provenance=fixture.provenance,
+            )
+            reordered_document = json.loads(json.dumps(fixture.coverage))
+            reordered_document["records"] = list(reversed(reordered_document["records"]))
+            reordered = self.manifest.validate_coverage(
+                reordered_document,
+                oracle_root=fixture.oracle_root,
+                provenance=fixture.provenance,
+            )
+            self.assertEqual(55, original.count)
+            self.assertEqual(55, reordered.count)
+            self.assertEqual(original.contractDigest, reordered.contractDigest)
+            self.assertRegex(original.contractDigest, r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                [item[0] for item in TASK3_MATRIX],
+                [record.variantId for record in reordered.records],
+            )
+            controls = []
+            mutations = (
+                ("sabotageId", "SAB-EXT02-01"),
+                ("responseClass", "terminal_reply"),
+                ("voiceEligibility", True),
+                ("promotionClass", "diagnostic"),
+                ("expectedVerdict", "UNVERIFIED"),
+                ("nonClaims", ["UNVERIFIED_NO_SHARED_FINALIZER"]),
+                ("layers", ["L1"]),
+            )
+            for field, value in mutations:
+                changed = json.loads(json.dumps(fixture.coverage))
+                changed["records"][0][field] = value
+                controls.append((field, changed))
+            for extra_field in ("baseline", "variantFamily", "sabotageReason"):
+                changed = json.loads(json.dumps(fixture.coverage))
+                changed["records"][0][extra_field] = "plan-only"
+                controls.append((extra_field, changed))
+            for label, changed in controls:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    self.manifest.validate_coverage(
+                        changed,
+                        oracle_root=fixture.oracle_root,
+                        provenance=fixture.provenance,
+                    )
+
+    def test_byte_owner_and_oracle_hashes_are_lowercase_exact_sha256(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._fixture_contracts(root)
+            manifest, schedule, coverage = fixture.manifest, fixture.schedule, fixture.coverage
+            mutations = []
+            for field in ("inputHash", "responseHash"):
+                changed = json.loads(json.dumps(manifest))
+                changed["scenarios"][0][field] = "A" * 64
+                mutations.append((field, changed, schedule, coverage))
+            changed = json.loads(json.dumps(manifest))
+            owner_path = next(iter(changed["scenarios"][0]["ownerModuleHashes"]))
+            changed["scenarios"][0]["ownerModuleHashes"][owner_path] = "0" * 64
+            mutations.append(("owner-hash", changed, schedule, coverage))
+            changed_coverage = json.loads(json.dumps(coverage))
+            changed_coverage["records"][0]["oracleHash"] = "0" * 64
+            mutations.append(("oracle-hash", manifest, schedule, changed_coverage))
+            for label, changed_manifest, changed_schedule, changed_coverage in mutations:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    self.manifest.validate_fixture_contracts(
+                        changed_manifest,
+                        changed_schedule,
+                        changed_coverage,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        oracle_root=fixture.oracle_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=fixture.provenance,
+                    )
+            first_input = fixture.input_root / manifest["scenarios"][0]["inputBundle"]
+            first_input.write_bytes(b"{}")
+            with self.assertRaises(ValueError):
+                self.manifest.validate_fixture_contracts(
+                    manifest,
+                    schedule,
+                    coverage,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+
+    def test_hash_correct_public_and_sealed_bundles_still_require_privacy_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            nonce = hashlib.sha256(os.urandom(32)).hexdigest()
+            first_scenario = fixture.manifest["scenarios"][0]
+            input_path = fixture.input_root / first_scenario["inputBundle"]
+            unsafe = self._json_bytes({"senderEmail": f"{nonce[:12]}@example.com"})
+            input_path.write_bytes(unsafe)
+            first_scenario["inputHash"] = _sha256(unsafe)
+            for entry in fixture.schedule["entries"]:
+                if entry["scenarioId"] == first_scenario["id"]:
+                    entry["inputHash"] = first_scenario["inputHash"]
+            with self.assertRaises(ValueError):
+                self.manifest.validate_fixture_contracts(
+                    fixture.manifest,
+                    fixture.schedule,
+                    fixture.coverage,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            nonce = hashlib.sha256(os.urandom(32)).hexdigest()
+            oracle_path = fixture.oracle_root / "known-filled.json"
+            unsafe = self._json_bytes({"senderEmail": f"{nonce[:12]}@example.com"})
+            oracle_path.write_bytes(unsafe)
+            fixture.coverage["records"][0]["oracleHash"] = _sha256(unsafe)
+            with self.assertRaises(ValueError):
+                self.manifest.validate_fixture_contracts(
+                    fixture.manifest,
+                    fixture.schedule,
+                    fixture.coverage,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+
+    def test_paths_are_relative_contained_regular_files_and_errors_are_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._fixture_contracts(root)
+            manifest, provenance = fixture.manifest, fixture.provenance
+            outside = root / "outside.json"
+            first_path = manifest["scenarios"][0]["inputBundle"]
+            outside.write_bytes((fixture.input_root / first_path).read_bytes())
+            cases = (
+                ("", "empty"),
+                (".", "dot"),
+                ("./input.json", "dot-prefix"),
+                ("/Users/private/customer.json", "absolute"),
+                ("C:/private/customer.json", "windows-drive"),
+                (r"C:\private\customer.json", "backslash"),
+                ("file:///Users/private/customer.json", "file-uri"),
+                ("https://example.invalid/input.json", "uri"),
+                ("../outside.json", "traversal"),
+                ("nested/../outside.json", "embedded-dotdot"),
+                ("nested//input.json", "empty-component"),
+                ("%2e%2e/outside.json", "encoded-dotdot"),
+                ("input%2falias.json", "encoded-separator"),
+                ("input.json\x00suffix", "nul"),
+            )
+            for value, label in cases:
+                changed = json.loads(json.dumps(manifest))
+                changed["scenarios"][0]["inputBundle"] = value
+                with self.subTest(label=label), self.assertRaises(ValueError) as raised:
+                    self.manifest.validate_public_manifest(
+                        changed,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=provenance,
+                    )
+                self.assertNotIn(value, str(raised.exception))
+            link = fixture.input_root / "input-link.json"
+            os.symlink(first_path, link)
+            changed = json.loads(json.dumps(manifest))
+            changed["scenarios"][0]["inputBundle"] = "input-link.json"
+            with self.assertRaises(ValueError):
+                self.manifest.validate_public_manifest(
+                    changed,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=provenance,
+                )
+
+            outside_dir = root / "outside-dir"
+            outside_dir.mkdir()
+            (outside_dir / "escaped.json").write_bytes(
+                (fixture.input_root / first_path).read_bytes()
+            )
+            os.symlink(outside_dir, fixture.input_root / "ancestor-link")
+            changed = json.loads(json.dumps(manifest))
+            changed["scenarios"][0]["inputBundle"] = "ancestor-link/escaped.json"
+            with self.assertRaises(ValueError):
+                self.manifest.validate_public_manifest(
+                    changed,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=provenance,
+                )
+
+    def test_bound_file_reads_reject_special_hardlinked_oversize_and_cross_surface_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            first = fixture.manifest["scenarios"][0]
+            original_path = fixture.input_root / first["inputBundle"]
+            controls = []
+
+            fifo = fixture.input_root / "fixture.fifo"
+            os.mkfifo(fifo)
+            changed = json.loads(json.dumps(fixture.manifest))
+            changed["scenarios"][0]["inputBundle"] = fifo.name
+            controls.append(("special", changed))
+
+            hardlink = fixture.input_root / "hardlink.json"
+            try:
+                os.link(original_path, hardlink)
+            except OSError as error:
+                self.skipTest(f"filesystem does not support hard links: {error.errno}")
+            changed = json.loads(json.dumps(fixture.manifest))
+            changed["scenarios"][0]["inputBundle"] = hardlink.name
+            controls.append(("hardlink", changed))
+
+            oversize = fixture.input_root / "oversize.json"
+            oversize.write_bytes(b"x" * (self.manifest.MAX_ARTIFACT_BYTES + 1))
+            changed = json.loads(json.dumps(fixture.manifest))
+            changed["scenarios"][0]["inputBundle"] = oversize.name
+            controls.append(("oversize", changed))
+
+            for label, manifest in controls:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    self.manifest.validate_public_manifest(
+                        manifest,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=fixture.provenance,
+                    )
+
+            response_alias = fixture.response_root / first["responseBundle"]
+            response_alias.unlink()
+            os.link(original_path, response_alias)
+            first["responseHash"] = first["inputHash"]
+            with self.assertRaises(ValueError):
+                self.manifest.validate_fixture_contracts(
+                    fixture.manifest,
+                    fixture.schedule,
+                    fixture.coverage,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+
+    def test_oracle_lookup_is_derived_and_input_cannot_alias_sealed_bytes(self):
+        self.assertEqual(
+            PurePosixPath("known-filled.json"),
+            self.manifest.oracle_path_for_variant("known-filled"),
+        )
+        with self.assertRaises(ValueError):
+            self.manifest.oracle_path_for_variant("caller/controlled")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            first = fixture.manifest["scenarios"][0]
+            oracle = fixture.oracle_root / "known-filled.json"
+            source = fixture.input_root / first["inputBundle"]
+            source.unlink()
+            os.link(oracle, source)
+            first["inputHash"] = _sha256(oracle.read_bytes())
+            for entry in fixture.schedule["entries"]:
+                if entry["scenarioId"] == first["id"]:
+                    entry["inputHash"] = first["inputHash"]
+            with self.assertRaises(ValueError):
+                self.manifest.validate_fixture_contracts(
+                    fixture.manifest,
+                    fixture.schedule,
+                    fixture.coverage,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+
+    def test_owner_hashes_are_nonempty_and_match_a_trusted_external_allowlist(self):
+        self.assertIn("Task 7", self.manifest.OWNER_COMPLETENESS_NONCLAIM)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            controls = []
+            omitted = json.loads(json.dumps(fixture.manifest))
+            omitted["scenarios"][0]["ownerModuleHashes"] = {}
+            controls.append(("empty", omitted, fixture.owner_root, fixture.expected_owner_paths))
+            missing_expected = dict(fixture.expected_owner_paths)
+            missing_expected[fixture.manifest["scenarios"][0]["id"]] = frozenset()
+            controls.append(("trusted-allowlist-empty", fixture.manifest, fixture.owner_root, missing_expected))
+            wrong_root = Path(tmp) / "wrong-owner-root"
+            wrong_root.mkdir()
+            for owner in fixture.owner_root.iterdir():
+                (wrong_root / owner.name).write_bytes(owner.read_bytes())
+            controls.append(("wrong-root-capability", fixture.manifest, wrong_root, fixture.expected_owner_paths))
+            for label, manifest, owner_root, expected in controls:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    self.manifest.validate_public_manifest(
+                        manifest,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=owner_root,
+                        expected_owner_paths=expected,
+                        provenance=fixture.provenance,
+                    )
+
+    def test_schedule_hashes_are_bound_to_unique_scenario_manifest_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            changed = json.loads(json.dumps(fixture.schedule))
+            first = changed["entries"][0]
+            other = next(
+                item
+                for item in fixture.manifest["scenarios"]
+                if item["id"] != first["scenarioId"]
+            )
+            first["inputHash"] = other["inputHash"]
+            first["responseHash"] = other["responseHash"]
+            with self.assertRaises(ValueError):
+                self.manifest.validate_fixture_contracts(
+                    fixture.manifest,
+                    changed,
+                    fixture.coverage,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+
+    def test_component_openat_holds_ancestor_fd_across_swap_and_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            scenario = fixture.manifest["scenarios"][0]
+            original = fixture.input_root / scenario["inputBundle"]
+            slot = fixture.input_root / "slot"
+            slot.mkdir()
+            payload = slot / "payload.json"
+            payload.write_bytes(original.read_bytes())
+            scenario["inputBundle"] = "slot/payload.json"
+            scenario["inputHash"] = _sha256(payload.read_bytes())
+            outside = Path(tmp) / "swap-outside"
+            outside.mkdir()
+            (outside / "payload.json").write_bytes(b'{"escaped":true}')
+            held = fixture.input_root / "held-slot"
+            real_open = self.manifest.os.open
+            swapped = False
+
+            def swapping_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if path == "payload.json" and kwargs.get("dir_fd") is not None and not swapped:
+                    swapped = True
+                    slot.rename(held)
+                    os.symlink(outside, slot)
+                    try:
+                        return real_open(path, flags, *args, **kwargs)
+                    finally:
+                        slot.unlink()
+                        held.rename(slot)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(self.manifest.os, "open", side_effect=swapping_open):
+                validated = self.manifest.validate_public_manifest(
+                    fixture.manifest,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+            self.assertTrue(swapped)
+            self.assertIs(type(validated), self.manifest.ValidatedManifest)
+
+    def test_same_byte_swap_restore_is_rejected_by_pre_post_fstat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            scenario = fixture.manifest["scenarios"][0]
+            path = fixture.input_root / scenario["inputBundle"]
+            original = path.read_bytes()
+            altered = bytes([original[0] ^ 1]) + original[1:]
+            real_read = self.manifest.os.read
+            mutated = False
+
+            def mutating_read(fd, count):
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    path.write_bytes(altered)
+                    path.write_bytes(original)
+                return real_read(fd, count)
+
+            with mock.patch.object(self.manifest.os, "read", side_effect=mutating_read):
+                with self.assertRaises(ValueError):
+                    self.manifest.validate_public_manifest(
+                        fixture.manifest,
+                        input_root=fixture.input_root,
+                        response_root=fixture.response_root,
+                        owner_root=fixture.owner_root,
+                        expected_owner_paths=fixture.expected_owner_paths,
+                        provenance=fixture.provenance,
+                    )
+            self.assertTrue(mutated)
+
+    def test_validated_records_detach_from_caller_mutation_and_retain_no_private_capabilities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture_contracts(Path(tmp))
+            validated_manifest, validated_schedule, validated_coverage = (
+                self.manifest.validate_fixture_contracts(
+                    fixture.manifest,
+                    fixture.schedule,
+                    fixture.coverage,
+                    input_root=fixture.input_root,
+                    response_root=fixture.response_root,
+                    owner_root=fixture.owner_root,
+                    oracle_root=fixture.oracle_root,
+                    expected_owner_paths=fixture.expected_owner_paths,
+                    provenance=fixture.provenance,
+                )
+            )
+            before = (
+                validated_manifest.to_mapping(),
+                validated_schedule.to_mapping(),
+                validated_coverage.to_mapping(),
+                self.manifest.emit_child_descriptors(validated_schedule),
+            )
+            fixture.manifest["scenarios"][0]["ownerModuleHashes"].clear()
+            fixture.schedule["entries"].reverse()
+            fixture.coverage["records"][0]["layers"].clear()
+            fixture.provenance["fictionalPeople"].append("Caller Mutation")
+            after = (
+                validated_manifest.to_mapping(),
+                validated_schedule.to_mapping(),
+                validated_coverage.to_mapping(),
+                self.manifest.emit_child_descriptors(validated_schedule),
+            )
+            self.assertEqual(before, after)
+            temp_prefix = str(Path(tmp))
+            for public in (validated_manifest, validated_schedule):
+                names = set(dir(public))
+                self.assertTrue(
+                    names.isdisjoint(
+                        {
+                            "coverage",
+                            "oracle",
+                            "provenance",
+                            "inputRoot",
+                            "responseRoot",
+                            "ownerRoot",
+                            "_coverage",
+                            "_oracle",
+                            "_provenance",
+                        }
+                    )
+                )
+                self.assertNotIn(temp_prefix, repr(public))
+
+    def test_typed_schedule_constructor_and_emitter_reject_forged_row_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _validated_manifest, schedule, _validated_coverage = self._validate(Path(tmp))
+            forged_entries = (schedule.entries[1], schedule.entries[0], *schedule.entries[2:])
+            with self.assertRaises(ValueError):
+                self.manifest.ValidatedExecutionSchedule(
+                    schemaVersion=schedule.schemaVersion,
+                    productionAncestor=schedule.productionAncestor,
+                    implementationBase=schedule.implementationBase,
+                    entries=forged_entries,
+                )
+            forged = object.__new__(self.manifest.ValidatedExecutionSchedule)
+            for name, value in (
+                ("schemaVersion", schedule.schemaVersion),
+                ("productionAncestor", schedule.productionAncestor),
+                ("implementationBase", schedule.implementationBase),
+                ("entries", forged_entries),
+            ):
+                object.__setattr__(forged, name, value)
+            with self.assertRaises(ValueError):
+                self.manifest.emit_child_descriptors(forged)
+
+    def test_privacy_scanners_accept_only_declared_synthetic_identity_and_clock(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        safe = self._json_bytes(
+            {
+                "name": "Avery Example",
+                "email": "avery@example.invalid",
+                "propertyAddress": "100 Example Plaza",
+                "receivedAt": "2040-06-01T12:00:00Z",
+            }
+        )
+        self.assertEqual((), self.privacy.scan_bytes(safe, artifact_id="safe", provenance=provenance))
+        self.assertEqual(
+            (),
+            self.privacy.scan_json(json.loads(safe), artifact_id="safe-json", provenance=provenance),
+        )
+        digest = hashlib.sha256(os.urandom(32)).hexdigest().encode("ascii")
+        cases = (
+            ("CEQ_PRIV_ABSOLUTE_PATH", b"/" + b"Users/fixture/customer.json"),
+            ("CEQ_PRIV_FILE_URI", b"file:" + b"///fixture/customer.json"),
+            ("CEQ_PRIV_PRODUCTION_ID", b"projects/" + digest[:20] + b"/databases/(default)"),
+            ("CEQ_PRIV_RAW_MESSAGE_ID", b"graph-message-id:" + digest),
+            ("CEQ_PRIV_CREDENTIAL", b"sk-" + digest),
+            ("CEQ_PRIV_CLOCK_RANGE", b"2032-01-01T00:00:00Z"),
+            ("CEQ_PRIV_NON_INVALID_MAILBOX", digest[:12] + b"@example.com"),
+            ("CEQ_PRIV_UNDECLARED_IDENTITY", digest[:12] + b"@other.invalid"),
+        )
+        for rule_id, token in cases:
+            with self.subTest(rule_id=rule_id), self.assertRaises(ValueError) as raised:
+                self.privacy.scan_bytes(token, artifact_id="bundle-01", provenance=provenance)
+            message = str(raised.exception)
+            self.assertEqual((rule_id, "bundle-01"), raised.exception.args)
+            self.assertNotIn(token.decode("ascii"), message)
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(
+            (),
+            self.privacy.scan_bytes(
+                b"ordinary words 14000 " + digest,
+                artifact_id="safe-nonclaim",
+                provenance=provenance,
+            ),
+        )
+        self.assertIn("arbitrary copied prose", self.privacy.SCANNER_NONCLAIM)
+        self.assertIn("numbers", self.privacy.SCANNER_NONCLAIM)
+        unsafe_artifact_id = hashlib.sha256(os.urandom(32)).hexdigest() + "@example.com"
+        with self.assertRaises(ValueError) as raised:
+            self.privacy.scan_bytes(
+                b"safe",
+                artifact_id=unsafe_artifact_id,
+                provenance=provenance,
+            )
+        self.assertEqual(
+            ("CEQ_PRIV_ARTIFACT_ID", "invalid-artifact-id"), raised.exception.args
+        )
+        self.assertNotIn(unsafe_artifact_id, str(raised.exception))
+
+    def test_seeded_forbidden_token_is_quarantined_without_committing_or_echoing_it(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        forbidden = hashlib.sha256(os.urandom(32)).hexdigest().encode("ascii")
+        with tempfile.TemporaryDirectory() as tmp:
+            seeded = Path(tmp) / "seeded.json"
+            seeded.write_bytes(b'{"value":"' + forbidden + b'"}')
+            with self.assertRaises(ValueError) as raised:
+                self.privacy.scan_tree(
+                    Path(tmp),
+                    artifact_id="seed-control",
+                    provenance=provenance,
+                    forbidden_tokens={"CEQ_TEST_FORBIDDEN": forbidden},
+                )
+        self.assertEqual(
+            ("CEQ_PRIV_FORBIDDEN_TOKEN", "seed-control"), raised.exception.args
+        )
+        self.assertNotIn(forbidden.decode("ascii"), str(raised.exception))
+        self.assertNotIn(
+            forbidden.decode("ascii"),
+            (REPO_ROOT / "tests/fixtures/ceq1/inputs/provenance.json").read_text(),
+        )
+
+    def test_json_identity_keys_and_tree_symlinks_are_quarantined(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        for key, value in (
+            ("brokerName", "Undeclared Person"),
+            ("propertyAddress", "999 Undeclared Street"),
+        ):
+            with self.subTest(key=key), self.assertRaises(ValueError) as raised:
+                self.privacy.scan_json(
+                    {key: value}, artifact_id="identity-control", provenance=provenance
+                )
+            self.assertIn("CEQ_PRIV_UNDECLARED_IDENTITY", str(raised.exception))
+            self.assertNotIn(value, str(raised.exception))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "safe.json").write_bytes(self._json_bytes({"name": "Avery Example"}))
+            self.assertEqual((), self.privacy.scan_tree(root, artifact_id="tree", provenance=provenance))
+            os.symlink("safe.json", root / "alias.json")
+            with self.assertRaises(ValueError) as raised:
+                self.privacy.scan_tree(root, artifact_id="tree", provenance=provenance)
+            self.assertIn("CEQ_PRIV_TREE_LINK", str(raised.exception))
+
+    def test_privacy_scanner_closes_encoded_identity_and_secret_key_evasions(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        nonce = hashlib.sha256(os.urandom(32)).hexdigest()
+        raw_cases = (
+            b'{"senderEmail":"' + nonce[:12].encode() + b'\\u0040other.invalid"}',
+            json.dumps({"senderEmail": f"{nonce[:12]}\u200b@other.invalid"}).encode(),
+            json.dumps({"senderEmail": f"{nonce[:12]}＠other.invalid"}).encode(),
+            json.dumps({"senderEmail": f"{nonce[:12]}%40other.invalid"}).encode(),
+            b'{"api\\u004bey":"' + nonce.encode() + b'"}',
+            b'{"accessToken":"ordinary-looking-value"}',
+            b'{"privateKey":"ordinary-looking-value"}',
+            b'{"messageId":"graph-message-id:' + nonce.encode() + b'"}',
+        )
+        for index, payload in enumerate(raw_cases):
+            with self.subTest(index=index), self.assertRaises(ValueError) as raised:
+                self.privacy.scan_bytes(
+                    payload, artifact_id=f"evasion-{index}", provenance=provenance
+                )
+            self.assertNotIn(nonce, str(raised.exception))
+        safe_encoded = b'{"senderEmail":"avery\\u0040example.invalid"}'
+        self.assertEqual(
+            (),
+            self.privacy.scan_bytes(
+                safe_encoded, artifact_id="encoded-safe", provenance=provenance
+            ),
+        )
+
+    def test_synthetic_clock_is_strict_valid_utc_z_and_range_bounded(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        for value in (
+            "2040-01-01T00:00:00Z",
+            "2040-12-31T23:59:59Z",
+        ):
+            self.assertEqual(
+                (),
+                self.privacy.scan_json(
+                    {"receivedAt": value}, artifact_id="clock-safe", provenance=provenance
+                ),
+            )
+        for value in (
+            "2039-12-31T23:59:59Z",
+            "2041-01-01T00:00:00Z",
+            "2040-01-01T00:00:00+00:00",
+            "2040-01-01T00:00:00.000Z",
+            "2040-02-30T00:00:00Z",
+            "2040-1-01T00:00:00Z",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError) as raised:
+                self.privacy.scan_json(
+                    {"receivedAt": value}, artifact_id="clock-control", provenance=provenance
+                )
+            self.assertEqual(
+                ("CEQ_PRIV_CLOCK_RANGE", "clock-control"), raised.exception.args
+            )
+            self.assertNotIn(value, str(raised.exception))
+
+    def test_tree_scans_filenames_rejects_specials_and_quarantines_opaque_pdf(self):
+        provenance = self.privacy.validate_generation_provenance(self._provenance())
+        nonce = hashlib.sha256(os.urandom(32)).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unsafe_name = f"{nonce[:12]}@example.com.json"
+            (root / unsafe_name).write_bytes(b"{}")
+            with self.assertRaises(ValueError) as raised:
+                self.privacy.scan_tree(root, artifact_id="filename-tree", provenance=provenance)
+            self.assertNotIn(unsafe_name, str(raised.exception))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fifo = root / "special"
+            os.mkfifo(fifo)
+            with self.assertRaises(ValueError) as raised:
+                self.privacy.scan_tree(root, artifact_id="special-tree", provenance=provenance)
+            self.assertEqual(("CEQ_PRIV_TREE_SPECIAL", "special-tree"), raised.exception.args)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf = root / "synthetic.pdf"
+            pdf.write_bytes(b"%PDF-1.7\x00synthetic")
+            with self.assertRaises(ValueError) as raised:
+                self.privacy.scan_tree(root, artifact_id="pdf-tree", provenance=provenance)
+            self.assertEqual(("CEQ_PRIV_OPAQUE_BINARY", "pdf-tree"), raised.exception.args)
+            self.assertEqual(
+                (),
+                self.privacy.scan_tree(
+                    root,
+                    artifact_id="pdf-tree",
+                    provenance=provenance,
+                    decoded_text_by_path={"synthetic.pdf": "Avery Example at 100 Example Plaza"},
+                ),
+            )
+
+    def test_generation_provenance_is_closed_newly_authored_and_review_gating_is_explicit(self):
+        valid = self._provenance()
+        parsed = self.privacy.validate_generation_provenance(valid)
+        self.assertEqual("newly_authored_synthetic_template", parsed.generationMethod)
+        self.assertFalse(parsed.rawCustomerSourcesAccessed)
+        self.assertEqual("pending", parsed.independentReviewStatus)
+        self.assertFalse(parsed.gateApproved)
+        self.assertIsNone(parsed.independentReviewerRole)
+        self.assertIsNone(parsed.reviewedArtifactSetSha256)
+        self.assertIsNone(parsed.reviewedCommit)
+        self.assertEqual(self.privacy.SCANNER_NONCLAIM, parsed.scannerNonClaim)
+        self.assertEqual(self.privacy.SCANNER_NONCLAIM, parsed.scannerNonClaim)
+        artifact_digest = hashlib.sha256(os.urandom(32)).hexdigest()
+        reviewed_commit = "3" * 40
+        approved = json.loads(json.dumps(valid))
+        approved.update(
+            {
+                "independentReviewStatus": "approved",
+                "independentReviewerRole": "independent_fixture_privacy_reviewer",
+                "reviewedArtifactSetSha256": artifact_digest,
+                "reviewedCommit": reviewed_commit,
+            }
+        )
+        self.assertTrue(
+            self.privacy.validate_generation_provenance(
+                approved,
+                artifact_set_sha256=artifact_digest,
+                current_commit=reviewed_commit,
+            ).gateApproved
+        )
+        self.assertFalse(
+            self.privacy.validate_generation_provenance(
+                approved,
+                artifact_set_sha256="4" * 64,
+                current_commit=reviewed_commit,
+            ).gateApproved
+        )
+        status_only = json.loads(json.dumps(valid))
+        status_only["independentReviewStatus"] = "approved"
+        with self.assertRaises(ValueError):
+            self.privacy.validate_generation_provenance(status_only)
+        mutations = []
+        for key, value in (
+            ("generationMethod", "adapted_customer_fixture"),
+            ("rawCustomerSourcesAccessed", True),
+            ("independentReviewStatus", "self-approved"),
+            ("scannerNonClaim", "overclaim"),
+        ):
+            changed = json.loads(json.dumps(valid))
+            changed[key] = value
+            mutations.append((key, changed))
+        extra = json.loads(json.dumps(valid))
+        extra["reviewerName"] = "not allowed"
+        mutations.append(("extra-key", extra))
+        missing = json.loads(json.dumps(valid))
+        missing.pop("scannerRules")
+        mutations.append(("missing-key", missing))
+        bad_hash = json.loads(json.dumps(valid))
+        bad_hash["scannerRules"][0]["sha256"] = "0" * 64
+        mutations.append(("scanner-rule-hash", bad_hash))
+        duplicate_rule = json.loads(json.dumps(valid))
+        duplicate_rule["scannerRules"].append(duplicate_rule["scannerRules"][0])
+        mutations.append(("scanner-rule-duplicate", duplicate_rule))
+        missing_rule = json.loads(json.dumps(valid))
+        missing_rule["scannerRules"].pop()
+        mutations.append(("scanner-rule-missing", missing_rule))
+        extra_rule = json.loads(json.dumps(valid))
+        extra_rule["scannerRules"].append({"ruleId": "CEQ_PRIV_UNKNOWN", "sha256": "0" * 64})
+        mutations.append(("scanner-rule-extra", extra_rule))
+        unsorted_rules = json.loads(json.dumps(valid))
+        unsorted_rules["scannerRules"].reverse()
+        mutations.append(("scanner-rule-order", unsorted_rules))
+        uppercase_mailbox = json.loads(json.dumps(valid))
+        uppercase_mailbox["fictionalMailboxes"] = ["Avery@example.invalid"]
+        mutations.append(("mailbox-lowercase", uppercase_mailbox))
+        noninvalid_domain = json.loads(json.dumps(valid))
+        noninvalid_domain["fictionalDomains"] = ["example.com"]
+        noninvalid_domain["fictionalMailboxes"] = [artifact_digest[:12] + "@example.com"]
+        mutations.append(("domain-invalid", noninvalid_domain))
+        wrong_role = json.loads(json.dumps(approved))
+        wrong_role["independentReviewerRole"] = "author"
+        mutations.append(("reviewer-role", wrong_role))
+        for label, changed in mutations:
+            with self.subTest(label=label), self.assertRaises((TypeError, ValueError)):
+                self.privacy.validate_generation_provenance(changed)
+        before = parsed.to_mapping()
+        valid["fictionalPeople"].append("caller mutation")
+        valid["scannerRules"].clear()
+        self.assertEqual(before, parsed.to_mapping())
+
+    def test_generation_provenance_raw_bytes_use_strict_loader(self):
+        valid = self._provenance()
+        raw = self._json_bytes(valid)
+        parsed = self.privacy.validate_generation_provenance_bytes(
+            raw, artifact_id="provenance"
+        )
+        self.assertEqual("pending", parsed.independentReviewStatus)
+        duplicate = raw[:-1] + b',"schemaVersion":1}'
+        with self.assertRaises(ValueError) as raised:
+            self.privacy.validate_generation_provenance_bytes(
+                duplicate, artifact_id="provenance"
+            )
+        self.assertEqual(("CEQ_JSON_INVALID", "provenance"), raised.exception.args)
+
+    def test_committed_provenance_is_synthetic_closed_and_pending(self):
+        path = REPO_ROOT / "tests/fixtures/ceq1/inputs/provenance.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        parsed = self.privacy.validate_generation_provenance(record)
+        self.assertEqual("newly_authored_synthetic_template", parsed.generationMethod)
+        self.assertFalse(parsed.rawCustomerSourcesAccessed)
+        self.assertEqual("pending", parsed.independentReviewStatus)
+        self.assertFalse(parsed.gateApproved)
+
+
 if __name__ == "__main__":
     unittest.main()
