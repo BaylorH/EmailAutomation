@@ -4068,6 +4068,8 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
         provenance = self.privacy.validate_generation_provenance(self._provenance())
         for payload in (
             b"Contact avery@example.invalid.",
+            b"Contact avery@example.invalid...",
+            "Contact avery@example.invalid\u2026".encode("utf-8"),
             b"rent / opex",
         ):
             with self.subTest(payload=payload):
@@ -4079,16 +4081,26 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                         provenance=provenance,
                     ),
                 )
-        with self.assertRaises(ValueError) as raised:
-            self.privacy.scan_bytes(
-                b"Contact broker@outside.example.",
-                artifact_id="punctuated-mailbox",
-                provenance=provenance,
-            )
-        self.assertEqual(
-            ("CEQ_PRIV_NON_INVALID_MAILBOX", "punctuated-mailbox"),
-            raised.exception.args,
-        )
+        for terminator in (
+            b".",
+            b"/",
+            b"]",
+            b"#",
+            b"=",
+            b"...",
+            "\u2026".encode("utf-8"),
+        ):
+            with self.subTest(terminator=terminator):
+                with self.assertRaises(ValueError) as raised:
+                    self.privacy.scan_bytes(
+                        b"Contact broker@outside.example" + terminator,
+                        artifact_id="punctuated-mailbox",
+                        provenance=provenance,
+                    )
+                self.assertEqual(
+                    ("CEQ_PRIV_NON_INVALID_MAILBOX", "punctuated-mailbox"),
+                    raised.exception.args,
+                )
         for payload in (
             b"/",
             b"label:/Users",
@@ -4353,6 +4365,29 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                 ("CEQ_PRIV_OPAQUE_BINARY", "pdf-compressed-forgery"),
                 raised.exception.args,
             )
+        compressed = zlib.compress(b"broker@outside.example")
+        for label, encoded in (
+            ("base64-zlib", base64.b64encode(compressed)),
+            ("ascii85-zlib", base64.a85encode(compressed)),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "synthetic.pdf").write_bytes(
+                    b"%PDF-1.7\nstream\n" + encoded + b"\nendstream\n%%EOF\n"
+                )
+                with self.assertRaises(ValueError) as raised:
+                    self.privacy.scan_tree(
+                        root,
+                        artifact_id="pdf-ascii-encoded-forgery",
+                        provenance=provenance,
+                        decoded_text_by_path={
+                            "synthetic.pdf": "Avery Example at 100 Example Plaza"
+                        },
+                    )
+                self.assertEqual(
+                    ("CEQ_PRIV_OPAQUE_BINARY", "pdf-ascii-encoded-forgery"),
+                    raised.exception.args,
+                )
 
     def test_generation_provenance_is_closed_newly_authored_and_review_gating_is_explicit(self):
         valid = self._provenance()

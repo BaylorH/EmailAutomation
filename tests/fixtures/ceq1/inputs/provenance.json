@@ -49,7 +49,7 @@
     },
     {
       "ruleId": "CEQ_PRIV_NON_INVALID_MAILBOX",
-      "sha256": "9645ad73f69c67ab48e7380190302b37a35ab9ea4a991560d1f0ab66613d58c2"
+      "sha256": "79c6d818e3b805aef94adb9b8720627b03382a56d900c7e65b5e2cfdec649e8f"
     },
     {
       "ruleId": "CEQ_PRIV_OBFUSCATED_IDENTITY",
@@ -57,7 +57,7 @@
     },
     {
       "ruleId": "CEQ_PRIV_OPAQUE_BINARY",
-      "sha256": "c2e81a1314be5070dc33aaa5ce67bb83c483916fb266a89e0f3b017de373b985"
+      "sha256": "5faeef098cfeba94211eddf7bd9902ed2a45f4b9c68449e7137988ad9c7dd918"
     },
     {
       "ruleId": "CEQ_PRIV_PRODUCTION_ID",
@@ -77,7 +77,7 @@
     },
     {
       "ruleId": "CEQ_PRIV_UNDECLARED_IDENTITY",
-      "sha256": "800faff1cc24200dc17b522f93363a59eb0118b19ac7509497c995402301b305"
+      "sha256": "605195e111bd93676acfad2b40dcb76862aa4a51e701835b6b35177dbdbe0bd5"
     }
   ],
   "schemaVersion": 1,

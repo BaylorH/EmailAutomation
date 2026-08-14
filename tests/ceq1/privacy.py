@@ -31,14 +31,14 @@ SCANNER_RULE_SPECS: dict[str, object] = {
     "CEQ_PRIV_FILE_URI": {"kind": "file-uri", "version": 1},
     "CEQ_PRIV_FORBIDDEN_TOKEN": {"kind": "seeded-token", "version": 2},
     "CEQ_PRIV_JSON_SECRET_FIELD": {"kind": "secret-json-field", "version": 1},
-    "CEQ_PRIV_NON_INVALID_MAILBOX": {"kind": "non-invalid-mailbox", "version": 2},
+    "CEQ_PRIV_NON_INVALID_MAILBOX": {"kind": "non-invalid-mailbox", "version": 3},
     "CEQ_PRIV_OBFUSCATED_IDENTITY": {"kind": "encoded-identity", "version": 1},
-    "CEQ_PRIV_OPAQUE_BINARY": {"kind": "opaque-binary", "version": 3},
+    "CEQ_PRIV_OPAQUE_BINARY": {"kind": "opaque-binary", "version": 4},
     "CEQ_PRIV_PRODUCTION_ID": {"kind": "production-shaped-id", "version": 4},
     "CEQ_PRIV_RAW_MESSAGE_ID": {"kind": "raw-message-id", "version": 1},
     "CEQ_PRIV_TREE_LINK": {"kind": "tree-link", "version": 1},
     "CEQ_PRIV_TREE_SPECIAL": {"kind": "tree-special-file", "version": 4},
-    "CEQ_PRIV_UNDECLARED_IDENTITY": {"kind": "undeclared-identity", "version": 3},
+    "CEQ_PRIV_UNDECLARED_IDENTITY": {"kind": "undeclared-identity", "version": 4},
 }
 SCANNER_RULE_HASHES = {
     rule_id: sha256_json(specification)
@@ -77,7 +77,7 @@ _MAILBOX = re.compile(
 _EMAIL = re.compile(
     r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@"
     r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
-    r"(?=$|[\s\"'<>),;:!?]|\.(?:$|[\s\"'<>),;:!?]))"
+    r"(?=$|[^A-Za-z0-9.-]|\.+(?:$|[^A-Za-z0-9.-]))"
 )
 _OBFUSCATED_IDENTITY_CHARACTERS = ("＠", "\u200b", "\u200c", "\u200d", "\ufeff")
 _UTF8_OBFUSCATED_IDENTITY_SIGNATURES = tuple(
@@ -769,28 +769,8 @@ def _scan_tree_directory(
                         raise TypeError("forbidden token values must be non-empty bytes")
                     if token in data:
                         _raise("CEQ_PRIV_FORBIDDEN_TOKEN", artifact)
-            try:
-                scan_bytes(
-                    data,
-                    artifact_id=artifact,
-                    provenance=provenance,
-                    forbidden_tokens=forbidden_tokens,
-                )
-            except PrivacyViolation as error:
-                if error.args != ("CEQ_PRIV_OPAQUE_BINARY", artifact):
-                    raise
-                _scan_pdf_raw_patterns(data, artifact, provenance)
-                _raise("CEQ_PRIV_OPAQUE_BINARY", artifact)
-            if relative not in decoded or type(decoded[relative]) is not str:
-                _raise("CEQ_PRIV_OPAQUE_BINARY", artifact)
-            seen_decoded.add(relative)
-            scan_bytes(
-                decoded[relative].encode("utf-8"),
-                artifact_id=artifact,
-                provenance=provenance,
-                forbidden_tokens=forbidden_tokens,
-            )
-            continue
+            _scan_pdf_raw_patterns(data, artifact, provenance)
+            _raise("CEQ_PRIV_OPAQUE_BINARY", artifact)
         scan_bytes(
             data,
             artifact_id=artifact,
