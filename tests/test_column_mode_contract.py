@@ -1994,8 +1994,12 @@ class AutomaticResponseScenarioValidationTests(unittest.TestCase):
             "Alex",
         )
 
-        self.assertNotIn("flyer", body.lower())
-        self.assertIn("everything we need", body.lower())
+        self.assertEqual(
+            "Hi Alex,\n\n"
+            "Thanks for sending those details over. "
+            "That gives me everything I need for now.",
+            body,
+        )
 
     def test_scenario_keeps_llm_copy_with_benign_link_context(self):
         safe_llm_body = (

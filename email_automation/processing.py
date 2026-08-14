@@ -4541,8 +4541,12 @@ Thanks for the details. When you have a moment, could you also confirm:
         llm_response_email
         and not truth_locked_mismatch
         and not _response_requests_nonrequestable_fields(
-        llm_response_email,
-        column_config,
+            llm_response_email,
+            column_config,
+        )
+        and (
+            scenario != "complete"
+            or not get_requested_ask_fields(llm_response_email, column_config)
         )
     ):
         return llm_response_email
@@ -4571,9 +4575,7 @@ Thank you for clarifying that the property does not meet the requirements.
 Do you have any other properties that might be a better fit?""",
         "complete": f"""{greeting}
 
-Thank you for providing all the requested information! We now have everything we need for your property details.
-
-We'll be in touch if we need any additional information.""",
+Thanks for sending those details over. That gives me everything I need for now.""",
     }
     if scenario not in fallbacks:
         raise ValueError(f"Unknown automatic response scenario: {scenario}")
@@ -8341,7 +8343,7 @@ Could you please provide your phone number so I can give you a call?"""
                             if response_body == llm_response_email:
                                 print(f"🤖 Using LLM-generated response for all fields complete scenario")
                             elif llm_response_email:
-                                print("⚠️ Ignoring LLM response because it requested a Note/Skip field")
+                                print("⚠️ Ignoring LLM response because it requested a configured field after completion")
 
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:

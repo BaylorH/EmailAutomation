@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -43,6 +44,70 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         body = "Thanks for sending this over. This covers everything I needed."
 
         self.assertFalse(processing._response_mentions_missing_fields(body, ["Rail Access"]))
+
+    def test_complete_response_rejects_reasking_any_configured_ask_field(self):
+        config = get_default_column_config()
+        config["customFields"]["Rail Access"] = {
+            "mode": "ask_optional",
+            "description": "Rail-service availability",
+        }
+        expected = (
+            "Hi Alex,\n\n"
+            "Thanks for sending those details over. "
+            "That gives me everything I need for now."
+        )
+
+        for llm_body in (
+            "Could you confirm the dock count one more time?",
+            "Could you confirm the total square footage one more time?",
+            "Could you confirm whether rail access is available one more time?",
+        ):
+            with self.subTest(llm_body=llm_body):
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    config,
+                    "Alex",
+                )
+
+                self.assertEqual(expected, body)
+
+    def test_complete_response_accepts_generic_natural_terminal_copy(self):
+        llm_body = "Thanks for sending those details over. I have everything I need for now."
+
+        body = processing._select_automatic_response_body(
+            "complete",
+            llm_body,
+            get_default_column_config(),
+            "Alex",
+        )
+
+        self.assertEqual(llm_body, body)
+
+    def test_complete_response_keeps_safe_single_field_acknowledgement(self):
+        llm_body = "Thanks for confirming the asking rent. We have everything we need."
+
+        body = processing._select_automatic_response_body(
+            "complete",
+            llm_body,
+            get_default_column_config(),
+            "Alex",
+        )
+
+        self.assertEqual(llm_body, body)
+
+    def test_complete_fallback_log_describes_terminal_configured_field_request(self):
+        source = inspect.getsource(processing.process_inbox_message)
+        complete_branch = source.split(
+            "# Scenario 4: All fields complete - send closing",
+            1,
+        )[1].split("sent = send_reply_in_thread", 1)[0]
+
+        self.assertIn(
+            "Ignoring LLM response because it requested a configured field after completion",
+            complete_branch,
+        )
+        self.assertNotIn("requested a Note/Skip field", complete_branch)
 
     def test_missing_field_response_must_reference_requested_detail(self):
         body = "Thanks for the info. Could you also confirm whether the building has rail access?"
