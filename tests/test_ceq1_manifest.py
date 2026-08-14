@@ -4221,6 +4221,12 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                 "CEQ_PRIV_PRODUCTION_ID",
                 b"projects/production-project/databases/(default)",
             ),
+            (
+                "CEQ_PRIV_RAW_MESSAGE_ID",
+                b"graph-message-id:0123456789abcdef0123456789abcdef",
+            ),
+            ("CEQ_PRIV_CLOCK_RANGE", b"2032-01-01T00:00:00Z"),
+            ("CEQ_PRIV_OBFUSCATED_IDENTITY", b"broker%40outside.example"),
         )
         for rule_id, raw_metadata in cases:
             with self.subTest(rule_id=rule_id), tempfile.TemporaryDirectory() as tmp:

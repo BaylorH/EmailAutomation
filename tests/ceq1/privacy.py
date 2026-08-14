@@ -387,11 +387,19 @@ def _contains_posix_absolute_path(
     return False
 
 
-def _scan_text(text: str, artifact_id: str, provenance: GenerationProvenance) -> None:
+def _scan_raw_applicable_text(
+    text: str,
+    artifact_id: str,
+    provenance: GenerationProvenance,
+    *,
+    posix_path_pattern: re.Pattern[str],
+) -> None:
     lowered = text.lower()
     if "file://" in lowered:
         _raise("CEQ_PRIV_FILE_URI", artifact_id)
-    if _contains_posix_absolute_path(text) or _WINDOWS_ABSOLUTE_PATH.search(text):
+    if _contains_posix_absolute_path(
+        text, posix_path_pattern
+    ) or _WINDOWS_ABSOLUTE_PATH.search(text):
         _raise("CEQ_PRIV_ABSOLUTE_PATH", artifact_id)
     if re.search(r"\bprojects/[A-Za-z0-9._-]+/databases/", text) or re.search(
         r"(?:\bgs://[A-Za-z0-9._-]+|\b(?:AAMk|AAQk|AQMk)[A-Za-z0-9+/=_-]{16,})",
@@ -434,38 +442,26 @@ def _scan_text(text: str, artifact_id: str, provenance: GenerationProvenance) ->
             _raise("CEQ_PRIV_CLOCK_RANGE", artifact_id)
 
 
+def _scan_text(text: str, artifact_id: str, provenance: GenerationProvenance) -> None:
+    _scan_raw_applicable_text(
+        text,
+        artifact_id,
+        provenance,
+        posix_path_pattern=_POSIX_ABSOLUTE_PATH,
+    )
+
+
 def _scan_pdf_raw_patterns(
     data: bytes,
     artifact_id: str,
     provenance: GenerationProvenance,
 ) -> None:
-    text = data.decode("latin-1")
-    lowered = text.lower()
-    if "file://" in lowered:
-        _raise("CEQ_PRIV_FILE_URI", artifact_id)
-    if _contains_posix_absolute_path(
-        text, _PDF_RAW_POSIX_ABSOLUTE_PATH
-    ) or _WINDOWS_ABSOLUTE_PATH.search(text):
-        _raise("CEQ_PRIV_ABSOLUTE_PATH", artifact_id)
-    if re.search(r"\bprojects/[A-Za-z0-9._-]+/databases/", text) or re.search(
-        r"(?:\bgs://[A-Za-z0-9._-]+|\b(?:AAMk|AAQk|AQMk)[A-Za-z0-9+/=_-]{16,})",
-        text,
-    ):
-        _raise("CEQ_PRIV_PRODUCTION_ID", artifact_id)
-    if re.search(
-        r"(?:\bsk-[A-Za-z0-9_-]{16,}|\bghp_[A-Za-z0-9]{16,}|"
-        r"\bAKIA[A-Z0-9]{16}\b|\bAIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]+PRIVATE KEY-----)",
-        text,
-    ):
-        _raise("CEQ_PRIV_CREDENTIAL", artifact_id)
-    declared_mailboxes = set(provenance.fictionalMailboxes)
-    for mailbox_match in _EMAIL.finditer(text):
-        mailbox = mailbox_match.group(0)
-        domain = mailbox.rsplit("@", 1)[1]
-        if not domain.endswith(".invalid"):
-            _raise("CEQ_PRIV_NON_INVALID_MAILBOX", artifact_id)
-        if mailbox not in declared_mailboxes:
-            _raise("CEQ_PRIV_UNDECLARED_IDENTITY", artifact_id)
+    _scan_raw_applicable_text(
+        data.decode("latin-1"),
+        artifact_id,
+        provenance,
+        posix_path_pattern=_PDF_RAW_POSIX_ABSOLUTE_PATH,
+    )
 
 
 def _scan_json_value(
