@@ -63,6 +63,9 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             "Could you confirm whether rail access is available one more time?",
         ):
             with self.subTest(llm_body=llm_body):
+                self.assertTrue(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
                 body = processing._select_automatic_response_body(
                     "complete",
                     llm_body,
@@ -96,7 +99,246 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertEqual(llm_body, body)
 
-    def test_complete_fallback_log_describes_terminal_configured_field_request(self):
+    def test_complete_response_rejects_outward_requests_without_known_field_aliases(self):
+        config = get_default_column_config()
+        config["customFields"]["Rail Access"] = {
+            "mode": "ask_optional",
+            "description": "Rail-service availability",
+        }
+        expected = (
+            "Hi Alex,\n\n"
+            "Thanks for sending those details over. "
+            "That gives me everything I need for now."
+        )
+
+        for llm_body in (
+            "Thanks for the details. What is the annual lease rate?",
+            "Thanks for confirming the specs. How tall is the warehouse?",
+            "Thanks for the update. Does the property have a rail spur?",
+            "Thanks for the details. Please send the annual lease rate.",
+            "Thanks for the update. Let me know whether a rail spur serves the building.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertTrue(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    config,
+                    "Alex",
+                )
+
+                self.assertEqual(expected, body)
+
+    def test_complete_response_keeps_acknowledgements_offers_and_no_need_copy(self):
+        for llm_body in (
+            "Thanks for confirming the annual lease rate. I have everything I need.",
+            "Thanks for confirming how tall the warehouse is. This covers everything I needed.",
+            "If helpful, I can send a summary after our review.",
+            "Let me know if you need anything from me; otherwise, I have everything I need.",
+            "Please know I appreciate your help. I have everything I need.",
+            "I'll reach out if we have any questions.",
+            "No need to send anything else. I have everything I need.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertFalse(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    get_default_column_config(),
+                    "Alex",
+                )
+
+                self.assertEqual(llm_body, body)
+
+    def test_complete_response_rejects_indirect_outward_requests(self):
+        expected = (
+            "Hi Alex,\n\n"
+            "Thanks for sending those details over. "
+            "That gives me everything I need for now."
+        )
+
+        for llm_body in (
+            "I'd appreciate it if you could share the lease abstract.",
+            "I'd appreciate the annual lease rate.",
+            "I would appreciate receiving the latest flyer.",
+            "I was hoping you could send the latest flyer.",
+            "We were hoping you would confirm the annual lease rate.",
+            "I hope you can send the latest flyer.",
+            "It would be helpful if you could confirm the annual lease rate.",
+            "It would be helpful to receive the latest flyer.",
+            "I'd like you to send the lease abstract.",
+            "Please let me know whether a rail spur serves the building.",
+            "Let me know if you have the latest flyer.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertTrue(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    get_default_column_config(),
+                    "Alex",
+                )
+
+                self.assertEqual(expected, body)
+
+    def test_complete_response_keeps_safe_urls_rhetoric_review_offers_and_negation(self):
+        for llm_body in (
+            "The summary is at https://example.com/report?view=full. I have everything I need.",
+            "What more could I ask for? This gives me everything I need.",
+            "Could this have gone any smoother? I have everything I need.",
+            "I need a moment to review this with my client.",
+            "We need a little time to review this internally.",
+            "I'd like a moment to review this with my client.",
+            "I would like some time to review this internally.",
+            "I'd like you to know I appreciate your help.",
+            "Let me know if you would like a summary from me.",
+            "Let me know if I can send a summary after review.",
+            "Let me know if there is anything you need from me.",
+            "We need not ask for anything else.",
+            "I do not need anything else.",
+            "I need nothing else.",
+            "No need to send anything else.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertFalse(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    get_default_column_config(),
+                    "Alex",
+                )
+
+                self.assertEqual(llm_body, body)
+
+    def test_complete_response_safe_span_does_not_hide_later_request(self):
+        expected = (
+            "Hi Alex,\n\n"
+            "Thanks for sending those details over. "
+            "That gives me everything I need for now."
+        )
+
+        for llm_body in (
+            "Let me know if you need anything from me. I was hoping you could send the latest flyer.",
+            "I need a moment to review this. Please send the latest flyer in the meantime.",
+            "What more could I ask for? Please send the updated flyer as well.",
+            "The summary is at https://example.com/report?view=full. I'd appreciate the lease abstract too.",
+            "I'd like you to know I appreciate your help. Please send the updated flyer as well.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertTrue(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    get_default_column_config(),
+                    "Alex",
+                )
+
+                self.assertEqual(expected, body)
+
+    def test_complete_response_rejects_request_after_same_sentence_conjunction(self):
+        expected = (
+            "Hi Alex,\n\n"
+            "Thanks for sending those details over. "
+            "That gives me everything I need for now."
+        )
+
+        for llm_body in (
+            "I need a moment to review this, but please send the lease abstract.",
+            "I'd like you to know I appreciate your help, but I'd like you to send the lease abstract.",
+            "I need a moment to review this and please send the lease abstract.",
+            "I'd like you to know I appreciate your help, and please send the lease abstract.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertTrue(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    get_default_column_config(),
+                    "Alex",
+                )
+
+                self.assertEqual(expected, body)
+
+    def test_complete_response_rejects_bare_request_verbs_after_conjunction(self):
+        config = get_default_column_config()
+        expected = (
+            "Hi Alex,\n\n"
+            "Thanks for sending those details over. "
+            "That gives me everything I need for now."
+        )
+
+        for llm_body in (
+            "I have everything I need, but send me the lease abstract anyway.",
+            "I have everything I need and share the lease abstract too.",
+            "Thanks for everything, but confirm the roof repair date.",
+            "I can review this but send me the lease abstract anyway.",
+            "We could look this over but share the lease abstract too.",
+            "I would review this but confirm the roof repair date.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertEqual(
+                    [],
+                    processing.get_requested_ask_fields(llm_body, config),
+                )
+                self.assertTrue(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    config,
+                    "Alex",
+                )
+
+                self.assertEqual(expected, body)
+
+    def test_complete_response_keeps_benign_same_sentence_conjunctions(self):
+        for llm_body in (
+            "I need a moment to review this and discuss it with my client.",
+            "I need a moment to review this, but I can send a summary afterward.",
+            "I'd like you to know I appreciate your help, and I have everything I need.",
+            "If helpful, I can review and send a summary after our discussion.",
+        ):
+            with self.subTest(llm_body=llm_body):
+                self.assertFalse(
+                    processing._complete_response_requests_more_information(llm_body)
+                )
+                body = processing._select_automatic_response_body(
+                    "complete",
+                    llm_body,
+                    get_default_column_config(),
+                    "Alex",
+                )
+
+                self.assertEqual(llm_body, body)
+
+    def test_complete_request_detector_does_not_change_noncomplete_scenarios(self):
+        llm_body = "I was hoping you could send any alternatives that might fit."
+
+        for scenario in ("nonviable", "nonviable_with_alternative"):
+            with self.subTest(scenario=scenario):
+                body = processing._select_automatic_response_body(
+                    scenario,
+                    llm_body,
+                    get_default_column_config(),
+                    "Alex",
+                )
+
+                self.assertEqual(llm_body, body)
+
+    def test_complete_fallback_log_describes_request_for_more_information(self):
         source = inspect.getsource(processing.process_inbox_message)
         complete_branch = source.split(
             "# Scenario 4: All fields complete - send closing",
@@ -104,10 +346,10 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         )[1].split("sent = send_reply_in_thread", 1)[0]
 
         self.assertIn(
-            "Ignoring LLM response because it requested a configured field after completion",
+            "Ignoring LLM response because it requested more information after completion",
             complete_branch,
         )
-        self.assertNotIn("requested a Note/Skip field", complete_branch)
+        self.assertNotIn("requested a configured field after completion", complete_branch)
 
     def test_missing_field_response_must_reference_requested_detail(self):
         body = "Thanks for the info. Could you also confirm whether the building has rail access?"

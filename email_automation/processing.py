@@ -4513,6 +4513,124 @@ def _automatic_request_field_label(
     return field
 
 
+_COMPLETE_RESPONSE_HTTP_URL_RE = re.compile(
+    r"\bhttps?://[^\s<>()]+",
+    re.IGNORECASE,
+)
+_COMPLETE_RESPONSE_SAFE_RHETORICAL_RE = re.compile(
+    r"\b(?:what more could (?:i|we) ask for|could (?:this|that) have gone any smoother)\?",
+    re.IGNORECASE,
+)
+_COMPLETE_RESPONSE_SAFE_REVIEW_RE = re.compile(
+    r"\b(?:"
+    r"(?:i|we)\s+(?:(?:still|also)\s+)?need\s+(?:"
+    r"to\s+|(?:(?:a\s+little|some\s+more|a|some|more)\s+)?(?:moment|time)\s+to\s+"
+    r")"
+    r"|(?:i|we)(?:\s+would|['\u2019]d)\s+like\s+(?:"
+    r"to\s+|(?:(?:a\s+little|some\s+more|a|some|more)\s+)?(?:moment|time)\s+to\s+"
+    r")"
+    r")"
+    r"(?:review|consider|discuss|look\s+over|go\s+over)\b",
+    re.IGNORECASE,
+)
+_COMPLETE_RESPONSE_NEGATED_NEED_RE = re.compile(
+    r"\b(?:"
+    r"(?:i|we)\s+(?:(?:do|does|did)\s+not\s+need\b|(?:(?:still|also)\s+)?need\s+(?:not|no|nothing|neither)\b)"
+    r"|no\s+need\s+to\b"
+    r")",
+    re.IGNORECASE,
+)
+_COMPLETE_RESPONSE_RECIPIENT_OFFER_RE = re.compile(
+    r"\b(?:please\s+)?let\s+(?:me|us)\s+know\s+if\s+(?:"
+    r"you\s+(?:need|want)\b"
+    r"|you(?:\s+would|['\u2019]d)\s+like\b"
+    r"|(?:i|we)\s+(?:can|could|should|would)\b"
+    r"|there(?:\s+is|['\u2019]s)\s+anything\s+you\s+(?:need|want)\b"
+    r"|there(?:\s+is|['\u2019]s)\s+anything\s+you(?:\s+would|['\u2019]d)\s+like\b"
+    r"|anything\s+(?:comes|changes)\b"
+    r")",
+    re.IGNORECASE,
+)
+_COMPLETE_RESPONSE_SAFE_SPEAKER_COORDINATION_RE = re.compile(
+    r"\b(?:i|we)\s+(?:can|could|may|might|should|will|would)\s+"
+    r"[^.!?;,:\n\u2013\u2014]{0,120}?"
+    r"\band(?=\s+(?:"
+    r"send|share|provide|confirm|clarify|tell|forward|attach|include|supply|verify|check"
+    r")\b)",
+    re.IGNORECASE,
+)
+_COMPLETE_RESPONSE_OUTWARD_REQUEST_RE = re.compile(
+    r"(?:"
+    r"^"
+    r"|[.!?;,:\n\u2013\u2014]\s*"
+    # Only unambiguous request-shaped starters make a conjunction a boundary.
+    r"|\b(?:and|but)\s+(?=(?:"
+    r"(?:please|kindly)\s+"
+    r"|(?:can|could|would|will|may)\s+you\b"
+    r"|(?:do|does|did)\s+you\b"
+    r"|(?:i|we)(?:\s+|['\u2019])"
+    r"|it\s+would\s+be\s+helpful\b"
+    r"|let\s+(?:me|us)\s+know\b"
+    r"|(?:send|share|provide|confirm|clarify|tell|forward|attach|include|supply|verify|check)\b"
+    r"))"
+    r")"
+    r"(?:"
+    r"(?:please|kindly)\s+"
+    r"(?:send|share|provide|confirm|clarify|tell|forward|attach|include|supply|verify|check)\b"
+    r"|(?:can|could|would|will|may)\s+you\b"
+    r"|(?:do|does|did)\s+you\b"
+    r"|(?:send|share|provide|confirm|clarify|tell|forward|attach|include|supply|verify|check)\b"
+    r"|(?:i|we)\s+(?:(?:still|also)\s+)?need\s+(?!nothing\b|no\b)"
+    r"|(?:i|we)(?:\s+would|['\u2019]d)\s+like\s+"
+    r"(?:"
+    r"you\s+to\s+(?:"
+    r"send|share|provide|confirm|clarify|tell|forward|attach|include|supply|verify|check"
+    r"|let\s+(?:me|us)\s+know"
+    r")\b"
+    r"|to\s+(?:know|receive|have|get)\b"
+    r"|(?:the|a|an|some|more)\b"
+    r")"
+    r"|(?:i|we)(?:\s+would|['\u2019]d)\s+appreciate(?:"
+    r"\s+it\s+if\s+you\s+(?:can|could|would|will)\b"
+    r"|\s+(?:receiving|having|getting)\b"
+    r"|\s+(?:the|a|an|some|more)\b"
+    r")"
+    r"|(?:i|we)\s+(?:am|are|was|were)\s+hoping\s+(?:that\s+)?"
+    r"you\s+(?:can|could|would|will|may)\b"
+    r"|(?:i|we)\s+hope\s+(?:that\s+)?you\s+(?:can|could|would|will|may)\b"
+    r"|it\s+would\s+be\s+helpful\s+(?:"
+    r"if\s+you\s+(?:can|could|would|will)\b"
+    r"|to\s+(?:receive|have|get|know|see)\b"
+    r")"
+    r"|(?:please\s+)?let\s+(?:me|us)\s+know\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _mask_complete_response_safe_spans(response_body: str) -> str:
+    """Mask closed terminal-safe phrases without hiding a later real request."""
+    scan = _COMPLETE_RESPONSE_HTTP_URL_RE.sub(
+        lambda match: match.group(0).replace("?", "_"),
+        response_body,
+    )
+    scan = _COMPLETE_RESPONSE_SAFE_RHETORICAL_RE.sub("acknowledged.", scan)
+    for safe_pattern in (
+        _COMPLETE_RESPONSE_SAFE_REVIEW_RE,
+        _COMPLETE_RESPONSE_NEGATED_NEED_RE,
+        _COMPLETE_RESPONSE_RECIPIENT_OFFER_RE,
+        _COMPLETE_RESPONSE_SAFE_SPEAKER_COORDINATION_RE,
+    ):
+        scan = safe_pattern.sub("acknowledged", scan)
+    return scan
+
+
+def _complete_response_requests_more_information(response_body: Optional[str]) -> bool:
+    """Reject questions and recipient-directed requests from terminal copy."""
+    scan = _mask_complete_response_safe_spans(str(response_body or ""))
+    return "?" in scan or bool(_COMPLETE_RESPONSE_OUTWARD_REQUEST_RE.search(scan))
+
+
 def _select_automatic_response_body(
     scenario: str,
     llm_response_email: Optional[str],
@@ -4546,7 +4664,10 @@ Thanks for the details. When you have a moment, could you also confirm:
         )
         and (
             scenario != "complete"
-            or not get_requested_ask_fields(llm_response_email, column_config)
+            or (
+                not _complete_response_requests_more_information(llm_response_email)
+                and not get_requested_ask_fields(llm_response_email, column_config)
+            )
         )
     ):
         return llm_response_email
@@ -8343,7 +8464,7 @@ Could you please provide your phone number so I can give you a call?"""
                             if response_body == llm_response_email:
                                 print(f"🤖 Using LLM-generated response for all fields complete scenario")
                             elif llm_response_email:
-                                print("⚠️ Ignoring LLM response because it requested a configured field after completion")
+                                print("⚠️ Ignoring LLM response because it requested more information after completion")
 
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:
