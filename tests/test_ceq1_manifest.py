@@ -381,6 +381,126 @@ class Ceq1BoundaryTests(unittest.TestCase):
             self.assertNotEqual(0, blocked.returncode)
             self.assertIn("input file", blocked.stderr)
 
+    def test_real_trampoline_rejects_symlinked_entries_and_manifest_hash_drift(self):
+        for relative in (
+            "scripts/verify_ceq1_entry.pl",
+            "scripts/bootstrap_ceq1_runtime.py",
+            "scripts/run_ceq1_env.py",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tmp:
+                root, verifier_hash, input_hash = self._synthetic_verifier_root(
+                    Path(tmp).resolve()
+                )
+                target = root / relative
+                alternate = target.with_name(f"{target.name}.reviewed-copy")
+                alternate.write_bytes(target.read_bytes())
+                target.unlink()
+                os.symlink(alternate.name, target)
+                result = subprocess.run(
+                    [
+                        "/usr/bin/perl",
+                        "-MDigest::SHA=sha256_hex",
+                        "-MFcntl=:DEFAULT",
+                        "-e",
+                        PERL_TRAMPOLINE,
+                        "scripts/verify_ceq1_entry.pl",
+                        verifier_hash,
+                        "bootstrap",
+                        input_hash,
+                        "--",
+                        "prepare",
+                    ],
+                    cwd=root,
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(0, result.returncode)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, verifier_hash, _input_hash = self._synthetic_verifier_root(
+                Path(tmp).resolve()
+            )
+            result = subprocess.run(
+                [
+                    "/usr/bin/perl",
+                    "-MDigest::SHA=sha256_hex",
+                    "-MFcntl=:DEFAULT",
+                    "-e",
+                    PERL_TRAMPOLINE,
+                    "scripts/verify_ceq1_entry.pl",
+                    verifier_hash,
+                    "bootstrap",
+                    "0" * 64,
+                    "--",
+                    "prepare",
+                ],
+                cwd=root,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(0, result.returncode)
+
+    def test_real_run_verifier_rejects_output_manifest_hash_drift_before_wrapper(self):
+        verifier = REPO_ROOT / "scripts/verify_ceq1_entry.pl"
+        input_manifest = REPO_ROOT / "docs/release-safety/ceq1-input-manifest.json"
+        result = subprocess.run(
+            [
+                "/usr/bin/perl",
+                "-MDigest::SHA=sha256_hex",
+                "-MFcntl=:DEFAULT",
+                "-e",
+                PERL_TRAMPOLINE,
+                "scripts/verify_ceq1_entry.pl",
+                _sha256(verifier.read_bytes()),
+                "run",
+                _sha256(input_manifest.read_bytes()),
+                "0" * 64,
+                "--",
+                "./.ceq1-venv/python/bin/python3.12",
+                "-I",
+                "-S",
+                "-B",
+                "scripts/run_ceq1_env.py",
+                "--inspect-runtime",
+            ],
+            cwd=REPO_ROOT,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("environmentKeys", result.stdout)
+
+    def test_plan_canonical_commands_have_no_direct_bootstrap_or_wrapper_bypass(self):
+        plan = (
+            REPO_ROOT
+            / "docs/superpowers/plans/2026-08-13-ceq1-conversation-extraction-qualification.md"
+        ).read_text(encoding="utf-8")
+        lines = plan.splitlines()
+        wrapper_lines = [
+            index
+            for index, line in enumerate(lines)
+            if line.lstrip().startswith("./.ceq1-venv/python/bin/python3.12 ")
+            and "scripts/run_ceq1_env.py" in line
+        ]
+        self.assertEqual(13, len(wrapper_lines))
+        for index in wrapper_lines:
+            command_prefix = "\n".join(lines[max(0, index - 12) : index + 1])
+            self.assertIn("/usr/bin/perl -MDigest::SHA=sha256_hex", command_prefix)
+            self.assertIn("scripts/verify_ceq1_entry.pl", command_prefix)
+            self.assertIn(" run ", command_prefix)
+        self.assertEqual(14, plan.count("/usr/bin/perl -MDigest::SHA=sha256_hex"))
+        self.assertNotRegex(
+            plan,
+            r"python(?:3(?:\.12)?)?\s+scripts/bootstrap_ceq1_runtime\.py\s+"
+            r"(?:prepare|derive-review-candidate)",
+        )
+
 
 class Ceq1WheelBuilderTests(unittest.TestCase):
     @classmethod
@@ -859,6 +979,9 @@ class Ceq1BootstrapTests(unittest.TestCase):
             cache_values = [item for item in command if item.startswith("UV_CACHE_DIR=")]
             self.assertEqual(1, len(cache_values))
             self.assertIn(".ceq1-runtime/bootstrap/uv-cache", cache_values[0])
+        self.assertTrue(
+            all(str(self.bootstrap.UV_CACHE) not in item for command in commands for item in command)
+        )
         for builder in (commands[1], commands[2]):
             cache_root = builder[builder.index("--cache-root") + 1]
             self.assertTrue(cache_root.endswith("/.ceq1-runtime/bootstrap/uv-cache"))
@@ -1112,6 +1235,73 @@ class Ceq1BootstrapTests(unittest.TestCase):
                 0o644,
                 stat.S_IMODE((destination / payload.relative_to(source)).stat().st_mode),
             )
+
+    def test_task_cache_clone_refuses_preexisting_or_symlinked_destination(self):
+        for kind in ("directory", "symlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                source = root / "source-cache"
+                source.mkdir()
+                _set_fixture_modes(source)
+                destination = root / "task-cache"
+                if kind == "directory":
+                    destination.mkdir()
+                else:
+                    outside = root / "outside"
+                    outside.mkdir()
+                    os.symlink(outside, destination)
+                with self.assertRaisesRegex(
+                    self.bootstrap.BootstrapBlocked,
+                    "destination already exists",
+                ):
+                    self.bootstrap.clone_cache_to_task(
+                        source,
+                        destination,
+                        self.bootstrap.cache_identity_receipt(source),
+                        self.bootstrap.cache_logical_receipt(source),
+                    )
+
+    def test_real_denied_python_cache_link_is_blocked_by_canonical_seatbelt(self):
+        with tempfile.TemporaryDirectory(
+            dir=REPO_ROOT / ".ceq1-runtime",
+            prefix="denied-link-test-",
+        ) as tmp:
+            cache = Path(tmp) / "cache"
+            link = cache / "archive-v0/example/bin/python"
+            link.parent.mkdir(parents=True)
+            denied_target = (
+                self.bootstrap.UV_PYTHON_STORE
+                / "cpython-3.11.15-macos-aarch64-none/bin/python3.11"
+            )
+            self.assertTrue(denied_target.is_file())
+            os.symlink(denied_target, link)
+            profile, _ = self.bootstrap.render_bootstrap_profile(REPO_ROOT)
+            probe = (
+                "import importlib.util,sys;"
+                f"p={str(REPO_ROOT / 'scripts/bootstrap_ceq1_runtime.py')!r};"
+                "s=importlib.util.spec_from_file_location('ceq1_denied_link_probe',p);"
+                "m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;"
+                f"s.loader.exec_module(m);m.prove_denied_cache_link_targets(m.Path({str(cache)!r}))"
+            )
+            result = subprocess.run(
+                [
+                    "/usr/bin/sandbox-exec",
+                    "-p",
+                    profile,
+                    str(PINNED_PYTHON),
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    probe,
+                ],
+                cwd=REPO_ROOT,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
 
     def test_task_cache_clone_rejects_swap_restore_before_open(self):
         for kind in ("directory", "file"):
@@ -1458,6 +1648,32 @@ class Ceq1BootstrapTests(unittest.TestCase):
             ],
             call_sites,
         )
+
+    def test_tree_receipt_detects_byte_mode_path_and_symlink_target_mutation(self):
+        for mutation in ("byte", "mode", "path", "symlink-target"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve() / "runtime"
+                root.mkdir()
+                first = root / "first.py"
+                second = root / "second.py"
+                first.write_bytes(b"FIRST = 1\n")
+                second.write_bytes(b"SECOND = 2\n")
+                first.chmod(0o644)
+                second.chmod(0o644)
+                link = root / "python"
+                os.symlink("first.py", link)
+                baseline = self.bootstrap.tree_receipt(root)
+                if mutation == "byte":
+                    first.write_bytes(b"FIRST = 9\n")
+                    first.chmod(0o644)
+                elif mutation == "mode":
+                    first.chmod(0o600)
+                elif mutation == "path":
+                    first.rename(root / "renamed.py")
+                else:
+                    link.unlink()
+                    os.symlink("second.py", link)
+                self.assertNotEqual(baseline, self.bootstrap.tree_receipt(root))
 
     def test_static_input_validation_hashes_builder_before_import(self):
         events: list[str] = []
