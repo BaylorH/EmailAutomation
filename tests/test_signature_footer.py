@@ -283,8 +283,12 @@ class SignatureFooterTests(unittest.TestCase):
         cases = [
             ("Everything I needed—I’ll follow up.", "Everything I needed - I'll follow up."),
             ("Everything I needed–I’ll follow up.", "Everything I needed - I'll follow up."),
+            ("Everything I needed―I’ll follow up.", "Everything I needed - I'll follow up."),
             ("Everything I needed — I’ll follow up.", "Everything I needed - I'll follow up."),
             ("A well-known property", "A well-known property"),
+            ("Open 9–5", "Open 9-5"),
+            ("Phoenix–Tucson", "Phoenix-Tucson"),
+            ("  — first item", "  - first item"),
         ]
 
         for source, expected in cases:
