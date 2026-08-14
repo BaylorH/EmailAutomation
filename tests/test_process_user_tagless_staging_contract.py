@@ -23,7 +23,7 @@ SHA = "1234567890abcdef1234567890abcdef12345678"
 SHORT_SHA = SHA[:12]
 REVISION_SUFFIX = f"stage-{SHORT_SHA}"
 CANDIDATE_REVISION = f"{SERVICE}-{REVISION_SUFFIX}"
-OLD_REVISION = "process-user-stage-11b86417590f"
+OLD_REVISION = "process-user-stage-4a21c93d7bbb"
 OTHER_REVISION = "process-user-00096-old"
 TAG = (
     "us-central1-docker.pkg.dev/email-automation-cache/"

@@ -18,11 +18,11 @@ sys.modules[SPEC.name] = phase1_rollout
 SPEC.loader.exec_module(phase1_rollout)
 
 
-OLD_REVISION = "process-user-stage-11b86417590f"
+OLD_REVISION = "process-user-stage-4a21c93d7bbb"
 CANDIDATE = "process-user-stage-1234567890ab"
 OLD_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
-    "process-user@sha256:8f2c6157c23ef77bfbb2dcd02809d8a97403d4d6114c33f605559c8f6263d001"
+    "process-user@sha256:64dbcfd0e35fdb518f6567151f343511d39345106aeea8238e7d256e8fd40403"
 )
 CANDIDATE_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
@@ -301,10 +301,11 @@ class FakeOps:
 
 class ValidatorTests(unittest.TestCase):
     def test_controller_pins_current_promoted_production_baseline(self):
-        self.assertEqual("process-user-stage-11b86417590f", phase1_rollout.OLD_REVISION)
+        self.assertEqual("fix/terminal-no-reask-20260814", phase1_rollout.BRANCH)
+        self.assertEqual("process-user-stage-4a21c93d7bbb", phase1_rollout.OLD_REVISION)
         self.assertEqual(
             "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
-            "process-user@sha256:8f2c6157c23ef77bfbb2dcd02809d8a97403d4d6114c33f605559c8f6263d001",
+            "process-user@sha256:64dbcfd0e35fdb518f6567151f343511d39345106aeea8238e7d256e8fd40403",
             phase1_rollout.OLD_IMAGE,
         )
 
@@ -473,7 +474,7 @@ class StateMachineTests(unittest.TestCase):
         self.assertIn("preflight", ops.events)
         self.assertIn("prerequisites", ops.events)
         self.assertIn("service-access", ops.events)
-        self.assertIn("revision:process-user-stage-11b86417590f", ops.events)
+        self.assertIn("revision:process-user-stage-4a21c93d7bbb", ops.events)
         self.assertIn("tasks", ops.events)
         self.assertNotIn("artifact", ops.events)
         self.assertNotIn(f"revision:{CANDIDATE}", ops.events)

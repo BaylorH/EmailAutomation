@@ -33,15 +33,15 @@ PROJECT_NUMBER = "248289505828"
 REGION = "us-central1"
 SERVICE = "process-user"
 QUEUE = "graph-process-user"
-BRANCH = "codex/policy-blocked-reply-review-release-20260812"
+BRANCH = "fix/terminal-no-reask-20260814"
 IMAGE_REPOSITORY = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     "cloud-run-source-deploy/process-user"
 )
-OLD_REVISION = "process-user-stage-11b86417590f"
+OLD_REVISION = "process-user-stage-4a21c93d7bbb"
 OLD_IMAGE = (
     IMAGE_REPOSITORY
-    + "@sha256:8f2c6157c23ef77bfbb2dcd02809d8a97403d4d6114c33f605559c8f6263d001"
+    + "@sha256:64dbcfd0e35fdb518f6567151f343511d39345106aeea8238e7d256e8fd40403"
 )
 RULES_HASH = "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
 HOSTING_VERSION = "33dd8acbe4e909c8"
