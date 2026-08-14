@@ -103,6 +103,61 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertNotIn("Docks", selected)
         self.assertNotIn("Ceiling Ht", selected)
 
+    def test_runtime_missing_field_labels_remain_guard_recognizable(self):
+        cases = (
+            ("total_sf", "Total SF", "Total available square footage"),
+            ("rent_sf_yr", "Rent/SF /Yr", "Asking rent per SF per year"),
+            ("ops_ex_sf", "Ops Ex /SF", "Operating expenses (NNN/CAM) per SF per year"),
+            ("drive_ins", "Drive Ins", "Number of drive-in doors"),
+            ("docks", "Docks", "Number of dock-high doors"),
+            ("ceiling_ht", "Ceiling Ht", "Clear height"),
+            ("power", "Power", "Electrical service (amps/voltage/phase)"),
+        )
+
+        for canonical, header, expected_label in cases:
+            with self.subTest(canonical=canonical):
+                config = get_default_column_config()
+                config["mappings"][canonical] = header
+                body = processing._select_automatic_response_body(
+                    "missing_fields",
+                    None,
+                    config,
+                    "Baylor",
+                    missing_fields=[header],
+                )
+                self.assertEqual(
+                    [expected_label],
+                    [line[2:] for line in body.splitlines() if line.startswith("- ")],
+                )
+                self.assertEqual(
+                    [header],
+                    processing.get_requested_ask_fields(body, config),
+                )
+                self.assertTrue(processing._response_mentions_missing_fields(
+                    body,
+                    [header],
+                    config,
+                ))
+
+        custom_config = get_default_column_config()
+        custom_config["customFields"]["Rail Access"] = {
+            "mode": "ask_required",
+            "description": "Rail-service availability",
+        }
+        custom_body = processing._select_automatic_response_body(
+            "missing_fields",
+            None,
+            custom_config,
+            "Baylor",
+            missing_fields=["Rail Access"],
+        )
+        self.assertIn("\n- Rail Access", custom_body)
+        self.assertTrue(processing._response_mentions_missing_fields(
+            custom_body,
+            ["Rail Access"],
+            custom_config,
+        ))
+
     def test_all_info_close_event_requires_complete_required_fields(self):
         event = {"type": "close_conversation", "notes": "all_info_gathered"}
 
