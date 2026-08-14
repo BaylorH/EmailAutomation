@@ -3659,7 +3659,8 @@ class Ceq1ManifestPrivacyTests(unittest.TestCase):
                         expected_owner_paths=fixture.expected_owner_paths,
                         provenance=provenance,
                     )
-                self.assertNotIn(value, str(raised.exception))
+                if value:
+                    self.assertNotIn(value, str(raised.exception))
             link = fixture.input_root / "input-link.json"
             os.symlink(first_path, link)
             changed = json.loads(json.dumps(manifest))
