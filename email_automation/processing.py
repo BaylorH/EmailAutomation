@@ -4485,6 +4485,34 @@ def _response_mentions_missing_fields(
     )
 
 
+_AUTOMATIC_REQUEST_FIELD_LABELS = {
+    "total_sf": "Total available square footage",
+    "rent_sf_yr": "Asking rent per SF per year",
+    "ops_ex_sf": "Operating expenses (NNN/CAM) per SF per year",
+    "drive_ins": "Number of drive-in doors",
+    "docks": "Number of dock-high doors",
+    "ceiling_ht": "Clear height",
+    "power": "Electrical service (amps/voltage/phase)",
+}
+
+
+def _automatic_request_field_label(
+    field: str,
+    column_config: Optional[dict],
+) -> str:
+    """Return broker-friendly copy for a configured canonical sheet header."""
+    mappings = (
+        column_config.get("mappings", {})
+        if isinstance(column_config, dict)
+        else {}
+    )
+    normalized_field = _normalize_request_field_name(field)
+    for canonical, configured_header in mappings.items():
+        if _normalize_request_field_name(configured_header) == normalized_field:
+            return _AUTOMATIC_REQUEST_FIELD_LABELS.get(canonical, field)
+    return field
+
+
 def _select_automatic_response_body(
     scenario: str,
     llm_response_email: Optional[str],
@@ -4498,12 +4526,13 @@ def _select_automatic_response_body(
         if not missing_fields:
             raise ValueError("missing_fields scenario requires authoritative fields")
         greeting = _build_greeting(contact_name)
-        field_list = "\n".join(f"- {field}" for field in missing_fields)
+        field_list = "\n".join(
+            f"- {_automatic_request_field_label(field, column_config)}"
+            for field in missing_fields
+        )
         return f"""{greeting}
 
-Thank you for the information!
-
-To complete the property details, could you please provide:
+Thanks for the details. When you have a moment, could you also confirm:
 
 {field_list}"""
 
