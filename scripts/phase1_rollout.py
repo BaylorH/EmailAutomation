@@ -33,21 +33,21 @@ PROJECT_NUMBER = "248289505828"
 REGION = "us-central1"
 SERVICE = "process-user"
 QUEUE = "graph-process-user"
-BRANCH = "fix/terminal-complete-no-followup-20260814"
+BRANCH = "fix/manual-paused-reply-item-scope-20260815"
 IMAGE_REPOSITORY = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     "cloud-run-source-deploy/process-user"
 )
-OLD_REVISION = "process-user-stage-b78ed3b27467"
+OLD_REVISION = "process-user-stage-48c7381cea2a"
 OLD_IMAGE = (
     IMAGE_REPOSITORY
-    + "@sha256:cc83f4743f4d82f60cd4b26eab9ae2ef6c0abbfa0faf2873e574e4539977d195"
+    + "@sha256:b3631cc28129aa2dc70dc68c22c6774b89781700dc78b32810c51d8d320cdfbb"
 )
 RULES_HASH = "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
-HOSTING_VERSION = "33dd8acbe4e909c8"
-INDEX_HASH = "687c3f827d2cb7f797b7a9aaf286dc3ed4d8137c4d47ad378f171dfa4eab6f15"
-JS_PATH = "static/js/main.96bc0645.js"
-JS_HASH = "20db7edcde967438955b85cd071203a1e2531175ee098b1c37efda42b32dd19b"
+HOSTING_VERSION = "a3758fb175d427f5"
+INDEX_HASH = "33a041852c11a578b5d4836c64e76b7208afbbf20ccac2208d1b2fc10e0182c0"
+JS_PATH = "static/js/main.e628d195.js"
+JS_HASH = "7858189175c50bed17581c6f206988a6ba5918dbaab636b2ea2673f43de73ea9"
 CSS_PATH = "static/css/main.aad5f62b.css"
 CSS_HASH = "43bd2f02d0f3de9ba18fce0c638b94b0e84c9f7a13542f3b3747a90736a54d22"
 DOMAINS = ("email-automation-cache.web.app", "sitesiftai.com")

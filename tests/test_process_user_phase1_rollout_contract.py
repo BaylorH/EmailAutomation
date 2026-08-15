@@ -18,11 +18,11 @@ sys.modules[SPEC.name] = phase1_rollout
 SPEC.loader.exec_module(phase1_rollout)
 
 
-OLD_REVISION = "process-user-stage-b78ed3b27467"
+OLD_REVISION = "process-user-stage-48c7381cea2a"
 CANDIDATE = "process-user-stage-1234567890ab"
 OLD_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
-    "process-user@sha256:cc83f4743f4d82f60cd4b26eab9ae2ef6c0abbfa0faf2873e574e4539977d195"
+    "process-user@sha256:b3631cc28129aa2dc70dc68c22c6774b89781700dc78b32810c51d8d320cdfbb"
 )
 CANDIDATE_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
@@ -301,13 +301,43 @@ class FakeOps:
 
 class ValidatorTests(unittest.TestCase):
     def test_controller_pins_current_promoted_production_baseline(self):
-        self.assertEqual("fix/terminal-complete-no-followup-20260814", phase1_rollout.BRANCH)
-        self.assertEqual("process-user-stage-b78ed3b27467", phase1_rollout.OLD_REVISION)
-        self.assertEqual(
-            "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
-            "process-user@sha256:cc83f4743f4d82f60cd4b26eab9ae2ef6c0abbfa0faf2873e574e4539977d195",
-            phase1_rollout.OLD_IMAGE,
-        )
+        expected = {
+            "branch": "fix/manual-paused-reply-item-scope-20260815",
+            "old revision": OLD_REVISION,
+            "old image": OLD_IMAGE,
+            "rules hash": (
+                "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
+            ),
+            "hosting version": "a3758fb175d427f5",
+            "index hash": (
+                "33a041852c11a578b5d4836c64e76b7208afbbf20ccac2208d1b2fc10e0182c0"
+            ),
+            "JavaScript path": "static/js/main.e628d195.js",
+            "JavaScript hash": (
+                "7858189175c50bed17581c6f206988a6ba5918dbaab636b2ea2673f43de73ea9"
+            ),
+            "stylesheet path": "static/css/main.aad5f62b.css",
+            "stylesheet hash": (
+                "43bd2f02d0f3de9ba18fce0c638b94b0e84c9f7a13542f3b3747a90736a54d22"
+            ),
+            "auxiliary tags": AUX_TAGS,
+        }
+        observed = {
+            "branch": phase1_rollout.BRANCH,
+            "old revision": phase1_rollout.OLD_REVISION,
+            "old image": phase1_rollout.OLD_IMAGE,
+            "rules hash": phase1_rollout.RULES_HASH,
+            "hosting version": phase1_rollout.HOSTING_VERSION,
+            "index hash": phase1_rollout.INDEX_HASH,
+            "JavaScript path": phase1_rollout.JS_PATH,
+            "JavaScript hash": phase1_rollout.JS_HASH,
+            "stylesheet path": phase1_rollout.CSS_PATH,
+            "stylesheet hash": phase1_rollout.CSS_HASH,
+            "auxiliary tags": phase1_rollout.AUX_TAGS,
+        }
+        for field, value in expected.items():
+            with self.subTest(field=field):
+                self.assertEqual(value, observed[field])
 
     def test_baseline_topology_accepts_exact_auxiliary_tags(self):
         topology = phase1_rollout.validate_topology(

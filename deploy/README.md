@@ -22,8 +22,8 @@ service-account JSON to `$RUNNER_TEMP/sa.json`).
 |------|---------|
 | `../Dockerfile` | Container image: `python:3.12-slim`, installs `requirements.txt`, non-root `appuser`, entrypoint `python main.py`. |
 | `cloudrun-job.yaml` | Cloud Run Job spec — task timeout, service-account placeholder, env vars (parameterized bucket + launch-safety scope), Secret Manager references. |
-| `cloudrun-service.yaml` | **Phase-1 webhook** Cloud Run *Service* spec — same image, gunicorn entrypoint serving `service.py` (`POST /process-user`), per-user lease, `PROCESS_USER_AUTH` gate. |
-| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user` plus exact legacy `/health` and `/healthz`. |
+| `cloudrun-service.yaml` | **Phase-1 webhook** Cloud Run *Service* spec — same image, gunicorn entrypoint serving `service.py` (`POST /process-user` and transport-only `POST /process-outbox`), per-user lease, `PROCESS_USER_AUTH` gate. |
+| `../service.py` | HTTP entrypoint: routes the per-user pipeline and one exact outbox document behind `run_with_user_lease`, plus `/health` and `/healthz`. |
 | `../email_automation/app_config.py` | `FIREBASE_BUCKET` now reads env, defaults to historical value. |
 | `../firebase_helpers.py` | Same env parameterization on the bucket that actually drives the token-cache round-trip. |
 | `../main.py` | SIGTERM→`sys.exit` bridge so the atexit token-cache upload runs on container shutdown. |
@@ -187,12 +187,15 @@ predecessor, not a broken trigger.
 
 ## Phase-1 webhook (Cloud Run Service) — `cloudrun-service.yaml`
 
-Alongside the batch JOB, `service.py` exposes the **same per-user pipeline** as an
-HTTP endpoint so a queue (Cloud Tasks) can drive one user per request instead of
-cron-scanning all users. FUNCTIONALITY-NEUTRAL: the endpoint calls
-`main.refresh_and_process_user(uid)` unchanged, wrapped in a **per-user lease**
-(`schedulerLeases/emailAutomation:{uid}`, TTL 600s / 10 min — see
-`scheduler_lease.DEFAULT_USER_LEASE_TTL_SECONDS`). The global batch lease
+Alongside the batch JOB, `service.py` exposes two bounded HTTP entrypoints under
+the same **per-user lease** (`schedulerLeases/emailAutomation:{uid}`, TTL 600s /
+10 min — see `scheduler_lease.DEFAULT_USER_LEASE_TTL_SECONDS`). `/process-user`
+is the functionality-neutral transport for `main.refresh_and_process_user(uid)`.
+`/process-outbox` reads only the exact requested outbox document and never enters
+the per-user pipeline, acquires mailbox credentials, scans a mailbox, or sends.
+Its only mutation is cancellation: after re-reading the exact manual item and
+linked action audit in one Firestore transaction, it deletes that outbox item and
+marks the linked audit cancelled atomically. The global batch lease
 (`schedulerLeases/emailAutomation`, 45-min TTL) and `run_with_scheduler_lease`
 are untouched; the two lease families never share a doc.
 
@@ -201,12 +204,14 @@ Contract:
 | Route | Request | Response |
 |-------|---------|----------|
 | `POST /process-user` | JSON `{"uid": "<firebase-uid>"}` | `200 {"status":"processed"}` ran · `503 {"status":"skipped_locked"}` same-uid already running (Cloud Tasks retries) · `400` missing/blank uid or non-JSON · `401` auth required + missing/wrong secret · `500 {"error":...}` pipeline raised (Cloud Tasks retries) |
+| `POST /process-outbox` | Exactly JSON `{"uid":"<firebase-uid>","outboxId":"<document-id>"}` with no extra keys or padded/unsafe IDs | Status-only body: `200 {"status":"manual_ready"}` for a reviewed later sender task, `200 {"status":"cancelled"}` after exact atomic cancellation, `200` `not_found`/`blocked_*` fail-closed outcomes, `503 {"status":"skipped_locked"}` retryable lease conflict, `400` invalid request, `401` unauthorized, or sanitized retryable `500` |
 | `GET /health` | — | `200` (never auth-gated; use this for external Cloud Run canaries because Cloud Run reserves some paths ending in `z`) |
 | `GET /healthz` | — | `200` legacy/local alias |
 
 **Auth.** Optional in-app shared secret via `PROCESS_USER_AUTH`; when set, requests
-must send it as `Authorization: Bearer <secret>` or `X-Process-User-Auth: <secret>`
-(constant-time compare). When unset the endpoint is open — rely on Cloud Run IAM.
+to either POST route must send it as `Authorization: Bearer <secret>` or
+`X-Process-User-Auth: <secret>` (constant-time compare). When unset the endpoint
+is open — rely on Cloud Run IAM.
 **TODO(auth):** real OIDC ID-token verification for the Cloud Tasks→Cloud Run
 invoker is deferred to the platform layer (deploy the service with "require
 authentication" and give Cloud Tasks an OIDC token whose audience is the service
@@ -221,10 +226,12 @@ gcloud run services replace deploy/cloudrun-service.yaml --region "$REGION"
 ```
 
 Pinned by `tests/test_ws_b_cloudrun_service_spec.py` (gunicorn entrypoint, request
-timeout <= user-lease TTL, secret gate wired, ADC only, no batch scope trio) and
-`tests/test_user_lease.py` + `tests/test_process_user_service.py` (lease + HTTP
-contract). **Not built/pushed/deployed** in this environment (same hard rule as
-the job scaffold).
+timeout <= user-lease TTL, secret gate wired, ADC only, no batch scope trio),
+`tests/test_user_lease.py`, `tests/test_process_user_service.py`, and
+`tests/test_process_outbox_item_scope.py` (lease, exact-item, cancellation, and
+HTTP contracts). The service is live; production releases must use the bounded
+tagless staging and closed promotion controllers below, not the scaffold replace
+command above.
 
 ## Verified vs Unverified (honest gaps)
 
@@ -293,9 +300,9 @@ readback prove all of the following:
 
 This script does not pause or resume a queue, mutate traffic, create a temporary
 certification tag, promote a revision, or execute rollback. Those are separate
-bounded rollout steps. Both global campaign switches must remain false, and
-staging must not call `POST /process-user` or perform a provider or mailbox
-canary.
+bounded rollout steps. Both global campaign switches must remain false. Neither
+dry-run nor staging may call `POST /process-user`, call `POST /process-outbox`,
+or perform a provider or mailbox canary.
 
 ### Closed Phase 1 promotion controller
 
@@ -380,8 +387,9 @@ have changed, and resumes only after the old topology, digest, health, private
 IAM, false switches, and empty task list are proven. An observed task is sticky
 and leaves the queue paused. If queue state itself cannot be proved, the command
 reports `MANUAL_RECOVERY: queue state unverified` instead of claiming
-containment. Neither mode invokes the worker route, changes campaign switches,
-or performs a provider/mailbox canary.
+containment. Dry-run, prerequisite verification, promotion, and recovery never
+invoke `POST /process-user` or `POST /process-outbox`, change campaign switches,
+or perform a provider/mailbox canary.
 
 ### Prove rollback and guaranteed Release A restoration
 
