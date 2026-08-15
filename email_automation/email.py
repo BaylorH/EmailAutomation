@@ -2755,8 +2755,8 @@ def _delete_cancelled_outbox_item_if_needed(
     return True
 
 
-def _exact_outbox_result(status: str, user_id: str, outbox_id: str) -> Dict[str, str]:
-    return {"status": status, "uid": user_id, "outboxId": outbox_id}
+def _exact_outbox_result(status: str) -> Dict[str, str]:
+    return {"status": status}
 
 
 def _is_exact_manual_inline_reply(data: Dict[str, Any]) -> bool:
@@ -2867,17 +2867,17 @@ def process_outbox_item(user_id: str, outbox_id: str) -> Dict[str, str]:
     )
     snapshot = doc_ref.get()
     if not snapshot.exists:
-        return _exact_outbox_result("not_found", user_id, outbox_id)
+        return _exact_outbox_result("not_found")
 
     data = snapshot.to_dict() or {}
     if not _is_exact_manual_inline_reply(data):
-        return _exact_outbox_result("blocked_non_manual", user_id, outbox_id)
+        return _exact_outbox_result("blocked_non_manual")
 
     if _is_cancelled_outbox_item(data):
         status = _cancel_exact_outbox_item_transactionally(user_id, doc_ref)
-        return _exact_outbox_result(status, user_id, outbox_id)
+        return _exact_outbox_result(status)
 
-    return _exact_outbox_result("manual_ready", user_id, outbox_id)
+    return _exact_outbox_result("manual_ready")
 
 
 def _must_process_outbox_item_individually(data: Dict[str, Any]) -> bool:

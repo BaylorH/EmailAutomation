@@ -167,11 +167,16 @@ class ProcessOutboxMainScopeTests(unittest.TestCase):
         processor = getattr(main, "process_outbox_item", None)
         self.assertTrue(callable(processor), "main.process_outbox_item is missing")
 
-        expected = {"status": "manual_ready", "uid": "uid-1", "outboxId": "outbox-1"}
+        downstream = {
+            "status": "manual_ready",
+            "uid": "must-not-escape",
+            "outboxId": "must-not-escape",
+            "internal": {"must": "not escape"},
+        }
         with patch.object(
             main,
             "process_exact_outbox_item",
-            return_value=expected,
+            return_value=downstream,
             create=True,
         ) as process_exact, \
                 patch.object(main, "send_outboxes") as send_outboxes, \
@@ -183,7 +188,7 @@ class ProcessOutboxMainScopeTests(unittest.TestCase):
                 patch.object(main, "ConfidentialClientApplication") as msal:
             result = processor("uid-1", "outbox-1")
 
-        self.assertEqual(expected, result)
+        self.assertEqual({"status": "manual_ready"}, result)
         process_exact.assert_called_once_with("uid-1", "outbox-1")
         send_outboxes.assert_not_called()
         scan_inbox.assert_not_called()
@@ -208,7 +213,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
             result = self._processor()("uid-1", "outbox-1")
 
         self.assertEqual(
-            {"status": "manual_ready", "uid": "uid-1", "outboxId": "outbox-1"},
+            {"status": "manual_ready"},
             result,
         )
         self.assertEqual([_outbox_path()], fake_fs.direct_reads)
@@ -226,7 +231,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
             result = self._processor()("uid-1", "outbox-1")
 
         self.assertEqual(
-            {"status": "blocked_non_manual", "uid": "uid-1", "outboxId": "outbox-1"},
+            {"status": "blocked_non_manual"},
             result,
         )
         self.assertIn(_outbox_path(), fake_fs.documents)
@@ -251,7 +256,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                 fake_fs.documents[_outbox_path()] = data
                 with patch("email_automation.clients._fs", fake_fs):
                     result = self._processor()("uid-1", "outbox-1")
-                self.assertEqual("blocked_non_manual", result["status"])
+                self.assertEqual({"status": "blocked_non_manual"}, result)
                 self.assertIn(_outbox_path(), fake_fs.documents)
                 self.assertEqual(0, fake_fs.committed_transactions)
 
@@ -262,7 +267,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
             result = self._processor()("uid-1", "missing")
 
         self.assertEqual(
-            {"status": "not_found", "uid": "uid-1", "outboxId": "missing"},
+            {"status": "not_found"},
             result,
         )
         self.assertEqual([_outbox_path(outbox_id="missing")], fake_fs.direct_reads)
@@ -280,7 +285,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
             result = self._processor()("uid-1", "outbox-1")
 
         self.assertEqual(
-            {"status": "cancelled", "uid": "uid-1", "outboxId": "outbox-1"},
+            {"status": "cancelled"},
             result,
         )
         self.assertNotIn(_outbox_path(), fake_fs.documents)
@@ -328,7 +333,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                 patch.object(email_module.firestore, "transactional", fake_transactional):
             result = self._processor()("uid-1", "outbox-1")
 
-        self.assertEqual("blocked_missing_action_audit", result["status"])
+        self.assertEqual({"status": "blocked_missing_action_audit"}, result)
         self.assertEqual(original_outbox, fake_fs.documents[_outbox_path()])
         self.assertEqual(0, fake_fs.committed_transactions)
 
@@ -347,7 +352,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                         patch.object(email_module.firestore, "transactional", fake_transactional):
                     result = self._processor()("uid-1", "outbox-1")
 
-                self.assertEqual("blocked_invalid_action_audit", result["status"])
+                self.assertEqual({"status": "blocked_invalid_action_audit"}, result)
                 self.assertEqual(original_outbox, fake_fs.documents[_outbox_path()])
                 self.assertEqual(0, fake_fs.committed_transactions)
 
@@ -366,7 +371,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                 patch.object(email_module.firestore, "transactional", fake_transactional):
             result = self._processor()("uid-1", "outbox-1")
 
-        self.assertEqual("blocked_invalid_action_audit", result["status"])
+        self.assertEqual({"status": "blocked_invalid_action_audit"}, result)
         self.assertEqual(original_outbox, fake_fs.documents[_outbox_path()])
         self.assertEqual(original_audit, fake_fs.documents[_audit_path()])
         self.assertEqual([_outbox_path()], fake_fs.transaction_reads)
@@ -388,7 +393,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                 patch.object(email_module.firestore, "transactional", fake_transactional):
             result = self._processor()("uid-1", "outbox-1")
 
-        self.assertEqual("blocked_non_manual", result["status"])
+        self.assertEqual({"status": "blocked_non_manual"}, result)
         self.assertEqual(original_outbox, fake_fs.documents[_outbox_path()])
         self.assertEqual(original_audit, fake_fs.documents[_audit_path()])
         self.assertEqual([], fake_fs.transaction_reads)
@@ -419,7 +424,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                 patch.object(email_module.firestore, "transactional", fake_transactional):
             result = self._processor()("uid-1", "outbox-1")
 
-        self.assertEqual("blocked_non_manual", result["status"])
+        self.assertEqual({"status": "blocked_non_manual"}, result)
         self.assertEqual(changed_outbox, fake_fs.documents[_outbox_path()])
         self.assertEqual(original_audit, fake_fs.documents[_audit_path()])
         self.assertEqual([_outbox_path()], fake_fs.transaction_reads)
@@ -475,7 +480,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                             ):
                         result = self._processor()("uid-1", "outbox-1")
 
-                    self.assertEqual(expected_status, result["status"])
+                    self.assertEqual({"status": expected_status}, result)
                     self.assertEqual(original_outbox, fake_fs.documents[_outbox_path()])
                     self.assertEqual(original_audit, fake_fs.documents[_audit_path()])
                     self.assertEqual([_outbox_path()], fake_fs.transaction_reads)
@@ -512,7 +517,7 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                         patch.object(email_module.firestore, "transactional", fake_transactional):
                     result = self._processor()("uid-1", "outbox-1")
 
-                self.assertEqual(expected_status, result["status"])
+                self.assertEqual({"status": expected_status}, result)
                 self.assertEqual(original_outbox, fake_fs.documents[_outbox_path()])
                 self.assertEqual(original_audit, fake_fs.documents[_audit_path()])
                 self.assertEqual(0, fake_fs.committed_transactions)

@@ -176,6 +176,27 @@ class ProcessUserServiceTests(unittest.TestCase):
 
 
 class ProcessOutboxServiceTests(unittest.TestCase):
+    TASK1_STATUSES = frozenset({
+        "manual_ready",
+        "cancelled",
+        "not_found",
+        "blocked_state_changed",
+        "blocked_non_manual",
+        "blocked_invalid_client",
+        "blocked_invalid_thread",
+        "blocked_invalid_notification",
+        "blocked_invalid_action_audit",
+        "blocked_missing_action_audit",
+        "blocked_audit_status",
+        "blocked_audit_actor",
+        "blocked_audit_source",
+        "blocked_audit_action_type",
+        "blocked_audit_client",
+        "blocked_audit_thread",
+        "blocked_audit_notification",
+        "blocked_audit_outbox",
+    })
+
     def setUp(self):
         self.client = service.app.test_client()
         os.environ.pop("PROCESS_USER_AUTH", None)
@@ -191,27 +212,28 @@ class ProcessOutboxServiceTests(unittest.TestCase):
             seen["result"] = fn()
             return True
 
-        expected = {
+        downstream = {
             "status": "manual_ready",
-            "uid": "user-123",
-            "outboxId": "outbox-456",
+            "uid": "must-not-escape",
+            "outboxId": "must-not-escape",
+            "internal": {"must": "not escape"},
         }
         with patch.object(service, "run_with_user_lease", side_effect=lease), \
                 patch.object(
                     service,
                     "process_outbox_item_entry",
-                    return_value=expected,
+                    return_value=downstream,
                     create=True,
                 ) as process_exact:
             resp = self.client.post(
                 "/process-outbox",
-                json={"uid": " user-123 ", "outboxId": " outbox-456 "},
+                json={"uid": "user-123", "outboxId": "outbox-456"},
             )
 
         self.assertEqual(200, resp.status_code)
-        self.assertEqual(expected, resp.get_json())
+        self.assertEqual({"status": "manual_ready"}, resp.get_json())
         self.assertEqual("user-123", seen["uid"])
-        self.assertEqual(expected, seen["result"])
+        self.assertEqual(downstream, seen["result"])
         process_exact.assert_called_once_with("user-123", "outbox-456")
 
     def test_process_outbox_locked_user_is_retryable_and_does_not_process(self):
@@ -227,26 +249,105 @@ class ProcessOutboxServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(503, resp.status_code)
-        self.assertEqual("skipped_locked", resp.get_json()["status"])
+        self.assertEqual({"status": "skipped_locked"}, resp.get_json())
+        process_exact.assert_not_called()
+
+    def test_process_outbox_rejects_extra_body_keys_before_lease(self):
+        with patch.object(service, "run_with_user_lease") as lease, \
+                patch.object(service, "process_outbox_item_entry") as process_exact:
+            resp = self.client.post(
+                "/process-outbox",
+                json={
+                    "uid": "user-123",
+                    "outboxId": "outbox-456",
+                    "unexpected": "must-not-be-accepted",
+                },
+            )
+
+        self.assertEqual(400, resp.status_code)
+        self.assertEqual(
+            {"status": "error", "reason": "invalid_request"},
+            resp.get_json(),
+        )
+        lease.assert_not_called()
+        process_exact.assert_not_called()
+
+    def test_process_outbox_rejects_non_object_or_wrong_type_inputs_before_lease(self):
+        invalid_requests = [
+            (
+                "non_json",
+                {"data": "not json", "content_type": "text/plain"},
+            ),
+            (
+                "json_list",
+                {"json": ["user-123", "outbox-456"]},
+            ),
+            (
+                "wrong_uid_type",
+                {"json": {"uid": 123, "outboxId": "outbox-456"}},
+            ),
+            (
+                "wrong_outbox_type",
+                {"json": {"uid": "user-123", "outboxId": {"id": "outbox-456"}}},
+            ),
+        ]
+
+        with patch.object(service, "run_with_user_lease") as lease, \
+                patch.object(service, "process_outbox_item_entry") as process_exact:
+            for label, request_kwargs in invalid_requests:
+                with self.subTest(case=label):
+                    resp = self.client.post("/process-outbox", **request_kwargs)
+                    self.assertEqual(400, resp.status_code)
+                    self.assertEqual(
+                        {"status": "error", "reason": "invalid_request"},
+                        resp.get_json(),
+                    )
+
+        lease.assert_not_called()
+        process_exact.assert_not_called()
+
+    def test_process_outbox_rejects_padded_ids_before_lease(self):
+        invalid_cases = [
+            {"uid": " user-123", "outboxId": "outbox-456"},
+            {"uid": "user-123 ", "outboxId": "outbox-456"},
+            {"uid": "user-123", "outboxId": " outbox-456"},
+            {"uid": "user-123", "outboxId": "outbox-456 "},
+        ]
+
+        with patch.object(service, "run_with_user_lease") as lease, \
+                patch.object(service, "process_outbox_item_entry") as process_exact:
+            for payload in invalid_cases:
+                with self.subTest(payload=payload):
+                    resp = self.client.post("/process-outbox", json=payload)
+                    self.assertEqual(400, resp.status_code)
+                    self.assertEqual(
+                        {"status": "error", "reason": "invalid_request"},
+                        resp.get_json(),
+                    )
+
+        lease.assert_not_called()
         process_exact.assert_not_called()
 
     def test_process_outbox_requires_exact_uid_and_outbox_id(self):
-        missing_uid = self.client.post(
-            "/process-outbox",
-            json={"outboxId": "outbox-456"},
-        )
-        missing_outbox = self.client.post(
-            "/process-outbox",
-            json={"uid": "user-123"},
-        )
-        blank_outbox = self.client.post(
-            "/process-outbox",
-            json={"uid": "user-123", "outboxId": "   "},
-        )
+        invalid_bodies = [
+            {"outboxId": "outbox-456"},
+            {"uid": "user-123"},
+            {"uid": "user-123", "outboxId": "   "},
+        ]
 
-        self.assertEqual(400, missing_uid.status_code)
-        self.assertEqual(400, missing_outbox.status_code)
-        self.assertEqual(400, blank_outbox.status_code)
+        with patch.object(service, "run_with_user_lease") as lease, \
+                patch.object(service, "process_outbox_item_entry") as process_exact:
+            for body in invalid_bodies:
+                with self.subTest(body=body):
+                    resp = self.client.post("/process-outbox", json=body)
+                    self.assertEqual(400, resp.status_code)
+                    self.assertEqual(
+                        {"status": "error", "reason": "invalid_request"},
+                        resp.get_json(),
+                    )
+
+        lease.assert_not_called()
+        process_exact.assert_not_called()
 
     def test_process_outbox_rejects_unsafe_or_unbounded_document_ids_before_lease(self):
         invalid_cases = [
@@ -268,9 +369,63 @@ class ProcessOutboxServiceTests(unittest.TestCase):
                 with self.subTest(payload=payload):
                     resp = self.client.post("/process-outbox", json=payload)
                     self.assertEqual(400, resp.status_code)
+                    self.assertEqual(
+                        {"status": "error", "reason": "invalid_request"},
+                        resp.get_json(),
+                    )
 
         lease.assert_not_called()
         process_exact.assert_not_called()
+
+    def test_process_outbox_returns_every_task1_status_as_status_only(self):
+        for status in self.TASK1_STATUSES:
+            with self.subTest(status=status), \
+                    patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
+                    patch.object(
+                        service,
+                        "process_outbox_item_entry",
+                        return_value={
+                            "status": status,
+                            "uid": "must-not-escape",
+                            "outboxId": "must-not-escape",
+                            "arbitrary": ["must-not-escape"],
+                        },
+                    ):
+                resp = self.client.post(
+                    "/process-outbox",
+                    json={"uid": "user-123", "outboxId": "outbox-456"},
+                )
+
+            self.assertEqual(200, resp.status_code)
+            self.assertEqual({"status": status}, resp.get_json())
+
+    def test_process_outbox_rejects_unknown_or_malformed_downstream_results(self):
+        malformed_results = [
+            None,
+            "manual_ready",
+            {},
+            {"status": None},
+            {"status": "unknown_status", "private": "must-not-escape"},
+        ]
+
+        for downstream in malformed_results:
+            with self.subTest(downstream=downstream), \
+                    patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
+                    patch.object(
+                        service,
+                        "process_outbox_item_entry",
+                        return_value=downstream,
+                    ):
+                resp = self.client.post(
+                    "/process-outbox",
+                    json={"uid": "user-123", "outboxId": "outbox-456"},
+                )
+
+            self.assertEqual(500, resp.status_code)
+            self.assertEqual(
+                {"status": "error", "reason": "processing_failed"},
+                resp.get_json(),
+            )
 
     def test_process_outbox_uses_existing_shared_secret_gate(self):
         with patch.dict(os.environ, {"PROCESS_USER_AUTH": "s3cret"}):
@@ -292,7 +447,12 @@ class ProcessOutboxServiceTests(unittest.TestCase):
                 )
 
         self.assertEqual(401, missing.status_code)
+        self.assertEqual(
+            {"status": "error", "reason": "unauthorized"},
+            missing.get_json(),
+        )
         self.assertNotEqual(401, allowed.status_code)
+        self.assertEqual({"status": "manual_ready"}, allowed.get_json())
 
     def test_process_outbox_downstream_exception_returns_retryable_500(self):
         def lease(uid, fn, **kwargs):
@@ -303,7 +463,7 @@ class ProcessOutboxServiceTests(unittest.TestCase):
                 patch.object(
                     service,
                     "process_outbox_item_entry",
-                    side_effect=RuntimeError("exact item failed"),
+                    side_effect=RuntimeError("PRIVATE-EXCEPTION-MARKER"),
                     create=True,
                 ):
             resp = self.client.post(
@@ -312,8 +472,11 @@ class ProcessOutboxServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(500, resp.status_code)
-        self.assertEqual("error", resp.get_json()["status"])
-        self.assertIn("exact item failed", resp.get_json()["error"])
+        self.assertEqual(
+            {"status": "error", "reason": "processing_failed"},
+            resp.get_json(),
+        )
+        self.assertNotIn("PRIVATE-EXCEPTION-MARKER", resp.get_data(as_text=True))
 
 
 class ProcessUserAuthTests(unittest.TestCase):

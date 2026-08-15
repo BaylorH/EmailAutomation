@@ -227,7 +227,9 @@ def process_outbox_item(user_id: str, outbox_id: str):
 
     Task 1 deliberately stops before credential acquisition or sender permit.
     """
-    return process_exact_outbox_item(user_id, outbox_id)
+    result = process_exact_outbox_item(user_id, outbox_id)
+    status = result.get("status") if isinstance(result, dict) else None
+    return {"status": status if isinstance(status, str) else None}
 
 
 def refresh_and_process_user(user_id: str):

@@ -60,6 +60,27 @@ app = Flask(__name__)
 _AUTH_ENV = "PROCESS_USER_AUTH"
 _MAX_UID_LENGTH = 128
 _MAX_FIRESTORE_DOCUMENT_ID_BYTES = 1500
+_PROCESS_OUTBOX_BODY_KEYS = frozenset({"uid", "outboxId"})
+_PROCESS_OUTBOX_STATUSES = frozenset({
+    "manual_ready",
+    "cancelled",
+    "not_found",
+    "blocked_state_changed",
+    "blocked_non_manual",
+    "blocked_invalid_client",
+    "blocked_invalid_thread",
+    "blocked_invalid_notification",
+    "blocked_invalid_action_audit",
+    "blocked_missing_action_audit",
+    "blocked_audit_status",
+    "blocked_audit_actor",
+    "blocked_audit_source",
+    "blocked_audit_action_type",
+    "blocked_audit_client",
+    "blocked_audit_thread",
+    "blocked_audit_notification",
+    "blocked_audit_outbox",
+})
 
 
 def _extract_bearer() -> str | None:
@@ -83,6 +104,8 @@ def _auth_ok() -> bool:
 
 def _valid_document_id(value: str, *, max_length: int | None = None) -> bool:
     if not isinstance(value, str) or not value:
+        return False
+    if value != value.strip():
         return False
     if value in {".", ".."} or "/" in value:
         return False
@@ -130,25 +153,18 @@ def process_user():
 @app.post("/process-outbox")
 def process_outbox():
     if not _auth_ok():
-        return jsonify({"status": "error", "error": "unauthorized"}), 401
+        return jsonify({"status": "error", "reason": "unauthorized"}), 401
 
     body = request.get_json(silent=True)
-    if not isinstance(body, dict):
-        return jsonify({"status": "error", "error": "invalid or missing JSON body"}), 400
+    if not isinstance(body, dict) or set(body) != _PROCESS_OUTBOX_BODY_KEYS:
+        return jsonify({"status": "error", "reason": "invalid_request"}), 400
 
-    raw_uid = body.get("uid")
-    raw_outbox_id = body.get("outboxId")
-    if not isinstance(raw_uid, str) or not raw_uid.strip():
-        return jsonify({"status": "error", "error": "missing uid"}), 400
-    if not isinstance(raw_outbox_id, str) or not raw_outbox_id.strip():
-        return jsonify({"status": "error", "error": "missing outboxId"}), 400
-
-    uid = raw_uid.strip()
-    outbox_id = raw_outbox_id.strip()
+    uid = body["uid"]
+    outbox_id = body["outboxId"]
     if not _valid_document_id(uid, max_length=_MAX_UID_LENGTH):
-        return jsonify({"status": "error", "error": "invalid uid"}), 400
+        return jsonify({"status": "error", "reason": "invalid_request"}), 400
     if not _valid_document_id(outbox_id):
-        return jsonify({"status": "error", "error": "invalid outboxId"}), 400
+        return jsonify({"status": "error", "reason": "invalid_request"}), 400
 
     outcome = {}
 
@@ -158,20 +174,17 @@ def process_outbox():
 
     try:
         acquired = run_with_user_lease(uid, process_exact_item)
-    except Exception as e:  # noqa: BLE001 — preserve retry semantics for the task delivery
-        return jsonify({"status": "error", "error": str(e)}), 500
+    except Exception:  # noqa: BLE001 — preserve retry semantics without leaking internals
+        return jsonify({"status": "error", "reason": "processing_failed"}), 500
 
     if not acquired:
-        return jsonify({
-            "status": "skipped_locked",
-            "uid": uid,
-            "outboxId": outbox_id,
-        }), 503
+        return jsonify({"status": "skipped_locked"}), 503
 
     result = outcome.get("value")
-    if not isinstance(result, dict):
-        result = {"status": "processed", "uid": uid, "outboxId": outbox_id}
-    return jsonify(result), 200
+    status = result.get("status") if isinstance(result, dict) else None
+    if not isinstance(status, str) or status not in _PROCESS_OUTBOX_STATUSES:
+        return jsonify({"status": "error", "reason": "processing_failed"}), 500
+    return jsonify({"status": status}), 200
 
 
 if __name__ == "__main__":
