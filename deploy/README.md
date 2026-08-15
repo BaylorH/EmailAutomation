@@ -1,4 +1,4 @@
-# WS-B — EmailAutomation scheduler → Cloud Run Job (scaffold)
+# WS-B — EmailAutomation Cloud Run deployment and release controls
 
 Migrate the scheduler worker off GitHub Actions cron (`.github/workflows/email.yml`
 → `python main.py` every 30 min) onto a **Python Cloud Run Job on Cloud Scheduler**.
@@ -10,9 +10,10 @@ and survives the move unchanged. Auth is via ADC — `firestore.Client()` picks 
 job's service account, so no key file is needed (contrast `email.yml`, which writes a
 service-account JSON to `$RUNNER_TEMP/sa.json`).
 
-> **Scaffold only.** Nothing here has been applied to any GCP project. All
-> `*_PLACEHOLDER` tokens must be replaced. No real project IDs / buckets / secrets
-> are committed.
+> The historical Cloud Run Job migration below remains an unapplied scaffold,
+> and every `*_PLACEHOLDER` must be replaced before that job path is used. The
+> `process-user` Cloud Run service is live; its bounded staging and promotion
+> controls are documented later in this file. No secret values are committed.
 
 ---
 
@@ -233,7 +234,7 @@ HTTP contracts). The service is live; production releases must use the bounded
 tagless staging and closed promotion controllers below, not the scaffold replace
 command above.
 
-## Verified vs Unverified (honest gaps)
+## Historical Cloud Run Job verification record
 
 **Verified (proven in this scaffold):**
 - New lease test passes: `python -m unittest tests.test_scheduler_lease_cloudrun_runtime` → 5/5 OK.
@@ -253,17 +254,18 @@ command above.
   via the `finally` in `run_with_scheduler_lease` (status `released`, not a 45-min
   TTL squat). Local + deterministic; what remains live-only is listed below.
 
-**Unverified / gaps (NOT proven — do not assume):**
+**Historical job gaps (NOT proven — do not assume):**
 - **SIGTERM → token-cache upload on real GCP.** The bridge and lease-release
   mechanics are unit-pinned (above), but the end-to-end path — Cloud Run actually
   delivering SIGTERM within the grace period and the REAL `upload_token` atexit
   handler finishing against Firebase Storage before SIGKILL — still needs one live
   validation: execute the job, force-terminate the task, confirm the upload in logs.
-- **Image build.** The Dockerfile was not built in this environment (no Docker/`gcloud`
-  available; no cloud mutations permitted). Wheel availability for `python:3.12-slim`
-  is expected for all requirements but unverified by an actual `docker build`.
-- **`gcloud` commands** above are unrun (hard rule: no cloud state mutation). Treat as a
-  runbook to execute manually.
+- **Historical job image build.** The job Dockerfile was not built during the
+  original scaffold qualification. Wheel availability for `python:3.12-slim`
+  is expected for all requirements but remains unverified by a job image build.
+- **Historical job `gcloud` commands.** The job commands above were not run as
+  part of scaffold qualification. They are not the live `process-user` service
+  release path, which uses the bounded controllers below.
 - **Task timeout vs lease TTL (hard invariant)** — the YAML sets
   `timeoutSeconds: 2400` (40m), and it MUST stay `<=` the Firestore lease TTL
   (`scheduler_lease.DEFAULT_TTL_SECONDS` = 2700s / 45m). A task that outlives its
@@ -303,6 +305,12 @@ certification tag, promote a revision, or execute rollback. Those are separate
 bounded rollout steps. Both global campaign switches must remain false. Neither
 dry-run nor staging may call `POST /process-user`, call `POST /process-outbox`,
 or perform a provider or mailbox canary.
+
+The prior cancelled manual-reply residue was already reconciled by normal
+legacy processing before this release. Logs and persisted counters showed no
+provider-send effect; direct mailbox verification was outside that readback.
+This release therefore has no cleanup invocation: staging and promotion must
+not call either POST route.
 
 ### Closed Phase 1 promotion controller
 

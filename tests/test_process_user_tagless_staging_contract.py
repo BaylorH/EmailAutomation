@@ -60,6 +60,14 @@ def _write_executable(path: Path, content: str) -> None:
 
 
 class TaglessStagingContractTests(unittest.TestCase):
+    def test_deploy_readme_does_not_describe_the_live_service_as_unapplied(self):
+        readme = (REPO_ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+        normalized = " ".join(readme.split())
+
+        self.assertNotIn("# WS-B — EmailAutomation scheduler → Cloud Run Job (scaffold)", readme)
+        self.assertNotIn("**Scaffold only.** Nothing here has been applied", readme)
+        self.assertIn("`process-user` Cloud Run service is live", normalized)
+
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
@@ -252,6 +260,9 @@ class TaglessStagingContractTests(unittest.TestCase):
         self.assertFalse(
             any(call[:3] == ["run", "services", "update-traffic"] for call in calls)
         )
+        deploy_source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        for route in ("/process-user", "/process-outbox"):
+            self.assertNotIn(route, deploy_source)
 
     def test_invalid_head_identity_stops_before_gcloud(self):
         result = self._run("--apply", scenario="invalid_sha")

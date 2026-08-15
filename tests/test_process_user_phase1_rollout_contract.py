@@ -813,8 +813,9 @@ class StaticSafetyTests(unittest.TestCase):
             for node in ast.walk(ast.parse(module))
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
-        self.assertNotIn("/process-user", string_values)
-        self.assertFalse(any(value.startswith("/process-user?") for value in string_values))
+        for route in ("/process-user", "/process-outbox"):
+            self.assertNotIn(route, string_values)
+            self.assertFalse(any(value.startswith(f"{route}?") for value in string_values))
         service_source = (ROOT / "service.py").read_text()
         self.assertNotIn("/health/identity/v1", service_source)
         self.assertNotIn("unauthenticated_status", module)
