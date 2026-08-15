@@ -136,6 +136,7 @@ def _audit_path(uid="uid-1", audit_id="audit-1"):
 
 def _manual_item(**overrides):
     data = {
+        "manualReplyLaneVersion": 1,
         "source": "dashboard_inline_reply",
         "actionType": "reply",
         "actionAuditId": "audit-1",
@@ -259,6 +260,89 @@ class ProcessExactOutboxEmailTests(unittest.TestCase):
                 self.assertEqual({"status": "blocked_non_manual"}, result)
                 self.assertIn(_outbox_path(), fake_fs.documents)
                 self.assertEqual(0, fake_fs.committed_transactions)
+
+    def test_manual_ready_requires_exact_numeric_version_one(self):
+        invalid_markers = [
+            {},
+            {"manualReplyLaneVersion": None},
+            {"manualReplyLaneVersion": False},
+            {"manualReplyLaneVersion": 0},
+            {"manualReplyLaneVersion": 2},
+            {"manualReplyLaneVersion": "1"},
+        ]
+
+        for marker_patch in invalid_markers:
+            with self.subTest(marker_patch=marker_patch):
+                fake_fs = FakeFirestore()
+                item = _manual_item()
+                if not marker_patch:
+                    item.pop("manualReplyLaneVersion")
+                else:
+                    item.update(marker_patch)
+                fake_fs.documents[_outbox_path()] = item
+
+                with patch("email_automation.clients._fs", fake_fs):
+                    result = self._processor()("uid-1", "outbox-1")
+
+                self.assertEqual({"status": "blocked_non_manual"}, result)
+                self.assertEqual(0, fake_fs.committed_transactions)
+
+    def test_exact_worker_rejects_generic_ownership_before_handoff_or_cancel(self):
+        for ownership in (
+            {"processingBy": "generic-worker"},
+            {"processingAt": "synthetic-claim-time"},
+            {
+                "processingBy": "generic-worker",
+                "processingAt": "synthetic-claim-time",
+                "cancelRequested": True,
+                "status": "cancel_requested",
+            },
+        ):
+            with self.subTest(ownership=ownership):
+                fake_fs = FakeFirestore()
+                original = _manual_item(**ownership)
+                fake_fs.documents[_outbox_path()] = dict(original)
+                fake_fs.documents[_audit_path()] = _queued_audit()
+
+                with patch("email_automation.clients._fs", fake_fs), \
+                        patch.object(email_module.firestore, "transactional", fake_transactional):
+                    result = self._processor()("uid-1", "outbox-1")
+
+                self.assertEqual({"status": "blocked_generic_owned"}, result)
+                self.assertEqual(original, fake_fs.documents[_outbox_path()])
+                self.assertEqual(0, fake_fs.committed_transactions)
+
+    def test_cancel_transaction_rejects_generic_ownership_that_wins_after_outer_read(self):
+        fake_fs = FakeFirestore()
+        initial = _manual_item(
+            cancelRequested=True,
+            status="cancel_requested",
+        )
+        raced = {
+            **initial,
+            "processingBy": "generic-worker",
+            "processingAt": "synthetic-claim-time",
+        }
+        audit = _queued_audit()
+        fake_fs.documents[_outbox_path()] = dict(initial)
+        fake_fs.documents[_audit_path()] = dict(audit)
+
+        def generic_claim_wins(root, path):
+            self.assertEqual(_outbox_path(), path)
+            root.documents[path] = dict(raced)
+
+        fake_fs.after_direct_read = generic_claim_wins
+
+        with patch("email_automation.clients._fs", fake_fs), \
+                patch.object(email_module.firestore, "transactional", fake_transactional):
+            result = self._processor()("uid-1", "outbox-1")
+
+        self.assertEqual({"status": "blocked_generic_owned"}, result)
+        self.assertEqual(raced, fake_fs.documents[_outbox_path()])
+        self.assertEqual(audit, fake_fs.documents[_audit_path()])
+        self.assertEqual([_outbox_path()], fake_fs.direct_reads)
+        self.assertEqual([_outbox_path()], fake_fs.transaction_reads)
+        self.assertEqual(0, fake_fs.committed_transactions)
 
     def test_missing_exact_item_is_not_replaced_by_an_outbox_scan(self):
         fake_fs = FakeFirestore()

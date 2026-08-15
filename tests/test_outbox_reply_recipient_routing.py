@@ -106,6 +106,13 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         )
         decision_patch.start()
         self.addCleanup(decision_patch.stop)
+        provider_gate_patch = patch.object(
+            email_module,
+            "_gate_generic_provider_unit",
+            return_value={"status": "ready", "data": []},
+        )
+        provider_gate_patch.start()
+        self.addCleanup(provider_gate_patch.stop)
 
     def _thread_reply_outbox(self, assigned_email):
         return FakeDoc({

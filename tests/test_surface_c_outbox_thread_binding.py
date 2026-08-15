@@ -173,6 +173,11 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
                  metadata={"terminal": False, "stopKind": "none"},
              )), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(
+                 email_module,
+                 "_gate_generic_provider_unit",
+                 return_value={"status": "ready", "data": [doc.to_dict()]},
+             ), \
              patch.object(email_module, "_get_reply_message_sender", return_value=reply_sender) as get_reply_sender, \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
              patch.object(email_module, "send_and_index_email") as send_and_index_email, \
@@ -285,6 +290,11 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(
+                 email_module,
+                 "_gate_generic_provider_unit",
+                 return_value={"status": "ready", "data": [doc.to_dict()]},
+             ), \
              patch.object(email_module, "_get_reply_message_sender", return_value="broker@example.invalid"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -319,6 +329,11 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(
+                 email_module,
+                 "_gate_generic_provider_unit",
+                 return_value={"status": "ready", "data": [doc.to_dict()]},
+             ), \
              patch.object(email_module, "_get_reply_message_sender", return_value="broker@example.invalid"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,

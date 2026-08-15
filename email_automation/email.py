@@ -1778,22 +1778,21 @@ def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None) -> bo
     from .clients import _fs
     from google.cloud.firestore import transactional
 
-    cancelled_seen = {}
-
     @transactional
     def claim_transaction(transaction, doc_ref):
         # Read current state
         snapshot = doc_ref.get(transaction=transaction)
         if not snapshot.exists:
             # Item was already deleted
-            return False
+            return "gone", None
 
         current_data = snapshot.to_dict() or {}
+        if _has_reserved_manual_reply_lane_marker(current_data):
+            return "manual_reply_lane", current_data
         if _is_cancelled_outbox_item(current_data):
             transaction.delete(doc_ref)
-            cancelled_seen["data"] = current_data
             print(f"   🗑️ Deleted canceled outbox item {doc_ref.id}")
-            return False
+            return "cancelled", current_data
 
         processing_by = current_data.get("processingBy")
         processing_at = current_data.get("processingAt")
@@ -1813,7 +1812,7 @@ def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None) -> bo
             if claim_age < CLAIM_TIMEOUT_SECONDS:
                 # Claim is still valid, skip this item
                 print(f"   ⏭️ Item {doc_ref.id} already being processed by {processing_by} ({int(claim_age)}s ago)")
-                return False
+                return "busy", current_data
             else:
                 print(f"   ⚠️ Stale claim on {doc_ref.id} by {processing_by} ({int(claim_age)}s ago), reclaiming")
 
@@ -1822,20 +1821,20 @@ def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None) -> bo
             "processingBy": WORKER_ID,
             "processingAt": now
         })
-        return True
+        return "claimed", current_data
 
     try:
         transaction = _fs.transaction()
-        claimed = claim_transaction(transaction, doc_ref)
-        if not claimed and cancelled_seen:
+        outcome, committed_data = claim_transaction(transaction, doc_ref)
+        if outcome == "cancelled":
             _terminalize_outbox_action_audit(
                 user_id,
                 doc_ref,
-                cancelled_seen.get("data") or data,
+                committed_data or data,
                 "cancelled",
                 {"cancelledAt": SERVER_TIMESTAMP},
             )
-        return claimed
+        return outcome == "claimed"
     except Exception as e:
         print(f"   ⚠️ Failed to claim {doc_ref.id}: {e}")
         return False
@@ -2705,6 +2704,97 @@ _CANCELLED_OUTBOX_STATUSES = {
     "canceling",
 }
 
+_MANUAL_REPLY_LANE_VERSION_FIELD = "manualReplyLaneVersion"
+_EXACT_MANUAL_REPLY_LANE_VERSION = 1
+
+
+def _has_reserved_manual_reply_lane_marker(data: Dict[str, Any]) -> bool:
+    """Any marker presence is reserved away from the broad legacy drain."""
+    return (
+        isinstance(data, dict)
+        and _MANUAL_REPLY_LANE_VERSION_FIELD in data
+    )
+
+
+def _manual_reply_lane_skip_result(count: int = 1) -> Dict[str, int]:
+    return {"manualReplyLaneSkipped": max(0, int(count))}
+
+
+def _manual_reply_lane_skipped_count(result: Any) -> int:
+    if not isinstance(result, dict):
+        return 0
+    count = result.get("manualReplyLaneSkipped")
+    if isinstance(count, bool) or not isinstance(count, int):
+        return 0
+    return max(0, count)
+
+
+def _single_manual_reply_lane_skip_result(data: Dict[str, Any]) -> Dict[str, int]:
+    assigned = data.get("assignedEmails") if isinstance(data, dict) else None
+    return _manual_reply_lane_skip_result(
+        max(1, len(assigned) if isinstance(assigned, list) else 0)
+    )
+
+
+def _gate_generic_provider_unit(doc_refs: List[Any]) -> Dict[str, Any]:
+    """Final Task-5 lane gate immediately before one legacy provider unit.
+
+    This writes no provider permission or outcome state. It only proves every
+    row is still owned by this generic worker, unmarked, and uncancelled. Task 6
+    must make the routing marker immutable before this lane is enabled live.
+    """
+    from .clients import _fs
+
+    refs = list(doc_refs or [])
+    if not refs:
+        return {"status": "gone", "data": []}
+
+    @firestore.transactional
+    def gate(transaction):
+        snapshots = [ref.get(transaction=transaction) for ref in refs]
+        current_items = []
+        for snapshot in snapshots:
+            if not getattr(snapshot, "exists", False):
+                current_items.append(None)
+            else:
+                current_items.append(snapshot.to_dict() or {})
+
+        existing_items = [current for current in current_items if current is not None]
+        if any(_has_reserved_manual_reply_lane_marker(current) for current in existing_items):
+            status = "manual_reply_lane"
+        elif any(_is_cancelled_outbox_item(current) for current in existing_items):
+            status = "cancelled"
+        elif len(existing_items) != len(current_items):
+            status = "gone"
+        elif any(current.get("processingBy") != WORKER_ID for current in existing_items):
+            status = "claim_lost"
+        else:
+            status = "ready"
+
+        if status != "ready":
+            for ref, current in zip(refs, current_items):
+                if current is not None and current.get("processingBy") == WORKER_ID:
+                    transaction.set(
+                        ref,
+                        {"processingBy": None, "processingAt": None},
+                        merge=True,
+                    )
+        elif status == "ready":
+            now = datetime.now(timezone.utc)
+            for ref in refs:
+                transaction.set(ref, {"processingAt": now}, merge=True)
+
+        return {
+            "status": status,
+            "data": current_items if status != "gone" else [],
+        }
+
+    try:
+        return gate(_fs.transaction())
+    except Exception as exc:
+        print(f"   ⚠️ Could not run final generic provider gate: {exc}")
+        return {"status": "blocked", "data": []}
+
 
 def _flag_is_truthy(value: Any) -> bool:
     """Truthy-check a loosely-typed flag WITHOUT an identity match.
@@ -2737,7 +2827,16 @@ def _delete_cancelled_outbox_item_if_needed(
     data: Dict[str, Any],
     user_id: Optional[str] = None,
 ) -> bool:
-    if not _is_cancelled_outbox_item(data):
+    if _has_reserved_manual_reply_lane_marker(data):
+        return False
+    current_data = _get_current_outbox_data(doc_ref)
+    if current_data is None:
+        return True
+    if not current_data:
+        current_data = data
+    if _has_reserved_manual_reply_lane_marker(current_data):
+        return False
+    if not _is_cancelled_outbox_item(current_data):
         return False
     doc_id = getattr(doc_ref, "id", "unknown")
     try:
@@ -2745,7 +2844,7 @@ def _delete_cancelled_outbox_item_if_needed(
         _terminalize_outbox_action_audit(
             user_id,
             doc_ref,
-            data,
+            current_data,
             "cancelled",
             {"cancelledAt": SERVER_TIMESTAMP},
         )
@@ -2761,8 +2860,18 @@ def _exact_outbox_result(status: str) -> Dict[str, str]:
 
 def _is_exact_manual_inline_reply(data: Dict[str, Any]) -> bool:
     return (
-        data.get("source") == DASHBOARD_INLINE_REPLY_SOURCE
+        type(data.get(_MANUAL_REPLY_LANE_VERSION_FIELD)) is int
+        and data.get(_MANUAL_REPLY_LANE_VERSION_FIELD)
+        == _EXACT_MANUAL_REPLY_LANE_VERSION
+        and data.get("source") == DASHBOARD_INLINE_REPLY_SOURCE
         and data.get("actionType") == DASHBOARD_REPLY_ACTION_TYPE
+    )
+
+
+def _has_generic_outbox_ownership(data: Dict[str, Any]) -> bool:
+    return bool(
+        data.get("processingBy") not in (None, "")
+        or data.get("processingAt") not in (None, "")
     )
 
 
@@ -2793,6 +2902,8 @@ def _cancel_exact_outbox_item_transactionally(user_id: str, doc_ref) -> str:
             return "blocked_state_changed"
         if not _is_exact_manual_inline_reply(data):
             return "blocked_non_manual"
+        if _has_generic_outbox_ownership(data):
+            return "blocked_generic_owned"
 
         for field, blocked_status in (
             ("clientId", "blocked_invalid_client"),
@@ -2872,6 +2983,9 @@ def process_outbox_item(user_id: str, outbox_id: str) -> Dict[str, str]:
     data = snapshot.to_dict() or {}
     if not _is_exact_manual_inline_reply(data):
         return _exact_outbox_result("blocked_non_manual")
+
+    if _has_generic_outbox_ownership(data):
+        return _exact_outbox_result("blocked_generic_owned")
 
     if _is_cancelled_outbox_item(data):
         status = _cancel_exact_outbox_item_transactionally(user_id, doc_ref)
@@ -3888,7 +4002,12 @@ def send_outboxes(
     # Group outbox items by recipient email to detect multi-property scenarios
     email_groups = defaultdict(list)
     for d in docs:
-        data = d.to_dict() or {}
+        data = _get_current_outbox_data(d.reference)
+        if data is None:
+            continue
+        if _has_reserved_manual_reply_lane_marker(data):
+            print("   ⏭️ Reserved manual reply lane item skipped by generic drain")
+            continue
         if _is_dashboard_tour_pending_finalization(data):
             _send_single_outbox_item(
                 user_id,
@@ -4018,6 +4137,7 @@ def send_outboxes(
                 return operation_states
 
         # Check if multiple properties for same broker
+        send_result = None
         if len(valid_items) > 1:
             # Per-campaign send mode: 'separate' (default — one email per property)
             # or 'combined' (one email covering ALL of this broker's properties).
@@ -4026,7 +4146,7 @@ def send_outboxes(
             send_mode = send_plan["mode"]
             if send_mode == 'combined':
                 print(f"🔗 Detected {len(valid_items)} properties for same broker (COMBINED mode): {recipient_email}")
-                _send_combined_property_email(
+                send_result = _send_combined_property_email(
                     user_id,
                     _fresh_graph_headers(headers, headers_provider),
                     recipient_email,
@@ -4039,7 +4159,7 @@ def send_outboxes(
                 )
             else:
                 print(f"🔗 Detected {len(valid_items)} properties for same broker: {recipient_email}")
-                _send_multi_property_email(
+                send_result = _send_multi_property_email(
                     user_id,
                     _fresh_graph_headers(headers, headers_provider),
                     recipient_email,
@@ -4053,7 +4173,7 @@ def send_outboxes(
         else:
             # Single property - send normally
             item = valid_items[0]
-            _send_single_outbox_item(
+            send_result = _send_single_outbox_item(
                 user_id,
                 _fresh_graph_headers(headers, headers_provider),
                 item,
@@ -4067,12 +4187,20 @@ def send_outboxes(
         # --- Rail 2: record the sends we just made -------------------------
         # If we cannot persist the increment we can no longer trust the ceiling
         # for subsequent recipients, so we halt the drain (fail-closed).
-        if daily_cap is not None or global_cap is not None:
+        recorded_send_count = max(
+            0,
+            send_count - _manual_reply_lane_skipped_count(send_result),
+        )
+        if recorded_send_count and (daily_cap is not None or global_cap is not None):
             try:
                 if daily_cap is not None:
-                    _increment_daily_send_count(_fs, user_id, cap_day_key, send_count)
+                    _increment_daily_send_count(
+                        _fs, user_id, cap_day_key, recorded_send_count
+                    )
                 if global_cap is not None:
-                    _increment_global_send_count(_fs, cap_day_key, send_count)
+                    _increment_global_send_count(
+                        _fs, cap_day_key, recorded_send_count
+                    )
             except Exception as exc:  # noqa: BLE001 - fail closed on write error
                 print(
                     f"🛑 Could not record daily send count for {user_id} — "
@@ -4110,6 +4238,16 @@ def _send_multi_property_email(
     Each property gets its own thread for clean tracking.
     The first email acknowledges there are multiple and explains the organization strategy.
     """
+    planned_manual_skip = _manual_reply_lane_skip_result(max(1, len(items)))
+    for item in items:
+        current = _get_current_outbox_data(item['doc'].reference)
+        if current is None:
+            continue
+        if _has_reserved_manual_reply_lane_marker(current):
+            print("   ⏭️ Reserved manual reply lane row skipped before grouped work")
+            return planned_manual_skip
+        item['data'] = current
+
     # Check for opted-out contacts first
     from .processing import is_contact_opted_out
     optout_record = is_contact_opted_out(user_id, recipient_email)
@@ -4172,6 +4310,10 @@ def _send_multi_property_email(
         if fresh_data:
             data = fresh_data
 
+        if _has_reserved_manual_reply_lane_marker(data):
+            _release_claim(item['doc'].reference)
+            return planned_manual_skip
+
         if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data, user_id=user_id):
             continue
 
@@ -4182,6 +4324,13 @@ def _send_multi_property_email(
         if _pause_client_outbox_item_if_needed(user_id, item['doc'].reference, data):
             print(f"   ⏸️ Moved outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
             continue
+
+        lane_gate = _gate_generic_provider_unit([item['doc'].reference])
+        if lane_gate.get("status") == "manual_reply_lane":
+            return planned_manual_skip
+        if lane_gate.get("status") != "ready":
+            return
+        data = (lane_gate.get("data") or [data])[0]
 
         if _dead_letter_campaign_recipient_row_mismatch_if_needed(
             user_id,
@@ -4300,6 +4449,18 @@ def _send_multi_property_email(
                     f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
                 )
                 continue
+            provider_gate = _gate_generic_provider_unit([item['doc'].reference])
+            provider_gate_status = provider_gate.get("status")
+            if provider_gate_status == "manual_reply_lane":
+                return planned_manual_skip
+            if provider_gate_status != "ready":
+                print(
+                    "   ⏭️ Grouped provider gate blocked "
+                    f"{item['doc'].id}: {provider_gate_status}"
+                )
+                return
+            data = (provider_gate.get("data") or [data])[0]
+
             send_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
             res = send_and_index_email(user_id, current_headers, script, [recipient_email],
                                        client_id_or_none=clientId, row_number=row_number,
@@ -4461,6 +4622,15 @@ def _send_combined_property_email(
     on every item, so items[0]['script'] is the whole message; we do NOT
     concatenate here.
     """
+    for item in items:
+        current = _get_current_outbox_data(item['doc'].reference)
+        if current is None:
+            continue
+        if _has_reserved_manual_reply_lane_marker(current):
+            print("   ⏭️ Reserved manual reply lane row skipped before combined work")
+            return _manual_reply_lane_skip_result(1)
+        item['data'] = current
+
     # Opt-out short-circuit (mirror separate mode): drop every queued item.
     from .processing import is_contact_opted_out
     optout_record = is_contact_opted_out(user_id, recipient_email)
@@ -4503,6 +4673,12 @@ def _send_combined_property_email(
         if fresh_data:
             data = fresh_data
 
+        if _has_reserved_manual_reply_lane_marker(data):
+            for prior in claimed:
+                _release_claim(prior["ref"])
+            _release_claim(ref)
+            return _manual_reply_lane_skip_result(1)
+
         if _delete_cancelled_outbox_item_if_needed(ref, data, user_id=user_id):
             continue
 
@@ -4512,6 +4688,17 @@ def _send_combined_property_email(
         if _pause_client_outbox_item_if_needed(user_id, ref, data):
             print(f"   ⏸️ Moved combined outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
             continue
+
+        lane_gate = _gate_generic_provider_unit([ref])
+        if lane_gate.get("status") == "manual_reply_lane":
+            for prior in claimed:
+                _release_claim(prior["ref"])
+            return _manual_reply_lane_skip_result(1)
+        if lane_gate.get("status") != "ready":
+            for prior in claimed:
+                _release_claim(prior["ref"])
+            return
+        data = (lane_gate.get("data") or [data])[0]
 
         if _dead_letter_campaign_recipient_row_mismatch_if_needed(
             user_id,
@@ -4721,6 +4908,19 @@ def _send_combined_property_email(
             "rows": rows,
         }
 
+        provider_gate = _gate_generic_provider_unit(
+            [entry["ref"] for entry in claimed]
+        )
+        provider_gate_status = provider_gate.get("status")
+        if provider_gate_status == "manual_reply_lane":
+            return _manual_reply_lane_skip_result(1)
+        if provider_gate_status != "ready":
+            print(
+                "   ⏭️ Combined provider gate blocked "
+                f"{primary_doc_id}: {provider_gate_status}"
+            )
+            return
+
         send_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
         res = send_and_index_email(
             user_id, current_headers, script, [recipient_email],
@@ -4807,6 +5007,11 @@ def _send_single_outbox_item(
     """
     d = item['doc']
     data = item['data']
+    planned_manual_skip = _single_manual_reply_lane_skip_result(data)
+
+    if _has_reserved_manual_reply_lane_marker(data):
+        print("   ⏭️ Reserved manual reply lane item skipped by generic sender")
+        return planned_manual_skip
 
     # Graph already accepted this tour-action reply.  This state is finalize-
     # only: claims, retries, and scheduler re-entry must never call Graph again.
@@ -4873,6 +5078,10 @@ def _send_single_outbox_item(
         return
     if fresh_data:
         data = fresh_data
+
+    if _has_reserved_manual_reply_lane_marker(data):
+        _release_claim(d.reference)
+        return planned_manual_skip
 
     if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
         return
@@ -4987,6 +5196,14 @@ def _send_single_outbox_item(
     }
     dashboard_tour_resolution: Optional[Dict[str, Any]] = None
 
+    def final_provider_gate() -> str:
+        nonlocal data
+        gate = _gate_generic_provider_unit([d.reference])
+        status = str(gate.get("status") or "blocked")
+        if status == "ready":
+            data = (gate.get("data") or [data])[0]
+        return status
+
     # Get follow-up config if present
     followup_config = data.get("followUpConfig")
 
@@ -5004,6 +5221,16 @@ def _send_single_outbox_item(
             print(f"   ⚠️ Could not fetch followUpConfig from client: {e}")
 
     contact_name = data.get("contactName") or data.get("firstName")
+    initial_provider_gate_status = final_provider_gate()
+    if initial_provider_gate_status == "manual_reply_lane":
+        return planned_manual_skip
+    if initial_provider_gate_status != "ready":
+        print(
+            f"   ⏭️ Initial provider gate blocked {d.id}: "
+            f"{initial_provider_gate_status}"
+        )
+        return
+
     reply_retry_metadata: Dict[str, Any] = {}
     if is_thread_reply and _should_preflight_sent_items_retry(data) and reply_to_msg_id:
         reply_retry_metadata = _fetch_graph_message_metadata(
@@ -5152,6 +5379,11 @@ def _send_single_outbox_item(
                 return
             else:
                 try:
+                    provider_gate_status = final_provider_gate()
+                    if provider_gate_status == "manual_reply_lane":
+                        return planned_manual_skip
+                    if provider_gate_status != "ready":
+                        return
                     res = _send_outbox_as_reply(
                         user_id, current_headers, script_content, reply_to_msg_id,
                         thread_id, user_signature=user_signature,
@@ -5277,6 +5509,11 @@ def _send_single_outbox_item(
                             "in Sent Items; manual review required before any resend",
                         )
                         return
+                    provider_gate_status = final_provider_gate()
+                    if provider_gate_status == "manual_reply_lane":
+                        return planned_manual_skip
+                    if provider_gate_status != "ready":
+                        return
                     res = send_and_index_email(
                         user_id, current_headers, script_content, [recipient_email],
                         client_id_or_none=clientId, row_number=row_number,
@@ -5399,6 +5636,11 @@ def _send_single_outbox_item(
                         data,
                         f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
                     )
+                    return
+                provider_gate_status = final_provider_gate()
+                if provider_gate_status == "manual_reply_lane":
+                    return planned_manual_skip
+                if provider_gate_status != "ready":
                     return
                 res = send_and_index_email(user_id, current_headers, selected_script, [recipient_email],
                                            client_id_or_none=clientId, row_number=row_number,

@@ -40,6 +40,7 @@ class FakeDocRef:
 
     def update(self, data):
         self.update_calls.append(data)
+        self._data.update(data)
 
 
 class FakeDoc:
@@ -156,6 +157,16 @@ class FakeFirestore:
 
     def transaction(self):
         return FakeFirestoreTransaction()
+
+
+def _claim_as_current_worker(doc_ref, _data, user_id=None):
+    """Model the state written by a successful production claim."""
+    del user_id
+    doc_ref.update({
+        "processingBy": email_module.WORKER_ID,
+        "processingAt": "test-claim",
+    })
+    return True
 
 
 def _seed_open_thread(fake_fs, user_id="uid-1", thread_id="thread-1",
@@ -562,7 +573,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "status": "cancel_requested",
         })
 
-        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+        with patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "send_and_index_email") as send_and_index_email, \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False):
             email_module._send_single_outbox_item(
@@ -737,7 +748,7 @@ class OutboxSafetyTests(unittest.TestCase):
             }
 
         with patch("email_automation.clients._fs", FakeFirestore()), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "get_contact_email_count", return_value=0), \
@@ -783,7 +794,7 @@ class OutboxSafetyTests(unittest.TestCase):
             }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
@@ -834,7 +845,7 @@ class OutboxSafetyTests(unittest.TestCase):
             }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
@@ -875,7 +886,7 @@ class OutboxSafetyTests(unittest.TestCase):
         ])
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
@@ -911,7 +922,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_sheets = FakeSheetsClient(["Casey Broker", "bp21harrison+correct@gmail.com"])
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
@@ -944,7 +955,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "get_contact_email_count", return_value=0), \
              patch.object(email_module, "_finalize_successful_outbox_item"), \
@@ -979,7 +990,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_get_sheet_id_or_fail", side_effect=RuntimeError("sheet unavailable")), \
              patch.object(email_module, "get_contact_email_count", return_value=0), \
@@ -1015,7 +1026,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "get_contact_email_count", return_value=0), \
              patch.object(email_module, "_finalize_successful_outbox_item"), \
@@ -1052,7 +1063,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_sheets = FakeSheetsClient(["Casey Broker", f"casey@example.com; {recipient}"])
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
@@ -1101,7 +1112,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_current_outbox_data", return_value=fresh_without_row_number), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
@@ -1145,7 +1156,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", FakeFirestore()), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
              patch.object(email_module, "_get_first_tab_title", return_value="Campaign"), \
@@ -1185,7 +1196,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
              patch.object(email_module, "_get_first_tab_title", return_value="Campaign"), \
@@ -1238,7 +1249,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", FakeFirestore()), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
              patch.object(email_module, "_get_first_tab_title", return_value="Campaign") as get_first_tab_title, \
@@ -1439,7 +1450,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-tour",
         }, doc_id="outbox-tour")
 
-        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+        with patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch("email_automation.clients._fs", FakeFirestore()), \
              patch.object(email_module, "_select_script_for_recipient", return_value="Wrong fallback body") as select_script, \
@@ -1477,7 +1488,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-tour",
         }, doc_id="outbox-tour")
 
-        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+        with patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch("email_automation.clients._fs", FakeFirestore()), \
              patch.object(email_module, "send_and_index_email", return_value={
@@ -1564,9 +1575,13 @@ class OutboxSafetyTests(unittest.TestCase):
             "status": "cancel_requested",
         }
 
+        def observe_cancel_after_claim(_ref):
+            doc.reference.set(cancelled_payload, merge=False)
+            return dict(cancelled_payload)
+
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
-             patch.object(email_module, "_get_current_outbox_data", return_value=cancelled_payload), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
+             patch.object(email_module, "_get_current_outbox_data", side_effect=observe_cancel_after_claim), \
              patch.object(email_module, "_get_reply_message_sender") as get_reply_sender, \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
              patch.object(email_module, "send_and_index_email") as send_and_index_email:
@@ -1590,7 +1605,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -1643,7 +1658,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -1718,7 +1733,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -1759,7 +1774,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="forged@example.com"), \
              patch.object(email_module, "_send_outbox_as_reply") as graph_send:
             email_module._send_single_outbox_item(
@@ -1788,7 +1803,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply") as graph_reply, \
              patch.object(email_module, "send_and_index_email") as graph_new_send:
@@ -1815,7 +1830,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply") as graph_reply, \
              patch.object(email_module, "send_and_index_email") as graph_new_send:
@@ -1843,7 +1858,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs, reply_to_message_id="graph-message-1")
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply") as graph_send:
             email_module._send_single_outbox_item(
@@ -1868,7 +1883,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs, reason="call_requested")
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply") as graph_send:
             email_module._send_single_outbox_item(
@@ -1894,7 +1909,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -1999,7 +2014,7 @@ class OutboxSafetyTests(unittest.TestCase):
         })
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -2107,7 +2122,7 @@ class OutboxSafetyTests(unittest.TestCase):
             }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", side_effect=graph_send) as send_reply, \
              patch.object(email_module, "_save_outbox_reply_message"), \
@@ -2273,7 +2288,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -2326,7 +2341,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value=graph_result) as send_reply, \
              patch.object(email_module, "_save_outbox_reply_message"), \
@@ -2355,7 +2370,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -2399,7 +2414,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_tour_notification(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -2467,7 +2482,7 @@ class OutboxSafetyTests(unittest.TestCase):
             }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", side_effect=graph_send), \
              patch.object(email_module, "_save_outbox_reply_message"), \
@@ -2645,7 +2660,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": True,
@@ -2694,7 +2709,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="wrong-broker@example.com"), \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
              patch.object(email_module, "send_and_index_email", return_value={
@@ -2730,7 +2745,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender") as get_reply_sender, \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
              patch.object(email_module, "send_and_index_email") as send_and_index_email:
@@ -2766,7 +2781,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_fetch_graph_message_metadata", return_value={
                  "conversationId": "conversation-1",
                  "subject": "RE: 0 Gemini Ave, Houston",
@@ -2810,7 +2825,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_fetch_graph_message_metadata", return_value={
                  "conversationId": "conversation-1",
                  "subject": "RE: 0 Gemini Ave, Houston",
@@ -2840,7 +2855,7 @@ class OutboxSafetyTests(unittest.TestCase):
         _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
              patch.object(email_module, "_send_outbox_as_reply", return_value={
                  "sent": False,
@@ -2879,7 +2894,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
              patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
@@ -2932,7 +2947,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
              patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match) as sent_guard, \
@@ -2983,7 +2998,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
              patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match) as sent_guard, \
@@ -3027,7 +3042,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_thread_row_number", return_value=7), \
              patch.object(email_module, "_get_reply_message_sender", return_value=recipient), \
              patch.object(email_module, "_fetch_graph_message_metadata", return_value={
@@ -3073,7 +3088,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_thread_row_number", return_value=7), \
              patch.object(email_module, "_get_reply_message_sender", return_value=recipient), \
              patch.object(email_module, "_fetch_graph_message_metadata", return_value={
@@ -3117,7 +3132,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_thread_row_number", return_value=7), \
              patch.object(email_module, "_get_reply_message_sender", return_value=recipient), \
              patch.object(email_module, "_fetch_graph_message_metadata", return_value={
@@ -3161,7 +3176,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
              patch.object(
@@ -3212,7 +3227,7 @@ class OutboxSafetyTests(unittest.TestCase):
             }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
@@ -3267,7 +3282,7 @@ class OutboxSafetyTests(unittest.TestCase):
             }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
@@ -3322,7 +3337,7 @@ class OutboxSafetyTests(unittest.TestCase):
         }
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
@@ -3358,7 +3373,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
              patch.object(email_module, "send_and_index_email", return_value={
@@ -3376,7 +3391,10 @@ class OutboxSafetyTests(unittest.TestCase):
             )
 
         self.assertTrue(doc.reference.deleted)
-        self.assertEqual([], doc.reference.set_calls)
+        self.assertFalse(any(
+            call[0][0].get("status") or call[0][0].get("attempts")
+            for call in doc.reference.set_calls
+        ))
         dead_letter_payload = fake_fs.add_calls[-1][1]
         self.assertEqual(dead_letter_payload["status"], "needs_reconciliation")
         self.assertTrue(dead_letter_payload["alreadySent"])
@@ -3407,7 +3425,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
              patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
@@ -3473,7 +3491,7 @@ class OutboxSafetyTests(unittest.TestCase):
         fake_fs = FakeFirestore()
 
         with patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=True), \
              patch.object(email_module, "send_and_index_email") as send_and_index_email:
             email_module._send_single_outbox_item(
@@ -3541,7 +3559,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", FakeFirestore()), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_dead_letter_unsafe_outbound_body_if_needed", side_effect=record_guard), \
              patch.object(email_module, "send_and_index_email", side_effect=record_send), \
@@ -3572,7 +3590,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "send_and_index_email", return_value={
                  "sent": [],
@@ -3590,7 +3608,10 @@ class OutboxSafetyTests(unittest.TestCase):
             )
 
         self.assertTrue(doc.reference.deleted)
-        self.assertEqual([], doc.reference.set_calls)
+        self.assertFalse(any(
+            call[0][0].get("status") or call[0][0].get("attempts")
+            for call in doc.reference.set_calls
+        ))
         dead_letter_payload = fake_fs.add_calls[-1][1]
         self.assertEqual(dead_letter_payload["status"], "needs_reconciliation")
         self.assertTrue(dead_letter_payload["alreadySent"])
@@ -3653,6 +3674,7 @@ class DailySendCapTests(unittest.TestCase):
         docs = self._same_recipient_docs(count)
         for doc in docs:
             doc._data["sendMode"] = "combined"
+            doc.reference.update({"sendMode": "combined"})
         return docs
 
     def _run_provider_send_cap_case(self, docs, *, scope, current, cap=20):
@@ -3929,7 +3951,7 @@ class DailySendCapTests(unittest.TestCase):
             "SITESIFT_DAILY_SEND_CAP": "20",
             "SITESIFT_GLOBAL_DAILY_SEND_CAP": "20",
         }), patch("email_automation.clients._fs", fake_fs), \
-             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_claim_outbox_item", side_effect=_claim_as_current_worker), \
              patch.object(email_module, "_get_current_outbox_data", return_value=doc.to_dict()), \
              patch.object(email_module, "_finalize_successful_outbox_item", side_effect=finalize) as finalizer, \
              patch.object(email_module, "_read_daily_send_count") as read_user_count, \
@@ -4121,8 +4143,13 @@ class SendModeCombineTests(unittest.TestCase):
                 "columnConfig": get_default_column_config(),
             }),
         ))
-        p("_claim_outbox_item", return_value=True)
-        p("_get_current_outbox_data", return_value={})
+        p("_claim_outbox_item", side_effect=_claim_as_current_worker)
+        p(
+            "_get_current_outbox_data",
+            side_effect=lambda ref: (
+                ref.get().to_dict() if ref.get().exists else None
+            ),
+        )
         p("_pause_client_outbox_item_if_needed", return_value=False)
         p("_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False)
         if callable(existing):

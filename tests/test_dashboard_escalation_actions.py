@@ -490,7 +490,11 @@ class SendSingleCancelRaceTests(unittest.TestCase):
         cancelled = {**pre_claim, **CANCEL_FIELDS}
 
         tx = _CancelTxn()
-        doc_ref = _CancelOutboxRef("outbox-cancel-send", tx_snapshot=_CancelSnapshot(cancelled))
+        doc_ref = _CancelOutboxRef(
+            "outbox-cancel-send",
+            tx_snapshot=_CancelSnapshot(cancelled),
+            plain_snapshots=[_CancelSnapshot(pre_claim)],
+        )
         fake_fs = _CancelFS(transaction=tx)
         doc = _CancelDoc(doc_ref, pre_claim)
 
@@ -524,10 +528,17 @@ class SendSingleCancelRaceTests(unittest.TestCase):
         fake_fs = _CancelFS()
         doc_ref = _CancelOutboxRef("outbox-cancel-post")
         doc = _CancelDoc(doc_ref, pre_claim)
+        refresh_values = [pre_claim, cancelled_refresh]
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
-             patch.object(email_module, "_get_current_outbox_data", return_value=cancelled_refresh), \
+             patch.object(
+                 email_module,
+                 "_get_current_outbox_data",
+                 side_effect=lambda _ref: dict(
+                     refresh_values.pop(0) if refresh_values else cancelled_refresh
+                 ),
+             ), \
              patch.object(email_module, "_get_reply_message_sender") as get_reply_sender, \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
              patch.object(email_module, "send_and_index_email") as send_and_index_email:

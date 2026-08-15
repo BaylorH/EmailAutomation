@@ -131,10 +131,22 @@ class StopCancelDismissWrongRecipientTest(unittest.TestCase):
             {"clientId": "client-1", "status": "active", "rowNumber": 20},
             message_ids=["graph-message-1"],
         )
+        refresh_values = [dict(queued), dict(live_data)]
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
-             patch.object(email_module, "_get_current_outbox_data", return_value=live_data), \
+             patch.object(
+                 email_module,
+                 "_get_current_outbox_data",
+                 side_effect=lambda _ref: dict(
+                     refresh_values.pop(0) if refresh_values else live_data
+                 ),
+             ), \
+             patch.object(
+                 email_module,
+                 "_gate_generic_provider_unit",
+                 return_value={"status": "ready", "data": [dict(live_data)]},
+             ), \
              patch.object(email_module, "_pause_results_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_should_preflight_sent_items_retry", return_value=False), \

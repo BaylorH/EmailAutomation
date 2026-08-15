@@ -189,6 +189,12 @@ class ComboStopCancelDuringClaimTests(unittest.TestCase):
             message_ids=["graph-message-1"],
         )
         fresh = live_data if live_data is not None else queued
+        refresh_values = [dict(queued), dict(fresh)]
+
+        def next_refresh(_ref):
+            if refresh_values:
+                return refresh_values.pop(0)
+            return dict(fresh)
 
         retry_result = retry_result or {}
         match = retry_result.get("_match")
@@ -197,8 +203,12 @@ class ComboStopCancelDuringClaimTests(unittest.TestCase):
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_pause_results_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "get_client_automation_pause", return_value=client_paused), \
-             patch.object(email_module, "_get_current_outbox_data", return_value=fresh), \
+             patch.object(email_module, "_get_current_outbox_data", side_effect=next_refresh), \
              patch.object(email_module, "_claim_outbox_item", return_value=claim) as claim_mock, \
+             patch.object(email_module, "_gate_generic_provider_unit", return_value={
+                 "status": "ready",
+                 "data": [dict(fresh)],
+             }), \
              patch.object(email_module, "_get_reply_message_sender", return_value=reply_sender), \
              patch.object(email_module, "_fetch_graph_message_metadata", return_value={}), \
              patch.object(email_module, "find_matching_sent_message_for_retry", return_value=match), \
