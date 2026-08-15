@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 1,
+  "domain": "sitesift-manual-reply-resolution:v1",
+  "encoding": "utf-8",
+  "framing": "uint32be-byte-length followed by raw bytes for every tuple member",
+  "tupleOrder": [
+    "domain",
+    "uid",
+    "threadId",
+    "immutableGraphMessageId",
+    "normalizedInternetMessageId",
+    "source"
+  ],
+  "hash": "sha256-lowercase-hex",
+  "boundaryRejectedCodePoints": [
+    "0009",
+    "000A",
+    "000B",
+    "000C",
+    "000D",
+    "0020",
+    "0085",
+    "00A0",
+    "1680",
+    "2000",
+    "2001",
+    "2002",
+    "2003",
+    "2004",
+    "2005",
+    "2006",
+    "2007",
+    "2008",
+    "2009",
+    "200A",
+    "2028",
+    "2029",
+    "202F",
+    "205F",
+    "3000",
+    "FEFF"
+  ],
+  "internetBoundaryTrimCodePoints": ["0009", "000A", "000D", "0020"],
+  "firestoreReservedPattern": "^__.*__$",
+  "loneSurrogateCodeUnit": "D800",
+  "positiveOpaqueGraphMessageId": "AQMk/opaque +Case==.value",
+  "generatedCases": {
+    "documentId": {
+      "asciiUnit": "u",
+      "asciiMaxCount": 1500,
+      "asciiOverCount": 1501,
+      "multibyteUnit": "\u00e9",
+      "multibyteMaxCount": 750,
+      "multibyteOverCount": 751
+    },
+    "immutableGraphMessageId": {
+      "asciiUnit": "G",
+      "asciiMaxCount": 2048,
+      "asciiOverCount": 2049,
+      "multibyteUnit": "\u00e9",
+      "multibyteMaxCount": 1024,
+      "multibyteOverCount": 1025
+    },
+    "internetMessageId": {
+      "localUnit": "a",
+      "domain": "xy",
+      "maxLocalCount": 993,
+      "overLocalCount": 994
+    }
+  },
+  "validation": {
+    "uid": "canonical Firestore document ID: string, 1..1500 UTF-8 bytes, no listed boundary code point, slash, control, DEL, dot, dot-dot, or reserved ^__.*__$ form",
+    "threadId": "canonical Firestore document ID: string, 1..1500 UTF-8 bytes, no listed boundary code point, slash, control, DEL, dot, dot-dot, or reserved ^__.*__$ form",
+    "immutableGraphMessageId": "opaque string, 1..2048 UTF-8 bytes, no listed boundary code point, control, or DEL; preserve bytes and case",
+    "internetMessageId": "ASCII string, 1..998 bytes after boundary ASCII whitespace removal, one angle-bracketed nonblank local@domain pair, no interior whitespace/control; lowercase ASCII A-Z only",
+    "source": "exact string dashboard_inline_reply"
+  },
+  "vectors": [
+    {
+      "name": "unicode-baseline",
+      "input": {
+        "uid": "synthetic-user-\u03b1",
+        "threadId": "synthetic-thread-\u6771\u4eac",
+        "immutableGraphMessageId": "AQMkAGraphCase_AaZ-09==",
+        "internetMessageId": " \t<Case.Fixture+01@EXAMPLE.TEST>\r\n",
+        "source": "dashboard_inline_reply"
+      },
+      "normalizedInternetMessageId": "<case.fixture+01@example.test>",
+      "expectedKey": "f85f10c7be4ee8f1c56ce4530a8d4b2e35b1621733caebf148eef205657d2043"
+    },
+    {
+      "name": "internet-id-alias",
+      "aliasOf": "unicode-baseline",
+      "input": {
+        "uid": "synthetic-user-\u03b1",
+        "threadId": "synthetic-thread-\u6771\u4eac",
+        "immutableGraphMessageId": "AQMkAGraphCase_AaZ-09==",
+        "internetMessageId": "<case.fixture+01@example.test>",
+        "source": "dashboard_inline_reply"
+      },
+      "normalizedInternetMessageId": "<case.fixture+01@example.test>",
+      "expectedKey": "f85f10c7be4ee8f1c56ce4530a8d4b2e35b1621733caebf148eef205657d2043"
+    },
+    {
+      "name": "opaque-case-differs",
+      "input": {
+        "uid": "synthetic-user-\u03b1",
+        "threadId": "synthetic-thread-\u6771\u4eac",
+        "immutableGraphMessageId": "aqmkagraphcase_aaz-09==",
+        "internetMessageId": "<case.fixture+01@example.test>",
+        "source": "dashboard_inline_reply"
+      },
+      "normalizedInternetMessageId": "<case.fixture+01@example.test>",
+      "expectedKey": "ac2deeccffea67a9e62245758a7e62950c7f01bb9f715114d888bdb22536321f"
+    },
+    {
+      "name": "canonical-source-pair-differs",
+      "input": {
+        "uid": "synthetic-user-\u03b1",
+        "threadId": "synthetic-thread-\u6771\u4eac",
+        "immutableGraphMessageId": "AQMkAGraphCase_AaZ-10==",
+        "internetMessageId": "<case.fixture+02@example.test>",
+        "source": "dashboard_inline_reply"
+      },
+      "normalizedInternetMessageId": "<case.fixture+02@example.test>",
+      "expectedKey": "491b90b23def4f90d099d48a6ae2f46ae9d5be3f2c29a4bf3fff6fb36d6d090f"
+    },
+    {
+      "name": "internet-id-only-differs",
+      "input": {
+        "uid": "synthetic-user-\u03b1",
+        "threadId": "synthetic-thread-\u6771\u4eac",
+        "immutableGraphMessageId": "AQMkAGraphCase_AaZ-09==",
+        "internetMessageId": "<case.fixture+03@example.test>",
+        "source": "dashboard_inline_reply"
+      },
+      "normalizedInternetMessageId": "<case.fixture+03@example.test>",
+      "expectedKey": "a12786654c5c99b1157cc3f56fdd03beb0383a457e386840a9819a2bd6a12ee6"
+    },
+    {
+      "name": "unicode-composed",
+      "input": {
+        "uid": "synthetic-user-\u00e9",
+        "threadId": "synthetic-thread-\u03b4",
+        "immutableGraphMessageId": "AQMkAGraphUnicode-01==",
+        "internetMessageId": "<unicode.fixture@example.test>",
+        "source": "dashboard_inline_reply"
+      },
+      "normalizedInternetMessageId": "<unicode.fixture@example.test>",
+      "expectedKey": "a0d83fb0943951b3b58e1bef4ec305c37b9b2fd6c4082d05a5cb5619079ae857"
+    },
+    {
+      "name": "unicode-decomposed",
+      "input": {
+        "uid": "synthetic-user-e\u0301",
+        "threadId": "synthetic-thread-\u03b4",
+        "immutableGraphMessageId": "AQMkAGraphUnicode-01==",
+        "internetMessageId": "<unicode.fixture@example.test>",
+        "source": "dashboard_inline_reply"
+      },
+      "normalizedInternetMessageId": "<unicode.fixture@example.test>",
+      "expectedKey": "aa3367e1f7397e959605b550e87d2e7f21c02cc0b2038fe4261e227fa7c30e1e"
+    }
+  ]
+}
