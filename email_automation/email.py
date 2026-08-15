@@ -2755,6 +2755,131 @@ def _delete_cancelled_outbox_item_if_needed(
     return True
 
 
+def _exact_outbox_result(status: str, user_id: str, outbox_id: str) -> Dict[str, str]:
+    return {"status": status, "uid": user_id, "outboxId": outbox_id}
+
+
+def _is_exact_manual_inline_reply(data: Dict[str, Any]) -> bool:
+    return (
+        data.get("source") == DASHBOARD_INLINE_REPLY_SOURCE
+        and data.get("actionType") == DASHBOARD_REPLY_ACTION_TYPE
+    )
+
+
+def _valid_exact_document_id(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    if value != value.strip():
+        return False
+    if not value or value in {".", ".."} or "/" in value:
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    return len(value.encode("utf-8")) <= 1500
+
+
+def _cancel_exact_outbox_item_transactionally(user_id: str, doc_ref) -> str:
+    """Delete one cancelled item and terminalize its linked audit atomically."""
+    from .clients import _fs
+
+    @firestore.transactional
+    def cancel(transaction):
+        snapshot = doc_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return "not_found"
+
+        data = snapshot.to_dict() or {}
+        if not _is_cancelled_outbox_item(data):
+            return "blocked_state_changed"
+        if not _is_exact_manual_inline_reply(data):
+            return "blocked_non_manual"
+
+        for field, blocked_status in (
+            ("clientId", "blocked_invalid_client"),
+            ("threadId", "blocked_invalid_thread"),
+            ("notificationId", "blocked_invalid_notification"),
+        ):
+            if not _valid_exact_document_id(data.get(field)):
+                return blocked_status
+
+        raw_audit_id = data.get("actionAuditId")
+        if not _valid_exact_document_id(raw_audit_id):
+            return "blocked_invalid_action_audit"
+        action_audit_id = raw_audit_id
+        audit_ref = (
+            _fs.collection("users").document(user_id)
+            .collection("actionAudit").document(action_audit_id)
+        )
+        audit_snapshot = audit_ref.get(transaction=transaction)
+        if not audit_snapshot.exists:
+            return "blocked_missing_action_audit"
+        audit = audit_snapshot.to_dict() or {}
+
+        if audit.get("status") != "queued":
+            return "blocked_audit_status"
+        if audit.get("actorUid") != user_id:
+            return "blocked_audit_actor"
+        if audit.get("source") != DASHBOARD_INLINE_REPLY_SOURCE:
+            return "blocked_audit_source"
+        if audit.get("actionType") != DASHBOARD_REPLY_ACTION_TYPE:
+            return "blocked_audit_action_type"
+        if audit.get("clientId") != data.get("clientId"):
+            return "blocked_audit_client"
+        if audit.get("threadId") != data.get("threadId"):
+            return "blocked_audit_thread"
+        if audit.get("notificationId") != data.get("notificationId"):
+            return "blocked_audit_notification"
+        audit_outbox_id = audit.get("outboxId")
+        if audit_outbox_id not in (None, "") and audit_outbox_id != doc_ref.id:
+            return "blocked_audit_outbox"
+
+        transaction.delete(doc_ref)
+        transaction.set(
+            audit_ref,
+            {
+                "status": "cancelled",
+                "outboxId": getattr(doc_ref, "id", None),
+                "clientId": data.get("clientId"),
+                "notificationId": data.get("notificationId"),
+                "threadId": data.get("threadId"),
+                "cancelledAt": SERVER_TIMESTAMP,
+                "updatedAt": SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return "cancelled"
+
+    return cancel(_fs.transaction())
+
+
+def process_outbox_item(user_id: str, outbox_id: str) -> Dict[str, str]:
+    """Classify one exact outbox document; never enumerate or send.
+
+    Cancellation is the only mutation in this transport slice. A non-cancelled
+    deployed inline reply is merely handed off for the later sender task; every
+    other non-cancelled source fails closed.
+    """
+    from .clients import _fs
+
+    doc_ref = (
+        _fs.collection("users").document(user_id)
+        .collection("outbox").document(outbox_id)
+    )
+    snapshot = doc_ref.get()
+    if not snapshot.exists:
+        return _exact_outbox_result("not_found", user_id, outbox_id)
+
+    data = snapshot.to_dict() or {}
+    if not _is_exact_manual_inline_reply(data):
+        return _exact_outbox_result("blocked_non_manual", user_id, outbox_id)
+
+    if _is_cancelled_outbox_item(data):
+        status = _cancel_exact_outbox_item_transactionally(user_id, doc_ref)
+        return _exact_outbox_result(status, user_id, outbox_id)
+
+    return _exact_outbox_result("manual_ready", user_id, outbox_id)
+
+
 def _must_process_outbox_item_individually(data: Dict[str, Any]) -> bool:
     """Dashboard-approved replies/exact-copy items must not be bundled into campaign outreach."""
     return bool(

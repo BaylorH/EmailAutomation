@@ -17,6 +17,10 @@ POST /process-user   body {"uid": "<firebase-uid>"}
       * 400 {"status": "error", ...}      — missing / blank uid or non-JSON body
       * 401 {"status": "error", ...}      — auth required and missing/wrong secret
       * 500 {"status": "error", "error"}  — pipeline raised (so Cloud Tasks retries)
+POST /process-outbox body {"uid": "<firebase-uid>", "outboxId": "<document-id>"}
+    Classifies only that exact outbox document under the same per-user lease.
+    This transport-only route does not permit a send; manual items are handed
+    off as ``manual_ready`` for a later reviewed sender task.
 GET  /health         — Cloud Run-safe liveness probe, always 200
 GET  /healthz        — legacy liveness alias, always 200 (never auth-gated)
 
@@ -47,12 +51,15 @@ import os
 
 from flask import Flask, jsonify, request
 
+from main import process_outbox_item as process_outbox_item_entry
 from main import refresh_and_process_user
 from email_automation.scheduler_lease import run_with_user_lease
 
 app = Flask(__name__)
 
 _AUTH_ENV = "PROCESS_USER_AUTH"
+_MAX_UID_LENGTH = 128
+_MAX_FIRESTORE_DOCUMENT_ID_BYTES = 1500
 
 
 def _extract_bearer() -> str | None:
@@ -72,6 +79,18 @@ def _auth_ok() -> bool:
     if not provided:
         return False
     return hmac.compare_digest(provided, expected)
+
+
+def _valid_document_id(value: str, *, max_length: int | None = None) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if value in {".", ".."} or "/" in value:
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    if max_length is not None and len(value) > max_length:
+        return False
+    return len(value.encode("utf-8")) <= _MAX_FIRESTORE_DOCUMENT_ID_BYTES
 
 
 @app.get("/health")
@@ -106,6 +125,53 @@ def process_user():
     # this request's outbox item was created. A non-2xx response keeps the Cloud
     # Task retryable instead of acknowledging work that no worker has observed.
     return jsonify({"status": "skipped_locked", "uid": uid}), 503
+
+
+@app.post("/process-outbox")
+def process_outbox():
+    if not _auth_ok():
+        return jsonify({"status": "error", "error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"status": "error", "error": "invalid or missing JSON body"}), 400
+
+    raw_uid = body.get("uid")
+    raw_outbox_id = body.get("outboxId")
+    if not isinstance(raw_uid, str) or not raw_uid.strip():
+        return jsonify({"status": "error", "error": "missing uid"}), 400
+    if not isinstance(raw_outbox_id, str) or not raw_outbox_id.strip():
+        return jsonify({"status": "error", "error": "missing outboxId"}), 400
+
+    uid = raw_uid.strip()
+    outbox_id = raw_outbox_id.strip()
+    if not _valid_document_id(uid, max_length=_MAX_UID_LENGTH):
+        return jsonify({"status": "error", "error": "invalid uid"}), 400
+    if not _valid_document_id(outbox_id):
+        return jsonify({"status": "error", "error": "invalid outboxId"}), 400
+
+    outcome = {}
+
+    def process_exact_item():
+        outcome["value"] = process_outbox_item_entry(uid, outbox_id)
+        return outcome["value"]
+
+    try:
+        acquired = run_with_user_lease(uid, process_exact_item)
+    except Exception as e:  # noqa: BLE001 — preserve retry semantics for the task delivery
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+    if not acquired:
+        return jsonify({
+            "status": "skipped_locked",
+            "uid": uid,
+            "outboxId": outbox_id,
+        }), 503
+
+    result = outcome.get("value")
+    if not isinstance(result, dict):
+        result = {"status": "processed", "uid": uid, "outboxId": outbox_id}
+    return jsonify(result), 200
 
 
 if __name__ == "__main__":

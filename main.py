@@ -8,6 +8,7 @@ from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload, _fs
+from email_automation.email import process_outbox_item as process_exact_outbox_item
 from email_automation.email import send_outboxes
 from email_automation.processing import (
     _graph_operation_error_state,
@@ -219,6 +220,14 @@ def _combine_graph_operation_states(operation_states):
         "status": "healthy",
         "operations": states,
     }
+
+
+def process_outbox_item(user_id: str, outbox_id: str):
+    """Classify one exact outbox item without entering the per-user pipeline.
+
+    Task 1 deliberately stops before credential acquisition or sender permit.
+    """
+    return process_exact_outbox_item(user_id, outbox_id)
 
 
 def refresh_and_process_user(user_id: str):

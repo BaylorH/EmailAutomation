@@ -175,6 +175,147 @@ class ProcessUserServiceTests(unittest.TestCase):
         self.assertIn("graph exploded", body["error"])
 
 
+class ProcessOutboxServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.client = service.app.test_client()
+        os.environ.pop("PROCESS_USER_AUTH", None)
+
+    def tearDown(self):
+        os.environ.pop("PROCESS_USER_AUTH", None)
+
+    def test_process_outbox_runs_exact_item_under_same_user_lease(self):
+        seen = {}
+
+        def lease(uid, fn, **kwargs):
+            seen["uid"] = uid
+            seen["result"] = fn()
+            return True
+
+        expected = {
+            "status": "manual_ready",
+            "uid": "user-123",
+            "outboxId": "outbox-456",
+        }
+        with patch.object(service, "run_with_user_lease", side_effect=lease), \
+                patch.object(
+                    service,
+                    "process_outbox_item_entry",
+                    return_value=expected,
+                    create=True,
+                ) as process_exact:
+            resp = self.client.post(
+                "/process-outbox",
+                json={"uid": " user-123 ", "outboxId": " outbox-456 "},
+            )
+
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual(expected, resp.get_json())
+        self.assertEqual("user-123", seen["uid"])
+        self.assertEqual(expected, seen["result"])
+        process_exact.assert_called_once_with("user-123", "outbox-456")
+
+    def test_process_outbox_locked_user_is_retryable_and_does_not_process(self):
+        with patch.object(service, "run_with_user_lease", side_effect=_lease_locked), \
+                patch.object(
+                    service,
+                    "process_outbox_item_entry",
+                    create=True,
+                ) as process_exact:
+            resp = self.client.post(
+                "/process-outbox",
+                json={"uid": "user-123", "outboxId": "outbox-456"},
+            )
+
+        self.assertEqual(503, resp.status_code)
+        self.assertEqual("skipped_locked", resp.get_json()["status"])
+        process_exact.assert_not_called()
+
+    def test_process_outbox_requires_exact_uid_and_outbox_id(self):
+        missing_uid = self.client.post(
+            "/process-outbox",
+            json={"outboxId": "outbox-456"},
+        )
+        missing_outbox = self.client.post(
+            "/process-outbox",
+            json={"uid": "user-123"},
+        )
+        blank_outbox = self.client.post(
+            "/process-outbox",
+            json={"uid": "user-123", "outboxId": "   "},
+        )
+
+        self.assertEqual(400, missing_uid.status_code)
+        self.assertEqual(400, missing_outbox.status_code)
+        self.assertEqual(400, blank_outbox.status_code)
+
+    def test_process_outbox_rejects_unsafe_or_unbounded_document_ids_before_lease(self):
+        invalid_cases = [
+            {"uid": "user/other", "outboxId": "outbox-1"},
+            {"uid": "user\nother", "outboxId": "outbox-1"},
+            {"uid": "u" * 129, "outboxId": "outbox-1"},
+            {"uid": "user-1", "outboxId": "folder/outbox-1"},
+            {"uid": "user-1", "outboxId": "outbox\x00one"},
+            {"uid": "user-1", "outboxId": "o" * 1501},
+        ]
+
+        with patch.object(service, "run_with_user_lease") as lease, \
+                patch.object(
+                    service,
+                    "process_outbox_item_entry",
+                    create=True,
+                ) as process_exact:
+            for payload in invalid_cases:
+                with self.subTest(payload=payload):
+                    resp = self.client.post("/process-outbox", json=payload)
+                    self.assertEqual(400, resp.status_code)
+
+        lease.assert_not_called()
+        process_exact.assert_not_called()
+
+    def test_process_outbox_uses_existing_shared_secret_gate(self):
+        with patch.dict(os.environ, {"PROCESS_USER_AUTH": "s3cret"}):
+            with patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
+                    patch.object(
+                        service,
+                        "process_outbox_item_entry",
+                        return_value={"status": "manual_ready"},
+                        create=True,
+                    ):
+                missing = self.client.post(
+                    "/process-outbox",
+                    json={"uid": "user-123", "outboxId": "outbox-456"},
+                )
+                allowed = self.client.post(
+                    "/process-outbox",
+                    json={"uid": "user-123", "outboxId": "outbox-456"},
+                    headers={"Authorization": "Bearer s3cret"},
+                )
+
+        self.assertEqual(401, missing.status_code)
+        self.assertNotEqual(401, allowed.status_code)
+
+    def test_process_outbox_downstream_exception_returns_retryable_500(self):
+        def lease(uid, fn, **kwargs):
+            fn()
+            return True
+
+        with patch.object(service, "run_with_user_lease", side_effect=lease), \
+                patch.object(
+                    service,
+                    "process_outbox_item_entry",
+                    side_effect=RuntimeError("exact item failed"),
+                    create=True,
+                ):
+            resp = self.client.post(
+                "/process-outbox",
+                json={"uid": "user-123", "outboxId": "outbox-456"},
+            )
+
+        self.assertEqual(500, resp.status_code)
+        self.assertEqual("error", resp.get_json()["status"])
+        self.assertIn("exact item failed", resp.get_json()["error"])
+
+
 class ProcessUserAuthTests(unittest.TestCase):
     def setUp(self):
         self.client = service.app.test_client()
