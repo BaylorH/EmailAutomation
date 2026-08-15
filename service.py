@@ -18,9 +18,9 @@ POST /process-user   body {"uid": "<firebase-uid>"}
       * 401 {"status": "error", ...}      — auth required and missing/wrong secret
       * 500 {"status": "error", "error"}  — pipeline raised (so Cloud Tasks retries)
 POST /process-outbox body {"uid": "<firebase-uid>", "outboxId": "<document-id>"}
-    Classifies only that exact outbox document under the same per-user lease.
-    This transport-only route does not permit a send; manual items are handed
-    off as ``manual_ready`` for a later reviewed sender task.
+    Continues only that exact outbox document under the same per-user lease.
+    Reviewed results are bounded to processed/terminal/manual-review/invalid;
+    Task 8 itself leaves a ready item fail-closed for the Task 9 sender.
 GET  /health         — Cloud Run-safe liveness probe, always 200
 GET  /healthz        — legacy liveness alias, always 200 (never auth-gated)
 
@@ -53,13 +53,16 @@ from flask import Flask, jsonify, request
 
 from main import process_outbox_item as process_outbox_item_entry
 from main import refresh_and_process_user
+from email_automation.manual_reply import (
+    bounded_manual_reply_result,
+    is_canonical_document_id,
+)
 from email_automation.scheduler_lease import run_with_user_lease
 
 app = Flask(__name__)
 
 _AUTH_ENV = "PROCESS_USER_AUTH"
 _MAX_UID_LENGTH = 128
-_MAX_FIRESTORE_DOCUMENT_ID_BYTES = 1500
 _PROCESS_OUTBOX_BODY_KEYS = frozenset({"uid", "outboxId"})
 _PROCESS_OUTBOX_STATUSES = frozenset({
     "manual_ready",
@@ -67,6 +70,7 @@ _PROCESS_OUTBOX_STATUSES = frozenset({
     "not_found",
     "blocked_state_changed",
     "blocked_non_manual",
+    "blocked_generic_owned",
     "blocked_invalid_client",
     "blocked_invalid_thread",
     "blocked_invalid_notification",
@@ -81,6 +85,12 @@ _PROCESS_OUTBOX_STATUSES = frozenset({
     "blocked_audit_notification",
     "blocked_audit_outbox",
 })
+_REVIEWED_PROCESS_OUTBOX_HTTP_CODES = {
+    "processed": 200,
+    "terminal_no_effect": 200,
+    "manual_review": 409,
+    "invalid": 400,
+}
 
 
 def _extract_bearer() -> str | None:
@@ -103,17 +113,11 @@ def _auth_ok() -> bool:
 
 
 def _valid_document_id(value: str, *, max_length: int | None = None) -> bool:
-    if not isinstance(value, str) or not value:
+    if max_length is not None and (
+        not isinstance(value, str) or len(value) > max_length
+    ):
         return False
-    if value != value.strip():
-        return False
-    if value in {".", ".."} or "/" in value:
-        return False
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        return False
-    if max_length is not None and len(value) > max_length:
-        return False
-    return len(value.encode("utf-8")) <= _MAX_FIRESTORE_DOCUMENT_ID_BYTES
+    return is_canonical_document_id(value)
 
 
 @app.get("/health")
@@ -182,9 +186,19 @@ def process_outbox():
 
     result = outcome.get("value")
     status = result.get("status") if isinstance(result, dict) else None
-    if not isinstance(status, str) or status not in _PROCESS_OUTBOX_STATUSES:
+    if isinstance(status, str) and status in _PROCESS_OUTBOX_STATUSES:
+        # Preserve the exact durable Task 2 transport response while the new
+        # main runner no longer produces this legacy classification envelope.
+        return jsonify({"status": status}), 200
+
+    try:
+        public_result = bounded_manual_reply_result(result)
+    except ValueError:
         return jsonify({"status": "error", "reason": "processing_failed"}), 500
-    return jsonify({"status": status}), 200
+    return (
+        jsonify(public_result),
+        _REVIEWED_PROCESS_OUTBOX_HTTP_CODES[public_result["status"]],
+    )
 
 
 if __name__ == "__main__":

@@ -328,6 +328,23 @@ class DeployScriptContractTests(unittest.TestCase):
             for relative_path in sorted(forbidden_paths):
                 self.assertTrue(is_ignored(relative_path), relative_path)
 
+    def test_deployed_entrypoint_uses_the_exact_manual_reply_runner(self):
+        main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+        service_source = (REPO_ROOT / "service.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "from email_automation.manual_reply import process_outbox_item as process_manual_reply_item",
+            main_source,
+        )
+        self.assertNotIn(
+            "from email_automation.email import process_outbox_item as process_exact_outbox_item",
+            main_source,
+        )
+        self.assertIn('@app.post("/process-outbox")', service_source)
+        self.assertTrue(
+            (REPO_ROOT / "email_automation" / "manual_reply.py").is_file()
+        )
+
     def test_explicit_dry_run_makes_zero_gcloud_calls(self):
         result = self._run("--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)

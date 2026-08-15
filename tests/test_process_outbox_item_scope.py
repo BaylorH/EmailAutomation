@@ -164,22 +164,23 @@ def _queued_audit(**overrides):
 
 
 class ProcessOutboxMainScopeTests(unittest.TestCase):
-    def test_main_hands_only_the_exact_identifiers_to_email_entrypoint(self):
+    def test_main_hands_only_the_exact_identifiers_to_manual_reply_entrypoint(self):
         processor = getattr(main, "process_outbox_item", None)
         self.assertTrue(callable(processor), "main.process_outbox_item is missing")
 
         downstream = {
-            "status": "manual_ready",
+            "status": "manual_review",
+            "reason": "send_lane_pending",
             "uid": "must-not-escape",
             "outboxId": "must-not-escape",
             "internal": {"must": "not escape"},
         }
         with patch.object(
             main,
-            "process_exact_outbox_item",
+            "process_manual_reply_item",
             return_value=downstream,
             create=True,
-        ) as process_exact, \
+        ) as process_manual, \
                 patch.object(main, "send_outboxes") as send_outboxes, \
                 patch.object(main, "scan_inbox_against_index") as scan_inbox, \
                 patch.object(main, "scan_sent_items_for_manual_replies") as scan_sent, \
@@ -189,8 +190,11 @@ class ProcessOutboxMainScopeTests(unittest.TestCase):
                 patch.object(main, "ConfidentialClientApplication") as msal:
             result = processor("uid-1", "outbox-1")
 
-        self.assertEqual({"status": "manual_ready"}, result)
-        process_exact.assert_called_once_with("uid-1", "outbox-1")
+        self.assertEqual(
+            {"status": "manual_review", "reason": "send_lane_pending"},
+            result,
+        )
+        process_manual.assert_called_once_with("uid-1", "outbox-1")
         send_outboxes.assert_not_called()
         scan_inbox.assert_not_called()
         scan_sent.assert_not_called()

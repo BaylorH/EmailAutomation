@@ -8,8 +8,9 @@ from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload, _fs
-from email_automation.email import process_outbox_item as process_exact_outbox_item
 from email_automation.email import send_outboxes
+from email_automation.manual_reply import process_outbox_item as process_manual_reply_item
+from email_automation.manual_reply import bounded_manual_reply_result
 from email_automation.processing import (
     _graph_operation_error_state,
     reconcile_stale_processing_failures,
@@ -223,13 +224,14 @@ def _combine_graph_operation_states(operation_states):
 
 
 def process_outbox_item(user_id: str, outbox_id: str):
-    """Classify one exact outbox item without entering the per-user pipeline.
+    """Run only the exact reviewed manual-reply continuation.
 
-    Task 1 deliberately stops before credential acquisition or sender permit.
+    This entrypoint intentionally has no path into refresh/send/scan/follow-up
+    work.  The manual-reply module owns the exact-item continuation and returns
+    the only public status/reason enums the HTTP adapter may expose.
     """
-    result = process_exact_outbox_item(user_id, outbox_id)
-    status = result.get("status") if isinstance(result, dict) else None
-    return {"status": status if isinstance(status, str) else None}
+    result = process_manual_reply_item(user_id, outbox_id)
+    return bounded_manual_reply_result(result)
 
 
 def refresh_and_process_user(user_id: str):
