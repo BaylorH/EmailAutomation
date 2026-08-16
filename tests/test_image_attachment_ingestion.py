@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import io
 import os
+import sys
 import unittest
 from collections import UserDict
 from types import MappingProxyType
@@ -6499,6 +6500,50 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             "image_attachment_type_mismatch",
             mismatch[0]["failure_code"],
         )
+
+    def test_graph_snapshot_rejects_oversized_page_before_materializing_copy(self):
+        oversized_values = [
+            {"id": "oversized-attachment"}
+        ] * (file_handling.GRAPH_ATTACHMENT_SNAPSHOT_MAX_ITEMS * 1000)
+        self.assertIs(type(oversized_values), list)
+
+        response = mock.MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"value": oversized_values}
+        materialized_lengths = []
+        snapshot_code = file_handling.fetch_message_attachment_snapshot.__code__
+
+        def record_snapshot_allocation(frame, event, _arg):
+            if frame.f_code is snapshot_code and event == "line":
+                attachments = frame.f_locals.get("attachments")
+                if type(attachments) is list:
+                    materialized_lengths.append(len(attachments))
+            return record_snapshot_allocation
+
+        previous_trace = sys.gettrace()
+        with mock.patch.object(
+            file_handling.requests,
+            "get",
+            return_value=response,
+        ):
+            try:
+                sys.settrace(record_snapshot_allocation)
+                with self.assertRaises(
+                    file_handling.requests.exceptions.RequestException
+                ) as raised:
+                    file_handling.fetch_message_attachment_snapshot(
+                        {"Authorization": "Bearer fake"},
+                        "graph-message-oversized-page",
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+        self.assertEqual(
+            "Graph attachment snapshot exceeded the item limit",
+            str(raised.exception),
+        )
+        self.assertTrue(materialized_lengths)
+        self.assertEqual(0, max(materialized_lengths))
 
     def test_prevalidated_native_target_remains_current_when_body_emits_new_property(self):
         attachment = self._valid_attachment()
