@@ -45,7 +45,12 @@ from .ai_processing import (
     get_row_anchor,
     propose_sheet_updates,
 )
-from .file_handling import fetch_and_process_linked_assets, fetch_and_process_pdfs, upload_pdf_to_drive
+from .file_handling import (
+    fetch_and_process_linked_assets,
+    fetch_and_process_pdfs,
+    host_first_native_image_manifest_asset,
+    upload_pdf_to_drive,
+)
 from .notifications import (
     write_notification,
     add_client_notifications,
@@ -346,16 +351,23 @@ def _record_asset_extraction_warning(
     """Persist failed asset provenance when usable message text still commits."""
     if not failures:
         return True
-    assets = [
-        {
+    assets = []
+    for entry in failures:
+        if entry.get("native_image_failure") is True:
+            assets.append({
+                "name": "Broker property image",
+                "sourceType": "native_image",
+                "method": "native_image_quarantined",
+                "failureCode": entry.get("failure_code"),
+            })
+            continue
+        assets.append({
             "name": entry.get("name"),
             "sourceUrl": entry.get("source_url"),
             "sourceType": entry.get("source_type"),
             "method": entry.get("method"),
             "error": entry.get("error"),
-        }
-        for entry in failures
-    ]
+        })
     warning_key = hashlib.sha256(
         json.dumps(
             {
@@ -4830,6 +4842,75 @@ def _attachment_source_text(attachment: Dict[str, Any]) -> str:
     ))
 
 
+def _is_prevalidated_native_target_manifest(attachment: Any) -> bool:
+    return bool(
+        isinstance(attachment, dict)
+        and attachment.get("name") == "Broker property image"
+        and attachment.get("method") == "native_image_normalized"
+        and attachment.get("source_type") == "native_image"
+        and attachment.get("property_binding") == "target"
+        and attachment.get("binding_method")
+        == "structured_filename_address"
+        and isinstance(attachment.get("images"), list)
+        and bool(attachment.get("images"))
+    )
+
+
+def _proposal_has_native_multi_property_pause(proposal: Any) -> bool:
+    if not isinstance(proposal, dict):
+        return False
+    events = proposal.get("events")
+    if not isinstance(events, list):
+        return False
+    return any(
+        isinstance(event, dict)
+        and event.get("type") == "needs_user_input"
+        and event.get("reason") == "multi_property_attachment"
+        for event in events
+    )
+
+
+def _proposal_allows_native_image_hosting(proposal: Any) -> bool:
+    if not isinstance(proposal, dict):
+        return False
+    events = proposal.get("events")
+    if not isinstance(events, list):
+        return False
+    if _proposal_has_native_multi_property_pause(proposal):
+        return False
+    # Opt-out authority wins over optional image hosting and row enrichment.
+    return not any(
+        isinstance(event, dict) and event.get("type") == "contact_optout"
+        for event in events
+    )
+
+
+def _host_current_native_image_if_eligible(
+    pdf_manifest: List[Dict[str, Any]],
+    proposal: Dict[str, Any],
+    header: List[str],
+    rowvals: List[str],
+) -> None:
+    """Apply hosted metadata only after validation and model classification."""
+    if not _proposal_allows_native_image_hosting(proposal):
+        return
+    if "property image" not in _header_index_map(header or []):
+        return
+    if _read_row_cell_by_header(header, rowvals, "Property Image"):
+        return
+
+    native_manifest = next((
+        attachment
+        for attachment in (pdf_manifest or [])
+        if _is_prevalidated_native_target_manifest(attachment)
+    ), None)
+    if native_manifest is None:
+        return
+    hosted_projection = host_first_native_image_manifest_asset(native_manifest)
+    if hosted_projection:
+        native_manifest.update(hosted_projection)
+
+
 def _attachment_matches_event_property(
     attachment: Dict[str, Any],
     event: Dict[str, Any],
@@ -4903,9 +4984,9 @@ def _partition_property_attachments(
         ):
             return [
                 attachment for attachment in (pdf_manifest or [])
-                if _attachment_property_verdict(
-                    _attachment_source_text(attachment),
-                    current_anchor,
+                if _is_prevalidated_native_target_manifest(attachment)
+                or _attachment_property_verdict(
+                    _attachment_source_text(attachment), current_anchor
                 ) == "target"
             ], []
         return list(pdf_manifest or []), []
@@ -4913,6 +4994,9 @@ def _partition_property_attachments(
     current_assets: List[Dict[str, Any]] = []
     event_assets: List[List[Dict[str, Any]]] = [[] for _ in new_property_events]
     for attachment in (pdf_manifest or []):
+        if _is_prevalidated_native_target_manifest(attachment):
+            current_assets.append(attachment)
+            continue
         source = _attachment_source_text(attachment)
         current_match = _source_mentions_target_property(source, current_anchor)
         scores = [
@@ -6770,8 +6854,21 @@ def process_inbox_message(
         defer_client_completion_for_closing_reply = False
         deferred_terminal_reason = None
 
-        # NEW: Handle PDF attachments with enhanced extraction for current message only
-        pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
+        # The native-image binding authority is the existing Property Address
+        # cell itself. Do not synthesize missing city/state/ZIP from adjacent
+        # columns, filenames, message text, geocoders, or any other source.
+        native_target_property_hint = _read_row_cell_by_header(
+            header,
+            rowvals,
+            "Property Address",
+        )
+
+        # Handle the current message's shared PDF/native Graph snapshot only.
+        pdf_manifest = fetch_and_process_pdfs(
+            headers,
+            msg_id,
+            target_property_hint=native_target_property_hint,
+        )
 
         if pdf_manifest:
             # Categorize PDFs into flyers vs floorplans based on filename
@@ -6805,7 +6902,10 @@ def process_inbox_message(
             if fetched_text:
                 url_texts.append({"url": clean, "text": fetched_text})
 
-        linked_asset_manifest = fetch_and_process_linked_assets(clean_urls)
+        linked_asset_manifest = fetch_and_process_linked_assets(
+            clean_urls,
+            target_property_hint=native_target_property_hint,
+        )
         if linked_asset_manifest:
             pdf_manifest.extend(linked_asset_manifest)
             for asset in linked_asset_manifest:
@@ -6822,6 +6922,14 @@ def process_inbox_message(
         usable_pdf_manifest = _without_extraction_failures(pdf_manifest, asset_failures)
         pdf_manifest = usable_pdf_manifest
 
+        native_asset_failures = [
+            failure
+            for failure in asset_failures
+            if failure.get("native_image_failure") is True
+        ]
+        if native_asset_failures and not (_text_for_ai or "").strip():
+            _raise_on_extraction_failures(native_asset_failures)
+
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
 
@@ -6835,6 +6943,24 @@ def process_inbox_message(
         )
 
         if proposal:
+            has_prevalidated_native = any(
+                _is_prevalidated_native_target_manifest(attachment)
+                for attachment in pdf_manifest
+            )
+            if (
+                has_prevalidated_native
+                and _proposal_has_native_multi_property_pause(proposal)
+            ):
+                proposal["updates"] = []
+                proposal["response_email"] = None
+                proposal["notes"] = ""
+            _host_current_native_image_if_eligible(
+                pdf_manifest,
+                proposal,
+                header,
+                rowvals,
+            )
+
             # Process updates
             if proposal.get("updates"):
                 broker_flyer_url_evidence = None

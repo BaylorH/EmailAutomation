@@ -6088,7 +6088,7 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
 
         self.assertIsNone(run["error"])
         run["image_store"].assert_called_once()
-        candidate = run["image_store"].call_args.args[9]
+        candidate = run["image_store"].call_args.args[8]
         self.assertEqual(
             "https://drive.google.com/uc?export=view&id=safe-native",
             candidate["url"],
@@ -6109,7 +6109,11 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         )
 
         self.assertIsInstance(run["error"], processing.RetryableProcessingError)
-        run["propose"].assert_not_called()
+        run["propose"].assert_called_once()
+        self.assertEqual(
+            [],
+            run["propose"].call_args.kwargs["pdf_manifest"],
+        )
         run["host"].assert_not_called()
         run["image_writer"].assert_not_called()
 

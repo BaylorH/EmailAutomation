@@ -62,6 +62,8 @@ NATIVE_IMAGE_MAX_SOURCE_BYTES = 10 * 1024 * 1024
 NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES = 20 * 1024 * 1024
 NATIVE_IMAGE_MAX_PIXELS = 20_000_000
 NATIVE_IMAGE_MAX_EDGE = 1400
+GRAPH_ATTACHMENT_SNAPSHOT_MAX_PAGES = 20
+GRAPH_ATTACHMENT_SNAPSHOT_MAX_ITEMS = 100
 # Graph attachment names are normally far shorter; 1024 also leaves ample room
 # for a sheet-derived complete property anchor while bounding Unicode/regex work.
 NATIVE_IMAGE_MAX_ADDRESS_TEXT_CHARS = 1024
@@ -1146,6 +1148,28 @@ def build_native_image_manifest_entry(
     }
 
 
+def build_native_image_failure_manifest_entry(
+    batch: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Project one quarantined native batch into a generic retry marker."""
+    if not isinstance(batch, dict) or batch.get("status") != "quarantined":
+        return None
+    failure = batch.get("failure")
+    code = failure.get("code") if isinstance(failure, dict) else None
+    if code not in _NATIVE_IMAGE_FAILURE_PRECEDENCE:
+        return None
+    return {
+        "name": _NATIVE_IMAGE_GENERIC_NAME,
+        "text": "",
+        "images": [],
+        "method": "native_image_quarantined",
+        "source_type": "native_image",
+        "extraction_failed": True,
+        "native_image_failure": True,
+        "failure_code": code,
+    }
+
+
 @dataclass(frozen=True)
 class _NativeImageMetadataSnapshot:
     content_type: str
@@ -1617,7 +1641,58 @@ def process_pdf_for_ai(content: bytes, filename: str = "document.pdf") -> Dict[s
     return result
 
 
-def fetch_pdf_attachments(headers: Dict[str, str], graph_msg_id: str) -> List[Dict[str, Any]]:
+def fetch_message_attachment_snapshot(
+    headers: Dict[str, str],
+    graph_msg_id: str,
+) -> List[Dict[str, Any]]:
+    """Fetch one bounded, ordered, paginated Graph attachment snapshot."""
+    base = "https://graph.microsoft.com/v1.0"
+    url = f"{base}/me/messages/{graph_msg_id}/attachments"
+    attachments: List[Dict[str, Any]] = []
+    page_count = 0
+
+    while url:
+        page_count += 1
+        if page_count > GRAPH_ATTACHMENT_SNAPSHOT_MAX_PAGES:
+            raise requests.exceptions.RequestException(
+                "Graph attachment snapshot exceeded the page limit"
+            )
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        payload = response.json() or {}
+        values = payload.get("value", []) if isinstance(payload, dict) else []
+        if not isinstance(values, list):
+            raise requests.exceptions.RequestException(
+                "Graph attachment snapshot returned an invalid page"
+            )
+        attachments.extend(values)
+        if len(attachments) > GRAPH_ATTACHMENT_SNAPSHOT_MAX_ITEMS:
+            raise requests.exceptions.RequestException(
+                "Graph attachment snapshot exceeded the item limit"
+            )
+
+        next_link = payload.get("@odata.nextLink") if isinstance(payload, dict) else None
+        if next_link is None:
+            url = ""
+        elif (
+            isinstance(next_link, str)
+            and next_link.startswith("https://graph.microsoft.com/")
+        ):
+            url = next_link
+        else:
+            raise requests.exceptions.RequestException(
+                "Graph attachment snapshot returned an invalid next link"
+            )
+
+    return attachments
+
+
+def fetch_pdf_attachments(
+    headers: Dict[str, str],
+    graph_msg_id: str,
+    *,
+    attachment_snapshot: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """Fetch PDF attachments from current message only.
 
     Fails CLOSED on Graph/network failure: a 401/403/5xx or network error while
@@ -1629,27 +1704,37 @@ def fetch_pdf_attachments(headers: Dict[str, str], graph_msg_id: str) -> List[Di
     silently dropped. Only a healthy 200 response with no PDF attachments
     returns ``[]``.
     """
-    base = "https://graph.microsoft.com/v1.0"
-
-    # Download the attachment list. A Graph/network failure MUST propagate;
-    # do not collapse it into an empty list.
-    resp = requests.get(
-        f"{base}/me/messages/{graph_msg_id}/attachments",
-        headers=headers,
-        timeout=30,
-    )
-    resp.raise_for_status()
-
-    attachments = resp.json().get("value", [])
+    if attachment_snapshot is None:
+        base = "https://graph.microsoft.com/v1.0"
+        # Preserve the legacy direct caller's one-page behavior. The current
+        # message integration supplies the shared paginated snapshot explicitly.
+        resp = requests.get(
+            f"{base}/me/messages/{graph_msg_id}/attachments",
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        attachments = resp.json().get("value", [])
+    else:
+        attachments = attachment_snapshot
     pdf_attachments = []
 
-    for attachment in attachments:
-        if attachment.get("contentType", "").lower() == "application/pdf":
+    for position, attachment in enumerate(attachments):
+        if not isinstance(attachment, dict):
+            continue
+        # A one-sided native image type claim is owned by the native validator.
+        # It must quarantine there, never fall through and get reprocessed as a
+        # PDF merely because its other type field says application/pdf.
+        if (
+            _native_image_candidate(attachment) is None
+            and attachment.get("contentType", "").lower() == "application/pdf"
+        ):
             name = attachment.get("name", "document.pdf")
             content_bytes = base64.b64decode(attachment.get("contentBytes", ""))
             pdf_attachments.append({
                 "name": name,
-                "bytes": content_bytes
+                "bytes": content_bytes,
+                "_snapshot_index": position,
             })
 
     print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
@@ -1986,6 +2071,61 @@ def upload_property_image_to_drive(name: str, content: bytes, folder_id: str = N
     except Exception as e:
         print(f"❌ Failed to upload property preview image: {e}")
         return None
+
+
+def host_first_native_image_manifest_asset(
+    manifest: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Host only the first sealed native image and return allowlisted fields."""
+    prepared = _prepare_safe_native_image_manifests([manifest])
+    if prepared is None or len(prepared) != 1 or not prepared[0].images:
+        return None
+
+    sealed = prepared[0]
+    encoded_image = sealed.images[0]
+    metadata = sealed.image_meta[0]
+    try:
+        normalized_data = _strict_native_image_base64_decode(
+            encoded_image,
+            metadata.normalized_bytes,
+        )
+    except ValueError:
+        return None
+
+    upload_name = (
+        f"broker-property-image-{metadata.normalized_sha256[:16]}.png"
+    )
+    uploaded = upload_property_image_to_drive(upload_name, normalized_data)
+    if not isinstance(uploaded, dict):
+        return None
+    image_url = uploaded.get("url")
+    if not isinstance(image_url, str):
+        return None
+    image_url = image_url.strip()
+    try:
+        parsed_url = urlparse(image_url)
+    except Exception:
+        return None
+    if (
+        parsed_url.scheme.lower() != "https"
+        or parsed_url.netloc.lower() != "drive.google.com"
+    ):
+        return None
+
+    return {
+        "property_image_url": image_url,
+        "property_image_source": "Broker native property image",
+        "property_image_source_type": "native_image",
+        "property_image_meta": {
+            "strategy": "native_image_normalized_v1",
+            "selectionReason": "prevalidated target native image",
+            "contentType": "image/png",
+            "byteCount": metadata.normalized_bytes,
+            "sha256": metadata.normalized_sha256,
+            "width": metadata.width,
+            "height": metadata.height,
+        },
+    }
 
 
 def _filename_from_asset_url(url: str, fallback: str = "broker flyer.pdf") -> str:
@@ -2383,23 +2523,17 @@ def upload_pdf_user_data(filename: str, content: bytes) -> str:
                 pass
 
 
-def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[Dict[str, Any]]:
-    """
-    Fetch PDF attachments and process them for AI consumption.
-
-    Returns list of processed PDFs with:
-        - name: Original filename
-        - text: Extracted text (if available)
-        - images: Base64 encoded page images (for vision)
-        - id: OpenAI file ID (fallback if local extraction failed)
-        - method: How content was extracted
-    """
-    attachments = fetch_pdf_attachments(headers, graph_msg_id)
-
-    processed = []
-    for attachment in attachments:
+def _process_pdf_attachment_batch(
+    attachments: List[Dict[str, Any]],
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Process already-fetched PDFs while retaining their snapshot positions."""
+    processed: List[Tuple[int, Dict[str, Any]]] = []
+    for fallback_position, attachment in enumerate(attachments or []):
         name = attachment.get("name", "document.pdf")
         content = attachment.get("bytes", b"")
+        snapshot_position = attachment.get("_snapshot_index")
+        if type(snapshot_position) is not int or snapshot_position < 0:
+            snapshot_position = fallback_position
 
         if not content:
             print(f"⚠️ Empty PDF attachment: {name}")
@@ -2419,7 +2553,7 @@ def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[D
             # drive_link, no property preview) so it is not mistaken for a usable
             # result.
             print(f"❌ PDF extraction failed for {name}; surfacing as failure (not a usable manifest entry)")
-            processed.append({
+            processed.append((snapshot_position, {
                 "name": name,
                 "text": "",
                 "images": result.get("images") or [],
@@ -2429,7 +2563,7 @@ def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[D
                 "drive_link": None,
                 "extraction_failed": True,
                 "error": "PDF text extraction and OpenAI upload both failed",
-            })
+            }))
             continue
 
         # Upload to Drive for archival
@@ -2448,6 +2582,63 @@ def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[D
             source_type="broker_pdf_preview",
         )
 
-        processed.append(result)
+        processed.append((snapshot_position, result))
 
     return processed
+
+
+def fetch_and_process_pdfs(
+    headers: Dict[str, str],
+    graph_msg_id: str,
+    *,
+    target_property_hint: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Process current-message PDFs and, when targeted, native images.
+
+    Legacy direct callers omit ``target_property_hint`` and retain the existing
+    PDF-only path. Processing supplies even an incomplete/empty row value so one
+    paginated Graph snapshot owns both PDF and native-image routing.
+    """
+    if target_property_hint is None:
+        legacy_attachments = fetch_pdf_attachments(headers, graph_msg_id)
+        return [
+            entry
+            for _position, entry in _process_pdf_attachment_batch(
+                legacy_attachments
+            )
+        ]
+
+    attachment_snapshot = fetch_message_attachment_snapshot(
+        headers,
+        graph_msg_id,
+    )
+    pdf_attachments = fetch_pdf_attachments(
+        headers,
+        graph_msg_id,
+        attachment_snapshot=attachment_snapshot,
+    )
+    positioned_entries = [
+        (position, 1, entry)
+        for position, entry in _process_pdf_attachment_batch(pdf_attachments)
+    ]
+
+    native_positions = [
+        position
+        for position, attachment in enumerate(attachment_snapshot)
+        if _native_image_candidate(attachment) is not None
+    ]
+    native_batch = validate_and_normalize_native_image_attachments(
+        attachment_snapshot,
+        target_property_hint=target_property_hint,
+    )
+    if native_positions:
+        if native_batch.get("status") == "accepted":
+            native_entry = build_native_image_manifest_entry(native_batch)
+        else:
+            native_entry = build_native_image_failure_manifest_entry(native_batch)
+        if native_entry is None:
+            raise ValueError("Native image manifest projection failed closed")
+        positioned_entries.append((native_positions[0], 0, native_entry))
+
+    positioned_entries.sort(key=lambda item: (item[0], item[1]))
+    return [entry for _position, _priority, entry in positioned_entries]
