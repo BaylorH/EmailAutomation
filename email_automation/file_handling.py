@@ -2030,7 +2030,13 @@ def render_pdf_first_page_preview(content: bytes, max_dimension: int = 1400) -> 
         return None
 
 
-def upload_property_image_to_drive(name: str, content: bytes, folder_id: str = None) -> Optional[Dict[str, Any]]:
+def upload_property_image_to_drive(
+    name: str,
+    content: bytes,
+    folder_id: str = None,
+    *,
+    redact_failure_detail: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Upload a generated property preview image and return safe hosted metadata."""
     if not content:
         return None
@@ -2082,7 +2088,13 @@ def upload_property_image_to_drive(name: str, content: bytes, folder_id: str = N
         return result
 
     except Exception as e:
-        print(f"❌ Failed to upload property preview image: {e}")
+        if redact_failure_detail:
+            print(
+                "❌ Failed to upload native property image: "
+                "native_image_host_failed"
+            )
+        else:
+            print(f"❌ Failed to upload property preview image: {e}")
         return None
 
 
@@ -2108,7 +2120,11 @@ def host_first_native_image_manifest_asset(
     upload_name = (
         f"broker-property-image-{metadata.normalized_sha256[:16]}.png"
     )
-    uploaded = upload_property_image_to_drive(upload_name, normalized_data)
+    uploaded = upload_property_image_to_drive(
+        upload_name,
+        normalized_data,
+        redact_failure_detail=True,
+    )
     if not isinstance(uploaded, dict):
         return None
     image_url = uploaded.get("url")
