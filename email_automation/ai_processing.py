@@ -4368,30 +4368,9 @@ _ATTACHMENT_ROUTING_KEY_TOKENS = frozenset({
 _ATTACHMENT_ROUTING_TOKEN_MAX_CHARS = 96
 _NATIVE_IMAGE_GENERIC_NAME_TOKEN = "brokerpropertyimage"
 _NATIVE_IMAGE_GENERIC_NAME_MAX_CHARS = 96
-_NATIVE_IMAGE_NAME_CONFUSABLES = str.maketrans({
-    # Bounded common Greek/Cyrillic homoglyphs in the reserved English marker.
-    "\u03b1": "a",
-    "\u03b2": "b",
-    "\u03b5": "e",
-    "\u03b9": "i",
-    "\u03ba": "k",
-    "\u03bc": "m",
-    "\u03bf": "o",
-    "\u03c1": "p",
-    "\u03c4": "t",
-    "\u03c5": "y",
-    "\u0430": "a",
-    "\u0432": "b",
-    "\u0435": "e",
-    "\u0456": "i",
-    "\u043a": "k",
-    "\u043c": "m",
-    "\u043e": "o",
-    "\u0440": "p",
-    "\u0441": "c",
-    "\u0442": "t",
-    "\u0443": "y",
-})
+_NATIVE_IMAGE_GENERIC_SUFFIX_TOKENS = (
+    "", "pdf", "png", "jpg", "jpeg", "webp", "gif",
+)
 _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS = {
     "google_drive_pdf": frozenset({
         "local_extraction",
@@ -4440,6 +4419,17 @@ _DIRECT_IMAGE_PRODUCER_KEYS = frozenset({
     "drive_link", "property_image_url", "property_image_source",
     "property_image_source_type", "property_image_meta",
 })
+_LINKED_PDF_PREVIEW_META_KEYS = frozenset({
+    "pageNumber", "pageCount", "strategy", "selectionReason", "score",
+    "signals", "contentType", "byteCount", "sha256", "driveLink",
+})
+_LINKED_PDF_PREVIEW_SIGNAL_KEYS = frozenset({
+    "imageAreaRatio", "textChars", "positiveTerms", "negativeTerms",
+})
+_DIRECT_IMAGE_META_KEYS = frozenset({
+    "strategy", "selectionReason", "contentType", "byteCount", "sha256",
+    "driveLink",
+})
 
 
 def _bounded_attachment_routing_token(value: Any) -> Optional[str]:
@@ -4463,28 +4453,42 @@ def _is_reserved_native_image_generic_name(value: Any) -> bool:
     if type(value) is not str:
         return False
     if len(value) > _NATIVE_IMAGE_GENERIC_NAME_MAX_CHARS:
-        return False
-    folded = unicodedata.normalize("NFKC", value).casefold().translate(
-        _NATIVE_IMAGE_NAME_CONFUSABLES
+        # The bounded recognizer cannot safely classify an over-limit marker;
+        # route it through strict validation instead of trusting it as legacy.
+        return True
+    folded = unicodedata.normalize(
+        "NFKD",
+        str.casefold(unicodedata.normalize("NFKC", value)),
     )
-    token = []
+    skeleton: List[Optional[str]] = []
     for character in folded:
         if str.isascii(character):
             if (
                 "a" <= character <= "z"
                 or "0" <= character <= "9"
             ):
-                token.append(character)
+                skeleton.append(character)
             continue
-        if str.isalnum(character):
+        category = unicodedata.category(character)
+        if category[:1] in {"L", "N"}:
+            # Do not maintain a partial homoglyph table.  A remaining Unicode
+            # letter or number is an unknown positional lookalike.
+            skeleton.append(None)
+        elif category[:1] in {"C", "M", "P", "S", "Z"}:
+            # Separators, marks, controls, punctuation, and symbols cannot
+            # make a reserved generic marker into a trusted PDF filename.
+            continue
+        else:
             return False
-        # Non-ASCII punctuation, marks, symbols, and format controls cannot
-        # turn the reserved generic marker into a trusted legacy filename.
-    collapsed = "".join(token)
-    return collapsed in {
-        _NATIVE_IMAGE_GENERIC_NAME_TOKEN,
-        f"{_NATIVE_IMAGE_GENERIC_NAME_TOKEN}pdf",
-    }
+
+    for suffix in _NATIVE_IMAGE_GENERIC_SUFFIX_TOKENS:
+        expected = f"{_NATIVE_IMAGE_GENERIC_NAME_TOKEN}{suffix}"
+        if len(skeleton) == len(expected) and all(
+            actual is None or actual == expected_character
+            for actual, expected_character in zip(skeleton, expected)
+        ):
+            return True
+    return False
 
 
 def _legacy_attachment_filename(manifest: dict) -> Optional[str]:
@@ -4511,7 +4515,11 @@ def _has_legacy_attachment_filename_shape(
     return str.endswith(folded, ".pdf")
 
 
-def _linked_source_url_identity(source_url: Any) -> Optional[Tuple[str, str]]:
+def _linked_source_url_identity(
+    source_url: Any,
+    *,
+    empty_basename_fallback: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
     """Return the exact HTTPS host and producer-derived basename."""
     if type(source_url) is not str or not source_url:
         return None
@@ -4530,8 +4538,118 @@ def _linked_source_url_identity(source_url: Any) -> Optional[Tuple[str, str]]:
     except (TypeError, ValueError):
         return None
     if not basename:
-        return None
+        if type(empty_basename_fallback) is not str:
+            return None
+        basename = empty_basename_fallback
     return str.casefold(host), basename
+
+
+def _has_exact_plain_dict_keys(
+    value: Any,
+    allowed_keys: frozenset,
+    *,
+    require_all: bool = True,
+) -> bool:
+    """Validate exact dict/string keys without invoking custom protocols."""
+    if type(value) is not dict:
+        return False
+    keys = list(dict.keys(value))
+    if any(type(key) is not str or key not in allowed_keys for key in keys):
+        return False
+    return not require_all or len(keys) == len(allowed_keys)
+
+
+def _is_exact_positive_int(value: Any) -> bool:
+    return type(value) is int and value > 0
+
+
+def _is_exact_finite_number(value: Any) -> bool:
+    return type(value) is int or (
+        type(value) is float and math.isfinite(value)
+    )
+
+
+def _is_exact_sha256(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _has_linked_pdf_preview_signals_shape(signals: Any) -> bool:
+    if not _has_exact_plain_dict_keys(
+        signals,
+        _LINKED_PDF_PREVIEW_SIGNAL_KEYS,
+        require_all=False,
+    ):
+        return False
+    for key in dict.keys(signals):
+        value = dict.get(signals, key)
+        if key == "imageAreaRatio":
+            if not _is_exact_finite_number(value) or not 0 <= value <= 1:
+                return False
+        elif key == "textChars":
+            if type(value) is not int or value < 0:
+                return False
+        elif (
+            type(value) is not list
+            or len(value) > 12
+            or any(type(item) is not str for item in value)
+        ):
+            return False
+    return True
+
+
+def _has_linked_pdf_preview_meta_shape(meta: Any) -> bool:
+    if not _has_exact_plain_dict_keys(meta, _LINKED_PDF_PREVIEW_META_KEYS):
+        return False
+    page_number = dict.get(meta, "pageNumber")
+    page_count = dict.get(meta, "pageCount")
+    strategy = dict.get(meta, "strategy")
+    selection_reason = dict.get(meta, "selectionReason")
+    score = dict.get(meta, "score")
+    drive_link = dict.get(meta, "driveLink")
+    return (
+        _is_exact_positive_int(page_number)
+        and _is_exact_positive_int(page_count)
+        and page_number <= page_count
+        and type(strategy) is str
+        and strategy in {
+            "property_preview_heuristic_v1",
+            "first_page_preview_fallback",
+        }
+        and type(selection_reason) is str
+        and bool(selection_reason)
+        and selection_reason == str.strip(selection_reason)
+        and _is_exact_finite_number(score)
+        and _has_linked_pdf_preview_signals_shape(dict.get(meta, "signals"))
+        and type(dict.get(meta, "contentType")) is str
+        and dict.get(meta, "contentType") == "image/png"
+        and _is_exact_positive_int(dict.get(meta, "byteCount"))
+        and _is_exact_sha256(dict.get(meta, "sha256"))
+        and type(drive_link) is str
+        and _linked_source_url_identity(drive_link) is not None
+    )
+
+
+def _has_direct_image_meta_shape(meta: Any) -> bool:
+    if not _has_exact_plain_dict_keys(meta, _DIRECT_IMAGE_META_KEYS):
+        return False
+    drive_link = dict.get(meta, "driveLink")
+    return (
+        type(dict.get(meta, "strategy")) is str
+        and dict.get(meta, "strategy") == "direct_image_link_v1"
+        and type(dict.get(meta, "selectionReason")) is str
+        and dict.get(meta, "selectionReason")
+        == "broker-provided public image link"
+        and type(dict.get(meta, "contentType")) is str
+        and dict.get(meta, "contentType") == "image/png"
+        and _is_exact_positive_int(dict.get(meta, "byteCount"))
+        and _is_exact_sha256(dict.get(meta, "sha256"))
+        and type(drive_link) is str
+        and _linked_source_url_identity(drive_link) is not None
+    )
 
 
 def _has_linked_pdf_producer_shape(
@@ -4554,8 +4672,14 @@ def _has_linked_pdf_producer_shape(
     legacy_id = dict.get(manifest, "id")
     drive_link = dict.get(manifest, "drive_link")
     method = dict.get(manifest, "method")
+    empty_basename_fallback = (
+        "broker flyer.pdf"
+        if source_type in {"google_drive_pdf", "dropbox_pdf"}
+        else None
+    )
     source_identity = _linked_source_url_identity(
-        dict.get(manifest, "source_url")
+        dict.get(manifest, "source_url"),
+        empty_basename_fallback=empty_basename_fallback,
     )
     if (
         type(name) is not str
@@ -4598,16 +4722,20 @@ def _has_linked_pdf_producer_shape(
             manifest,
             "property_image_source_type",
         )
+        property_image_meta = dict.get(manifest, "property_image_meta")
         if (
             type(property_image_url) is not str
             or not property_image_url
+            or _linked_source_url_identity(property_image_url) is None
             or type(property_image_source) is not str
-            or not property_image_source.startswith(
-                f"Broker flyer link preview: {name}, page "
-            )
             or type(property_image_source_type) is not str
             or property_image_source_type != "broker_pdf_link_preview"
-            or type(dict.get(manifest, "property_image_meta")) is not dict
+            or not _has_linked_pdf_preview_meta_shape(property_image_meta)
+            or property_image_source
+            != (
+                f"Broker flyer link preview: {name}, page "
+                f"{dict.get(property_image_meta, 'pageNumber')}"
+            )
         ):
             return False
 
@@ -4633,8 +4761,12 @@ def _has_direct_image_producer_shape(manifest: dict) -> bool:
     method = dict.get(manifest, "method")
     source_type = dict.get(manifest, "source_type")
     source_identity = _linked_source_url_identity(
-        dict.get(manifest, "source_url")
+        dict.get(manifest, "source_url"),
+        empty_basename_fallback="broker property image.png",
     )
+    source_host = source_identity[0] if source_identity is not None else None
+    source_name = source_identity[1] if source_identity is not None else None
+    reserved_generic_name = _is_reserved_native_image_generic_name(name)
     property_image_url = dict.get(manifest, "property_image_url")
     property_image_source_type = dict.get(
         manifest,
@@ -4645,6 +4777,7 @@ def _has_direct_image_producer_shape(manifest: dict) -> bool:
         type(name) is not str
         or not name
         or name != str.strip(name)
+        or len(name) > _NATIVE_IMAGE_GENERIC_NAME_MAX_CHARS
         or type(method) is not str
         or method != "direct_image_link"
         or type(source_type) is not str
@@ -4658,6 +4791,14 @@ def _has_direct_image_producer_shape(manifest: dict) -> bool:
         or type(images) is not list
         or len(images) != 0
         or source_identity is None
+        or (
+            reserved_generic_name
+            and not (
+                source_host == "googleusercontent.com"
+                or source_host.endswith(".googleusercontent.com")
+            )
+        )
+        or (not reserved_generic_name and source_name != name)
         or dict.get(manifest, "drive_link") is not None
         or type(property_image_url) is not str
         or not property_image_url
@@ -4667,13 +4808,7 @@ def _has_direct_image_producer_shape(manifest: dict) -> bool:
         != f"Broker image link: {name}"
         or type(property_image_source_type) is not str
         or property_image_source_type != "broker_image_link"
-        or type(property_image_meta) is not dict
-        or type(dict.get(property_image_meta, "strategy")) is not str
-        or dict.get(property_image_meta, "strategy")
-        != "direct_image_link_v1"
-        or type(dict.get(property_image_meta, "selectionReason")) is not str
-        or dict.get(property_image_meta, "selectionReason")
-        != "broker-provided public image link"
+        or not _has_direct_image_meta_shape(property_image_meta)
     ):
         return False
     return True
@@ -4694,8 +4829,6 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
             and key not in _ATTACHMENT_ROUTING_KEYS
         ):
             return True
-    if _is_reserved_native_image_generic_name(dict.get(manifest, "name")):
-        return True
     if any(
         dict.__contains__(manifest, key)
         for key in _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS
@@ -4703,8 +4836,24 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
         return True
 
     method = dict.get(manifest, "method")
+    source_type = dict.get(manifest, "source_type")
+    has_reserved_native_name = any(
+        _is_reserved_native_image_generic_name(dict.get(manifest, key))
+        for key in ("name", "filename")
+        if dict.__contains__(manifest, key)
+    )
+    if has_reserved_native_name:
+        if (
+            type(source_type) is str
+            and source_type == "direct_image"
+            and type(method) is str
+            and method == "direct_image_link"
+            and _has_direct_image_producer_shape(manifest)
+        ):
+            return False
+        return True
+
     if dict.__contains__(manifest, "source_type"):
-        source_type = dict.get(manifest, "source_type")
         if (
             type(source_type) is str
             and type(method) is str

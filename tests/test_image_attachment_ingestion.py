@@ -3371,6 +3371,34 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "grapheme_joiner_reserved_native_name_pdf_suffix",
                 "Broker\u034f property image.pdf",
             ),
+            (
+                "dotless_i_reserved_native_name_pdf_suffix",
+                "Broker property \u0131mage.pdf",
+            ),
+            (
+                "script_g_reserved_native_name_pdf_suffix",
+                "Broker property ima\u0261e.pdf",
+            ),
+            (
+                "reserved_native_name_png_suffix",
+                f"{GENERIC_IMAGE_NAME}.png",
+            ),
+            (
+                "reserved_native_name_jpg_suffix",
+                f"{GENERIC_IMAGE_NAME}.jpg",
+            ),
+            (
+                "reserved_native_name_jpeg_suffix",
+                f"{GENERIC_IMAGE_NAME}.jpeg",
+            ),
+            (
+                "reserved_native_name_webp_suffix",
+                f"{GENERIC_IMAGE_NAME}.webp",
+            ),
+            (
+                "reserved_native_name_gif_suffix",
+                f"{GENERIC_IMAGE_NAME}.gif",
+            ),
         ):
             sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
             downgraded = self._single_manifest(label)
@@ -3393,6 +3421,161 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             malformed_source_type_manifests.append(
                 (label, downgraded, sentinel)
             )
+
+        for label, include_benign_name in (
+            ("filename_only_reserved_native_name", False),
+            ("secondary_filename_reserved_native_name", True),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            filename_downgrade = self._single_manifest(label)
+            for key in (
+                "name", "source_type", "property_binding",
+                "binding_method", "image_meta",
+            ):
+                filename_downgrade.pop(key)
+            filename_downgrade.update({
+                "filename": f"{GENERIC_IMAGE_NAME}.pdf",
+                "method": "local_extraction",
+                "id": sentinel,
+                "file_id": sentinel,
+            })
+            if include_benign_name:
+                filename_downgrade["name"] = "legacy-looking.pdf"
+            malformed_source_type_manifests.append((
+                label,
+                filename_downgrade,
+                sentinel,
+            ))
+
+        for label, reserved_name in (
+            (
+                "producer_shape_dotless_i_reserved_name",
+                "Broker property \u0131mage.pdf",
+            ),
+            (
+                "producer_shape_script_g_reserved_name",
+                "Broker property ima\u0261e.pdf",
+            ),
+            (
+                "producer_shape_reserved_name_png",
+                f"{GENERIC_IMAGE_NAME}.png",
+            ),
+            (
+                "producer_shape_reserved_name_jpg",
+                f"{GENERIC_IMAGE_NAME}.jpg",
+            ),
+            (
+                "producer_shape_reserved_name_jpeg",
+                f"{GENERIC_IMAGE_NAME}.jpeg",
+            ),
+            (
+                "producer_shape_reserved_name_webp",
+                f"{GENERIC_IMAGE_NAME}.webp",
+            ),
+            (
+                "producer_shape_reserved_name_gif",
+                f"{GENERIC_IMAGE_NAME}.gif",
+            ),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            malformed_source_type_manifests.append((
+                label,
+                {
+                    "name": reserved_name,
+                    "filename": reserved_name,
+                    "text": f"{self.TARGET}\n{sentinel}",
+                    "images": [],
+                    "method": "openai_upload",
+                    "file_id": sentinel,
+                    "id": sentinel,
+                    "source_type": "public_pdf",
+                    "source_url": (
+                        "https://assets.example.test/"
+                        f"{quote(reserved_name)}"
+                    ),
+                    "drive_link": None,
+                },
+                sentinel,
+            ))
+
+        over_limit_name_sentinel = (
+            "PRIVATE_OVER_LIMIT_RESERVED_NAME_SENTINEL"
+        )
+        over_limit_reserved_name = (
+            "Broker" + "\u200b" * 80 + " property image.pdf"
+        )
+        malformed_source_type_manifests.append((
+            "over_limit_reserved_native_name",
+            {
+                "name": over_limit_reserved_name,
+                "filename": over_limit_reserved_name,
+                "text": f"{self.TARGET}\n{over_limit_name_sentinel}",
+                "images": [],
+                "method": "openai_upload",
+                "file_id": over_limit_name_sentinel,
+                "id": over_limit_name_sentinel,
+                "source_type": "public_pdf",
+                "source_url": (
+                    "https://assets.example.test/"
+                    f"{quote(over_limit_reserved_name)}"
+                ),
+                "drive_link": None,
+            },
+            over_limit_name_sentinel,
+        ))
+
+        public_trailing_sentinel = "PRIVATE_PUBLIC_TRAILING_SENTINEL"
+        malformed_source_type_manifests.append((
+            "public_pdf_trailing_slash_fallback",
+            {
+                "name": "broker flyer.pdf",
+                "filename": "broker flyer.pdf",
+                "text": f"{self.TARGET}\n{public_trailing_sentinel}",
+                "images": [],
+                "method": "local_extraction",
+                "file_id": None,
+                "id": None,
+                "source_type": "public_pdf",
+                "source_url": "https://assets.example.test/",
+                "drive_link": None,
+            },
+            public_trailing_sentinel,
+        ))
+
+        arbitrary_direct_sentinel = "PRIVATE_ARBITRARY_DIRECT_SENTINEL"
+        malformed_source_type_manifests.append((
+            "generic_direct_image_arbitrary_https_host",
+            {
+                "name": f"{GENERIC_IMAGE_NAME}.png",
+                "text": "",
+                "images": [],
+                "method": "direct_image_link",
+                "source_type": "direct_image",
+                "source_url": (
+                    "https://assets.example.test/"
+                    f"{arbitrary_direct_sentinel}"
+                ),
+                "drive_link": None,
+                "property_image_url": (
+                    "https://drive.google.com/uc?export=view&id=arbitrary"
+                ),
+                "property_image_source": (
+                    f"Broker image link: {GENERIC_IMAGE_NAME}.png"
+                ),
+                "property_image_source_type": "broker_image_link",
+                "property_image_meta": {
+                    "strategy": "direct_image_link_v1",
+                    "selectionReason": "broker-provided public image link",
+                    "contentType": "image/png",
+                    "byteCount": 17,
+                    "sha256": "f" * 64,
+                    "driveLink": (
+                        "https://drive.google.com/file/d/arbitrary/view"
+                    ),
+                },
+            },
+            arbitrary_direct_sentinel,
+        ))
 
         custom_value_sentinel = "PRIVATE_NESTED_CUSTOM_VALUE_SENTINEL"
         malformed_source_type_manifests.append((
@@ -3484,6 +3667,133 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "property_image_meta": {},
             },
             preview_protocol_sentinel,
+        ))
+
+        direct_meta_sentinel = "PRIVATE_DIRECT_META_EXTRA_SENTINEL"
+        malformed_source_type_manifests.append((
+            "direct_image_nested_metadata_extra",
+            {
+                "name": f"{GENERIC_IMAGE_NAME}.png",
+                "text": "",
+                "images": [],
+                "method": "direct_image_link",
+                "source_type": "direct_image",
+                "source_url": (
+                    "https://lh3.googleusercontent.com/p/direct-meta-fixture"
+                ),
+                "drive_link": None,
+                "property_image_url": (
+                    "https://drive.google.com/uc?export=view&id=direct-meta"
+                ),
+                "property_image_source": (
+                    f"Broker image link: {GENERIC_IMAGE_NAME}.png"
+                ),
+                "property_image_source_type": "broker_image_link",
+                "property_image_meta": {
+                    "strategy": "direct_image_link_v1",
+                    "selectionReason": "broker-provided public image link",
+                    "contentType": "image/png",
+                    "byteCount": 17,
+                    "sha256": "a" * 64,
+                    "driveLink": (
+                        "https://drive.google.com/file/d/direct-meta/view"
+                    ),
+                    "raw_filename": direct_meta_sentinel,
+                    "exif": {"Comment": direct_meta_sentinel},
+                    "unknown": {"private": direct_meta_sentinel},
+                },
+            },
+            direct_meta_sentinel,
+        ))
+
+        linked_meta_sentinel = "PRIVATE_LINKED_META_EXTRA_SENTINEL"
+        malformed_source_type_manifests.append((
+            "linked_pdf_nested_metadata_extra",
+            {
+                "name": "linked-meta.pdf",
+                "filename": "linked-meta.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "file_id": None,
+                "id": None,
+                "source_type": "public_pdf",
+                "source_url": (
+                    "https://assets.example.test/linked-meta.pdf"
+                ),
+                "drive_link": None,
+                "property_image_url": (
+                    "https://drive.google.com/uc?export=view&id=linked-meta"
+                ),
+                "property_image_source": (
+                    "Broker flyer link preview: linked-meta.pdf, page 1"
+                ),
+                "property_image_source_type": "broker_pdf_link_preview",
+                "property_image_meta": {
+                    "pageNumber": 1,
+                    "pageCount": 1,
+                    "strategy": "first_page_preview_fallback",
+                    "selectionReason": (
+                        "fallback to first available preview page"
+                    ),
+                    "score": 0,
+                    "signals": {},
+                    "contentType": "image/png",
+                    "byteCount": 19,
+                    "sha256": "b" * 64,
+                    "driveLink": (
+                        "https://drive.google.com/file/d/linked-meta/view"
+                    ),
+                    "raw_filename": linked_meta_sentinel,
+                    "exif": {"Comment": linked_meta_sentinel},
+                },
+            },
+            linked_meta_sentinel,
+        ))
+
+        linked_signal_sentinel = "PRIVATE_LINKED_SIGNAL_EXTRA_SENTINEL"
+        malformed_source_type_manifests.append((
+            "linked_pdf_nested_signal_extra",
+            {
+                "name": "linked-signal.pdf",
+                "filename": "linked-signal.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "file_id": None,
+                "id": None,
+                "source_type": "public_pdf",
+                "source_url": (
+                    "https://assets.example.test/linked-signal.pdf"
+                ),
+                "drive_link": None,
+                "property_image_url": (
+                    "https://drive.google.com/uc?export=view&id=linked-signal"
+                ),
+                "property_image_source": (
+                    "Broker flyer link preview: linked-signal.pdf, page 1"
+                ),
+                "property_image_source_type": "broker_pdf_link_preview",
+                "property_image_meta": {
+                    "pageNumber": 1,
+                    "pageCount": 1,
+                    "strategy": "first_page_preview_fallback",
+                    "selectionReason": (
+                        "fallback to first available preview page"
+                    ),
+                    "score": 0,
+                    "signals": {
+                        "unknown": linked_signal_sentinel,
+                    },
+                    "contentType": "image/png",
+                    "byteCount": 19,
+                    "sha256": "b" * 64,
+                    "driveLink": (
+                        "https://drive.google.com/file/d/linked-signal/view"
+                    ),
+                },
+            },
+            linked_signal_sentinel,
         ))
 
         def assert_strict_rejection(manifest, sentinel=None):
@@ -3653,7 +3963,19 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "property_image_source_type": "broker_pdf_link_preview",
                 "property_image_meta": {
                     "pageNumber": 1,
+                    "pageCount": 1,
                     "strategy": "first_page_preview_fallback",
+                    "selectionReason": (
+                        "fallback to first available preview page"
+                    ),
+                    "score": 0,
+                    "signals": {},
+                    "contentType": "image/png",
+                    "byteCount": 23,
+                    "sha256": "c" * 64,
+                    "driveLink": (
+                        "https://drive.google.com/file/d/preview/view"
+                    ),
                 },
             },
             [],
@@ -3665,7 +3987,7 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             legacy_manifests.append((
                 f"{source_type}:{method}",
                 {
-                    "name": "broker linked asset.png",
+                    "name": "broker-linked-asset.png",
                     "text": "",
                     "images": [],
                     "method": method,
@@ -3678,7 +4000,7 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                         "https://drive.google.com/uc?export=view&id=image"
                     ),
                     "property_image_source": (
-                        "Broker image link: broker linked asset.png"
+                        "Broker image link: broker-linked-asset.png"
                     ),
                     "property_image_source_type": "broker_image_link",
                     "property_image_meta": {
@@ -3688,8 +4010,10 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                         ),
                         "contentType": "image/png",
                         "byteCount": 17,
-                        "sha256": "direct-image-sha",
-                        "driveLink": None,
+                        "sha256": "d" * 64,
+                        "driveLink": (
+                            "https://drive.google.com/file/d/image/view"
+                        ),
                     },
                 },
                 [],
@@ -3856,6 +4180,83 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 ),
             )
 
+        for trailing_label, trailing_url, expected_source_type in (
+            (
+                "actual_google_drive_trailing_slash",
+                "https://drive.google.com/file/d/trailing-fixture/view/",
+                "google_drive_pdf",
+            ),
+            (
+                "actual_dropbox_trailing_slash",
+                "https://www.dropbox.com/scl/fi/trailing-fixture/",
+                "dropbox_pdf",
+            ),
+        ):
+            with mock.patch.object(
+                file_handling,
+                "_download_linked_asset",
+                return_value=(
+                    b"%PDF-1.4 trailing linked fixture",
+                    "application/pdf",
+                ),
+            ), mock.patch.object(
+                file_handling,
+                "extract_pdf_text",
+                return_value=(drive_view_text, []),
+            ), mock.patch.object(
+                file_handling,
+                "upload_pdf_to_drive",
+                return_value=None,
+            ), mock.patch.object(
+                file_handling,
+                "render_pdf_property_preview",
+                return_value=None,
+            ), mock.patch.object(
+                file_handling,
+                "render_pdf_first_page_preview",
+                return_value=None,
+            ), mock.patch(
+                "builtins.print",
+            ):
+                trailing_manifest = (
+                    file_handling.fetch_and_process_linked_assets(
+                        [trailing_url]
+                    )
+                )
+
+            with self.subTest(legacy_source_pair=trailing_label):
+                trailing_run = self._run_proposal(
+                    trailing_manifest,
+                    dry_run=False,
+                )
+                trailing_persist_call = (
+                    trailing_run["firestore"].collection.return_value
+                    .document.return_value
+                    .collection.return_value
+                    .document.return_value
+                    .set
+                )
+                self.assertEqual(
+                    (
+                        1,
+                        "broker flyer.pdf",
+                        "broker flyer.pdf",
+                        expected_source_type,
+                        True,
+                        1,
+                        1,
+                    ),
+                    (
+                        len(trailing_manifest),
+                        (trailing_manifest[0] or {}).get("name"),
+                        (trailing_manifest[0] or {}).get("filename"),
+                        (trailing_manifest[0] or {}).get("source_type"),
+                        trailing_run["proposal"] is not None,
+                        trailing_run["client"].responses.create.call_count,
+                        trailing_persist_call.call_count,
+                    ),
+                )
+
         direct_image_url = (
             "https://lh3.googleusercontent.com/p/"
             "AF1QipActualProducer=w1200-h800"
@@ -3880,7 +4281,7 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 ),
                 "contentType": "image/png",
                 "byteCount": 31,
-                "sha256": "actual-direct-image-sha",
+                "sha256": "e" * 64,
             },
         ), mock.patch(
             "builtins.print",
