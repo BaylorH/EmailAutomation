@@ -6340,6 +6340,44 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
                     target_property_hint=self.TARGET,
                 )
 
+        private_page_sentinel = "PRIVATE_GRAPH_PAGE_SHAPE_SENTINEL"
+        malformed_pages = (
+            [private_page_sentinel],
+            {private_page_sentinel: "missing-value"},
+            {"value": {private_page_sentinel: "not-a-list"}},
+            {
+                "value": [],
+                "@odata.nextLink": {private_page_sentinel: "not-a-url"},
+            },
+        )
+        for malformed_page in malformed_pages:
+            with self.subTest(malformed_page=type(malformed_page).__name__):
+                malformed_response = mock.MagicMock()
+                malformed_response.status_code = 200
+                malformed_response.json.return_value = malformed_page
+                captured_output = io.StringIO()
+                with mock.patch.object(
+                    file_handling.requests,
+                    "get",
+                    return_value=malformed_response,
+                ), mock.patch.object(
+                    file_handling,
+                    "process_pdf_for_ai",
+                ) as malformed_pdf_processor, contextlib.redirect_stdout(
+                    captured_output
+                ):
+                    with self.assertRaises(
+                        file_handling.requests.exceptions.RequestException
+                    ) as raised:
+                        file_handling.fetch_and_process_pdfs(
+                            {"Authorization": "Bearer fake"},
+                            "graph-message-malformed-page",
+                            target_property_hint=self.TARGET,
+                        )
+                malformed_pdf_processor.assert_not_called()
+                self.assertNotIn(private_page_sentinel, str(raised.exception))
+                self.assertNotIn(private_page_sentinel, captured_output.getvalue())
+
         four_native = [
             self._valid_attachment(f"angle-{index}", (8 + index, 6))
             for index in range(4)
