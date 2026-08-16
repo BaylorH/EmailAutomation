@@ -337,18 +337,27 @@ _NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE = re.compile(
     rf"\b(?:{_NATIVE_IMAGE_STATE_PATTERN})\s+\d{{5}}"
     r"(?![a-z0-9])(?:\s+\d{4}(?![a-z0-9])|(?!\s+\d{4}))"
 )
-_NATIVE_IMAGE_PARTIAL_NUMBER_NAME_RE = re.compile(
-    r"(?<![a-z0-9])\d{1,6}[a-z]?\s+"
-    r"(?!(?:aerial|copy|elevation|exterior|front|image|interior|photo|rear|view)\b)"
-    r"[a-z][a-z0-9]*\b"
+_NATIVE_IMAGE_PARTIAL_NUMBER_STREET_TOKEN_RE = re.compile(
+    r"(?<![a-z0-9])\d+[a-z]?\s+"
+    rf"{_NATIVE_IMAGE_STREET_TOKEN_PATTERN}\b"
 )
-_NATIVE_IMAGE_PARTIAL_SUFFIX_STATE_RE = re.compile(
-    rf"\b(?:[a-z][a-z0-9]*\s+){{1,5}}(?:{_NATIVE_IMAGE_SUFFIX_PATTERN})"
-    rf"\s+(?:[a-z]+\s+){{1,5}}(?:{_NATIVE_IMAGE_STATE_PATTERN})\b"
+_NATIVE_IMAGE_PARTIAL_STREET_WITHOUT_NUMBER_RE = re.compile(
+    rf"(?<![a-z0-9])(?:{_NATIVE_IMAGE_STREET_TOKEN_PATTERN}\s+){{1,9}}"
+    rf"(?:{_NATIVE_IMAGE_SUFFIX_PATTERN})\b"
 )
 _NATIVE_IMAGE_STREET_NUMBER_RANGE_RE = re.compile(
-    r"(?<![a-z0-9])(?P<start>\d{1,6}[a-z]?)\s*-\s*"
-    r"(?P<end>\d{1,6}[a-z]?)(?=(?:\s+|-+)[a-z])"
+    r"(?<![a-z0-9])(?P<start>\d+[a-z]?)\s*-\s*"
+    r"(?P<end>\d+[a-z]?)(?=(?:\s+|-+)[a-z])"
+)
+_NATIVE_IMAGE_LEADING_ISO_DATE_RE = re.compile(
+    r"^(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-"
+    r"(?:0[1-9]|[12]\d|3[01])(?:-+|\s+)"
+)
+_NATIVE_IMAGE_MALFORMED_ZIP_PLUS_RE = re.compile(
+    r"(?<!\d)\d{5}\s*-\s*(?:\d{1,3}|\d{5,})(?!\d)"
+)
+_NATIVE_IMAGE_STATE_AT_END_RE = re.compile(
+    rf"(?:^|\s)(?:{_NATIVE_IMAGE_STATE_PATTERN})$"
 )
 
 
@@ -403,29 +412,27 @@ def _normalize_native_image_address_text(
         if not unicodedata.combining(character)
     )
     text = text.casefold()
-    for range_match in _NATIVE_IMAGE_STREET_NUMBER_RANGE_RE.finditer(text):
-        start = range_match.group("start")
-        end = range_match.group("end")
-        if (
-            start.isdigit()
-            and end.isdigit()
-            and len(start) == 5
-            and len(end) == 4
-        ):
-            continue
-        prefix = text[:range_match.start()].rstrip(" -_,")
-        prefix_token = re.search(r"([a-z]+)$", prefix)
-        if prefix.endswith("#") or (
-            prefix_token
-            and prefix_token.group(1) in _NATIVE_IMAGE_UNIT_MARKERS
-        ):
-            continue
-        return None
+    text = _NATIVE_IMAGE_LEADING_ISO_DATE_RE.sub("", text, count=1)
     text = re.sub(
         r"\b([a-z])\s*\.\s*([a-z])\s*\.?(?=\s|$)",
         r"\1\2",
         text,
     )
+    if _NATIVE_IMAGE_MALFORMED_ZIP_PLUS_RE.search(text):
+        return None
+    for range_match in _NATIVE_IMAGE_STREET_NUMBER_RANGE_RE.finditer(text):
+        start = range_match.group("start")
+        end = range_match.group("end")
+        prefix = text[:range_match.start()].rstrip(" -_,")
+        if (
+            start.isdigit()
+            and end.isdigit()
+            and len(start) == 5
+            and len(end) == 4
+            and _NATIVE_IMAGE_STATE_AT_END_RE.search(prefix)
+        ):
+            continue
+        return None
     for first, second, canonical in _NATIVE_IMAGE_HYPHENATED_DIRECTIONALS:
         text = re.sub(
             rf"\b{first}\s*-\s*{second}\b",
@@ -435,12 +442,12 @@ def _normalize_native_image_address_text(
     text = re.sub(r"(?<!\d)(\d{5})\s*-\s*(\d{4})(?!\d)", r"\1 \2", text)
     text = re.sub(
         rf"\b({_NATIVE_IMAGE_UNIT_PATTERN})\s+"
-        r"([a-z0-9]+)\s*-\s*([a-z0-9]{1,3})(?=[^a-z0-9]|$)",
+        r"([a-z0-9]+)\s*-\s*([a-z][a-z0-9]{0,2})(?=[^a-z0-9]|$)",
         r"\1 \2\3",
         text,
     )
     text = re.sub(
-        r"#\s*([a-z0-9]+)\s*-\s*([a-z0-9]{1,3})(?=[^a-z0-9]|$)",
+        r"#\s*([a-z0-9]+)\s*-\s*([a-z][a-z0-9]{0,2})(?=[^a-z0-9]|$)",
         r" unit \1\2 ",
         text,
     )
@@ -494,8 +501,8 @@ def _native_image_filename_address_claims(
     has_incomplete_claim = bool(
         _NATIVE_IMAGE_PARTIAL_STREET_RE.search(unclaimed)
         or _NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE.search(unclaimed)
-        or _NATIVE_IMAGE_PARTIAL_NUMBER_NAME_RE.search(unclaimed)
-        or _NATIVE_IMAGE_PARTIAL_SUFFIX_STATE_RE.search(unclaimed)
+        or _NATIVE_IMAGE_PARTIAL_NUMBER_STREET_TOKEN_RE.search(unclaimed)
+        or _NATIVE_IMAGE_PARTIAL_STREET_WITHOUT_NUMBER_RE.search(unclaimed)
     )
     return claims, has_incomplete_claim
 
@@ -1039,6 +1046,9 @@ def build_native_image_manifest_entry(
                 _inspect_native_image_pillow_format(data)
             )
             _verify_native_image(data)
+            canonical_data, canonical_width, canonical_height = (
+                _normalize_native_image(data)
+            )
         except Exception:
             return None
         if (
@@ -1046,6 +1056,8 @@ def build_native_image_manifest_entry(
             or pillow_format != "PNG"
             or (header_width, header_height) != (width, height)
             or (pillow_width, pillow_height) != (width, height)
+            or (canonical_width, canonical_height) != (width, height)
+            or canonical_data != data
         ):
             return None
 

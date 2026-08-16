@@ -77,6 +77,13 @@ def _png_bytes(mode="RGB", size=(8, 6), *, alpha=None, metadata=None):
     return output.getvalue()
 
 
+def _grayscale_png_bytes(size=(8, 6)):
+    image = Image.new("L", size, 96)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 def _attachment(
     name,
     content_type,
@@ -1418,6 +1425,295 @@ class NativeImageManifestIntegrityTests(unittest.TestCase):
         ):
             with self.subTest(keys=sorted(asset)):
                 self.assertIsNone(self._adapt([asset]))
+
+
+class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
+    TARGET = "123 North Sample Road, Example City, Arizona 85001"
+    MATCHING_FILENAME = "123 N Sample Rd Example City AZ 85001.png"
+
+    def _classify(self, filename, *, target=None):
+        return file_handling.classify_native_image_filename_binding(
+            filename,
+            target_property_hint=self.TARGET if target is None else target,
+        )
+
+    def _validate(self, filename, *, target=None):
+        return file_handling.validate_and_normalize_native_image_attachments(
+            [_attachment(filename, "image/png", _png_bytes())],
+            target_property_hint=self.TARGET if target is None else target,
+        )
+
+    def _assert_unbound_classification(self, result):
+        self.assertEqual(
+            {"failure_code": "image_attachment_unbound_property"},
+            result,
+        )
+
+    def _assert_unbound_batch(self, result):
+        self.assertEqual(
+            {
+                "status": "quarantined",
+                "assets": [],
+                "failure": {
+                    "name": GENERIC_IMAGE_NAME,
+                    "code": "image_attachment_unbound_property",
+                },
+            },
+            result,
+        )
+
+    def _assert_target(self, result):
+        self.assertEqual(
+            {
+                "property_binding": "target",
+                "binding_method": "structured_filename_address",
+            },
+            result,
+        )
+
+    def test_rejects_every_reviewed_residual_claim_in_filename_target_and_batch(self):
+        residuals = (
+            "Oak Road Tempe",
+            "Oak Road",
+            "456 View",
+            "456 7th",
+            "456 Front",
+        )
+        for residual in residuals:
+            filename = (
+                "123 N Sample Rd Example City AZ 85001 "
+                f"{residual}.png"
+            )
+            with self.subTest(location="filename", residual=residual):
+                self._assert_unbound_classification(self._classify(filename))
+                self._assert_unbound_batch(self._validate(filename))
+
+            target = f"{self.TARGET} {residual}"
+            with self.subTest(location="target", residual=residual):
+                self._assert_unbound_classification(
+                    self._classify(self.MATCHING_FILENAME, target=target)
+                )
+                self._assert_unbound_batch(
+                    self._validate(self.MATCHING_FILENAME, target=target)
+                )
+
+    def test_rejects_numeric_address_and_unit_hyphen_collisions(self):
+        target_6789 = "6789 Main Road, Example City, Arizona 85001"
+        collided_address = (
+            "12345-6789 Main Rd Example City AZ 85001.png"
+        )
+        self._assert_unbound_classification(
+            self._classify(collided_address, target=target_6789)
+        )
+        self._assert_unbound_batch(
+            self._validate(collided_address, target=target_6789)
+        )
+        self._assert_unbound_classification(
+            self._classify(
+                "6789 Main Rd Example City AZ 85001.png",
+                target="12345-6789 Main Rd Example City AZ 85001",
+            )
+        )
+
+        target_unit_123 = (
+            "123 N Sample Rd Suite 123, Example City, Arizona 85001"
+        )
+        collided_unit = (
+            "123 N Sample Rd Suite 12-3 Example City AZ 85001.png"
+        )
+        self._assert_unbound_classification(
+            self._classify(collided_unit, target=target_unit_123)
+        )
+        self._assert_unbound_batch(
+            self._validate(collided_unit, target=target_unit_123)
+        )
+        self._assert_unbound_classification(
+            self._classify(
+                "123 N Sample Rd Suite 123 Example City AZ 85001.png",
+                target=(
+                    "123 N Sample Rd Suite 12-3 Example City AZ 85001"
+                ),
+            )
+        )
+
+        self._assert_target(
+            self._classify(
+                "123 N Sample Rd Suite 4-B Example City AZ 85001.png",
+                target=(
+                    "123 North Sample Road Suite 4B, "
+                    "Example City, Arizona 85001"
+                ),
+            )
+        )
+
+    def test_rejects_seven_digit_residual_and_range_claims(self):
+        residual = "and 1234567 Oak"
+        residual_filename = (
+            "123 N Sample Rd Example City AZ 85001 "
+            f"{residual}.png"
+        )
+        self._assert_unbound_classification(
+            self._classify(residual_filename)
+        )
+        self._assert_unbound_batch(self._validate(residual_filename))
+
+        residual_target = f"{self.TARGET} {residual}"
+        self._assert_unbound_classification(
+            self._classify(
+                self.MATCHING_FILENAME,
+                target=residual_target,
+            )
+        )
+        self._assert_unbound_batch(
+            self._validate(
+                self.MATCHING_FILENAME,
+                target=residual_target,
+            )
+        )
+
+        target_6789 = "6789 Main Road, Example City, Arizona 85001"
+        range_collision = (
+            "1234567-6789 Main Rd Example City AZ 85001.png"
+        )
+        self._assert_unbound_classification(
+            self._classify(range_collision, target=target_6789)
+        )
+        self._assert_unbound_batch(
+            self._validate(range_collision, target=target_6789)
+        )
+        self._assert_unbound_classification(
+            self._classify(
+                "6789 Main Rd Example City AZ 85001.png",
+                target=(
+                    "1234567-6789 Main Rd Example City AZ 85001"
+                ),
+            )
+        )
+
+    def test_rejects_malformed_zip_plus_three(self):
+        malformed_filename = (
+            "123 N Sample Rd Example City AZ 85001-123.png"
+        )
+        malformed_target = (
+            "123 N Sample Rd Example City AZ 85001-123"
+        )
+
+        self._assert_unbound_classification(
+            self._classify(malformed_filename)
+        )
+        self._assert_unbound_batch(self._validate(malformed_filename))
+        self._assert_unbound_classification(
+            self._classify(self.MATCHING_FILENAME, target=malformed_target)
+        )
+        self._assert_unbound_batch(
+            self._validate(self.MATCHING_FILENAME, target=malformed_target)
+        )
+
+    def test_preserves_contextual_zip_plus_four_and_unit_suffixes(self):
+        cases = (
+            (
+                (
+                    "123 Main Rd Suite 4-B Santa Fe New Mexico "
+                    "87101-1234 exterior.png"
+                ),
+                (
+                    "123 Main Road Suite 4B, Santa Fe, "
+                    "New Mexico 87101"
+                ),
+            ),
+            (
+                (
+                    "123 Main Rd Suite 4-B Washington District of "
+                    "Columbia 20001-1234 exterior.png"
+                ),
+                (
+                    "123 Main Road Suite 4B, Washington, "
+                    "District of Columbia 20001"
+                ),
+            ),
+            (
+                (
+                    "123 Main Rd Suite 4-B Phoenix A.Z. "
+                    "85001-1234 exterior.png"
+                ),
+                (
+                    "123 Main Road Suite 4B, Phoenix, Arizona 85001"
+                ),
+            ),
+        )
+
+        for filename, target in cases:
+            with self.subTest(filename=filename):
+                self._assert_target(self._classify(filename, target=target))
+                self.assertEqual(
+                    "accepted",
+                    self._validate(filename, target=target)["status"],
+                )
+
+    def test_allows_only_valid_leading_iso_date_descriptor(self):
+        dated_filename = (
+            "2026-08-16-123-N-Sample-Rd-Example-City-AZ-85001.png"
+        )
+        self._assert_target(self._classify(dated_filename))
+        self.assertEqual("accepted", self._validate(dated_filename)["status"])
+
+        invalid_date_filename = (
+            "2026-13-40-123-N-Sample-Rd-Example-City-AZ-85001.png"
+        )
+        self._assert_unbound_classification(
+            self._classify(invalid_date_filename)
+        )
+        self._assert_unbound_batch(self._validate(invalid_date_filename))
+
+        dated_with_residual = (
+            "2026-08-16-123-N-Sample-Rd-Example-City-AZ-85001-456-Oak.png"
+        )
+        self._assert_unbound_classification(
+            self._classify(dated_with_residual)
+        )
+        self._assert_unbound_batch(self._validate(dated_with_residual))
+
+
+class NativeImageCanonicalManifestReviewTests(unittest.TestCase):
+    def _asset(self, data):
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+        return {
+            "name": GENERIC_IMAGE_NAME,
+            "content_type": "image/png",
+            "data": data,
+            "width": width,
+            "height": height,
+            "source_bytes": 1,
+            "normalized_bytes": len(data),
+            "normalized_sha256": hashlib.sha256(data).hexdigest(),
+            "property_binding": "target",
+            "binding_method": "structured_filename_address",
+        }
+
+    def _adapt(self, data):
+        return file_handling.build_native_image_manifest_entry(
+            {"status": "accepted", "assets": [self._asset(data)]}
+        )
+
+    def test_rejects_metadata_trailing_bytes_and_noncanonical_color_mode(self):
+        private_text_sentinel = "PRIVATE_TEXT_METADATA_SENTINEL"
+        trailing_sentinel = b"PRIVATE_TRAILING_SENTINEL"
+        cases = (
+            _png_bytes(metadata={"Comment": private_text_sentinel}),
+            _png_bytes() + trailing_sentinel,
+            _grayscale_png_bytes(),
+        )
+
+        for data in cases:
+            with self.subTest(data_length=len(data)):
+                manifest = self._adapt(data)
+                self.assertIsNone(manifest)
+                self.assertNotIn(private_text_sentinel, repr(manifest))
+                self.assertNotIn(
+                    trailing_sentinel.decode("ascii"),
+                    repr(manifest),
+                )
 
 
 if __name__ == "__main__":
