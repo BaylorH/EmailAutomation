@@ -1753,7 +1753,7 @@ def fetch_pdf_attachments(
     print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
     return _PdfAttachmentList(pdf_attachments, attachments)
 
-def ensure_drive_folder():
+def ensure_drive_folder(*, redact_failure_detail: bool = False):
     """Ensure Drive folder exists and return folder ID."""
     try:
         creds = _helper_google_creds()
@@ -1780,7 +1780,13 @@ def ensure_drive_folder():
         return folder.get("id")
         
     except Exception as e:
-        print(f"❌ Failed to ensure Drive folder: {e}")
+        if redact_failure_detail:
+            print(
+                "❌ Failed to ensure native image Drive folder: "
+                "native_image_host_failed"
+            )
+        else:
+            print(f"❌ Failed to ensure Drive folder: {e}")
         return None
 
 def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> Optional[str]:
@@ -2046,7 +2052,9 @@ def upload_property_image_to_drive(
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         if not folder_id:
-            folder_id = ensure_drive_folder()
+            folder_id = ensure_drive_folder(
+                redact_failure_detail=redact_failure_detail,
+            )
 
         base_name = os.path.splitext(name or "property-preview.pdf")[0].strip() or "property-preview"
         image_name = f"{base_name} preview.png"
