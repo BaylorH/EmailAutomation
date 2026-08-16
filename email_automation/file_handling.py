@@ -1674,11 +1674,13 @@ def fetch_message_attachment_snapshot(
             raise requests.exceptions.RequestException(
                 "Graph attachment snapshot returned an invalid page"
             )
-        attachments.extend(values)
-        if len(attachments) > GRAPH_ATTACHMENT_SNAPSHOT_MAX_ITEMS:
+        if len(values) > (
+            GRAPH_ATTACHMENT_SNAPSHOT_MAX_ITEMS - len(attachments)
+        ):
             raise requests.exceptions.RequestException(
                 "Graph attachment snapshot exceeded the item limit"
             )
+        attachments.extend(values)
 
         next_link = payload.get("@odata.nextLink")
         if next_link is None:
