@@ -1590,6 +1590,88 @@ class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
             )
         )
 
+    def test_rejects_unicode_dash_street_number_ranges(self):
+        target_125 = "125 Main Road, Example City, Arizona 85001"
+        matching_filename = "125 Main Rd Example City AZ 85001.png"
+        dash_cases = (
+            ("en_dash", "\N{EN DASH}"),
+            ("em_dash", "\N{EM DASH}"),
+            ("minus_sign", "\N{MINUS SIGN}"),
+        )
+
+        for label, dash in dash_cases:
+            ranged = (
+                f"123{dash}125 Main Rd Example City AZ 85001"
+            )
+            with self.subTest(label=label, surface="filename_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(f"{ranged}.png", target=target_125)
+                )
+            with self.subTest(label=label, surface="filename_batch"):
+                self._assert_unbound_batch(
+                    self._validate(f"{ranged}.png", target=target_125)
+                )
+            with self.subTest(label=label, surface="target_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(matching_filename, target=ranged)
+                )
+            with self.subTest(label=label, surface="target_batch"):
+                self._assert_unbound_batch(
+                    self._validate(matching_filename, target=ranged)
+                )
+
+    def test_rejects_punctuation_and_ordinal_range_collisions(self):
+        cases = (
+            (
+                "underscore_after_range",
+                "123-125_ Main Rd Example City AZ 85001",
+                "125 Main Road, Example City, Arizona 85001",
+                "125 Main Rd Example City AZ 85001.png",
+            ),
+            (
+                "comma_after_range",
+                "123-125, Main Rd Example City AZ 85001",
+                "125 Main Road, Example City, Arizona 85001",
+                "125 Main Rd Example City AZ 85001.png",
+            ),
+            (
+                "slash_after_range",
+                "123-125/ Main Rd Example City AZ 85001",
+                "125 Main Road, Example City, Arizona 85001",
+                "125 Main Rd Example City AZ 85001.png",
+            ),
+            (
+                "ordinal_street",
+                "123-125 7th St Example City AZ 85001",
+                "125 7th Street, Example City, Arizona 85001",
+                "125 7th St Example City AZ 85001.png",
+            ),
+            (
+                "seven_digit_underscore",
+                "1234567_6789 Main Rd Example City AZ 85001",
+                "6789 Main Road, Example City, Arizona 85001",
+                "6789 Main Rd Example City AZ 85001.png",
+            ),
+        )
+
+        for label, ranged, target, matching_filename in cases:
+            with self.subTest(label=label, surface="filename_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(f"{ranged}.png", target=target)
+                )
+            with self.subTest(label=label, surface="filename_batch"):
+                self._assert_unbound_batch(
+                    self._validate(f"{ranged}.png", target=target)
+                )
+            with self.subTest(label=label, surface="target_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(matching_filename, target=ranged)
+                )
+            with self.subTest(label=label, surface="target_batch"):
+                self._assert_unbound_batch(
+                    self._validate(matching_filename, target=ranged)
+                )
+
     def test_rejects_malformed_zip_plus_three(self):
         malformed_filename = (
             "123 N Sample Rd Example City AZ 85001-123.png"
@@ -1640,6 +1722,15 @@ class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
                     "123 Main Road Suite 4B, Phoenix, Arizona 85001"
                 ),
             ),
+            (
+                (
+                    "123 Main Rd Suite 4-B Phoenix AZ. "
+                    "85001-1234 exterior.png"
+                ),
+                (
+                    "123 Main Road Suite 4B, Phoenix, Arizona 85001"
+                ),
+            ),
         )
 
         for filename, target in cases:
@@ -1657,13 +1748,18 @@ class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
         self._assert_target(self._classify(dated_filename))
         self.assertEqual("accepted", self._validate(dated_filename)["status"])
 
-        invalid_date_filename = (
-            "2026-13-40-123-N-Sample-Rd-Example-City-AZ-85001.png"
+        invalid_date_filenames = (
+            "2026-13-40-123-N-Sample-Rd-Example-City-AZ-85001.png",
+            "2026-02-31-123-N-Sample-Rd-Example-City-AZ-85001.png",
         )
-        self._assert_unbound_classification(
-            self._classify(invalid_date_filename)
-        )
-        self._assert_unbound_batch(self._validate(invalid_date_filename))
+        for invalid_date_filename in invalid_date_filenames:
+            with self.subTest(invalid_date=invalid_date_filename):
+                self._assert_unbound_classification(
+                    self._classify(invalid_date_filename)
+                )
+                self._assert_unbound_batch(
+                    self._validate(invalid_date_filename)
+                )
 
         dated_with_residual = (
             "2026-08-16-123-N-Sample-Rd-Example-City-AZ-85001-456-Oak.png"
@@ -1714,6 +1810,37 @@ class NativeImageCanonicalManifestReviewTests(unittest.TestCase):
                     trailing_sentinel.decode("ascii"),
                     repr(manifest),
                 )
+
+    def test_rejects_actual_overlimit_dimensions_before_full_decode(self):
+        actual_over_edge = _png_bytes(
+            size=(file_handling.NATIVE_IMAGE_MAX_EDGE + 1, 1)
+        )
+        forged_asset = self._asset(actual_over_edge)
+        forged_asset["width"] = 8
+        forged_asset["height"] = 6
+        forbidden = AssertionError(
+            "forged dimensions reached verify/canonical normalization"
+        )
+
+        with mock.patch.object(
+            file_handling,
+            "_verify_native_image",
+            side_effect=forbidden,
+        ) as verify_call, mock.patch.object(
+            file_handling,
+            "_normalize_native_image",
+            side_effect=forbidden,
+        ) as normalize_call:
+            try:
+                manifest = file_handling.build_native_image_manifest_entry(
+                    {"status": "accepted", "assets": [forged_asset]}
+                )
+            except AssertionError as exc:
+                self.fail(str(exc))
+
+        self.assertIsNone(manifest)
+        verify_call.assert_not_called()
+        normalize_call.assert_not_called()
 
 
 if __name__ == "__main__":

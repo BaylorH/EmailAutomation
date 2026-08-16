@@ -1,5 +1,6 @@
 import os
 import base64
+import datetime
 import hashlib
 import ipaddress
 import re
@@ -345,19 +346,11 @@ _NATIVE_IMAGE_PARTIAL_STREET_WITHOUT_NUMBER_RE = re.compile(
     rf"(?<![a-z0-9])(?:{_NATIVE_IMAGE_STREET_TOKEN_PATTERN}\s+){{1,9}}"
     rf"(?:{_NATIVE_IMAGE_SUFFIX_PATTERN})\b"
 )
-_NATIVE_IMAGE_STREET_NUMBER_RANGE_RE = re.compile(
-    r"(?<![a-z0-9])(?P<start>\d+[a-z]?)\s*-\s*"
-    r"(?P<end>\d+[a-z]?)(?=(?:\s+|-+)[a-z])"
-)
 _NATIVE_IMAGE_LEADING_ISO_DATE_RE = re.compile(
-    r"^(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-"
-    r"(?:0[1-9]|[12]\d|3[01])(?:-+|\s+)"
+    r"^(?P<date>\d{4}-\d{2}-\d{2})(?:-+|\s+)"
 )
-_NATIVE_IMAGE_MALFORMED_ZIP_PLUS_RE = re.compile(
-    r"(?<!\d)\d{5}\s*-\s*(?:\d{1,3}|\d{5,})(?!\d)"
-)
-_NATIVE_IMAGE_STATE_AT_END_RE = re.compile(
-    rf"(?:^|\s)(?:{_NATIVE_IMAGE_STATE_PATTERN})$"
+_NATIVE_IMAGE_UNCLAIMED_NUMBER_RE = re.compile(
+    r"(?<![a-z0-9])\d+[a-z]?(?![a-z0-9])"
 )
 
 
@@ -412,27 +405,19 @@ def _normalize_native_image_address_text(
         if not unicodedata.combining(character)
     )
     text = text.casefold()
-    text = _NATIVE_IMAGE_LEADING_ISO_DATE_RE.sub("", text, count=1)
+    date_match = _NATIVE_IMAGE_LEADING_ISO_DATE_RE.match(text)
+    if date_match:
+        try:
+            datetime.date.fromisoformat(date_match.group("date"))
+        except ValueError:
+            pass
+        else:
+            text = text[date_match.end():]
     text = re.sub(
         r"\b([a-z])\s*\.\s*([a-z])\s*\.?(?=\s|$)",
         r"\1\2",
         text,
     )
-    if _NATIVE_IMAGE_MALFORMED_ZIP_PLUS_RE.search(text):
-        return None
-    for range_match in _NATIVE_IMAGE_STREET_NUMBER_RANGE_RE.finditer(text):
-        start = range_match.group("start")
-        end = range_match.group("end")
-        prefix = text[:range_match.start()].rstrip(" -_,")
-        if (
-            start.isdigit()
-            and end.isdigit()
-            and len(start) == 5
-            and len(end) == 4
-            and _NATIVE_IMAGE_STATE_AT_END_RE.search(prefix)
-        ):
-            continue
-        return None
     for first, second, canonical in _NATIVE_IMAGE_HYPHENATED_DIRECTIONALS:
         text = re.sub(
             rf"\b{first}\s*-\s*{second}\b",
@@ -503,6 +488,7 @@ def _native_image_filename_address_claims(
         or _NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE.search(unclaimed)
         or _NATIVE_IMAGE_PARTIAL_NUMBER_STREET_TOKEN_RE.search(unclaimed)
         or _NATIVE_IMAGE_PARTIAL_STREET_WITHOUT_NUMBER_RE.search(unclaimed)
+        or _NATIVE_IMAGE_UNCLAIMED_NUMBER_RE.search(unclaimed)
     )
     return claims, has_incomplete_claim
 
@@ -1045,6 +1031,20 @@ def build_native_image_manifest_entry(
             pillow_format, pillow_width, pillow_height = (
                 _inspect_native_image_pillow_format(data)
             )
+        except Exception:
+            return None
+        if (
+            header_format != "PNG"
+            or pillow_format != "PNG"
+            or header_width <= 0
+            or header_height <= 0
+            or max(header_width, header_height) > NATIVE_IMAGE_MAX_EDGE
+            or header_width * header_height > NATIVE_IMAGE_MAX_PIXELS
+            or (header_width, header_height) != (width, height)
+            or (pillow_width, pillow_height) != (width, height)
+        ):
+            return None
+        try:
             _verify_native_image(data)
             canonical_data, canonical_width, canonical_height = (
                 _normalize_native_image(data)
@@ -1052,11 +1052,7 @@ def build_native_image_manifest_entry(
         except Exception:
             return None
         if (
-            header_format != "PNG"
-            or pillow_format != "PNG"
-            or (header_width, header_height) != (width, height)
-            or (pillow_width, pillow_height) != (width, height)
-            or (canonical_width, canonical_height) != (width, height)
+            (canonical_width, canonical_height) != (width, height)
             or canonical_data != data
         ):
             return None
