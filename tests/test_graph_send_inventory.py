@@ -10,6 +10,7 @@ INVENTORY_PATH = REPO_ROOT / "docs" / "release-safety" / "outbound-send-surface-
 GRAPH_SEND_PATTERN = re.compile(
     r"/me/(?:sendMail|messages/\{[^}]+\}/(?:reply|send|createReply|createReplyAll))"
     r"|graph\.microsoft\.com/v1\.0/me/(?:sendMail|messages/.*/(?:reply|send))"
+    r"|f?[\"']\{draft_path\}/send[\"']"
 )
 
 IGNORED_PATH_PARTS = {
@@ -76,7 +77,13 @@ class GraphSendInventoryTests(unittest.TestCase):
 
     def test_inventory_marks_each_surface_policy_status(self):
         inventory = json.loads(INVENTORY_PATH.read_text())
-        allowed_statuses = {"guarded", "provider", "legacy_disabled", "legacy_script"}
+        allowed_statuses = {
+            "guarded",
+            "provider",
+            "unwired",
+            "legacy_disabled",
+            "legacy_script",
+        }
 
         for entry in inventory.get("sendSurfaces", []):
             with self.subTest(path=entry.get("path")):
@@ -96,6 +103,29 @@ class GraphSendInventoryTests(unittest.TestCase):
             "legacy_disabled",
             entries["email_automation/email_operations.py"]["policyStatus"],
         )
+
+    def test_manual_reply_delivery_surface_is_registered_as_unwired(self):
+        inventory = json.loads(INVENTORY_PATH.read_text())
+        entries = {
+            entry["path"]: entry
+            for entry in inventory.get("sendSurfaces", [])
+        }
+
+        self.assertIn(
+            "email_automation/manual_reply.py",
+            entries,
+            "The Task 9 exact manual-reply Graph surface is missing from the inventory",
+        )
+        entry = entries["email_automation/manual_reply.py"]
+        self.assertEqual("manual_reply_exact_item", entry["lane"])
+        self.assertEqual("unwired", entry["policyStatus"])
+        self.assertIn("No production trigger", entry["trigger"])
+        self.assertIn("production orchestration must remain disconnected", entry["risk"])
+        controls = set(entry["currentControls"])
+        self.assertIn("exact item-scoped transaction snapshot", controls)
+        self.assertIn("ImmutableId-only Graph requests", controls)
+        self.assertIn("single non-retried draft send", controls)
+        self.assertIn("Keep the transport unwired", entry["nextGate"])
 
     def test_active_send_surfaces_reference_shared_body_policy(self):
         inventory = json.loads(INVENTORY_PATH.read_text())

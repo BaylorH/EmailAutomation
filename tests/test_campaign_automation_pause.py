@@ -2,7 +2,7 @@ import contextlib
 import io
 import unittest
 
-from email_automation import campaign_safety
+from email_automation import campaign_safety, manual_reply
 
 
 class _FakeSnapshot:
@@ -358,6 +358,155 @@ class CampaignAutomationPauseTests(unittest.TestCase):
         self.assertTrue(paused)
         self.assertEqual("client_automation_state_not_found", reason)
         self.assertEqual({}, client_data)
+
+    def test_manual_reply_authorities_are_independent_and_fail_closed(self):
+        authorize = getattr(manual_reply, "manual_reply_authority_decision", None)
+        self.assertTrue(
+            callable(authorize),
+            "manual_reply.manual_reply_authority_decision is missing",
+        )
+        uid = "synthetic-user"
+        live_client = {"status": "live"}
+        maintenance_client = {
+            "status": "live",
+            "automationPaused": True,
+            "automationPauseReason": "maintenance_window",
+        }
+        binding = {
+            "userPathUid": uid,
+            "clientId": "client-1",
+            "outboxClientId": "client-1",
+            "threadClientId": "client-1",
+            "notificationClientId": "client-1",
+            "activeLocation": "clients",
+        }
+        enabled = {"state": "enabled"}
+
+        for client in (live_client, maintenance_client):
+            with self.subTest(allowed_client=client):
+                decision = authorize(
+                    uid=uid,
+                    global_access=enabled,
+                    active_client=client,
+                    archived_client=None,
+                    client_binding=binding,
+                    outbound_mode="live",
+                )
+                self.assertTrue(decision["allowed"])
+
+        denied = (
+            ({"state": "maintenance"}, maintenance_client, None, "live"),
+            ({"state": "disabled"}, maintenance_client, None, "live"),
+            ({"state": "read_error"}, maintenance_client, None, "live"),
+            ({"state": "missing"}, maintenance_client, None, "live"),
+            (enabled, live_client, None, "paused"),
+            (enabled, live_client, None, "dry_run"),
+            (enabled, {"status": "stopped"}, None, "live"),
+            (enabled, {"status": "unknown"}, None, "live"),
+            (enabled, live_client, {"status": "archived"}, "live"),
+        )
+        for global_access, active, archived, outbound_mode in denied:
+            with self.subTest(
+                global_access=global_access,
+                active=active,
+                archived=archived,
+                outbound_mode=outbound_mode,
+            ):
+                decision = authorize(
+                    uid=uid,
+                    global_access=global_access,
+                    active_client=active,
+                    archived_client=archived,
+                    client_binding=binding,
+                    outbound_mode=outbound_mode,
+                )
+                self.assertFalse(decision["allowed"])
+                self.assertNotIn("permit", decision)
+
+        malformed_bindings = (
+            {**binding, "activeLocation": None},
+            {**binding, "userPathUid": "other-user"},
+            {**binding, "threadClientId": "other-client"},
+            {**binding, "notificationClientId": "other-client"},
+        )
+        for malformed_binding in malformed_bindings:
+            with self.subTest(malformed_binding=malformed_binding):
+                decision = authorize(
+                    uid=uid,
+                    global_access=enabled,
+                    active_client=live_client,
+                    archived_client=None,
+                    client_binding=malformed_binding,
+                    outbound_mode="live",
+                )
+                self.assertFalse(decision["allowed"])
+
+    def test_manual_reply_global_policy_uses_exact_raw_schema_without_fallback(self):
+        classify = getattr(manual_reply, "manual_reply_global_access_decision", None)
+        self.assertTrue(
+            callable(classify),
+            "manual_reply.manual_reply_global_access_decision is missing",
+        )
+        uid = "synthetic-user"
+        cases = (
+            (
+                {"automationEnabled": True, "allowedUids": []},
+                True,
+                False,
+                "enabled",
+            ),
+            (
+                {"automationEnabled": False, "allowedUids": [uid]},
+                True,
+                False,
+                "enabled",
+            ),
+            (
+                {"automationEnabled": False, "allowedUids": []},
+                True,
+                False,
+                "disabled",
+            ),
+            (
+                {"automationEnabled": "true", "allowedUids": []},
+                True,
+                False,
+                "malformed",
+            ),
+            (
+                {"automationEnabled": True, "allowedUids": "all"},
+                True,
+                False,
+                "malformed",
+            ),
+            (None, False, False, "missing"),
+            (None, True, True, "read_error"),
+        )
+        for policy, exists, read_error, expected in cases:
+            with self.subTest(
+                policy=policy,
+                exists=exists,
+                read_error=read_error,
+            ):
+                decision = classify(
+                    uid=uid,
+                    policy=policy,
+                    exists=exists,
+                    read_error=read_error,
+                )
+                self.assertEqual(expected, decision["state"])
+
+        # A missing policy is denied for every UID. Manual replies must not
+        # inherit campaign_safety's historical special-user fallback.
+        for candidate_uid in (uid, "another-synthetic-user"):
+            with self.subTest(candidate_uid=candidate_uid):
+                decision = classify(
+                    uid=candidate_uid,
+                    policy=None,
+                    exists=False,
+                    read_error=False,
+                )
+                self.assertEqual("missing", decision["state"])
 
 
 if __name__ == "__main__":

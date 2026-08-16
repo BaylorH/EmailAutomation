@@ -338,7 +338,17 @@ class ManualReplyContinuationTests(unittest.TestCase):
             email_module,
             "process_outbox_item",
             return_value={"status": "manual_ready", "private": "must-not-escape"},
-        ) as classify:
+        ) as classify, patch.object(
+            manual_reply,
+            "prepare_manual_reply_item",
+            side_effect=AssertionError("Task9A preparation must remain unwired"),
+            create=True,
+        ) as prepare, patch.object(
+            manual_reply,
+            "send_prepared_manual_reply_once",
+            side_effect=AssertionError("Task9A transport must remain unwired"),
+            create=True,
+        ) as transport:
             result = self._processor()("user-123", "outbox-456")
 
         self.assertEqual(
@@ -346,6 +356,8 @@ class ManualReplyContinuationTests(unittest.TestCase):
             result,
         )
         classify.assert_called_once_with("user-123", "outbox-456")
+        prepare.assert_not_called()
+        transport.assert_not_called()
 
     def test_terminal_task1_results_have_no_effect(self):
         processor = self._processor()

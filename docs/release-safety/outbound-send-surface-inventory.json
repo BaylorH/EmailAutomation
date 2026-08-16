@@ -18,6 +18,21 @@
       "nextGate": "Centralize these controls into a shared outbound policy object and require every other send surface to call it or document why it is legacy-disabled."
     },
     {
+      "path": "email_automation/manual_reply.py",
+      "lane": "manual_reply_exact_item",
+      "policyStatus": "unwired",
+      "trigger": "No production trigger. Task 9A exposes an injected low-level primitive for offline contract testing only; Task 10 owns any future connection.",
+      "risk": "The low-level transport can send one reviewed reply draft; production orchestration must remain disconnected until authority lifecycle and atomic cap/outcome gates are complete.",
+      "currentControls": [
+        "exact item-scoped transaction snapshot",
+        "ImmutableId-only Graph requests",
+        "single non-retried draft send",
+        "shared outbound body policy",
+        "one To recipient and zero CC/BCC"
+      ],
+      "nextGate": "Keep the transport unwired until the server-only authority lifecycle, final cap reservations, and accepted-or-ambiguous outcome state machine are implemented and reviewed."
+    },
+    {
       "path": "email_automation/processing.py",
       "lane": "inbox_auto_reply",
       "policyStatus": "guarded",

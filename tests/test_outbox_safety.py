@@ -1,5 +1,7 @@
 import unittest
 import os
+from copy import deepcopy
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 from contextlib import ExitStack
 
@@ -10,6 +12,7 @@ os.environ.setdefault(
 )
 
 from email_automation import email as email_module
+from email_automation import manual_reply
 from email_automation import notifications as notifications_module
 from email_automation.column_config import get_default_column_config
 
@@ -4269,6 +4272,331 @@ class SendModeCombineTests(unittest.TestCase):
         self.assertEqual(captured["thread_context"]["propertyAddresses"],
                          ["200 Interference Rd", "300 Drip Feed Dr"])
         self.assertEqual(finalize.call_count, 2, "only the surviving rows finalize")
+
+
+class ManualReplyFinalSnapshotTests(unittest.TestCase):
+    def _snapshot(self):
+        timestamp = datetime(2026, 8, 15, 12, 1, tzinfo=timezone.utc)
+        return {
+            "outbox": {
+                "id": "outbox-1",
+                "manualReplyLaneVersion": 1,
+                "status": "manual_reply_claimed",
+                "source": "dashboard_inline_reply",
+                "actionType": "reply",
+                "actionAuditId": "audit-1",
+                "clientId": "client-1",
+                "notificationClientId": "client-1",
+                "notificationId": "notification-1",
+                "threadId": "thread-1",
+                "replyToMessageId": "client-message-alias-1",
+                "sourceMessageId": "<source-1@example.invalid>",
+                "sourceGraphMessageId": "client-message-alias-1",
+                "sourceInternetMessageId": "<source-1@example.invalid>",
+                "sourceMessage": {
+                    "graphMessageId": "client-message-alias-1",
+                    "internetMessageId": "<source-1@example.invalid>",
+                },
+                "assignedEmails": ["broker@example.invalid"],
+                "ccEmails": [],
+                "script": "Synthetic reviewed reply.",
+                "subject": "Synthetic subject",
+                "contactName": "Synthetic Broker",
+                "rowNumber": 42,
+                "isPersonalized": True,
+                "createdAt": timestamp,
+                "sourceDeadLetterId": None,
+                "actionReason": "needs_user_input:client_question",
+                "forceScript": True,
+                "scriptSelectionMode": "exact",
+                "deleteNotificationOnSend": True,
+                "resumeThreadOnSend": True,
+                "processingBy": "worker-1",
+                "processingAt": timestamp,
+                "serverRoute": {
+                    "kind": "manual_reply",
+                    "resolutionKey": "resolution-1",
+                    "fence": "fence-1",
+                },
+            },
+            "activeClientSlot": {
+                "present": True,
+                "location": "clients",
+                "record": {"status": "live"},
+            },
+            "archivedClientSlot": {"present": False, "record": None},
+            "thread": {"id": "thread-1", "status": "paused"},
+            "followUp": {"enabled": False, "processingBy": None},
+            "notification": {
+                "id": "notification-1",
+                "kind": "action_needed",
+                "authorityKey": "authority-1",
+            },
+            "actionAudit": {
+                "id": "audit-1",
+                "status": "queued",
+                "actorUid": "uid-1",
+                "source": "dashboard_inline_reply",
+                "actionType": "reply",
+                "clientId": "client-1",
+                "threadId": "thread-1",
+                "notificationId": "notification-1",
+                "finalBody": "Synthetic reviewed reply.",
+                "finalRecipients": ["broker@example.invalid"],
+                "finalCcRecipients": [],
+                "replyToMessageId": "client-message-alias-1",
+                "sourceMessageId": "<source-1@example.invalid>",
+                "sourceGraphMessageId": "client-message-alias-1",
+                "sourceInternetMessageId": "<source-1@example.invalid>",
+            },
+            "sourceBinding": {
+                "graphLookupMessageId": "client-message-alias-1",
+                "normalizedInternetMessageId": "<source-1@example.invalid>",
+                "conversationId": "conversation-1",
+                "authenticatedMailboxAddress": "sender@example.invalid",
+                "fromAddress": "broker@example.invalid",
+                "senderAddress": "broker@example.invalid",
+                "sourceAudience": {
+                    "to": ["sender@example.invalid"],
+                    "cc": [],
+                    "bcc": [],
+                    "replyTo": [],
+                },
+                "audience": {
+                    "to": ["broker@example.invalid"],
+                    "cc": [],
+                    "bcc": [],
+                },
+            },
+            "selectedAccount": {
+                "home_account_id": "synthetic-home-account-1",
+                "local_account_id": "local-account-1",
+                "environment": "login.microsoftonline.com",
+                "realm": "synthetic-tenant-1",
+                "username": "sender@example.invalid",
+            },
+            "graphMe": {
+                "id": "local-account-1",
+                "mail": "mail-alias@example.invalid",
+                "userPrincipalName": "sender@example.invalid",
+            },
+            "serverAuthority": {
+                "schemaVersion": 1,
+                "authorityPath": "users/uid-1/manualReplyAuthorities/authority-1",
+                "status": "claimed",
+                "uid": "uid-1",
+                "clientId": "client-1",
+                "threadId": "thread-1",
+                "notificationId": "notification-1",
+                "source": "dashboard_inline_reply",
+                "graphLookupMessageId": "client-message-alias-1",
+                "normalizedInternetMessageId": "<source-1@example.invalid>",
+                "conversationId": "conversation-1",
+                "authenticatedMailboxAddress": "sender@example.invalid",
+                "fromAddress": "broker@example.invalid",
+                "senderAddress": "broker@example.invalid",
+                "sourceAudience": {
+                    "to": ["sender@example.invalid"],
+                    "cc": [],
+                    "bcc": [],
+                    "replyTo": [],
+                },
+                "audience": {
+                    "to": ["broker@example.invalid"],
+                    "cc": [],
+                    "bcc": [],
+                },
+                "ownerOutboxId": "outbox-1",
+                "actionAuditId": "audit-1",
+                "immutableGraphMessageId": "source-immutable-1",
+                "internetMessageId": "<source-1@example.invalid>",
+                "reviewedBodyHash": "body-hash-1",
+                "snapshotHash": "claim-snapshot-hash-1",
+                "fence": "fence-1",
+                "createdAt": timestamp,
+                "claimedAt": timestamp,
+                "updatedAt": timestamp,
+            },
+            "logicalResolution": {
+                "present": True,
+                "record": {
+                    "status": "claimed",
+                    "uid": "uid-1",
+                    "outboxId": "outbox-1",
+                    "resolutionKey": "resolution-1",
+                    "workerId": "worker-1",
+                    "fence": "fence-1",
+                },
+            },
+            "globalAccess": {"state": "enabled"},
+            "clientDecision": {"state": "allow", "stopKind": "none"},
+            "outboundMode": "live",
+        }
+
+    def test_final_snapshot_hash_binds_every_named_pre_send_input(self):
+        digest = getattr(manual_reply, "manual_reply_snapshot_hash", None)
+        self.assertTrue(
+            callable(digest),
+            "manual_reply.manual_reply_snapshot_hash is missing",
+        )
+        baseline = self._snapshot()
+        try:
+            baseline_hash = digest(baseline)
+        except Exception as error:
+            self.fail(
+                "manual_reply_snapshot_hash rejected the valid Task9A snapshot: "
+                f"{type(error).__name__}"
+            )
+        self.assertRegex(baseline_hash, r"^[0-9a-f]{64}$")
+
+        mutations = {
+            "outbox": lambda value: value["outbox"].update(script="Changed body"),
+            "outbox_processing_time": lambda value: value["outbox"].update(
+                processingAt=datetime(2026, 8, 15, 12, 2, tzinfo=timezone.utc)
+            ),
+            "active_slot": lambda value: value["activeClientSlot"].update(
+                present=False,
+                record=None,
+            ),
+            "archived_slot": lambda value: value["archivedClientSlot"].update(
+                present=True,
+                record={"status": "archived"},
+            ),
+            "thread": lambda value: value["thread"].update(status="stopped"),
+            "follow_up": lambda value: value["followUp"].update(enabled=True),
+            "notification": lambda value: value["notification"].update(kind="dismissed"),
+            "notification_authority": lambda value: value["notification"].update(
+                authorityKey="other-authority"
+            ),
+            "audit": lambda value: value["actionAudit"].update(status="cancelled"),
+            "audit_exact_optional_outbox": lambda value: value["actionAudit"].update(
+                outboxId="outbox-1"
+            ),
+            "source_pair": lambda value: value["sourceBinding"].update(
+                normalizedInternetMessageId="<different@example.invalid>"
+            ),
+            "authenticated_mailbox": lambda value: value["sourceBinding"].update(
+                authenticatedMailboxAddress="other-account@example.invalid"
+            ),
+            "source_audience": lambda value: value["sourceBinding"][
+                "sourceAudience"
+            ].update(to=["other-account@example.invalid"]),
+            "account_home": lambda value: value["selectedAccount"].update(
+                home_account_id="other-home"
+            ),
+            "account_local": lambda value: value["selectedAccount"].update(
+                local_account_id="other-local"
+            ),
+            "account_environment": lambda value: value["selectedAccount"].update(
+                environment="other.invalid"
+            ),
+            "account_realm": lambda value: value["selectedAccount"].update(
+                realm="other-realm"
+            ),
+            "account_username": lambda value: value["selectedAccount"].update(
+                username="other-sender@example.invalid"
+            ),
+            "graph_me_id": lambda value: value["graphMe"].update(id="other-local"),
+            "graph_me_upn": lambda value: value["graphMe"].update(
+                userPrincipalName="other-sender@example.invalid"
+            ),
+            "graph_me_mail": lambda value: value["graphMe"].update(
+                mail="other-alias@example.invalid"
+            ),
+            "server_authority": lambda value: value["serverAuthority"].update(
+                ownerOutboxId="other-outbox"
+            ),
+            "authority_uid": lambda value: value["serverAuthority"].update(
+                uid="other-user"
+            ),
+            "authority_body_hash": lambda value: value["serverAuthority"].update(
+                reviewedBodyHash="other-body-hash"
+            ),
+            "authority_snapshot_hash": lambda value: value["serverAuthority"].update(
+                snapshotHash="other-snapshot-hash"
+            ),
+            "resolution": lambda value: value["logicalResolution"]["record"].update(
+                fence="other-fence"
+            ),
+            "global_access": lambda value: value["globalAccess"].update(state="disabled"),
+            "client_decision": lambda value: value["clientDecision"].update(state="blocked"),
+            "kill_switch": lambda value: value.update(outboundMode="paused"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = deepcopy(baseline)
+                mutate(changed)
+                self.assertNotEqual(baseline_hash, digest(changed))
+
+        forbidden = deepcopy(baseline)
+        forbidden["storedPermit"] = {"allowed": True}
+        with self.assertRaises(ValueError):
+            digest(forbidden)
+
+    def test_snapshot_schema_is_closed_typed_and_order_stable(self):
+        digest = getattr(manual_reply, "manual_reply_snapshot_hash", None)
+        self.assertTrue(callable(digest), "manual_reply_snapshot_hash is missing")
+        baseline = self._snapshot()
+        try:
+            baseline_hash = digest(baseline)
+        except Exception as error:
+            self.fail(
+                "manual_reply_snapshot_hash rejected the valid Task9A snapshot: "
+                f"{type(error).__name__}"
+            )
+
+        reordered = {key: baseline[key] for key in reversed(tuple(baseline))}
+        self.assertEqual(baseline_hash, digest(reordered))
+
+        for key in tuple(baseline):
+            with self.subTest(missing=key):
+                missing = deepcopy(baseline)
+                missing.pop(key)
+                with self.assertRaises(ValueError):
+                    digest(missing)
+
+        required_nested = (
+            ("outbox", "script"),
+            ("outbox", "processingAt"),
+            ("activeClientSlot", "present"),
+            ("archivedClientSlot", "present"),
+            ("thread", "status"),
+            ("followUp", "enabled"),
+            ("notification", "kind"),
+            ("notification", "authorityKey"),
+            ("actionAudit", "finalBody"),
+            ("sourceBinding", "normalizedInternetMessageId"),
+            ("selectedAccount", "home_account_id"),
+            ("graphMe", "id"),
+            ("serverAuthority", "fence"),
+            ("serverAuthority", "uid"),
+            ("serverAuthority", "reviewedBodyHash"),
+            ("serverAuthority", "snapshotHash"),
+            ("logicalResolution", "record"),
+            ("globalAccess", "state"),
+            ("clientDecision", "state"),
+        )
+        for section, field in required_nested:
+            with self.subTest(section=section, missing=field):
+                missing = deepcopy(baseline)
+                missing[section].pop(field)
+                with self.assertRaises(ValueError):
+                    digest(missing)
+
+        nested_extra = deepcopy(baseline)
+        nested_extra["outbox"]["storedPermit"] = True
+        with self.assertRaises(ValueError):
+            digest(nested_extra)
+
+        unsupported = deepcopy(baseline)
+        unsupported["thread"]["updatedAt"] = object()
+        with self.assertRaises(ValueError):
+            digest(unsupported)
+
+        naive_timestamp = deepcopy(baseline)
+        naive_timestamp["outbox"]["processingAt"] = datetime(2026, 8, 15, 12, 1)
+        with self.assertRaises(ValueError):
+            digest(naive_timestamp)
 
 
 if __name__ == "__main__":
