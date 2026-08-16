@@ -13,6 +13,7 @@ os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "email-automation-cache")
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 from email_automation import file_handling
+from email_automation import property_images
 
 
 FILE_ATTACHMENT_TYPE = "#microsoft.graph.fileAttachment"
@@ -619,6 +620,452 @@ class NativeImageValidationTests(unittest.TestCase):
                     self._validate(attachments),
                     "image_attachment_too_many",
                 )
+
+
+class NativeImageBindingAtomicityTests(unittest.TestCase):
+    TARGET = (
+        "123 North Main Street, Suite 4B, Phoenix, Arizona 85001-1234"
+    )
+    MATCHING_FILENAME = (
+        "PRIVATE_FILENAME_SENTINEL 123 N. Main St #4B, Phoenix AZ 85001 "
+        "exterior.png"
+    )
+
+    def _classifier(self):
+        classifier = getattr(
+            file_handling,
+            "classify_native_image_filename_binding",
+            None,
+        )
+        self.assertTrue(
+            callable(classifier),
+            "native-image filename binding classifier has not been implemented",
+        )
+        return classifier
+
+    def _batch_validator(self):
+        validator = getattr(
+            file_handling,
+            "validate_and_normalize_native_image_attachments",
+            None,
+        )
+        self.assertTrue(
+            callable(validator),
+            "bound native-image batch validator has not been implemented",
+        )
+        return validator
+
+    def _manifest_adapter(self):
+        adapter = getattr(
+            file_handling,
+            "build_native_image_manifest_entry",
+            None,
+        )
+        self.assertTrue(
+            callable(adapter),
+            "native-image manifest adapter has not been implemented",
+        )
+        return adapter
+
+    def _classify(self, filename, *, target=None):
+        return self._classifier()(
+            filename,
+            target_property_hint=self.TARGET if target is None else target,
+        )
+
+    def _validate(self, attachments, *, target=None):
+        return self._batch_validator()(
+            attachments,
+            target_property_hint=self.TARGET if target is None else target,
+        )
+
+    def _assert_failure(self, batch, code):
+        self.assertEqual(
+            {
+                "status": "quarantined",
+                "assets": [],
+                "failure": {
+                    "name": GENERIC_IMAGE_NAME,
+                    "code": code,
+                },
+            },
+            batch,
+        )
+
+    def _assert_target_binding(self, result):
+        self.assertEqual(
+            {
+                "property_binding": "target",
+                "binding_method": "structured_filename_address",
+            },
+            result,
+        )
+
+    def test_accepts_every_filename_claim_matching_complete_row_anchor(self):
+        filenames = [
+            self.MATCHING_FILENAME,
+            (
+                "front_123 North Main Street Suite 4-B Phoenix Arizona "
+                "85001-9876.jpg"
+            ),
+            (
+                "123 N Main St Unit 4B Phoenix AZ 85001 copy "
+                "123 North Main Street #4B Phoenix Arizona 85001.jpeg"
+            ),
+        ]
+        for filename in filenames:
+            with self.subTest(filename=filename):
+                self._assert_target_binding(self._classify(filename))
+        self._assert_target_binding(
+            self._classify(
+                "123 N.E. Main St #4B San Jose A.Z. 85001.png",
+                target=(
+                    "123 Northeast Main Street Suite 4B, "
+                    "San Jos\N{LATIN SMALL LETTER E WITH ACUTE}, Arizona 85001"
+                ),
+            )
+        )
+        self._assert_target_binding(
+            self._classify(
+                "123-N-Sample-Rd-Ste-200-Example-City-AZ-85001.PNG",
+                target=(
+                    "123 North Sample Road Suite 200, "
+                    "Example City, Arizona 85001"
+                ),
+            )
+        )
+
+        shared_pixels = _png_bytes()
+        batch = self._validate(
+            [
+                _attachment(filenames[0], "image/png", shared_pixels),
+                _attachment(filenames[1], "image/jpeg", _jpeg_bytes()),
+                _attachment(filenames[2], "image/jpeg", _jpeg_bytes()),
+            ]
+        )
+
+        self.assertEqual("accepted", batch["status"])
+        self.assertEqual(3, len(batch["assets"]))
+        for asset in batch["assets"]:
+            self.assertEqual("target", asset["property_binding"])
+            self.assertEqual(
+                "structured_filename_address",
+                asset["binding_method"],
+            )
+            self.assertNotIn("filename", asset)
+
+        manifest = self._manifest_adapter()(batch)
+        self.assertEqual(
+            {
+                "name",
+                "text",
+                "images",
+                "method",
+                "source_type",
+                "property_binding",
+                "binding_method",
+                "image_meta",
+            },
+            set(manifest),
+        )
+        self.assertEqual(GENERIC_IMAGE_NAME, manifest["name"])
+        self.assertEqual("", manifest["text"])
+        self.assertEqual("native_image_normalized", manifest["method"])
+        self.assertEqual("native_image", manifest["source_type"])
+        self.assertEqual("target", manifest["property_binding"])
+        self.assertEqual(
+            "structured_filename_address",
+            manifest["binding_method"],
+        )
+        self.assertEqual(3, len(manifest["images"]))
+        self.assertEqual(3, len(manifest["image_meta"]))
+        self.assertNotIn("PRIVATE_FILENAME_SENTINEL", repr(batch))
+        self.assertNotIn("PRIVATE_FILENAME_SENTINEL", repr(manifest))
+        self.assertNotIn("drive_link", repr(manifest))
+        for metadata in manifest["image_meta"]:
+            self.assertEqual(
+                {
+                    "content_type",
+                    "width",
+                    "height",
+                    "source_bytes",
+                    "normalized_bytes",
+                    "normalized_sha256",
+                },
+                set(metadata),
+            )
+
+    def test_rejects_wrong_property_filename(self):
+        wrong = "456 South Oak Road, Tempe AZ 85281 exterior.png"
+
+        self.assertEqual(
+            {"failure_code": "image_attachment_wrong_property"},
+            self._classify(wrong),
+        )
+        self._assert_failure(
+            self._validate([_attachment(wrong, "image/png", _png_bytes())]),
+            "image_attachment_wrong_property",
+        )
+
+    def test_rejects_mixed_property_claims_in_one_filename(self):
+        target_claim = "123 N Main St #4B Phoenix AZ 85001"
+        wrong_claim = "456 S Oak Rd Tempe AZ 85281"
+        mixed_name = f"{target_claim} and {wrong_claim}.png"
+        duplicate_wrong = f"{wrong_claim} copy {wrong_claim}.png"
+
+        self.assertEqual(
+            {"failure_code": "image_attachment_mixed_property"},
+            self._classify(mixed_name),
+        )
+        self.assertEqual(
+            {"failure_code": "image_attachment_wrong_property"},
+            self._classify(duplicate_wrong),
+        )
+
+        target_attachment = _attachment(
+            f"{target_claim}.png",
+            "image/png",
+            _png_bytes(),
+        )
+        wrong_attachment = _attachment(
+            f"{wrong_claim}.png",
+            "image/png",
+            _png_bytes(),
+        )
+        for attachments in (
+            [target_attachment, wrong_attachment],
+            [wrong_attachment, target_attachment],
+        ):
+            with self.subTest(order=[item["name"] for item in attachments]):
+                self._assert_failure(
+                    self._validate(attachments),
+                    "image_attachment_mixed_property",
+                )
+
+    def test_rejects_addressless_or_incomplete_filename(self):
+        cases = (
+            "front exterior.png",
+            "123 N Main St front.png",
+            (
+                "123 N Main St #4B Phoenix AZ 85001 and "
+                "456 Oak Road rear.png"
+            ),
+            "123 N Main Phoenix AZ 85001.png",
+        )
+
+        for filename in cases:
+            with self.subTest(filename=filename):
+                self.assertEqual(
+                    {"failure_code": "image_attachment_unbound_property"},
+                    self._classify(filename),
+                )
+
+    def test_rejects_same_street_with_different_city_state_or_zip(self):
+        cases = (
+            "123 N Main St #4B Tucson AZ 85001 exterior.png",
+            "123 N Main St #4B Phoenix New Mexico 85001 exterior.png",
+            "123 N Main St #4B Phoenix AZ 85002 exterior.png",
+        )
+
+        for filename in cases:
+            with self.subTest(filename=filename):
+                self.assertEqual(
+                    {"failure_code": "image_attachment_wrong_property"},
+                    self._classify(filename),
+                )
+
+    def test_rejects_street_suffix_mismatch(self):
+        self.assertEqual(
+            {"failure_code": "image_attachment_wrong_property"},
+            self._classify(
+                "123 N Main Avenue #4B Phoenix AZ 85001 exterior.png"
+            ),
+        )
+        self.assertEqual(
+            {"failure_code": "image_attachment_unbound_property"},
+            self._classify(
+                "123 N Main Str #4B Phoenix AZ 85001 exterior.png"
+            ),
+        )
+
+    def test_rejects_unit_mismatch_or_one_sided_unit(self):
+        mismatch_cases = (
+            "123 N Main St Unit 5 Phoenix AZ 85001.png",
+            "123 N Main St Phoenix AZ 85001.png",
+        )
+        for filename in mismatch_cases:
+            with self.subTest(filename=filename):
+                self.assertEqual(
+                    {"failure_code": "image_attachment_wrong_property"},
+                    self._classify(filename),
+                )
+
+        target_without_unit = "123 N Main St, Phoenix AZ 85001"
+        self.assertEqual(
+            {"failure_code": "image_attachment_wrong_property"},
+            self._classify(
+                "123 N Main St Unit 4B Phoenix AZ 85001.png",
+                target=target_without_unit,
+            ),
+        )
+        self._assert_target_binding(
+            self._classify(
+                "123 North Main Street Phoenix Arizona 85001.png",
+                target=target_without_unit,
+            )
+        )
+
+    def test_rejects_incomplete_row_and_filename_address_components(self):
+        valid_filename = "123 N Main St #4B Phoenix AZ 85001.png"
+        incomplete_targets = (
+            "North Main Street Suite 4B Phoenix AZ 85001",
+            "123 North Main Suite 4B Phoenix AZ 85001",
+            "123 North Main Street Suite 4B AZ 85001",
+            "123 North Main Street Suite 4B Phoenix 85001",
+            "123 North Main Street Suite 4B Phoenix AZ",
+            (
+                "123 N Main St #4B Phoenix AZ 85001 and "
+                "123 N Main St #4B Phoenix AZ 85001"
+            ),
+            (
+                "123 N Main St #4B Phoenix AZ 85001 and "
+                "456 S Oak Rd Tempe AZ 85281"
+            ),
+        )
+
+        for target in incomplete_targets:
+            with self.subTest(target=target):
+                self.assertEqual(
+                    {"failure_code": "image_attachment_unbound_property"},
+                    self._classify(valid_filename, target=target),
+                )
+
+    def test_does_not_rescue_single_addressless_image_from_target_text(self):
+        self._assert_failure(
+            self._validate(
+                [_attachment("front-elevation.png", "image/png", _png_bytes())]
+            ),
+            "image_attachment_unbound_property",
+        )
+
+    def test_one_invalid_sibling_quarantines_the_complete_batch(self):
+        pixels = _png_bytes()
+        valid = _attachment(
+            "123 N Main St #4B Phoenix AZ 85001 front.png",
+            "image/png",
+            pixels,
+        )
+        addressless = _attachment("rear.png", "image/png", pixels)
+        wrong = _attachment(
+            "456 S Oak Rd Tempe AZ 85281 rear.png",
+            "image/png",
+            pixels,
+        )
+
+        for sibling, expected in (
+            (addressless, "image_attachment_unbound_property"),
+            (wrong, "image_attachment_mixed_property"),
+        ):
+            for attachments in ([valid, sibling], [sibling, valid]):
+                with self.subTest(
+                    expected=expected,
+                    order=[item["name"] for item in attachments],
+                ):
+                    self._assert_failure(self._validate(attachments), expected)
+
+    def test_complete_batch_validation_precedes_drive_model_and_sheet_calls(self):
+        valid = _attachment(
+            "123 N Main St #4B Phoenix AZ 85001 front.png",
+            "image/png",
+            _png_bytes(),
+        )
+        wrong_bad_magic = _attachment(
+            "456 S Oak Rd Tempe AZ 85281 rear.png",
+            "image/png",
+            b"not a png",
+        )
+        ignored = [
+            _attachment(
+                "999 Hostile Ave Other AZ 85999 signature.png",
+                "image/png",
+                content_bytes="not strict base64",
+                is_inline=True,
+            ),
+            _attachment(
+                "888 Hostile Ave Other AZ 85888 item.png",
+                "image/png",
+                content_bytes="not strict base64",
+                discriminator="#microsoft.graph.itemAttachment",
+            ),
+            _attachment(
+                "777 Hostile Ave Other AZ 85777 reference.png",
+                "image/png",
+                content_bytes="not strict base64",
+                discriminator="#microsoft.graph.referenceAttachment",
+            ),
+        ]
+
+        with mock.patch.object(
+            file_handling,
+            "upload_property_image_to_drive",
+        ) as drive_call, mock.patch.object(
+            file_handling.client.responses,
+            "create",
+        ) as model_call, mock.patch.object(
+            property_images,
+            "build_property_image_sheet_updates",
+        ) as sheet_call:
+            for attachments in (
+                [valid, wrong_bad_magic],
+                [wrong_bad_magic, valid],
+            ):
+                with self.subTest(
+                    order=[item["name"] for item in attachments]
+                ):
+                    self._assert_failure(
+                        self._validate(attachments),
+                        "image_attachment_bad_magic",
+                    )
+
+            accepted = self._validate(ignored + [valid])
+            self.assertEqual("accepted", accepted["status"])
+            drive_call.assert_not_called()
+            model_call.assert_not_called()
+            sheet_call.assert_not_called()
+
+        precedence = getattr(
+            file_handling,
+            "_select_native_image_failure",
+            None,
+        )
+        self.assertTrue(callable(precedence))
+        all_codes = [
+            "image_attachment_unbound_property",
+            "image_attachment_wrong_property",
+            "image_attachment_mixed_property",
+            "image_attachment_decode_failed",
+            "image_attachment_bad_magic",
+            "image_attachment_invalid_base64",
+            "image_attachment_type_mismatch",
+            "image_attachment_too_large",
+            "image_attachment_too_many",
+        ]
+        self.assertEqual("image_attachment_too_many", precedence(all_codes))
+        self.assertEqual(
+            "image_attachment_too_many",
+            precedence(list(reversed(all_codes))),
+        )
+        self.assertEqual(
+            "image_attachment_mixed_property",
+            precedence(all_codes[:3]),
+        )
+        self.assertEqual(
+            "image_attachment_wrong_property",
+            precedence(all_codes[:2]),
+        )
+        self.assertIsNone(self._manifest_adapter()(
+            self._validate([valid, wrong_bad_magic])
+        ))
 
 
 if __name__ == "__main__":

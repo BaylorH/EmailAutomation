@@ -6,6 +6,7 @@ import re
 import requests
 import socket
 import tempfile
+import unicodedata
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import unquote, urljoin, urlparse
 from googleapiclient.discovery import build
@@ -68,7 +69,181 @@ _NATIVE_IMAGE_FAILURE_PRECEDENCE = (
     "image_attachment_invalid_base64",
     "image_attachment_bad_magic",
     "image_attachment_decode_failed",
+    "image_attachment_mixed_property",
+    "image_attachment_wrong_property",
+    "image_attachment_unbound_property",
 )
+_NATIVE_IMAGE_STREET_SUFFIX_ALIASES = {
+    "alley": "aly",
+    "aly": "aly",
+    "avenue": "ave",
+    "ave": "ave",
+    "boulevard": "blvd",
+    "blvd": "blvd",
+    "circle": "cir",
+    "cir": "cir",
+    "court": "ct",
+    "ct": "ct",
+    "crescent": "cres",
+    "cres": "cres",
+    "crossing": "xing",
+    "xing": "xing",
+    "drive": "dr",
+    "dr": "dr",
+    "expressway": "expy",
+    "expy": "expy",
+    "freeway": "fwy",
+    "fwy": "fwy",
+    "highway": "hwy",
+    "hwy": "hwy",
+    "lane": "ln",
+    "ln": "ln",
+    "loop": "loop",
+    "parkway": "pkwy",
+    "pkwy": "pkwy",
+    "place": "pl",
+    "pl": "pl",
+    "plaza": "plz",
+    "plz": "plz",
+    "road": "rd",
+    "rd": "rd",
+    "square": "sq",
+    "sq": "sq",
+    "street": "st",
+    "st": "st",
+    "terrace": "ter",
+    "ter": "ter",
+    "trail": "trl",
+    "trl": "trl",
+    "turnpike": "tpke",
+    "tpke": "tpke",
+    "way": "way",
+}
+_NATIVE_IMAGE_DIRECTIONAL_ALIASES = {
+    "n": "n",
+    "north": "n",
+    "ne": "ne",
+    "northeast": "ne",
+    "e": "e",
+    "east": "e",
+    "se": "se",
+    "southeast": "se",
+    "s": "s",
+    "south": "s",
+    "sw": "sw",
+    "southwest": "sw",
+    "w": "w",
+    "west": "w",
+    "nw": "nw",
+    "northwest": "nw",
+}
+_NATIVE_IMAGE_UNIT_MARKERS = frozenset(
+    ("apartment", "apt", "suite", "ste", "unit")
+)
+_NATIVE_IMAGE_STATE_ALIASES = {
+    "alabama": "AL",
+    "al": "AL",
+    "alaska": "AK",
+    "ak": "AK",
+    "arizona": "AZ",
+    "az": "AZ",
+    "arkansas": "AR",
+    "ar": "AR",
+    "california": "CA",
+    "ca": "CA",
+    "colorado": "CO",
+    "co": "CO",
+    "connecticut": "CT",
+    "ct": "CT",
+    "delaware": "DE",
+    "de": "DE",
+    "district of columbia": "DC",
+    "dc": "DC",
+    "florida": "FL",
+    "fl": "FL",
+    "georgia": "GA",
+    "ga": "GA",
+    "hawaii": "HI",
+    "hi": "HI",
+    "idaho": "ID",
+    "id": "ID",
+    "illinois": "IL",
+    "il": "IL",
+    "indiana": "IN",
+    "in": "IN",
+    "iowa": "IA",
+    "ia": "IA",
+    "kansas": "KS",
+    "ks": "KS",
+    "kentucky": "KY",
+    "ky": "KY",
+    "louisiana": "LA",
+    "la": "LA",
+    "maine": "ME",
+    "me": "ME",
+    "maryland": "MD",
+    "md": "MD",
+    "massachusetts": "MA",
+    "ma": "MA",
+    "michigan": "MI",
+    "mi": "MI",
+    "minnesota": "MN",
+    "mn": "MN",
+    "mississippi": "MS",
+    "ms": "MS",
+    "missouri": "MO",
+    "mo": "MO",
+    "montana": "MT",
+    "mt": "MT",
+    "nebraska": "NE",
+    "ne": "NE",
+    "nevada": "NV",
+    "nv": "NV",
+    "new hampshire": "NH",
+    "nh": "NH",
+    "new jersey": "NJ",
+    "nj": "NJ",
+    "new mexico": "NM",
+    "nm": "NM",
+    "new york": "NY",
+    "ny": "NY",
+    "north carolina": "NC",
+    "nc": "NC",
+    "north dakota": "ND",
+    "nd": "ND",
+    "ohio": "OH",
+    "oh": "OH",
+    "oklahoma": "OK",
+    "ok": "OK",
+    "oregon": "OR",
+    "or": "OR",
+    "pennsylvania": "PA",
+    "pa": "PA",
+    "rhode island": "RI",
+    "ri": "RI",
+    "south carolina": "SC",
+    "sc": "SC",
+    "south dakota": "SD",
+    "sd": "SD",
+    "tennessee": "TN",
+    "tn": "TN",
+    "texas": "TX",
+    "tx": "TX",
+    "utah": "UT",
+    "ut": "UT",
+    "vermont": "VT",
+    "vt": "VT",
+    "virginia": "VA",
+    "va": "VA",
+    "washington": "WA",
+    "wa": "WA",
+    "west virginia": "WV",
+    "wv": "WV",
+    "wisconsin": "WI",
+    "wi": "WI",
+    "wyoming": "WY",
+    "wy": "WY",
+}
 _NATIVE_IMAGE_JPEG_SOF_MARKERS = frozenset(
     (
         0xC0,
@@ -85,6 +260,48 @@ _NATIVE_IMAGE_JPEG_SOF_MARKERS = frozenset(
         0xCE,
         0xCF,
     )
+)
+_NATIVE_IMAGE_SUFFIX_PATTERN = "|".join(
+    re.escape(alias)
+    for alias in sorted(
+        _NATIVE_IMAGE_STREET_SUFFIX_ALIASES,
+        key=lambda value: (len(value.split()), len(value)),
+        reverse=True,
+    )
+)
+_NATIVE_IMAGE_UNIT_PATTERN = "|".join(
+    re.escape(alias)
+    for alias in sorted(_NATIVE_IMAGE_UNIT_MARKERS, key=len, reverse=True)
+)
+_NATIVE_IMAGE_STATE_PATTERN = "|".join(
+    re.escape(alias).replace(r"\ ", r"\s+")
+    for alias in sorted(
+        _NATIVE_IMAGE_STATE_ALIASES,
+        key=lambda value: (len(value.split()), len(value)),
+        reverse=True,
+    )
+)
+_NATIVE_IMAGE_STREET_TOKEN_PATTERN = (
+    r"(?:[a-z][a-z0-9]*|\d+(?:st|nd|rd|th))"
+)
+_NATIVE_IMAGE_ADDRESS_RE = re.compile(
+    r"(?<![a-z0-9])(?P<number>\d+[a-z]?)\s+"
+    rf"(?P<street>(?:{_NATIVE_IMAGE_STREET_TOKEN_PATTERN}\s+){{1,9}}?)"
+    rf"(?P<suffix>{_NATIVE_IMAGE_SUFFIX_PATTERN})"
+    rf"(?:\s+(?P<unit_marker>{_NATIVE_IMAGE_UNIT_PATTERN})"
+    r"\s+(?P<unit>[a-z0-9]+))?"
+    rf"\s+(?P<city>(?!(?:{_NATIVE_IMAGE_UNIT_PATTERN})\b)"
+    r"[a-z]+(?:\s+[a-z]+){0,5}?)"
+    rf"\s+(?P<state>{_NATIVE_IMAGE_STATE_PATTERN})"
+    r"\s+(?P<zip>\d{5})(?:\s+\d{4})?(?!\d)"
+)
+_NATIVE_IMAGE_PARTIAL_STREET_RE = re.compile(
+    r"(?<![a-z0-9])\d+[a-z]?\s+"
+    rf"(?:{_NATIVE_IMAGE_STREET_TOKEN_PATTERN}\s+){{1,9}}?"
+    rf"(?:{_NATIVE_IMAGE_SUFFIX_PATTERN})\b"
+)
+_NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE = re.compile(
+    rf"\b(?:{_NATIVE_IMAGE_STATE_PATTERN})\s+\d{{5}}(?:\s+\d{{4}})?\b"
 )
 
 
@@ -118,6 +335,135 @@ def _native_image_size_failure(
     if any(pixel_count > NATIVE_IMAGE_MAX_PIXELS for pixel_count in pixel_counts):
         return "image_attachment_too_large"
     return None
+
+
+def _normalize_native_image_address_text(
+    value: Any,
+    *,
+    strip_extension: bool = False,
+) -> str:
+    """Normalize address punctuation and Unicode with no external lookup."""
+    if not isinstance(value, str):
+        return ""
+    text = os.path.splitext(value)[0] if strip_extension else value
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(
+        character
+        for character in text
+        if not unicodedata.combining(character)
+    )
+    text = text.casefold()
+    text = re.sub(
+        r"\b([a-z])\s*\.\s*([a-z])\s*\.?(?=\s|$)",
+        r"\1\2",
+        text,
+    )
+    text = re.sub(r"(?<!\d)(\d{5})\s*-\s*(\d{4})(?!\d)", r"\1 \2", text)
+    text = re.sub(
+        rf"\b({_NATIVE_IMAGE_UNIT_PATTERN})\s+"
+        r"([a-z0-9]+)\s*-\s*([a-z0-9]{1,3})(?=[^a-z0-9]|$)",
+        r"\1 \2\3",
+        text,
+    )
+    text = re.sub(
+        r"#\s*([a-z0-9]+)\s*-\s*([a-z0-9]{1,3})(?=[^a-z0-9]|$)",
+        r" unit \1\2 ",
+        text,
+    )
+    text = re.sub(r"-+", " ", text)
+    text = re.sub(r"#\s*(?=[a-z0-9])", " unit ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _native_image_filename_address_claims(
+    value: Any,
+    *,
+    strip_extension: bool,
+) -> Tuple[List[Tuple[str, str, str, Optional[str], str, str, str]], bool]:
+    """Return complete normalized claims plus an incomplete-claim sentinel."""
+    normalized = _normalize_native_image_address_text(
+        value,
+        strip_extension=strip_extension,
+    )
+    claims = []
+    claimed_spans = []
+    for match in _NATIVE_IMAGE_ADDRESS_RE.finditer(normalized):
+        street_tokens = [
+            _NATIVE_IMAGE_DIRECTIONAL_ALIASES.get(token, token)
+            for token in match.group("street").split()
+        ]
+        state_text = " ".join(match.group("state").split())
+        state_code = _NATIVE_IMAGE_STATE_ALIASES.get(state_text)
+        suffix = _NATIVE_IMAGE_STREET_SUFFIX_ALIASES.get(match.group("suffix"))
+        if not street_tokens or not state_code or not suffix:
+            continue
+        claims.append(
+            (
+                match.group("number"),
+                " ".join(street_tokens),
+                suffix,
+                match.group("unit") or None,
+                " ".join(match.group("city").split()),
+                state_code,
+                match.group("zip")[:5],
+            )
+        )
+        claimed_spans.append(match.span())
+
+    residue = list(normalized)
+    for start, end in claimed_spans:
+        residue[start:end] = " " * (end - start)
+    unclaimed = "".join(residue)
+    has_incomplete_claim = bool(
+        _NATIVE_IMAGE_PARTIAL_STREET_RE.search(unclaimed)
+        or _NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE.search(unclaimed)
+    )
+    return claims, has_incomplete_claim
+
+
+def _native_image_target_address_tuple(
+    target_property_hint: Any,
+) -> Optional[Tuple[str, str, str, Optional[str], str, str, str]]:
+    claims, has_incomplete_claim = _native_image_filename_address_claims(
+        target_property_hint,
+        strip_extension=False,
+    )
+    if has_incomplete_claim or len(claims) != 1:
+        return None
+    return claims[0]
+
+
+def classify_native_image_filename_binding(
+    raw_filename: str,
+    *,
+    target_property_hint: str,
+) -> Dict[str, str]:
+    """Return only target/safe-method or a stable generic failure code."""
+    target_tuple = _native_image_target_address_tuple(target_property_hint)
+    if target_tuple is None:
+        return {"failure_code": "image_attachment_unbound_property"}
+
+    claims, has_incomplete_claim = _native_image_filename_address_claims(
+        raw_filename,
+        strip_extension=True,
+    )
+    distinct_claims = set(claims)
+    errors = set()
+    if len(distinct_claims) > 1:
+        errors.add("image_attachment_mixed_property")
+    if not claims or has_incomplete_claim:
+        errors.add("image_attachment_unbound_property")
+    if len(distinct_claims) == 1 and next(iter(distinct_claims)) != target_tuple:
+        errors.add("image_attachment_wrong_property")
+
+    failure = _select_native_image_failure(errors)
+    if failure:
+        return {"failure_code": failure}
+    return {
+        "property_binding": "target",
+        "binding_method": "structured_filename_address",
+    }
 
 
 def _native_image_base64_decoded_size(value: Any) -> int:
@@ -289,6 +635,7 @@ def _native_image_candidate(attachment: Any) -> Optional[Dict[str, Any]]:
         return None
 
     return {
+        "_raw_filename": name,
         "extension": extension,
         "content_type": content_type,
         "content_bytes": attachment.get("contentBytes"),
@@ -481,6 +828,122 @@ def validate_and_normalize_native_image_content_batch(
     if first_failure:
         return _native_image_failure(first_failure)
     return {"status": "accepted", "assets": assets}
+
+
+def validate_and_normalize_native_image_attachments(
+    attachments: List[Dict[str, Any]],
+    *,
+    target_property_hint: str,
+) -> Dict[str, Any]:
+    """Return fully bound normalized assets or one stable batch failure."""
+    attachment_items = list(attachments or [])
+    content_batch = validate_and_normalize_native_image_content_batch(
+        attachment_items
+    )
+    if content_batch.get("status") != "accepted":
+        return content_batch
+
+    private_candidates = [
+        candidate
+        for candidate in (
+            _native_image_candidate(attachment)
+            for attachment in attachment_items
+        )
+        if candidate is not None
+    ]
+    if not private_candidates:
+        return content_batch
+    if len(private_candidates) != len(content_batch.get("assets") or []):
+        return _native_image_failure("image_attachment_decode_failed")
+
+    target_tuple = _native_image_target_address_tuple(target_property_hint)
+    binding_errors = set()
+    if target_tuple is None:
+        binding_errors.add("image_attachment_unbound_property")
+
+    distinct_claims = set()
+    for candidate in private_candidates:
+        claims, has_incomplete_claim = _native_image_filename_address_claims(
+            candidate["_raw_filename"],
+            strip_extension=True,
+        )
+        distinct_claims.update(claims)
+        if not claims or has_incomplete_claim:
+            binding_errors.add("image_attachment_unbound_property")
+
+    if len(distinct_claims) > 1:
+        binding_errors.add("image_attachment_mixed_property")
+    elif (
+        len(distinct_claims) == 1
+        and target_tuple is not None
+        and next(iter(distinct_claims)) != target_tuple
+    ):
+        binding_errors.add("image_attachment_wrong_property")
+
+    binding_failure = _select_native_image_failure(binding_errors)
+    if binding_failure:
+        return _native_image_failure(binding_failure)
+
+    assets = [
+        {
+            **asset,
+            "property_binding": "target",
+            "binding_method": "structured_filename_address",
+        }
+        for asset in content_batch["assets"]
+    ]
+    return {"status": "accepted", "assets": assets}
+
+
+def build_native_image_manifest_entry(
+    batch: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Project an accepted bound batch into the shared safe manifest shape."""
+    if not isinstance(batch, dict) or batch.get("status") != "accepted":
+        return None
+    assets = batch.get("assets")
+    if not isinstance(assets, list) or not assets:
+        return None
+
+    images = []
+    image_meta = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            return None
+        if (
+            asset.get("property_binding") != "target"
+            or asset.get("binding_method")
+            != "structured_filename_address"
+            or asset.get("content_type") != "image/png"
+            or not isinstance(asset.get("data"), bytes)
+        ):
+            return None
+        try:
+            images.append(base64.b64encode(asset["data"]).decode("ascii"))
+            image_meta.append(
+                {
+                    "content_type": "image/png",
+                    "width": asset["width"],
+                    "height": asset["height"],
+                    "source_bytes": asset["source_bytes"],
+                    "normalized_bytes": asset["normalized_bytes"],
+                    "normalized_sha256": asset["normalized_sha256"],
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    return {
+        "name": _NATIVE_IMAGE_GENERIC_NAME,
+        "text": "",
+        "images": images,
+        "method": "native_image_normalized",
+        "source_type": "native_image",
+        "property_binding": "target",
+        "binding_method": "structured_filename_address",
+        "image_meta": image_meta,
+    }
+
 
 def extract_pdf_text(content: bytes, filename: str = "document.pdf") -> Tuple[str, List[bytes]]:
     """
