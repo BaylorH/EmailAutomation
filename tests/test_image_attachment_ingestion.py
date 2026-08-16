@@ -2771,6 +2771,25 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 method_subclass_sentinel,
             ),
         ))
+        for label, method in (
+            ("integer_method", 7),
+            ("bytes_method", b"local_extraction"),
+            ("bytearray_method", bytearray(b"local_extraction")),
+            ("object_method", object()),
+            ("none_method", None),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            malformed_source_type_manifests.append((
+                label,
+                {
+                    "name": "legacy.pdf",
+                    "text": sentinel,
+                    "images": [],
+                    "method": method,
+                    "id": sentinel,
+                },
+                sentinel,
+            ))
 
         def assert_strict_rejection(manifest, sentinel=None):
             run = self._run_proposal([manifest], dry_run=False)

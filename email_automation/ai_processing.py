@@ -4398,7 +4398,7 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
             return False
         return True
 
-    if isinstance(method, str) and type(method) is not str:
+    if dict.__contains__(manifest, "method") and type(method) is not str:
         return True
     return type(method) is str and str.startswith(
         str.casefold(method),
