@@ -6248,6 +6248,40 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         self.assertNotIn(private_host_exception, native_host_output.getvalue())
         self.assertIn("native_image_host_failed", native_host_output.getvalue())
 
+        private_folder_exception = "PRIVATE_NATIVE_FOLDER_EXCEPTION_SENTINEL"
+        fake_drive = mock.MagicMock()
+        fake_drive.files.return_value.create.return_value.execute.return_value = {
+            "id": "native-folder-fallback-image",
+            "webViewLink": (
+                "https://drive.google.com/file/d/"
+                "native-folder-fallback-image/view"
+            ),
+        }
+        nested_folder_output = io.StringIO()
+        with mock.patch.object(
+            file_handling,
+            "_helper_google_creds",
+            side_effect=[object(), RuntimeError(private_folder_exception)],
+        ), mock.patch.object(
+            file_handling,
+            "build",
+            return_value=fake_drive,
+        ), contextlib.redirect_stdout(nested_folder_output):
+            nested_result = (
+                file_handling.host_first_native_image_manifest_asset(
+                    native_manifest
+                )
+            )
+        self.assertIsNotNone(nested_result)
+        self.assertNotIn(
+            private_folder_exception,
+            nested_folder_output.getvalue(),
+        )
+        self.assertIn(
+            "native_image_host_failed",
+            nested_folder_output.getvalue(),
+        )
+
         legacy_host_output = io.StringIO()
         legacy_exception_detail = "LEGACY_PROPERTY_PREVIEW_FAILURE_DETAIL"
         with mock.patch.object(
