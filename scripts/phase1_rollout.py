@@ -33,15 +33,15 @@ PROJECT_NUMBER = "248289505828"
 REGION = "us-central1"
 SERVICE = "process-user"
 QUEUE = "graph-process-user"
-BRANCH = "fix/manual-paused-reply-item-scope-20260815"
+BRANCH = "fix/scanned-pdf-production-candidate-20260816"
 IMAGE_REPOSITORY = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     "cloud-run-source-deploy/process-user"
 )
-OLD_REVISION = "process-user-stage-48c7381cea2a"
+OLD_REVISION = "process-user-stage-f6f716e71845"
 OLD_IMAGE = (
     IMAGE_REPOSITORY
-    + "@sha256:b3631cc28129aa2dc70dc68c22c6774b89781700dc78b32810c51d8d320cdfbb"
+    + "@sha256:9876351289fc63c148dea949924552977341e9389c3c8e76c4e320fdd60740cd"
 )
 RULES_HASH = "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
 HOSTING_VERSION = "a3758fb175d427f5"

@@ -18,11 +18,11 @@ sys.modules[SPEC.name] = phase1_rollout
 SPEC.loader.exec_module(phase1_rollout)
 
 
-OLD_REVISION = "process-user-stage-48c7381cea2a"
+OLD_REVISION = "process-user-stage-f6f716e71845"
 CANDIDATE = "process-user-stage-1234567890ab"
 OLD_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
-    "process-user@sha256:b3631cc28129aa2dc70dc68c22c6774b89781700dc78b32810c51d8d320cdfbb"
+    "process-user@sha256:9876351289fc63c148dea949924552977341e9389c3c8e76c4e320fdd60740cd"
 )
 CANDIDATE_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
@@ -302,7 +302,7 @@ class FakeOps:
 class ValidatorTests(unittest.TestCase):
     def test_controller_pins_current_promoted_production_baseline(self):
         expected = {
-            "branch": "fix/manual-paused-reply-item-scope-20260815",
+            "branch": "fix/scanned-pdf-production-candidate-20260816",
             "old revision": OLD_REVISION,
             "old image": OLD_IMAGE,
             "rules hash": (
