@@ -4009,7 +4009,12 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                         "fallback to first available preview page"
                     ),
                     "score": 0,
-                    "signals": {},
+                    "signals": {
+                        "imageAreaRatio": 0.42,
+                        "textChars": 320,
+                        "positiveTerms": ["sf", "clear height"],
+                        "negativeTerms": [],
+                    },
                     "contentType": "image/png",
                     "byteCount": 19,
                     "sha256": "b" * 64,
@@ -4241,7 +4246,12 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                         "fallback to first available preview page"
                     ),
                     "score": 0,
-                    "signals": {},
+                    "signals": {
+                        "imageAreaRatio": 0.42,
+                        "textChars": 320,
+                        "positiveTerms": ["sf", "clear height"],
+                        "negativeTerms": [],
+                    },
                     "contentType": "image/png",
                     "byteCount": 23,
                     "sha256": "c" * 64,
@@ -5118,6 +5128,227 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             self.assertEqual(
                 1,
                 exact_normalized_run["client"].responses.create.call_count,
+            )
+
+        def assert_snapshot_rejected_without_effects(run):
+            persist_call = (
+                run["firestore"].collection.return_value
+                .document.return_value
+                .collection.return_value
+                .document.return_value
+                .set
+            )
+            self.assertEqual(
+                (None, 0, 0, 0, 0),
+                (
+                    run["proposal"],
+                    run["client"].responses.create.call_count,
+                    run["client"].files.create.call_count,
+                    run["usage_call"].call_count,
+                    persist_call.call_count,
+                ),
+            )
+
+        over_count = self._manifest([
+            ("snapshot-a", "png", "image/png", _png_bytes(size=(8, 6))),
+            ("snapshot-b", "png", "image/png", _png_bytes(size=(7, 5))),
+            ("snapshot-c", "png", "image/png", _png_bytes(size=(6, 4))),
+        ])
+        fourth_manifest = self._single_manifest("snapshot-fourth")
+        fourth_image = fourth_manifest["images"][0]
+        fourth_meta = fourth_manifest["image_meta"][0]
+        over_count["images"].append(fourth_image)
+        over_count["image_meta"].append(fourth_meta)
+        original_freeze = ai_processing._freeze_legacy_json_value
+        with self.subTest(resource_case="snapshot_native_count_preflight"):
+            with mock.patch.object(
+                ai_processing,
+                "_freeze_legacy_json_value",
+                wraps=original_freeze,
+            ) as freeze_call:
+                over_count_run = self._run_proposal(
+                    [over_count],
+                    dry_run=False,
+                )
+            assert_snapshot_rejected_without_effects(over_count_run)
+            visited_values = [
+                call.args[0]
+                for call in freeze_call.call_args_list
+                if call.args
+            ]
+            self.assertFalse(any(
+                value is fourth_image or value is fourth_meta
+                for value in visited_values
+            ))
+
+        aggregate_count = [
+            self._single_manifest(descriptor, size=(8 + index, 6 + index))
+            for index, descriptor in enumerate((
+                "request-alpha",
+                "request-beta",
+                "request-gamma",
+                "request-delta",
+            ))
+        ]
+        fourth_request_image = aggregate_count[3]["images"][0]
+        fourth_request_meta = aggregate_count[3]["image_meta"][0]
+        fourth_request_sentinel = (
+            "PRIVATE_SNAPSHOT_FOURTH_NATIVE_SENTINEL"
+        )
+        aggregate_count[3]["ignored_tree"] = [fourth_request_sentinel]
+        with self.subTest(
+            resource_case="snapshot_request_native_count_preflight"
+        ):
+            with mock.patch.object(
+                ai_processing,
+                "_freeze_legacy_json_value",
+                wraps=original_freeze,
+            ) as freeze_call:
+                aggregate_count_run = self._run_proposal(
+                    aggregate_count,
+                    dry_run=False,
+                )
+            assert_snapshot_rejected_without_effects(aggregate_count_run)
+            visited_values = [
+                call.args[0]
+                for call in freeze_call.call_args_list
+                if call.args
+            ]
+            self.assertFalse(any(
+                value is fourth_request_image
+                or value is fourth_request_meta
+                or value is fourth_request_sentinel
+                for value in visited_values
+            ))
+
+        over_width = self._single_manifest("snapshot-over-width")
+        first_width_sentinel = "PRIVATE_SNAPSHOT_WIDTH_FIRST_SENTINEL"
+        last_width_sentinel = "PRIVATE_SNAPSHOT_WIDTH_LAST_SENTINEL"
+        over_width["ignored_tree"] = [
+            first_width_sentinel,
+            *[f"snapshot-width-{index}" for index in range(63)],
+            last_width_sentinel,
+        ]
+        with self.subTest(resource_case="snapshot_container_width_preflight"):
+            with mock.patch.object(
+                ai_processing,
+                "_ATTACHMENT_SNAPSHOT_MAX_CONTAINER_ITEMS",
+                64,
+                create=True,
+            ), mock.patch.object(
+                ai_processing,
+                "_ATTACHMENT_SNAPSHOT_MAX_NODES",
+                4096,
+                create=True,
+            ), mock.patch.object(
+                ai_processing,
+                "_freeze_legacy_json_value",
+                wraps=original_freeze,
+            ) as freeze_call:
+                over_width_run = self._run_proposal(
+                    [over_width],
+                    dry_run=False,
+                )
+            assert_snapshot_rejected_without_effects(over_width_run)
+            visited_values = [
+                call.args[0]
+                for call in freeze_call.call_args_list
+                if call.args
+            ]
+            self.assertFalse(any(
+                value is first_width_sentinel
+                or value is last_width_sentinel
+                for value in visited_values
+            ))
+
+        def build_snapshot_node_boundary(*, one_over):
+            manifest = self._single_manifest("snapshot-node-budget")
+            branches = [
+                [
+                    f"snapshot-node-{outer}-{inner}"
+                    for inner in range(64)
+                ]
+                for outer in range(62)
+            ]
+            branches.extend([
+                [f"snapshot-node-tail-{inner}" for inner in range(45)],
+                [],
+            ])
+            if one_over:
+                branches[-1].append(
+                    "PRIVATE_SNAPSHOT_NODE_SENTINEL"
+                )
+            manifest["ignored_tree"] = branches
+            return manifest
+
+        ignored_budget = build_snapshot_node_boundary(one_over=True)
+        ignored_node_sentinel = ignored_budget["ignored_tree"][-1][0]
+        with self.subTest(resource_case="snapshot_ignored_tree_node_budget"):
+            with mock.patch.object(
+                ai_processing,
+                "_ATTACHMENT_SNAPSHOT_MAX_CONTAINER_ITEMS",
+                64,
+                create=True,
+            ), mock.patch.object(
+                ai_processing,
+                "_ATTACHMENT_SNAPSHOT_MAX_NODES",
+                4096,
+                create=True,
+            ), mock.patch.object(
+                ai_processing,
+                "_freeze_legacy_json_value",
+                wraps=original_freeze,
+            ) as freeze_call:
+                ignored_budget_run = self._run_proposal(
+                    [ignored_budget],
+                    dry_run=False,
+                )
+            assert_snapshot_rejected_without_effects(ignored_budget_run)
+            self.assertLessEqual(freeze_call.call_count, 4097)
+            self.assertFalse(any(
+                call.args and call.args[0] is ignored_node_sentinel
+                for call in freeze_call.call_args_list
+            ))
+
+        exact_snapshot_boundary = build_snapshot_node_boundary(
+            one_over=False
+        )
+        with self.subTest(
+            resource_case="snapshot_exact_width_and_node_boundaries"
+        ):
+            with mock.patch.object(
+                ai_processing,
+                "_ATTACHMENT_SNAPSHOT_MAX_CONTAINER_ITEMS",
+                64,
+                create=True,
+            ), mock.patch.object(
+                ai_processing,
+                "_ATTACHMENT_SNAPSHOT_MAX_NODES",
+                4096,
+                create=True,
+            ):
+                exact_snapshot_run = self._run_proposal(
+                    [exact_snapshot_boundary],
+                    dry_run=False,
+                )
+            exact_snapshot_persist = (
+                exact_snapshot_run["firestore"].collection.return_value
+                .document.return_value
+                .collection.return_value
+                .document.return_value
+                .set
+            )
+            self.assertEqual(
+                (True, 1, 0, 1, 1),
+                (
+                    exact_snapshot_run["proposal"] is not None,
+                    exact_snapshot_run[
+                        "client"
+                    ].responses.create.call_count,
+                    exact_snapshot_run["client"].files.create.call_count,
+                    exact_snapshot_run["usage_call"].call_count,
+                    exact_snapshot_persist.call_count,
+                ),
             )
 
     def test_mixed_native_and_scanned_pdf_preserves_pdf_file_semantics(self):

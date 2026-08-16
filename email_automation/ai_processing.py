@@ -4901,10 +4901,32 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
 
 
 _LEGACY_ATTACHMENT_SNAPSHOT_MAX_DEPTH = 16
+_ATTACHMENT_SNAPSHOT_MAX_CONTAINER_ITEMS = 64
+_ATTACHMENT_SNAPSHOT_MAX_NODES = 4096
 
 
 class _UnsafeLegacyAttachmentSnapshot(ValueError):
     pass
+
+
+@dataclass
+class _AttachmentSnapshotBudget:
+    remaining_nodes: int
+    native_asset_slots: int = 0
+
+    def reserve_nodes(self, count: int) -> None:
+        if count < 0 or count > self.remaining_nodes:
+            raise _UnsafeLegacyAttachmentSnapshot()
+        self.remaining_nodes -= count
+
+    def reserve_native_asset_slots(self, count: int) -> None:
+        if (
+            count < 0
+            or self.native_asset_slots + count
+            > _file_handling.NATIVE_IMAGE_MAX_COUNT
+        ):
+            raise _UnsafeLegacyAttachmentSnapshot()
+        self.native_asset_slots += count
 
 
 @dataclass(frozen=True)
@@ -4925,14 +4947,57 @@ class _FrozenUnsafeAttachmentLeaf:
 _FROZEN_UNSAFE_ATTACHMENT_LEAF = _FrozenUnsafeAttachmentLeaf()
 
 
+def _reserve_snapshot_native_asset_slots(
+    items: Tuple[Tuple[str, Any], ...],
+    snapshot_budget: _AttachmentSnapshotBudget,
+) -> None:
+    """Bound strong native envelopes before visiting their child values."""
+    values = {key: item for key, item in items}
+    exact_markers = (
+        ("name", "Broker property image"),
+        ("text", ""),
+        ("method", "native_image_normalized"),
+        ("source_type", "native_image"),
+        ("property_binding", "target"),
+        ("binding_method", "structured_filename_address"),
+    )
+    if any(
+        type(values.get(key)) is not str
+        or values.get(key) != expected
+        for key, expected in exact_markers
+    ):
+        return
+
+    images = values.get("images")
+    image_meta = values.get("image_meta")
+    if type(images) is not list or type(image_meta) is not list:
+        return
+    image_count = list.__len__(images)
+    metadata_count = list.__len__(image_meta)
+    if (
+        image_count > _file_handling.NATIVE_IMAGE_MAX_COUNT
+        or metadata_count > _file_handling.NATIVE_IMAGE_MAX_COUNT
+    ):
+        raise _UnsafeLegacyAttachmentSnapshot()
+    snapshot_budget.reserve_native_asset_slots(
+        max(image_count, metadata_count)
+    )
+
+
 def _freeze_legacy_json_value(
     value: Any,
     *,
     depth: int = 0,
     active_container_ids: Optional[set] = None,
     allow_unsafe_leaf: bool = False,
+    snapshot_budget: Optional[_AttachmentSnapshotBudget] = None,
 ) -> Any:
     """Freeze exact JSON-safe types without invoking caller protocols."""
+    if snapshot_budget is None:
+        snapshot_budget = _AttachmentSnapshotBudget(
+            remaining_nodes=_ATTACHMENT_SNAPSHOT_MAX_NODES,
+        )
+        snapshot_budget.reserve_nodes(1)
     if depth > _LEGACY_ATTACHMENT_SNAPSHOT_MAX_DEPTH:
         raise _UnsafeLegacyAttachmentSnapshot()
     if value is None or type(value) in (bool, int, str):
@@ -4953,14 +5018,22 @@ def _freeze_legacy_json_value(
     if type(value) is list:
         active_container_ids.add(container_id)
         try:
+            item_count = list.__len__(value)
+            if item_count > _ATTACHMENT_SNAPSHOT_MAX_CONTAINER_ITEMS:
+                raise _UnsafeLegacyAttachmentSnapshot()
+            snapshot_budget.reserve_nodes(item_count)
+            items = tuple(list.__iter__(value))
+            if len(items) != item_count:
+                raise _UnsafeLegacyAttachmentSnapshot()
             return _FrozenLegacyList(tuple(
                 _freeze_legacy_json_value(
                     item,
                     depth=depth + 1,
                     active_container_ids=active_container_ids,
                     allow_unsafe_leaf=allow_unsafe_leaf,
+                    snapshot_budget=snapshot_budget,
                 )
-                for item in list.__iter__(value)
+                for item in items
             ))
         finally:
             active_container_ids.remove(container_id)
@@ -4968,10 +5041,22 @@ def _freeze_legacy_json_value(
     if type(value) is dict:
         active_container_ids.add(container_id)
         try:
+            item_count = dict.__len__(value)
+            if item_count > _ATTACHMENT_SNAPSHOT_MAX_CONTAINER_ITEMS:
+                raise _UnsafeLegacyAttachmentSnapshot()
+            snapshot_budget.reserve_nodes(item_count)
+            items = tuple(dict.items(value))
+            if len(items) != item_count:
+                raise _UnsafeLegacyAttachmentSnapshot()
+            if any(type(key) is not str for key, _ in items):
+                raise _UnsafeLegacyAttachmentSnapshot()
+            if depth == 1:
+                _reserve_snapshot_native_asset_slots(
+                    items,
+                    snapshot_budget,
+                )
             frozen_items = []
-            for key, item in dict.items(value):
-                if type(key) is not str:
-                    raise _UnsafeLegacyAttachmentSnapshot()
+            for key, item in items:
                 frozen_items.append((
                     key,
                     _freeze_legacy_json_value(
@@ -4979,6 +5064,7 @@ def _freeze_legacy_json_value(
                         depth=depth + 1,
                         active_container_ids=active_container_ids,
                         allow_unsafe_leaf=allow_unsafe_leaf,
+                        snapshot_budget=snapshot_budget,
                     ),
                 ))
             return _FrozenLegacyDict(tuple(frozen_items))
