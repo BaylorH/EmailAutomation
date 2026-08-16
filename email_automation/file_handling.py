@@ -60,8 +60,25 @@ NATIVE_IMAGE_MAX_SOURCE_BYTES = 10 * 1024 * 1024
 NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES = 20 * 1024 * 1024
 NATIVE_IMAGE_MAX_PIXELS = 20_000_000
 NATIVE_IMAGE_MAX_EDGE = 1400
+# Graph attachment names are normally far shorter; 1024 also leaves ample room
+# for a sheet-derived complete property anchor while bounding Unicode/regex work.
+NATIVE_IMAGE_MAX_ADDRESS_TEXT_CHARS = 1024
 
 _NATIVE_IMAGE_GENERIC_NAME = "Broker property image"
+_NATIVE_IMAGE_BOUND_ASSET_KEYS = frozenset(
+    (
+        "name",
+        "content_type",
+        "data",
+        "width",
+        "height",
+        "source_bytes",
+        "normalized_bytes",
+        "normalized_sha256",
+        "property_binding",
+        "binding_method",
+    )
+)
 _NATIVE_IMAGE_FAILURE_PRECEDENCE = (
     "image_attachment_too_many",
     "image_attachment_too_large",
@@ -76,8 +93,11 @@ _NATIVE_IMAGE_FAILURE_PRECEDENCE = (
 _NATIVE_IMAGE_STREET_SUFFIX_ALIASES = {
     "alley": "aly",
     "aly": "aly",
+    "av": "ave",
     "avenue": "ave",
     "ave": "ave",
+    "bend": "bnd",
+    "bnd": "bnd",
     "boulevard": "blvd",
     "blvd": "blvd",
     "circle": "cir",
@@ -103,10 +123,12 @@ _NATIVE_IMAGE_STREET_SUFFIX_ALIASES = {
     "pkwy": "pkwy",
     "place": "pl",
     "pl": "pl",
+    "pike": "pike",
     "plaza": "plz",
     "plz": "plz",
     "road": "rd",
     "rd": "rd",
+    "row": "row",
     "square": "sq",
     "sq": "sq",
     "street": "st",
@@ -137,6 +159,16 @@ _NATIVE_IMAGE_DIRECTIONAL_ALIASES = {
     "nw": "nw",
     "northwest": "nw",
 }
+_NATIVE_IMAGE_HYPHENATED_DIRECTIONALS = (
+    ("north", "east", "ne"),
+    ("n", "e", "ne"),
+    ("north", "west", "nw"),
+    ("n", "w", "nw"),
+    ("south", "east", "se"),
+    ("s", "e", "se"),
+    ("south", "west", "sw"),
+    ("s", "w", "sw"),
+)
 _NATIVE_IMAGE_UNIT_MARKERS = frozenset(
     ("apartment", "apt", "suite", "ste", "unit")
 )
@@ -293,7 +325,8 @@ _NATIVE_IMAGE_ADDRESS_RE = re.compile(
     rf"\s+(?P<city>(?!(?:{_NATIVE_IMAGE_UNIT_PATTERN})\b)"
     r"[a-z]+(?:\s+[a-z]+){0,5}?)"
     rf"\s+(?P<state>{_NATIVE_IMAGE_STATE_PATTERN})"
-    r"\s+(?P<zip>\d{5})(?:\s+\d{4})?(?!\d)"
+    r"\s+(?P<zip>\d{5})(?![a-z0-9])"
+    r"(?:\s+\d{4}(?![a-z0-9])|(?!\s+\d{4}))"
 )
 _NATIVE_IMAGE_PARTIAL_STREET_RE = re.compile(
     r"(?<![a-z0-9])\d+[a-z]?\s+"
@@ -301,7 +334,21 @@ _NATIVE_IMAGE_PARTIAL_STREET_RE = re.compile(
     rf"(?:{_NATIVE_IMAGE_SUFFIX_PATTERN})\b"
 )
 _NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE = re.compile(
-    rf"\b(?:{_NATIVE_IMAGE_STATE_PATTERN})\s+\d{{5}}(?:\s+\d{{4}})?\b"
+    rf"\b(?:{_NATIVE_IMAGE_STATE_PATTERN})\s+\d{{5}}"
+    r"(?![a-z0-9])(?:\s+\d{4}(?![a-z0-9])|(?!\s+\d{4}))"
+)
+_NATIVE_IMAGE_PARTIAL_NUMBER_NAME_RE = re.compile(
+    r"(?<![a-z0-9])\d{1,6}[a-z]?\s+"
+    r"(?!(?:aerial|copy|elevation|exterior|front|image|interior|photo|rear|view)\b)"
+    r"[a-z][a-z0-9]*\b"
+)
+_NATIVE_IMAGE_PARTIAL_SUFFIX_STATE_RE = re.compile(
+    rf"\b(?:[a-z][a-z0-9]*\s+){{1,5}}(?:{_NATIVE_IMAGE_SUFFIX_PATTERN})"
+    rf"\s+(?:[a-z]+\s+){{1,5}}(?:{_NATIVE_IMAGE_STATE_PATTERN})\b"
+)
+_NATIVE_IMAGE_STREET_NUMBER_RANGE_RE = re.compile(
+    r"(?<![a-z0-9])(?P<start>\d{1,6}[a-z]?)\s*-\s*"
+    r"(?P<end>\d{1,6}[a-z]?)(?=(?:\s+|-+)[a-z])"
 )
 
 
@@ -341,10 +388,13 @@ def _normalize_native_image_address_text(
     value: Any,
     *,
     strip_extension: bool = False,
-) -> str:
+) -> Optional[str]:
     """Normalize address punctuation and Unicode with no external lookup."""
-    if not isinstance(value, str):
-        return ""
+    if (
+        not isinstance(value, str)
+        or len(value) > NATIVE_IMAGE_MAX_ADDRESS_TEXT_CHARS
+    ):
+        return None
     text = os.path.splitext(value)[0] if strip_extension else value
     text = unicodedata.normalize("NFKD", text)
     text = "".join(
@@ -353,11 +403,35 @@ def _normalize_native_image_address_text(
         if not unicodedata.combining(character)
     )
     text = text.casefold()
+    for range_match in _NATIVE_IMAGE_STREET_NUMBER_RANGE_RE.finditer(text):
+        start = range_match.group("start")
+        end = range_match.group("end")
+        if (
+            start.isdigit()
+            and end.isdigit()
+            and len(start) == 5
+            and len(end) == 4
+        ):
+            continue
+        prefix = text[:range_match.start()].rstrip(" -_,")
+        prefix_token = re.search(r"([a-z]+)$", prefix)
+        if prefix.endswith("#") or (
+            prefix_token
+            and prefix_token.group(1) in _NATIVE_IMAGE_UNIT_MARKERS
+        ):
+            continue
+        return None
     text = re.sub(
         r"\b([a-z])\s*\.\s*([a-z])\s*\.?(?=\s|$)",
         r"\1\2",
         text,
     )
+    for first, second, canonical in _NATIVE_IMAGE_HYPHENATED_DIRECTIONALS:
+        text = re.sub(
+            rf"\b{first}\s*-\s*{second}\b",
+            canonical,
+            text,
+        )
     text = re.sub(r"(?<!\d)(\d{5})\s*-\s*(\d{4})(?!\d)", r"\1 \2", text)
     text = re.sub(
         rf"\b({_NATIVE_IMAGE_UNIT_PATTERN})\s+"
@@ -386,6 +460,8 @@ def _native_image_filename_address_claims(
         value,
         strip_extension=strip_extension,
     )
+    if normalized is None:
+        return [], True
     claims = []
     claimed_spans = []
     for match in _NATIVE_IMAGE_ADDRESS_RE.finditer(normalized):
@@ -418,6 +494,8 @@ def _native_image_filename_address_claims(
     has_incomplete_claim = bool(
         _NATIVE_IMAGE_PARTIAL_STREET_RE.search(unclaimed)
         or _NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE.search(unclaimed)
+        or _NATIVE_IMAGE_PARTIAL_NUMBER_NAME_RE.search(unclaimed)
+        or _NATIVE_IMAGE_PARTIAL_SUFFIX_STATE_RE.search(unclaimed)
     )
     return claims, has_incomplete_claim
 
@@ -902,41 +980,97 @@ def build_native_image_manifest_entry(
     if not isinstance(batch, dict) or batch.get("status") != "accepted":
         return None
     assets = batch.get("assets")
-    if not isinstance(assets, list) or not assets:
+    if (
+        not isinstance(assets, list)
+        or not assets
+        or len(assets) > NATIVE_IMAGE_MAX_COUNT
+    ):
         return None
 
-    images = []
+    validated_data = []
     image_meta = []
+    aggregate_source_bytes = 0
     for asset in assets:
-        if not isinstance(asset, dict):
+        if (
+            type(asset) is not dict
+            or len(asset) != len(_NATIVE_IMAGE_BOUND_ASSET_KEYS)
+            or set(asset) != _NATIVE_IMAGE_BOUND_ASSET_KEYS
+        ):
             return None
         if (
-            asset.get("property_binding") != "target"
+            asset.get("name") != _NATIVE_IMAGE_GENERIC_NAME
+            or asset.get("property_binding") != "target"
             or asset.get("binding_method")
             != "structured_filename_address"
             or asset.get("content_type") != "image/png"
-            or not isinstance(asset.get("data"), bytes)
+            or type(asset.get("data")) is not bytes
         ):
             return None
-        try:
-            images.append(base64.b64encode(asset["data"]).decode("ascii"))
-            image_meta.append(
-                {
-                    "content_type": "image/png",
-                    "width": asset["width"],
-                    "height": asset["height"],
-                    "source_bytes": asset["source_bytes"],
-                    "normalized_bytes": asset["normalized_bytes"],
-                    "normalized_sha256": asset["normalized_sha256"],
-                }
-            )
-        except (KeyError, TypeError, ValueError):
+
+        data = asset["data"]
+        width = asset["width"]
+        height = asset["height"]
+        source_bytes = asset["source_bytes"]
+        normalized_bytes = asset["normalized_bytes"]
+        if (
+            type(width) is not int
+            or type(height) is not int
+            or width <= 0
+            or height <= 0
+            or max(width, height) > NATIVE_IMAGE_MAX_EDGE
+            or width * height > NATIVE_IMAGE_MAX_PIXELS
+            or type(source_bytes) is not int
+            or source_bytes <= 0
+            or source_bytes > NATIVE_IMAGE_MAX_SOURCE_BYTES
+            or type(normalized_bytes) is not int
+            or normalized_bytes <= 0
+            or normalized_bytes != len(data)
+            or normalized_bytes > NATIVE_IMAGE_MAX_SOURCE_BYTES
+            or hashlib.sha256(data).hexdigest()
+            != asset.get("normalized_sha256")
+        ):
             return None
+
+        try:
+            header_format, header_width, header_height = (
+                _inspect_native_image_header(data)
+            )
+            pillow_format, pillow_width, pillow_height = (
+                _inspect_native_image_pillow_format(data)
+            )
+            _verify_native_image(data)
+        except Exception:
+            return None
+        if (
+            header_format != "PNG"
+            or pillow_format != "PNG"
+            or (header_width, header_height) != (width, height)
+            or (pillow_width, pillow_height) != (width, height)
+        ):
+            return None
+
+        aggregate_source_bytes += source_bytes
+        if aggregate_source_bytes > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES:
+            return None
+        validated_data.append(data)
+        image_meta.append(
+            {
+                "content_type": "image/png",
+                "width": width,
+                "height": height,
+                "source_bytes": source_bytes,
+                "normalized_bytes": normalized_bytes,
+                "normalized_sha256": asset["normalized_sha256"],
+            }
+        )
 
     return {
         "name": _NATIVE_IMAGE_GENERIC_NAME,
         "text": "",
-        "images": images,
+        "images": [
+            base64.b64encode(data).decode("ascii")
+            for data in validated_data
+        ],
         "method": "native_image_normalized",
         "source_type": "native_image",
         "property_binding": "target",

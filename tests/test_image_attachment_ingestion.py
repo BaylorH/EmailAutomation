@@ -31,6 +31,19 @@ class _ExplodingBase64Regex:
         raise AssertionError("over-limit base64 reached the full-input regex")
 
 
+class _ExplodingOversizedAddressText(str):
+    def rfind(self, *args, **kwargs):
+        raise AssertionError("oversized address text reached path splitting")
+
+
+class _ExplodingAddressRegex:
+    def finditer(self, *args, **kwargs):
+        raise AssertionError("oversized address text reached address regex")
+
+    def search(self, *args, **kwargs):
+        raise AssertionError("oversized address text reached residual regex")
+
+
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
     image = Image.new("RGB", size, (28, 96, 164))
     output = io.BytesIO()
@@ -1066,6 +1079,345 @@ class NativeImageBindingAtomicityTests(unittest.TestCase):
         self.assertIsNone(self._manifest_adapter()(
             self._validate([valid, wrong_bad_magic])
         ))
+
+
+class NativeImageBindingContractReviewTests(unittest.TestCase):
+    TARGET = (
+        "123 North Sample Road Suite 200, Example City, Arizona 85001-1234"
+    )
+    MATCHING_FILENAME = (
+        "123 N Sample Rd Ste 200 Example City AZ 85001 exterior.png"
+    )
+
+    def _classify(self, filename, *, target=None):
+        return file_handling.classify_native_image_filename_binding(
+            filename,
+            target_property_hint=self.TARGET if target is None else target,
+        )
+
+    def _validate(self, filename, *, target=None):
+        return file_handling.validate_and_normalize_native_image_attachments(
+            [_attachment(filename, "image/png", _png_bytes())],
+            target_property_hint=self.TARGET if target is None else target,
+        )
+
+    def _assert_unbound_classification(self, result):
+        self.assertEqual(
+            {"failure_code": "image_attachment_unbound_property"},
+            result,
+        )
+
+    def _assert_unbound_batch(self, result):
+        self.assertEqual(
+            {
+                "status": "quarantined",
+                "assets": [],
+                "failure": {
+                    "name": GENERIC_IMAGE_NAME,
+                    "code": "image_attachment_unbound_property",
+                },
+            },
+            result,
+        )
+
+    def _assert_target(self, result):
+        self.assertEqual(
+            {
+                "property_binding": "target",
+                "binding_method": "structured_filename_address",
+            },
+            result,
+        )
+
+    def test_rejects_residual_partial_claims_in_filename_and_target(self):
+        residuals = (
+            "456 Oak",
+            "Oak Road Tempe AZ",
+        )
+        for residual in residuals:
+            filename = (
+                "123 N Sample Rd Ste 200 Example City AZ 85001 "
+                f"{residual}.png"
+            )
+            with self.subTest(location="filename", residual=residual):
+                self._assert_unbound_classification(self._classify(filename))
+                self._assert_unbound_batch(self._validate(filename))
+
+            target = f"{self.TARGET} {residual}"
+            with self.subTest(location="target", residual=residual):
+                self._assert_unbound_classification(
+                    self._classify(self.MATCHING_FILENAME, target=target)
+                )
+                self._assert_unbound_batch(
+                    self._validate(self.MATCHING_FILENAME, target=target)
+                )
+
+    def test_rejects_unsupported_street_number_range_without_collapsing(self):
+        target = "125 N Sample Rd Ste 200 Example City AZ 85001"
+        ranged_filename = (
+            "123-125-N-Sample-Rd-Ste-200-Example-City-AZ-85001.png"
+        )
+
+        self._assert_unbound_classification(
+            self._classify(ranged_filename, target=target)
+        )
+        self._assert_unbound_batch(
+            self._validate(ranged_filename, target=target)
+        )
+        self._assert_unbound_classification(
+            self._classify(
+                "125 N Sample Rd Ste 200 Example City AZ 85001.png",
+                target=(
+                    "123-125 N Sample Rd Ste 200 Example City AZ 85001"
+                ),
+            )
+        )
+
+    def test_rejects_zip_prefix_followed_by_letters(self):
+        bad_filename = (
+            "123 N Sample Rd Ste 200 Example City AZ 85001evil.png"
+        )
+        bad_target = (
+            "123 N Sample Rd Ste 200 Example City AZ 85001evil"
+        )
+
+        self._assert_unbound_classification(self._classify(bad_filename))
+        self._assert_unbound_batch(self._validate(bad_filename))
+        self._assert_unbound_classification(
+            self._classify(self.MATCHING_FILENAME, target=bad_target)
+        )
+        self._assert_unbound_batch(
+            self._validate(self.MATCHING_FILENAME, target=bad_target)
+        )
+
+    def test_supports_reviewed_street_suffix_aliases(self):
+        cases = (
+            (
+                "123 Sample Av Example City AZ 85001.png",
+                "123 Sample Avenue Example City Arizona 85001",
+            ),
+            (
+                "123 Sample Bnd Example City AZ 85001.png",
+                "123 Sample Bend Example City Arizona 85001",
+            ),
+            (
+                "123 Sample Pike Example City AZ 85001.png",
+                "123 Sample Pike Example City Arizona 85001",
+            ),
+            (
+                "123 Sample Row Example City AZ 85001.png",
+                "123 Sample Row Example City Arizona 85001",
+            ),
+        )
+
+        for filename, target in cases:
+            with self.subTest(filename=filename):
+                self._assert_target(self._classify(filename, target=target))
+
+        accepted = self._validate(cases[0][0], target=cases[0][1])
+        self.assertEqual("accepted", accepted["status"])
+
+    def test_normalizes_hyphenated_compound_directionals(self):
+        target = "123 Northeast Sample Road Example City Arizona 85001"
+        filenames = (
+            "123 North-East Sample Rd Example City AZ 85001.png",
+            "123 N-E Sample Rd Example City AZ 85001.png",
+        )
+
+        for filename in filenames:
+            with self.subTest(filename=filename):
+                self._assert_target(self._classify(filename, target=target))
+
+        accepted = self._validate(filenames[1], target=target)
+        self.assertEqual("accepted", accepted["status"])
+
+    def test_caps_filename_and_target_before_unicode_or_regex(self):
+        expected_cap = 1024
+        oversized_target = _ExplodingOversizedAddressText(
+            "x" * (expected_cap + 1)
+        )
+        oversized_filename = _ExplodingOversizedAddressText(
+            ("x" * (expected_cap + 1)) + ".png"
+        )
+        original_normalize = file_handling.unicodedata.normalize
+
+        def guarded_normalize(form, value):
+            if value is oversized_target or value is oversized_filename:
+                raise AssertionError(
+                    "oversized address text reached Unicode normalization"
+                )
+            return original_normalize(form, value)
+
+        with mock.patch.object(
+            file_handling.unicodedata,
+            "normalize",
+            side_effect=guarded_normalize,
+        ), mock.patch.object(
+            file_handling,
+            "_NATIVE_IMAGE_ADDRESS_RE",
+            _ExplodingAddressRegex(),
+        ), mock.patch.object(
+            file_handling,
+            "_NATIVE_IMAGE_PARTIAL_STREET_RE",
+            _ExplodingAddressRegex(),
+        ), mock.patch.object(
+            file_handling,
+            "_NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE",
+            _ExplodingAddressRegex(),
+        ):
+            try:
+                target_result = self._classify(
+                    self.MATCHING_FILENAME,
+                    target=oversized_target,
+                )
+            except AssertionError as exc:
+                self.fail(str(exc))
+            self._assert_unbound_classification(target_result)
+
+        with mock.patch.object(
+            file_handling.unicodedata,
+            "normalize",
+            side_effect=guarded_normalize,
+        ):
+            try:
+                filename_result = self._classify(oversized_filename)
+            except AssertionError as exc:
+                self.fail(str(exc))
+            self._assert_unbound_classification(filename_result)
+
+        normal_oversized_filename = ("x" * (expected_cap + 1)) + ".png"
+        self._assert_unbound_batch(self._validate(normal_oversized_filename))
+        self.assertEqual(
+            expected_cap,
+            getattr(
+                file_handling,
+                "NATIVE_IMAGE_MAX_ADDRESS_TEXT_CHARS",
+                None,
+            ),
+        )
+
+
+class NativeImageManifestIntegrityTests(unittest.TestCase):
+    def _asset(self, data=None, **overrides):
+        normalized_data = _png_bytes() if data is None else data
+        asset = {
+            "name": GENERIC_IMAGE_NAME,
+            "content_type": "image/png",
+            "data": normalized_data,
+            "width": 8,
+            "height": 6,
+            "source_bytes": len(normalized_data),
+            "normalized_bytes": len(normalized_data),
+            "normalized_sha256": hashlib.sha256(normalized_data).hexdigest(),
+            "property_binding": "target",
+            "binding_method": "structured_filename_address",
+        }
+        asset.update(overrides)
+        return asset
+
+    def _adapt(self, assets):
+        return file_handling.build_native_image_manifest_entry(
+            {"status": "accepted", "assets": assets}
+        )
+
+    def test_rejects_non_png_or_corrupt_normalized_bytes(self):
+        cases = (
+            self._asset(data=b"not a PNG"),
+            self._asset(data=_png_bytes()[:-12]),
+        )
+        for asset in cases:
+            with self.subTest(data_length=len(asset["data"])):
+                self.assertIsNone(self._adapt([asset]))
+
+    def test_rejects_more_than_maximum_asset_count(self):
+        self.assertIsNone(
+            self._adapt(
+                [
+                    self._asset()
+                    for _ in range(
+                        file_handling.NATIVE_IMAGE_MAX_COUNT + 1
+                    )
+                ]
+            )
+        )
+
+    def test_rejects_mismatched_nonpositive_or_overlimit_dimensions(self):
+        over_edge_data = _png_bytes(
+            size=(file_handling.NATIVE_IMAGE_MAX_EDGE + 1, 1)
+        )
+        cases = (
+            self._asset(width=9),
+            self._asset(width=0),
+            self._asset(height=-1),
+            self._asset(width=True),
+            self._asset(
+                data=over_edge_data,
+                width=file_handling.NATIVE_IMAGE_MAX_EDGE + 1,
+                height=1,
+            ),
+        )
+        for asset in cases:
+            with self.subTest(
+                width=asset["width"],
+                height=asset["height"],
+            ):
+                self.assertIsNone(self._adapt([asset]))
+
+    def test_rejects_invalid_or_overlimit_size_metadata(self):
+        data = _png_bytes()
+        cases = (
+            self._asset(data=data, source_bytes=0),
+            self._asset(data=data, source_bytes=-1),
+            self._asset(data=data, source_bytes=True),
+            self._asset(
+                data=data,
+                source_bytes=file_handling.NATIVE_IMAGE_MAX_SOURCE_BYTES + 1,
+            ),
+            self._asset(data=data, normalized_bytes=0),
+            self._asset(data=data, normalized_bytes=True),
+            self._asset(data=data, normalized_bytes=len(data) + 1),
+            self._asset(
+                data=data,
+                normalized_bytes=(
+                    file_handling.NATIVE_IMAGE_MAX_SOURCE_BYTES + 1
+                ),
+            ),
+        )
+        for asset in cases:
+            with self.subTest(
+                source_bytes=asset["source_bytes"],
+                normalized_bytes=asset["normalized_bytes"],
+            ):
+                self.assertIsNone(self._adapt([asset]))
+
+        aggregate_over_limit = [
+            self._asset(source_bytes=7 * 1024 * 1024)
+            for _ in range(3)
+        ]
+        self.assertIsNone(self._adapt(aggregate_over_limit))
+
+    def test_rejects_normalized_sha256_mismatch(self):
+        self.assertIsNone(
+            self._adapt([self._asset(normalized_sha256="0" * 64)])
+        )
+
+    def test_rejects_unsafe_or_nonexact_asset_shape(self):
+        extra_filename = self._asset()
+        extra_filename["raw_filename"] = "private-property-name.png"
+        extra_exif = self._asset()
+        extra_exif["exif"] = {"OwnerName": "private"}
+        missing_name = self._asset()
+        missing_name.pop("name")
+        wrong_name = self._asset(name="private-property-name.png")
+
+        for asset in (
+            extra_filename,
+            extra_exif,
+            missing_name,
+            wrong_name,
+        ):
+            with self.subTest(keys=sorted(asset)):
+                self.assertIsNone(self._adapt([asset]))
 
 
 if __name__ == "__main__":
