@@ -28,6 +28,7 @@ from .column_config import (
 )
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
+from . import file_handling as _file_handling
 from .file_handling import project_safe_native_image_manifest
 from .property_images import STREET_SUFFIX_TOKENS
 from .tour_scheduling import (
@@ -4380,10 +4381,25 @@ def _prepare_ai_attachment_manifest(
 ) -> Optional[List[Tuple[dict, Optional[dict]]]]:
     """Validate native entries while leaving legacy PDF entries unchanged."""
     prepared = []
+    native_asset_count = 0
+    native_source_bytes = 0
+    native_normalized_bytes = 0
     for attachment in (pdf_manifest or []):
         if _is_native_image_manifest_candidate(attachment):
             safe_projection = project_safe_native_image_manifest(attachment)
             if safe_projection is None:
+                return None
+            for metadata in safe_projection["image_meta"]:
+                native_asset_count += 1
+                native_source_bytes += metadata["source_bytes"]
+                native_normalized_bytes += metadata["normalized_bytes"]
+            if (
+                native_asset_count > _file_handling.NATIVE_IMAGE_MAX_COUNT
+                or native_source_bytes
+                > _file_handling.NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
+                or native_normalized_bytes
+                > _file_handling.NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
+            ):
                 return None
             prepared.append((attachment, safe_projection))
         else:

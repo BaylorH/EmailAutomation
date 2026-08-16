@@ -1183,8 +1183,9 @@ def project_safe_native_image_manifest(
     ):
         return None
 
-    safe_meta = []
+    preflight_images = []
     aggregate_source_bytes = 0
+    aggregate_normalized_bytes = 0
     for encoded_image, metadata in zip(encoded_images, image_meta):
         if type(encoded_image) is not str or type(metadata) is not dict:
             return None
@@ -1225,6 +1226,23 @@ def project_safe_native_image_manifest(
             or projected_decoded_size > NATIVE_IMAGE_MAX_SOURCE_BYTES
         ):
             return None
+
+        aggregate_source_bytes += source_bytes
+        aggregate_normalized_bytes += projected_decoded_size
+        if (
+            aggregate_source_bytes > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
+            or aggregate_normalized_bytes
+            > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
+        ):
+            return None
+        preflight_images.append((
+            encoded_image,
+            metadata,
+            projected_decoded_size,
+        ))
+
+    safe_meta = []
+    for encoded_image, metadata, projected_decoded_size in preflight_images:
         try:
             normalized_data = _strict_native_image_base64_decode(
                 encoded_image,
@@ -1232,6 +1250,10 @@ def project_safe_native_image_manifest(
             )
         except ValueError:
             return None
+        width = metadata["width"]
+        height = metadata["height"]
+        normalized_bytes = metadata["normalized_bytes"]
+        normalized_sha256 = metadata["normalized_sha256"]
         if (
             len(normalized_data) != normalized_bytes
             or hashlib.sha256(normalized_data).hexdigest()
@@ -1280,9 +1302,6 @@ def project_safe_native_image_manifest(
         ):
             return None
 
-        aggregate_source_bytes += source_bytes
-        if aggregate_source_bytes > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES:
-            return None
         safe_meta.append({
             key: metadata[key]
             for key in _NATIVE_IMAGE_SAFE_META_KEYS
