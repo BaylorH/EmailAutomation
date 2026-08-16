@@ -1384,6 +1384,7 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
 
     def test_hidden_attachment_from_full_readback_runs_same_message_extraction_only(self):
         messages = self._messages(predecessor_has_attachments=False)
+        messages[0]["bodyPreview"] = ""
         full_predecessor = self._response({
             "body": {
                 "contentType": "Text",
@@ -1459,9 +1460,115 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
             authenticated_mailbox_email=self.MAILBOX,
         )
         self.assertTrue(saved_messages[0][3]["hasAttachments"])
+        self.assertTrue(messages[0]["hasAttachments"])
         mark_processed.assert_called_once_with(
             self.USER_ID,
             messages[0]["internetMessageId"],
+        )
+
+        messages[0]["internetMessageHeaders"] = [
+            {"name": "X-Test", "value": "inert"},
+        ]
+        thread_snapshot = mock.MagicMock(exists=False)
+        thread_snapshot.to_dict.return_value = {}
+        fake_fs = mock.MagicMock()
+        (
+            fake_fs.collection.return_value
+            .document.return_value
+            .collection.return_value
+            .document.return_value
+            .get.return_value
+        ) = thread_snapshot
+        campaign_decision = CampaignAutomationDecision(
+            state="allow",
+            reason="",
+            client_data={"status": "live", "automationPaused": False},
+            metadata={"source": "test", "terminal": False},
+        )
+        attachment_fetch = mock.MagicMock(
+            side_effect=proc.RetryableProcessingError("attachment fetch reached"),
+        )
+        real_processor_patchers = [
+            mock.patch.object(
+                proc,
+                "exponential_backoff_request",
+                side_effect=RuntimeError("second readback unavailable"),
+            ),
+            mock.patch.object(
+                proc,
+                "lookup_thread_by_message_id",
+                return_value=self.THREAD_ID,
+            ),
+            mock.patch.object(
+                proc,
+                "lookup_thread_by_conversation_id",
+                return_value=self.THREAD_ID,
+            ),
+            mock.patch.object(proc, "_fs", fake_fs),
+            mock.patch.object(
+                proc,
+                "get_thread_status",
+                return_value=proc.THREAD_STATUS["active"],
+            ),
+            mock.patch.object(proc, "_find_client_id_by_email", return_value=None),
+            mock.patch.object(
+                proc,
+                "get_client_automation_decision",
+                return_value=campaign_decision,
+            ),
+            mock.patch.object(proc, "save_message", return_value=True),
+            mock.patch.object(proc, "index_message_id", return_value=True),
+            mock.patch.object(proc, "dump_thread_from_firestore"),
+            mock.patch(
+                "email_automation.followup.cancel_followup_on_response",
+            ),
+            mock.patch.object(
+                proc,
+                "fetch_and_log_sheet_for_thread",
+                return_value=(
+                    "client-native-batch",
+                    "sheet-native",
+                    ["Property Address"],
+                    3,
+                    ["912 Gemini St"],
+                    {},
+                    [],
+                ),
+            ),
+            mock.patch.object(
+                proc,
+                "_resolve_reply_identity",
+                return_value={
+                    "recipient_email": "broker@example.test",
+                    "contact_name": "Dana",
+                    "original_email": "broker@example.test",
+                    "source": "test",
+                },
+            ),
+            mock.patch.object(
+                proc,
+                "fetch_and_process_pdfs",
+                new=attachment_fetch,
+            ),
+            mock.patch.object(proc.time, "sleep"),
+        ]
+        with contextlib_nested(real_processor_patchers):
+            with self.assertRaisesRegex(
+                proc.RetryableProcessingError,
+                "attachment fetch reached",
+            ):
+                proc.process_inbox_message(
+                    self.USER_ID,
+                    self.HEADERS,
+                    messages[0],
+                    allow_outbound_reply=False,
+                    authenticated_mailbox_email=self.MAILBOX,
+                )
+
+        attachment_fetch.assert_called_once_with(
+            self.HEADERS,
+            messages[0]["id"],
+            target_property_hint="912 Gemini St",
         )
 
     def test_success_marks_only_processed_predecessor_and_defers_later_messages(self):
