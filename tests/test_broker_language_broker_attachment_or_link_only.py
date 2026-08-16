@@ -30,6 +30,7 @@ import re
 import io
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 # The exact URL detector used inside processing.process_inbox_message
@@ -1130,6 +1131,301 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
         self.assertEqual(2, len(result))
         self.assertIs(distinct_but_equal, result[0])
         self.assertIs(usable, result[1])
+
+
+class NativeImageThreadBatchingTests(unittest.TestCase):
+    USER_ID = "user-native-batch"
+    THREAD_ID = "thread-native-batch"
+    HEADERS = {"Authorization": "Bearer fake"}
+    MAILBOX = "operator@example.test"
+
+    @staticmethod
+    def _response(payload):
+        response = mock.MagicMock()
+        response.json.return_value = payload
+        return response
+
+    @staticmethod
+    def _message(label, received_at, *, has_attachments=False):
+        return {
+            "id": f"graph-{label}",
+            "internetMessageId": f"<{label}@example.test>",
+            "conversationId": "conversation-native-batch",
+            "subject": "RE: 912 Gemini St",
+            "from": {"emailAddress": {"address": "broker@example.test"}},
+            "sender": {"emailAddress": {"address": "broker@example.test"}},
+            "receivedDateTime": received_at.isoformat().replace("+00:00", "Z"),
+            "bodyPreview": f"Broker message {label}",
+            "hasAttachments": has_attachments,
+        }
+
+    def _messages(self, *, predecessor_has_attachments=True, count=2):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        messages = [
+            self._message(
+                "predecessor",
+                now - timedelta(minutes=2),
+                has_attachments=predecessor_has_attachments,
+            ),
+            self._message("newest", now, has_attachments=False),
+        ]
+        if count == 3:
+            messages.insert(
+                1,
+                self._message("middle", now - timedelta(minutes=1)),
+            )
+        return messages
+
+    def _scan_with_mocked_save(
+        self,
+        messages,
+        *,
+        save_side_effect=None,
+        process_side_effect=None,
+    ):
+        save_message_to_thread = mock.MagicMock(side_effect=save_side_effect)
+        process_message = mock.MagicMock(side_effect=process_side_effect)
+        mark_processed = mock.MagicMock()
+        clear_failure = mock.MagicMock()
+        record_failure = mock.MagicMock()
+
+        patchers = [
+            mock.patch.object(
+                proc,
+                "exponential_backoff_request",
+                return_value=self._response({"value": messages}),
+            ),
+            mock.patch.object(proc, "has_processed", return_value=False),
+            mock.patch.object(
+                proc,
+                "_match_message_to_thread",
+                return_value=self.THREAD_ID,
+            ),
+            mock.patch.object(
+                proc,
+                "_has_pending_reply_review_projection_recovery",
+                return_value=False,
+            ),
+            mock.patch.object(
+                proc,
+                "_resolve_current_mailbox_email",
+                return_value=self.MAILBOX,
+            ),
+            mock.patch.object(
+                proc,
+                "_skip_inbox_retry_after_manual_continuation",
+                return_value=False,
+            ),
+            mock.patch.object(
+                proc,
+                "_save_message_to_thread",
+                new=save_message_to_thread,
+            ),
+            mock.patch.object(proc, "process_inbox_message", new=process_message),
+            mock.patch.object(proc, "mark_processed", new=mark_processed),
+            mock.patch.object(
+                proc,
+                "_clear_ai_processing_failure",
+                new=clear_failure,
+            ),
+            mock.patch.object(
+                proc,
+                "_record_inbox_processing_failure",
+                new=record_failure,
+            ),
+            mock.patch.object(
+                proc,
+                "_client_id_for_processing_failure",
+                return_value="client-native-batch",
+            ),
+            mock.patch.object(proc, "set_last_scan_iso"),
+            mock.patch.object(proc.time, "sleep"),
+        ]
+        with contextlib_nested(patchers):
+            result = proc.scan_inbox_against_index(
+                self.USER_ID,
+                self.HEADERS,
+                only_unread=False,
+                top=len(messages),
+            )
+
+        return {
+            "result": result,
+            "save": save_message_to_thread,
+            "process": process_message,
+            "mark": mark_processed,
+            "clear": clear_failure,
+            "record": record_failure,
+        }
+
+    def test_oldest_visible_attachment_message_runs_extraction_only_then_stops(self):
+        messages = self._messages(count=3)
+        calls = self._scan_with_mocked_save(
+            messages,
+            save_side_effect=lambda _uid, _thread, msg, _headers, **_kwargs: bool(
+                msg.get("hasAttachments")
+            ),
+        )
+
+        calls["save"].assert_called_once_with(
+            self.USER_ID,
+            self.THREAD_ID,
+            messages[0],
+            self.HEADERS,
+            authenticated_mailbox_email=self.MAILBOX,
+        )
+        calls["process"].assert_called_once_with(
+            self.USER_ID,
+            self.HEADERS,
+            messages[0],
+            allow_outbound_reply=False,
+            authenticated_mailbox_email=self.MAILBOX,
+        )
+        self.assertEqual(1, calls["result"]["processed"])
+
+    def test_hidden_attachment_from_full_readback_runs_same_message_extraction_only(self):
+        messages = self._messages(predecessor_has_attachments=False)
+        full_predecessor = self._response({
+            "body": {
+                "contentType": "Text",
+                "content": "The details are in the attached image.",
+            },
+            "hasAttachments": True,
+        })
+        graph_responses = iter([
+            self._response({"value": messages}),
+            full_predecessor,
+        ])
+        process_message = mock.MagicMock()
+        mark_processed = mock.MagicMock()
+        saved_messages = []
+
+        patchers = [
+            mock.patch.object(
+                proc,
+                "exponential_backoff_request",
+                side_effect=lambda _request: next(graph_responses),
+            ),
+            mock.patch.object(proc, "has_processed", return_value=False),
+            mock.patch.object(
+                proc,
+                "_match_message_to_thread",
+                return_value=self.THREAD_ID,
+            ),
+            mock.patch.object(
+                proc,
+                "_has_pending_reply_review_projection_recovery",
+                return_value=False,
+            ),
+            mock.patch.object(
+                proc,
+                "_resolve_current_mailbox_email",
+                return_value=self.MAILBOX,
+            ),
+            mock.patch.object(
+                proc,
+                "_skip_inbox_retry_after_manual_continuation",
+                return_value=False,
+            ),
+            mock.patch.object(
+                proc,
+                "save_message",
+                side_effect=lambda *args: saved_messages.append(args) or True,
+            ),
+            mock.patch.object(proc, "index_message_id", return_value=True),
+            mock.patch.object(proc, "_fs"),
+            mock.patch(
+                "email_automation.followup.cancel_followup_on_response",
+            ),
+            mock.patch.object(proc, "process_inbox_message", new=process_message),
+            mock.patch.object(proc, "mark_processed", new=mark_processed),
+            mock.patch.object(proc, "_clear_ai_processing_failure"),
+            mock.patch.object(proc, "_record_inbox_processing_failure"),
+            mock.patch.object(proc, "set_last_scan_iso"),
+            mock.patch.object(proc.time, "sleep"),
+        ]
+        with contextlib_nested(patchers):
+            proc.scan_inbox_against_index(
+                self.USER_ID,
+                self.HEADERS,
+                only_unread=False,
+                top=2,
+            )
+
+        process_message.assert_called_once_with(
+            self.USER_ID,
+            self.HEADERS,
+            messages[0],
+            allow_outbound_reply=False,
+            authenticated_mailbox_email=self.MAILBOX,
+        )
+        self.assertTrue(saved_messages[0][3]["hasAttachments"])
+        mark_processed.assert_called_once_with(
+            self.USER_ID,
+            messages[0]["internetMessageId"],
+        )
+
+    def test_success_marks_only_processed_predecessor_and_defers_later_messages(self):
+        messages = self._messages()
+        calls = self._scan_with_mocked_save(
+            messages,
+            save_side_effect=lambda *_args, **_kwargs: True,
+        )
+
+        calls["mark"].assert_called_once_with(
+            self.USER_ID,
+            messages[0]["internetMessageId"],
+        )
+        calls["clear"].assert_called_once_with(
+            self.USER_ID,
+            self.THREAD_ID,
+            messages[0]["internetMessageId"],
+        )
+        calls["record"].assert_not_called()
+        self.assertNotIn(
+            messages[1]["internetMessageId"],
+            [call.args[1] for call in calls["mark"].call_args_list],
+        )
+
+    def test_failure_marks_neither_attachment_message_nor_later_message(self):
+        messages = self._messages()
+        failure = proc.RetryableProcessingError("native image extraction failed")
+        calls = self._scan_with_mocked_save(
+            messages,
+            save_side_effect=lambda *_args, **_kwargs: True,
+            process_side_effect=failure,
+        )
+
+        calls["mark"].assert_not_called()
+        calls["clear"].assert_not_called()
+        calls["record"].assert_called_once_with(
+            self.USER_ID,
+            "client-native-batch",
+            self.THREAD_ID,
+            messages[0]["internetMessageId"],
+            failure,
+            messages[0],
+        )
+        self.assertEqual(0, calls["result"]["processed"])
+
+    def test_extraction_only_predecessor_suppresses_outbound_reply(self):
+        messages = self._messages()
+        send_reply = mock.MagicMock()
+
+        def extraction_processor(_uid, _headers, _msg, **kwargs):
+            if kwargs.get("allow_outbound_reply", True):
+                send_reply()
+
+        calls = self._scan_with_mocked_save(
+            messages,
+            save_side_effect=lambda *_args, **_kwargs: True,
+            process_side_effect=extraction_processor,
+        )
+
+        send_reply.assert_not_called()
+        process_kwargs = calls["process"].call_args.kwargs
+        self.assertFalse(process_kwargs["allow_outbound_reply"])
+        self.assertNotIn("operator_replay_attempt_id", process_kwargs)
 
 
 class TestWrongPropertyPdfNoDeterministicGuard(unittest.TestCase):
