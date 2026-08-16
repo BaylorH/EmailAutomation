@@ -1182,10 +1182,11 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
         *,
         save_side_effect=None,
         process_side_effect=None,
+        mark_return_value=True,
     ):
         save_message_to_thread = mock.MagicMock(side_effect=save_side_effect)
         process_message = mock.MagicMock(side_effect=process_side_effect)
-        mark_processed = mock.MagicMock()
+        mark_processed = mock.MagicMock(return_value=mark_return_value)
         clear_failure = mock.MagicMock()
         record_failure = mock.MagicMock()
 
@@ -1297,7 +1298,7 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
             full_predecessor,
         ])
         process_message = mock.MagicMock()
-        mark_processed = mock.MagicMock()
+        mark_processed = mock.MagicMock(return_value=True)
         saved_messages = []
 
         patchers = [
@@ -1386,6 +1387,23 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
             messages[1]["internetMessageId"],
             [call.args[1] for call in calls["mark"].call_args_list],
         )
+
+        marker_failure = self._scan_with_mocked_save(
+            messages,
+            save_side_effect=lambda *_args, **_kwargs: True,
+            mark_return_value=False,
+        )
+        marker_failure["mark"].assert_called_once_with(
+            self.USER_ID,
+            messages[0]["internetMessageId"],
+        )
+        marker_failure["clear"].assert_not_called()
+        marker_failure["record"].assert_called_once()
+        self.assertIs(
+            messages[0],
+            marker_failure["record"].call_args.args[5],
+        )
+        self.assertEqual(0, marker_failure["result"]["processed"])
 
     def test_failure_marks_neither_attachment_message_nor_later_message(self):
         messages = self._messages()
