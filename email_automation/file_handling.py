@@ -13,6 +13,15 @@ from googleapiclient.http import MediaIoBaseUpload
 import io
 from .clients import _helper_google_creds, client
 
+
+_PDF_PAGE_MARKER_LINE_RE = re.compile(r"^--- Page [1-9]\d* ---$", re.MULTILINE)
+
+
+def _pdf_substantive_text_for_threshold(extracted_text: str) -> str:
+    """Remove exact generated page-marker lines for threshold evaluation."""
+    return _PDF_PAGE_MARKER_LINE_RE.sub("", extracted_text).strip()
+
+
 # PDF extraction libraries
 try:
     import pdfplumber
@@ -173,7 +182,7 @@ def process_pdf_for_ai(content: bytes, filename: str = "document.pdf") -> Dict[s
     # Try local extraction first
     extracted_text, page_images = extract_pdf_text(content, filename)
 
-    if extracted_text and len(extracted_text) > 100:
+    if extracted_text and len(_pdf_substantive_text_for_threshold(extracted_text)) > 100:
         result['text'] = extracted_text
         result['method'] = 'local_extraction'
 
