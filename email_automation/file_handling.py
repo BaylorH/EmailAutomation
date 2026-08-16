@@ -14,7 +14,7 @@ import io
 from .clients import _helper_google_creds, client
 
 
-_PDF_PAGE_MARKER_LINE_RE = re.compile(r"^--- Page [1-9]\d* ---$", re.MULTILINE)
+_PDF_PAGE_MARKER_LINE_RE = re.compile(r"^--- Page [1-9][0-9]* ---$", re.MULTILINE)
 
 
 def _pdf_substantive_text_for_threshold(extracted_text: str) -> str:
