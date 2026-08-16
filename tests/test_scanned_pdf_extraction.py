@@ -17,7 +17,7 @@ from email_automation import ai_processing, file_handling
 SCANNED_PDF_NAME = "fictional-seven-page-raster-brochure.pdf"
 SCANNED_FILE_ID = "file-fictional-seven-page-scan"
 PAGE_COUNT = 7
-EXACT_PAGE_MARKER_LINE_RE = re.compile(r"(?m)^--- Page [1-9]\d* ---$")
+EXACT_PAGE_MARKER_LINE_RE = re.compile(r"(?m)^--- Page [1-9][0-9]* ---$")
 NATIVE_TEXT = (
     "Fictional lease notes keep --- Page 12 --- inside this sentence while "
     "supplying enough substantive detail."
@@ -113,6 +113,14 @@ class ScannedPdfExtractionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.scanned_pdf = _build_image_only_pdf()
+
+    def test_threshold_projection_retains_full_line_with_non_ascii_digit(self):
+        marker_like_user_text = "--- Page 1٢ ---"
+
+        self.assertEqual(
+            marker_like_user_text,
+            file_handling._pdf_substantive_text_for_threshold(marker_like_user_text),
+        )
 
     def test_real_image_only_pdf_has_visible_raster_pages_and_only_generated_markers(self):
         self.assertEqual(self.scanned_pdf, _build_image_only_pdf())
