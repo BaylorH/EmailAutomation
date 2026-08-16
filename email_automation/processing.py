@@ -8843,7 +8843,10 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                         )
                         attachment_predecessor_handled = True
                         break
-                    mark_processed(user_id, processed_key)
+                    if mark_processed(user_id, processed_key) is not True:
+                        raise RetryableProcessingError(
+                            "Batched plain predecessor processed marker write failed"
+                        )
                 except Exception as e:
                     print(f"❌ Failed to process batched predecessor: {e}")
                     _record_inbox_processing_failure(
