@@ -12,8 +12,8 @@ text-extraction threshold so long image-only PDFs retain a full-file fallback.
 **Architecture:** Preserve the existing extraction output and manifest schema.
 Add one pure threshold helper in `file_handling.py` that removes only exact
 generated page-marker lines. Use its length for the current local-success
-decision; leave upload, image caps, AI request construction, and failure behavior
-unchanged.
+decision; leave upload-manifest text behavior, image caps, AI request
+construction, and failure behavior unchanged.
 
 **Tech stack:** Python 3, `unittest`, PyMuPDF (`fitz`), existing pdfplumber/Pillow
 extraction path, and `unittest.mock` only at the OpenAI upload/Responses network
@@ -38,7 +38,8 @@ action is allowed.
   returns page images, and has no non-marker substantive text.
 - [ ] Patch only `upload_pdf_user_data`, call real `process_pdf_for_ai()`, and
   assert one upload call, `method == "openai_upload+images"`, retained identical
-  `file_id`/`id`, and the existing five-image manifest cap.
+  `file_id`/`id`, the existing empty fallback `text`, and the existing five-image
+  manifest cap.
 - [ ] Pass the real processed manifest to real `propose_sheet_updates()` with a
   complete synthetic column contract and conversation. Replace only
   `client.responses.create`; assert its content has exactly one `input_file`
@@ -69,8 +70,9 @@ action is allowed.
 - [ ] Add one module-level compiled regex matching only full generated marker
   lines and one pure helper returning the trimmed threshold projection.
 - [ ] Replace only the local-success length operand in `process_pdf_for_ai()`;
-  preserve the returned marked text, manifest keys, method values, image caps,
-  upload exception path, and logging behavior.
+  preserve marked `extract_pdf_text()` output and native-manifest text, while
+  preserving the existing empty upload-manifest text, manifest keys, method
+  values, image caps, upload exception path, and logging behavior.
 - [ ] Re-run the focused test and require all cases green.
 - [ ] Inspect the diff for broad marker removal, manifest drift, or added network
   seams. Commit the test and minimal production change as one TDD unit.

@@ -16,9 +16,10 @@ three rendered page previews. Facts on later scanned pages are unreachable.
 
 ## Decision
 
-Keep the page markers in the returned text because they are useful provenance,
-but exclude only exact internally generated page-marker lines when evaluating
-whether local extraction found more than 100 characters of substantive text.
+Keep the page markers in `extract_pdf_text()` output because they are useful
+provenance, but exclude only exact internally generated page-marker lines when
+evaluating whether local extraction found more than 100 characters of
+substantive text.
 The existing fallback remains authoritative:
 
 - marker-only or otherwise sparse scans use `openai_upload` or
@@ -35,7 +36,10 @@ similar substring.
 ## Data Flow
 
 1. Render and extract the PDF exactly as today.
-2. Preserve the original cleaned text, including page markers, in the manifest.
+2. Preserve the original cleaned extraction output, including page markers. A
+   native-text manifest continues to carry it; the existing upload fallback
+   continues to leave its manifest `text` empty rather than introducing a
+   second behavior change in this slice.
 3. Derive a threshold-only substantive projection by removing exact generated
    marker lines and trimming whitespace.
 4. Use that projection for the existing `> 100` local-success decision.
@@ -51,7 +55,8 @@ similar substring.
 - Prove local extraction returns all seven page markers but zero substantive
   text.
 - Prove `process_pdf_for_ai()` calls the upload seam once, returns the file ID,
-  and reports `openai_upload+images` with the existing five-image manifest cap.
+  reports `openai_upload+images` with the existing five-image manifest cap, and
+  preserves the existing empty-text upload-manifest contract.
 - Pass that real manifest through `propose_sheet_updates()` with only the
   OpenAI Responses boundary replaced; prove the request contains exactly one
   `input_file`, three bounded `input_image` previews, and one `input_text`.
