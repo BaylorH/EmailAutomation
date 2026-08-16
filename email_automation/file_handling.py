@@ -69,9 +69,6 @@ _NATIVE_IMAGE_FAILURE_PRECEDENCE = (
     "image_attachment_bad_magic",
     "image_attachment_decode_failed",
 )
-_NATIVE_IMAGE_STRICT_BASE64_RE = re.compile(
-    rb"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
-)
 _NATIVE_IMAGE_JPEG_SOF_MARKERS = frozenset(
     (
         0xC0,
@@ -123,23 +120,47 @@ def _native_image_size_failure(
     return None
 
 
-def _strict_native_image_base64_payload(value: Any) -> Tuple[bytes, int]:
+def _native_image_base64_decoded_size(value: Any) -> int:
+    """Project decoded size with constant-space length and suffix checks."""
+    if not isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("invalid base64")
+
+    encoded_length = len(value)
+    if encoded_length % 4:
+        raise ValueError("invalid base64")
+
+    double_padding = "==" if isinstance(value, str) else b"=="
+    single_padding = "=" if isinstance(value, str) else b"="
+    if value.endswith(double_padding):
+        padding = 2
+    elif value.endswith(single_padding):
+        padding = 1
+    else:
+        padding = 0
+    return (encoded_length // 4) * 3 - padding
+
+
+def _strict_native_image_base64_decode(value: Any, decoded_size: int) -> bytes:
+    """Strictly decode only after source and aggregate bounds have passed."""
     if isinstance(value, str):
         try:
             encoded = value.encode("ascii")
         except UnicodeEncodeError as exc:
             raise ValueError("invalid base64") from exc
-    elif isinstance(value, (bytes, bytearray)):
+    elif isinstance(value, bytes):
+        encoded = value
+    elif isinstance(value, bytearray):
         encoded = bytes(value)
     else:
         raise ValueError("invalid base64")
 
-    if not _NATIVE_IMAGE_STRICT_BASE64_RE.fullmatch(encoded):
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("invalid base64") from exc
+    if len(content) != decoded_size:
         raise ValueError("invalid base64")
-
-    padding = 2 if encoded.endswith(b"==") else 1 if encoded.endswith(b"=") else 0
-    decoded_size = (len(encoded) // 4) * 3 - padding
-    return encoded, decoded_size
+    return content
 
 
 def _native_image_magic_format(content: bytes) -> Optional[str]:
@@ -191,11 +212,12 @@ def _inspect_native_image_header(content: bytes) -> Tuple[str, int, int]:
     raise ValueError("invalid image header")
 
 
-def _inspect_native_image_pillow_format(content: bytes) -> str:
+def _inspect_native_image_pillow_format(content: bytes) -> Tuple[str, int, int]:
     if not HAS_PILLOW:
         raise RuntimeError("Pillow unavailable")
     with Image.open(io.BytesIO(content)) as image:
-        return str(image.format or "").upper()
+        width, height = image.size
+        return str(image.format or "").upper(), int(width), int(height)
 
 
 def _verify_native_image(content: bytes) -> None:
@@ -248,7 +270,7 @@ def _native_image_candidate(attachment: Any) -> Optional[Dict[str, Any]]:
         return None
     if attachment.get("@odata.type") != NATIVE_IMAGE_FILE_ATTACHMENT_TYPE:
         return None
-    if attachment.get("isInline") is True:
+    if attachment.get("isInline") is not False:
         return None
 
     raw_name = attachment.get("name")
@@ -303,12 +325,11 @@ def validate_and_normalize_native_image_content_batch(
             errors.add("image_attachment_type_mismatch")
 
         try:
-            encoded, decoded_size = _strict_native_image_base64_payload(
+            decoded_size = _native_image_base64_decoded_size(
                 candidate["content_bytes"]
             )
         except ValueError:
             errors.add("image_attachment_invalid_base64")
-            encoded = None
             decoded_size = None
 
         if decoded_size is not None:
@@ -318,7 +339,6 @@ def validate_and_normalize_native_image_content_batch(
                 **candidate,
                 "expected_mime": expected_mime,
                 "types_match": types_match,
-                "encoded": encoded,
                 "decoded_size": decoded_size,
             }
         )
@@ -329,14 +349,14 @@ def validate_and_normalize_native_image_content_batch(
 
     decoded = []
     for candidate in prepared:
-        if candidate["encoded"] is None:
+        if candidate["decoded_size"] is None:
             continue
         try:
-            content = base64.b64decode(candidate["encoded"], validate=True)
-        except Exception:
-            errors.add("image_attachment_invalid_base64")
-            continue
-        if len(content) != candidate["decoded_size"]:
+            content = _strict_native_image_base64_decode(
+                candidate["content_bytes"],
+                candidate["decoded_size"],
+            )
+        except ValueError:
             errors.add("image_attachment_invalid_base64")
             continue
 
@@ -378,26 +398,49 @@ def validate_and_normalize_native_image_content_batch(
         ):
             errors.add("image_attachment_type_mismatch")
         pixel_counts.append(width * height)
-        inspected.append(candidate)
+        inspected.append(
+            {
+                **candidate,
+                "header_width": width,
+                "header_height": height,
+            }
+        )
 
     size_failure = _native_image_size_failure(decoded_sizes, pixel_counts)
     if size_failure:
-        errors.add(size_failure)
-    first_failure = _select_native_image_failure(errors)
-    if first_failure:
-        return _native_image_failure(first_failure)
+        return _native_image_failure(size_failure)
 
+    pillow_pixel_counts: List[int] = []
     for candidate in inspected:
         try:
-            pillow_format = _inspect_native_image_pillow_format(
-                candidate["content"]
+            (
+                pillow_format,
+                pillow_width,
+                pillow_height,
+            ) = _inspect_native_image_pillow_format(
+                candidate["content"],
             )
         except Exception:
             errors.add("image_attachment_decode_failed")
             continue
-        if pillow_format != candidate["expected_format"]:
+        if pillow_width > 0 and pillow_height > 0:
+            pillow_pixel_counts.append(pillow_width * pillow_height)
+        else:
+            errors.add("image_attachment_decode_failed")
+        if (
+            pillow_width != candidate["header_width"]
+            or pillow_height != candidate["header_height"]
+        ):
+            errors.add("image_attachment_too_large")
+        if (
+            candidate["magic_matches_expected"]
+            and pillow_format != candidate["expected_format"]
+        ):
             errors.add("image_attachment_type_mismatch")
 
+    size_failure = _native_image_size_failure(decoded_sizes, pillow_pixel_counts)
+    if size_failure:
+        errors.add(size_failure)
     first_failure = _select_native_image_failure(errors)
     if first_failure:
         return _native_image_failure(first_failure)

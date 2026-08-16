@@ -17,6 +17,17 @@ from email_automation import file_handling
 
 FILE_ATTACHMENT_TYPE = "#microsoft.graph.fileAttachment"
 GENERIC_IMAGE_NAME = "Broker property image"
+MISSING_INLINE = object()
+
+
+class _NoEncodeCanonicalBase64(str):
+    def encode(self, *args, **kwargs):
+        raise AssertionError("over-limit base64 was encoded before size rejection")
+
+
+class _ExplodingBase64Regex:
+    def fullmatch(self, *args, **kwargs):
+        raise AssertionError("over-limit base64 reached the full-input regex")
 
 
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
@@ -64,8 +75,9 @@ def _attachment(
     attachment = {
         "name": name,
         "contentType": content_type,
-        "isInline": is_inline,
     }
+    if is_inline is not MISSING_INLINE:
+        attachment["isInline"] = is_inline
     if discriminator is not None:
         attachment["@odata.type"] = discriminator
     if content_bytes is None:
@@ -233,7 +245,7 @@ class NativeImageValidationTests(unittest.TestCase):
                     with mock.patch.object(
                         file_handling,
                         "_inspect_native_image_pillow_format",
-                        return_value=pillow_format_override,
+                        return_value=(pillow_format_override, 8, 6),
                         create=True,
                     ):
                         batch = self._validate(attachments)
@@ -304,6 +316,85 @@ class NativeImageValidationTests(unittest.TestCase):
             "image_attachment_too_large",
             guard([limit + 1], []),
         )
+
+    def test_preflights_source_and_aggregate_size_before_encoding_or_decode(self):
+        four_decoded_bytes = _NoEncodeCanonicalBase64("QUJDRA==")
+        three_decoded_bytes = _NoEncodeCanonicalBase64("QUJD")
+        forbidden_call = AssertionError("over-limit content reached decode/Pillow")
+
+        cases = (
+            (
+                "source",
+                3,
+                20,
+                [
+                    _attachment(
+                        "source-over.png",
+                        "image/png",
+                        content_bytes=four_decoded_bytes,
+                    )
+                ],
+            ),
+            (
+                "aggregate",
+                3,
+                5,
+                [
+                    _attachment(
+                        "aggregate-one.png",
+                        "image/png",
+                        content_bytes=three_decoded_bytes,
+                    ),
+                    _attachment(
+                        "aggregate-two.png",
+                        "image/png",
+                        content_bytes=three_decoded_bytes,
+                    ),
+                ],
+            ),
+        )
+
+        for label, source_limit, aggregate_limit, attachments in cases:
+            with self.subTest(label=label), mock.patch.object(
+                file_handling,
+                "NATIVE_IMAGE_MAX_SOURCE_BYTES",
+                source_limit,
+            ), mock.patch.object(
+                file_handling,
+                "NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES",
+                aggregate_limit,
+            ), mock.patch.object(
+                file_handling,
+                "_NATIVE_IMAGE_STRICT_BASE64_RE",
+                _ExplodingBase64Regex(),
+                create=True,
+            ), mock.patch.object(
+                file_handling.base64,
+                "b64decode",
+                side_effect=forbidden_call,
+            ), mock.patch.object(
+                file_handling,
+                "_inspect_native_image_header",
+                side_effect=forbidden_call,
+            ), mock.patch.object(
+                file_handling,
+                "_inspect_native_image_pillow_format",
+                side_effect=forbidden_call,
+            ), mock.patch.object(
+                file_handling,
+                "_verify_native_image",
+                side_effect=forbidden_call,
+            ), mock.patch.object(
+                file_handling,
+                "_normalize_native_image",
+                side_effect=forbidden_call,
+            ):
+                try:
+                    batch = self._validate(attachments)
+                except AssertionError as exc:
+                    self.fail(str(exc))
+                else:
+                    self._assert_failure(batch, "image_attachment_too_large")
 
     def test_accepts_exactly_twenty_megapixels_and_rejects_one_pixel_over_before_decode(self):
         guard = self._size_guard()
@@ -386,6 +477,77 @@ class NativeImageValidationTests(unittest.TestCase):
 
         self.assertEqual("accepted", batch["status"])
         self.assertEqual(1, len(batch["assets"]))
+
+    def test_requires_literal_false_inline_flag_before_candidate_work(self):
+        ignored = [
+            _attachment(
+                f"ignored-inline-state-{index}.png",
+                "image/png",
+                content_bytes="not strict base64",
+                is_inline=inline_state,
+            )
+            for index, inline_state in enumerate(
+                (MISSING_INLINE, None, True, 1, "true")
+            )
+        ]
+
+        batch = self._validate(
+            ignored
+            + [
+                _attachment(
+                    "literal-false.png",
+                    "image/png",
+                    _png_bytes(),
+                    is_inline=False,
+                )
+            ]
+        )
+
+        self.assertEqual("accepted", batch["status"])
+        self.assertEqual(1, len(batch["assets"]))
+
+    def test_rejects_pillow_dimension_overflow_or_header_disagreement_before_decode(self):
+        source = _attachment("broker.png", "image/png", _png_bytes())
+        forbidden_call = AssertionError(
+            "untrusted dimensions reached verify/normalization"
+        )
+        cases = (
+            (
+                "pillow_over_limit",
+                ("PNG", 8, 6),
+                ("PNG", file_handling.NATIVE_IMAGE_MAX_PIXELS + 1, 1),
+            ),
+            (
+                "crafted_header_disagreement",
+                ("PNG", 1, 1),
+                ("PNG", 8, 6),
+            ),
+        )
+
+        for label, raw_header, pillow_header in cases:
+            with self.subTest(label=label), mock.patch.object(
+                file_handling,
+                "_inspect_native_image_header",
+                return_value=raw_header,
+            ), mock.patch.object(
+                file_handling,
+                "_inspect_native_image_pillow_format",
+                return_value=pillow_header,
+            ), mock.patch.object(
+                file_handling,
+                "_verify_native_image",
+                side_effect=forbidden_call,
+            ), mock.patch.object(
+                file_handling,
+                "_normalize_native_image",
+                side_effect=forbidden_call,
+            ):
+                try:
+                    batch = self._validate([source])
+                except AssertionError as exc:
+                    self.fail(str(exc))
+                else:
+                    self._assert_failure(batch, "image_attachment_too_large")
 
     def test_compound_invalid_batch_uses_stable_precedence_independent_of_order(self):
         mismatch = _attachment("mismatch.jpg", "image/png", _png_bytes())
