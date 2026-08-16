@@ -318,12 +318,46 @@ def process_outbox_item(uid: str, outbox_id: str) -> dict[str, str]:
     raise ValueError("exact outbox classifier returned an unsupported status")
 
 
-def _validate_graph_message_id(value: object) -> str:
-    opaque = _require_string(value, "immutable_graph_message_id")
-    _utf8_bytes(opaque, "immutable_graph_message_id", 2048)
+def canonical_graph_message_id(
+    value: object,
+    field: str = "graph_message_id",
+) -> str:
+    """Return one exact Task4-canonical Microsoft Graph message ID."""
+
+    opaque = _require_string(value, field)
+    _utf8_bytes(opaque, field, 2048)
     if _has_rejected_boundary(opaque) or _has_control(opaque):
-        raise ValueError("immutable_graph_message_id is not canonical")
+        raise ValueError(f"{field} is not canonical")
     return opaque
+
+
+def canonical_email_address(
+    value: object,
+    field: str = "email_address",
+) -> str:
+    """Return one lowercase ASCII one-at-sign address without DNS assumptions."""
+
+    address = _require_string(value, field)
+    try:
+        address.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{field} must be ASCII") from error
+    if (
+        address != address.strip()
+        or any(character.isspace() for character in address)
+        or _has_control(address)
+    ):
+        raise ValueError(f"{field} is not canonical")
+    if address.count("@") != 1:
+        raise ValueError(f"{field} is not an email address")
+    local, domain = address.split("@")
+    if (
+        not local
+        or not domain
+        or any(character in "<>,;" for character in address)
+    ):
+        raise ValueError(f"{field} is not an email address")
+    return address.lower()
 
 
 def normalize_internet_message_id(internet_message_id: str) -> str:
@@ -365,7 +399,7 @@ def manual_reply_resolution_key(
 
     canonical_uid = _validate_document_id(uid, "uid")
     canonical_thread_id = _validate_document_id(thread_id, "thread_id")
-    opaque_graph_id = _validate_graph_message_id(immutable_graph_message_id)
+    opaque_graph_id = canonical_graph_message_id(immutable_graph_message_id)
     normalized_internet_id = normalize_internet_message_id(internet_message_id)
     canonical_source = _require_string(source, "source")
     if canonical_source != _SOURCE:
@@ -684,7 +718,7 @@ def _canonical_address_list(
     if type(value) is not list or (size is not None and len(value) != size):
         raise ValueError(f"{field} is not an exact address list")
     return [
-        _normalize_address(address, f"{field}[]")
+        canonical_email_address(address, f"{field}[]")
         for address in value
     ]
 
@@ -720,15 +754,15 @@ def _canonical_source_projection(value: object) -> dict:
     ):
         raise ValueError("canonical_source has an unsupported shape")
     source = value
-    lookup_id = _validate_graph_message_id(source.get("graphLookupMessageId"))
-    immutable_id = _validate_graph_message_id(source.get("immutableGraphMessageId"))
+    lookup_id = canonical_graph_message_id(source.get("graphLookupMessageId"))
+    immutable_id = canonical_graph_message_id(source.get("immutableGraphMessageId"))
     internet_id = normalize_internet_message_id(source.get("internetMessageId"))
     conversation_id = _require_string(source.get("conversationId"), "conversation_id")
     if not conversation_id or _has_control(conversation_id):
         raise ValueError("conversation_id is not canonical")
-    from_address = _normalize_address(source.get("fromAddress"), "source from")
-    sender_address = _normalize_address(source.get("senderAddress"), "source sender")
-    if _normalize_address(source.get("sender"), "source sender alias") != sender_address:
+    from_address = canonical_email_address(source.get("fromAddress"), "source from")
+    sender_address = canonical_email_address(source.get("senderAddress"), "source sender")
+    if canonical_email_address(source.get("sender"), "source sender alias") != sender_address:
         raise ValueError("source sender aliases disagree")
     audience = _require_exact_keys(source.get("audience"), {
         "to", "cc", "bcc",
@@ -765,7 +799,7 @@ def _canonical_source_projection(value: object) -> dict:
         "audience": {"to": [recipient], "cc": [], "bcc": []},
     }
     if extended.issubset(source):
-        authenticated_mailbox = _normalize_address(
+        authenticated_mailbox = canonical_email_address(
             source["authenticatedMailboxAddress"],
             "canonical_source.authenticatedMailboxAddress",
         )
@@ -820,8 +854,8 @@ def _validate_task7_outbox(data: object, outbox_id: str) -> dict:
         "notificationId", "threadId", "sourceMessageId",
     ):
         _validate_document_id(data.get(field), field)
-    reply_alias = _validate_graph_message_id(data.get("replyToMessageId"))
-    graph_alias = _validate_graph_message_id(data.get("sourceGraphMessageId"))
+    reply_alias = canonical_graph_message_id(data.get("replyToMessageId"))
+    graph_alias = canonical_graph_message_id(data.get("sourceGraphMessageId"))
     if data.get("notificationClientId") != data.get("clientId"):
         raise ValueError("notification client binding changed")
     if reply_alias != graph_alias:
@@ -834,7 +868,7 @@ def _validate_task7_outbox(data: object, outbox_id: str) -> dict:
     recipients = data.get("assignedEmails")
     if type(recipients) is not list or len(recipients) != 1:
         raise ValueError("manual reply must have one recipient")
-    _normalize_address(recipients[0], "outbox recipient")
+    canonical_email_address(recipients[0], "outbox recipient")
     script = _require_string(data.get("script"), "script")
     if (
         not script.strip()
@@ -908,7 +942,7 @@ def _validate_eligible_authority(
     ):
         raise ValueError("manual_reply_authority has an unsupported shape")
     authority = data
-    authenticated_mailbox = _normalize_address(
+    authenticated_mailbox = canonical_email_address(
         authority.get("authenticatedMailboxAddress"),
         "authority authenticated mailbox",
     )
@@ -962,9 +996,9 @@ def _validate_eligible_authority(
             "replyTo": [],
         }
         or audience != canonical_source["audience"]
-        or _normalize_address(authority.get("fromAddress"), "authority from")
+        or canonical_email_address(authority.get("fromAddress"), "authority from")
         != canonical_source["fromAddress"]
-        or _normalize_address(authority.get("senderAddress"), "authority sender")
+        or canonical_email_address(authority.get("senderAddress"), "authority sender")
         != canonical_source["senderAddress"]
     ):
         raise ValueError("manual reply authority audience changed")
@@ -974,7 +1008,7 @@ def _validate_eligible_authority(
         raise ValueError("manual reply authority source pair changed")
     if (
         "immutableGraphMessageId" in authority
-        and _validate_graph_message_id(authority["immutableGraphMessageId"])
+        and canonical_graph_message_id(authority["immutableGraphMessageId"])
         != canonical_source["immutableGraphMessageId"]
     ):
         raise ValueError("manual reply authority immutable ID changed")
@@ -995,8 +1029,8 @@ def _graph_me_projection(value: object) -> dict:
     if type(value) is not dict:
         raise ValueError("Graph /me is missing")
     graph_id = _require_string(value.get("id"), "graph_me.id")
-    principal = _normalize_address(value.get("userPrincipalName"), "graph_me.userPrincipalName")
-    mail = _normalize_address(value.get("mail"), "graph_me.mail")
+    principal = canonical_email_address(value.get("userPrincipalName"), "graph_me.userPrincipalName")
+    mail = canonical_email_address(value.get("mail"), "graph_me.mail")
     return {"id": graph_id, "mail": mail, "userPrincipalName": principal}
 
 
@@ -1110,7 +1144,7 @@ def claim_manual_reply_item(
             outbox["sourceGraphMessageId"] != source["graphLookupMessageId"]
             or normalize_internet_message_id(outbox["sourceInternetMessageId"])
             != source["internetMessageId"]
-            or _normalize_address(outbox["assignedEmails"][0], "outbox recipient")
+            or canonical_email_address(outbox["assignedEmails"][0], "outbox recipient")
             != source["audience"]["to"][0]
         ):
             return {"status": "manual_review", "reason": "source_binding_mismatch"}
@@ -1227,7 +1261,7 @@ def _eligible_authority_source(data: object, *, uid: str, outbox: dict) -> dict:
         or authority.get("source") != _SOURCE
     ):
         raise ValueError("manual reply authority is not eligible")
-    lookup_id = _validate_graph_message_id(authority.get("graphLookupMessageId"))
+    lookup_id = canonical_graph_message_id(authority.get("graphLookupMessageId"))
     if lookup_id != outbox["sourceGraphMessageId"]:
         raise ValueError("authority lookup alias changed")
     internet_id = normalize_internet_message_id(
@@ -1238,12 +1272,12 @@ def _eligible_authority_source(data: object, *, uid: str, outbox: dict) -> dict:
     conversation_id = _require_string(authority.get("conversationId"), "conversation_id")
     if not conversation_id or _has_control(conversation_id):
         raise ValueError("authority conversation is not canonical")
-    authenticated_mailbox = _normalize_address(
+    authenticated_mailbox = canonical_email_address(
         authority.get("authenticatedMailboxAddress"),
         "authority authenticated mailbox",
     )
-    from_address = _normalize_address(authority.get("fromAddress"), "authority from")
-    sender_address = _normalize_address(authority.get("senderAddress"), "authority sender")
+    from_address = canonical_email_address(authority.get("fromAddress"), "authority from")
+    sender_address = canonical_email_address(authority.get("senderAddress"), "authority sender")
     source_audience = _canonical_source_audience(
         authority.get("sourceAudience"),
         "authority.sourceAudience",
@@ -1270,7 +1304,7 @@ def _eligible_authority_source(data: object, *, uid: str, outbox: dict) -> dict:
             size=0,
         ),
     }
-    recipient = _normalize_address(outbox["assignedEmails"][0], "outbox recipient")
+    recipient = canonical_email_address(outbox["assignedEmails"][0], "outbox recipient")
     if (
         canonical_audience != {"to": [recipient], "cc": [], "bcc": []}
         or source_audience != {
@@ -1305,7 +1339,7 @@ def _eligible_authority_source(data: object, *, uid: str, outbox: dict) -> dict:
         "audience": canonical_audience,
     }
     if "immutableGraphMessageId" in authority:
-        source["expectedImmutableGraphMessageId"] = _validate_graph_message_id(
+        source["expectedImmutableGraphMessageId"] = canonical_graph_message_id(
             authority["immutableGraphMessageId"]
         )
     return source
@@ -1330,7 +1364,7 @@ def _validate_token_context(context: object, *, attempt_id: str) -> dict:
     if (
         claims.get("oid") != account["local_account_id"]
         or claims.get("tid") != account["realm"]
-        or _normalize_address(
+        or canonical_email_address(
             claims.get("preferred_username"),
             "token preferred_username",
         ) != account["username"]
@@ -1368,7 +1402,7 @@ def _graph_address_list(value: object, field: str) -> list[str]:
         email_address = entry.get("emailAddress")
         if type(email_address) is not dict:
             raise ValueError(f"{field} contains an invalid recipient")
-        addresses.append(_normalize_address(
+        addresses.append(canonical_email_address(
             email_address.get("address"),
             f"{field}.address",
         ))
@@ -1400,13 +1434,13 @@ def _resolve_canonical_graph_source(
         headers=headers,
         retry=False,
     ))
-    immutable_id = _validate_graph_message_id(source.get("id"))
+    immutable_id = canonical_graph_message_id(source.get("id"))
     internet_id = normalize_internet_message_id(source.get("internetMessageId"))
-    graph_from = _normalize_address(
+    graph_from = canonical_email_address(
         source.get("from", {}).get("emailAddress", {}).get("address"),
         "Graph source from",
     )
-    graph_sender = _normalize_address(
+    graph_sender = canonical_email_address(
         source.get("sender", {}).get("emailAddress", {}).get("address"),
         "Graph source sender",
     )
@@ -1590,15 +1624,15 @@ def _final_manual_reply_snapshot(
                 ) != canonical_source["internetMessageId"]
                 or authority.get("conversationId")
                 != canonical_source["conversationId"]
-                or _normalize_address(
+                or canonical_email_address(
                     authority.get("authenticatedMailboxAddress"),
                     "claimed authority mailbox",
                 ) != canonical_source["authenticatedMailboxAddress"]
-                or _normalize_address(
+                or canonical_email_address(
                     authority.get("fromAddress"),
                     "claimed authority from",
                 ) != canonical_source["fromAddress"]
-                or _normalize_address(
+                or canonical_email_address(
                     authority.get("senderAddress"),
                     "claimed authority sender",
                 ) != canonical_source["senderAddress"]
@@ -1671,7 +1705,7 @@ def _final_manual_reply_snapshot(
             or notification.get("kind") != "action_needed"
             or notification.get("threadId") != thread_id
             or notification.get("manualReplyAuthorityKey") != authority_key
-            or _normalize_address(notification.get("email"), "notification email")
+            or canonical_email_address(notification.get("email"), "notification email")
             != canonical_source["audience"]["to"][0]
             or type(notification.get("meta")) is not dict
             or notification.get("meta", {}).get("replyToMessageId")
@@ -1682,7 +1716,7 @@ def _final_manual_reply_snapshot(
         if (
             type(source_record) is not dict
             or source_record.get("direction") != "inbound"
-            or _normalize_address(source_record.get("from"), "stored source from")
+            or canonical_email_address(source_record.get("from"), "stored source from")
             != canonical_source["fromAddress"]
             or type(source_message) is not dict
             or source_message.get("graphMessageId")
@@ -1907,16 +1941,6 @@ def _response_json(response: object) -> dict:
     return payload
 
 
-def _normalize_address(value: object, field: str) -> str:
-    address = _require_string(value, field)
-    if address != address.strip() or _has_control(address):
-        raise ValueError(f"{field} is not canonical")
-    local, separator, domain = address.rpartition("@")
-    if not separator or not local or not domain or "." not in domain:
-        raise ValueError(f"{field} is not an email address")
-    return address.casefold()
-
-
 def _canonical_selected_account(selected_account: object) -> dict[str, str]:
     if type(selected_account) is not dict or set(selected_account) != set(_ACCOUNT_FIELDS):
         raise ValueError("selected account has an unsupported shape")
@@ -1926,7 +1950,7 @@ def _canonical_selected_account(selected_account: object) -> dict[str, str]:
         if not value or value != value.strip() or _has_control(value):
             raise ValueError(f"selected account {field} is not canonical")
         canonical[field] = value
-    canonical["username"] = _normalize_address(
+    canonical["username"] = canonical_email_address(
         canonical["username"],
         "selected account username",
     )
@@ -1939,7 +1963,7 @@ def _graph_me_matches_account(payload: object, selected_account: object) -> bool
         if type(payload) is not dict:
             return False
         graph_id = _require_string(payload.get("id"), "graph_me.id")
-        principal_name = _normalize_address(
+        principal_name = canonical_email_address(
             payload.get("userPrincipalName"),
             "graph_me.userPrincipalName",
         )
@@ -1952,7 +1976,7 @@ def _graph_me_matches_account(payload: object, selected_account: object) -> bool
 
 
 def _graph_message_path(message_id: object) -> str:
-    canonical = _validate_graph_message_id(message_id)
+    canonical = canonical_graph_message_id(message_id)
     return f"/me/messages/{quote(canonical, safe='')}"
 
 
@@ -1978,7 +2002,7 @@ def prepare_canonical_manual_reply_draft(
     try:
         graph_headers = _exact_graph_headers(headers)
         account = _canonical_selected_account(selected_account)
-        canonical_recipient = _normalize_address(recipient, "recipient")
+        canonical_recipient = canonical_email_address(recipient, "recipient")
         reviewed_body = _require_string(body, "body")
         if not reviewed_body.strip() or _has_unsafe_body_control(reviewed_body):
             raise ValueError("body is not a reviewed nonblank string")
@@ -2018,11 +2042,11 @@ def prepare_canonical_manual_reply_draft(
             headers=graph_headers,
             retry=False,
         ))
-        graph_from = _normalize_address(
+        graph_from = canonical_email_address(
             source.get("from", {}).get("emailAddress", {}).get("address"),
             "Graph source from",
         )
-        graph_sender = _normalize_address(
+        graph_sender = canonical_email_address(
             source.get("sender", {}).get("emailAddress", {}).get("address"),
             "Graph source sender",
         )
@@ -2070,7 +2094,7 @@ def prepare_canonical_manual_reply_draft(
             retry=False,
         )
         reply = _response_json(reply_response)
-        immutable_draft_id = _validate_graph_message_id(reply.get("id"))
+        immutable_draft_id = canonical_graph_message_id(reply.get("id"))
         draft_path = _graph_message_path(immutable_draft_id)
         patch_response = http_client.patch(
             draft_path,
@@ -2098,7 +2122,7 @@ def prepare_canonical_manual_reply_draft(
         exact_to = (
             type(to_recipients) is list
             and len(to_recipients) == 1
-            and _normalize_address(
+            and canonical_email_address(
                 to_recipients[0].get("emailAddress", {}).get("address"),
                 "draft recipient",
             ) == canonical_recipient
@@ -2187,8 +2211,8 @@ def reconcile_canonical_manual_reply(
 
     try:
         graph_headers = _exact_graph_headers(headers)
-        draft_id = _validate_graph_message_id(immutable_draft_id)
-        source_id = _validate_graph_message_id(immutable_source_message_id)
+        draft_id = canonical_graph_message_id(immutable_draft_id)
+        source_id = canonical_graph_message_id(immutable_source_message_id)
         draft = _response_json(http_client.get(
             _graph_message_path(draft_id),
             headers=graph_headers,
@@ -2217,6 +2241,8 @@ def reconcile_canonical_manual_reply(
 
 __all__ = [
     "bounded_manual_reply_result",
+    "canonical_email_address",
+    "canonical_graph_message_id",
     "claim_manual_reply_item",
     "is_canonical_document_id",
     "manual_reply_authority_key",

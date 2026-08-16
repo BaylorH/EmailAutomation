@@ -9,6 +9,8 @@ from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs
 from google.cloud import firestore
 from .manual_reply import (
+    canonical_email_address,
+    canonical_graph_message_id,
     is_canonical_document_id,
     manual_reply_authority_key,
     normalize_internet_message_id,
@@ -50,26 +52,12 @@ def _canonical_opaque(value: object, maximum_bytes: int = 2048) -> Optional[str]
     return value
 
 
-def _canonical_email_address(value: object) -> Optional[str]:
-    if type(value) is not str or not value or value != value.strip():
-        return None
-    try:
-        value.encode("ascii")
-    except UnicodeEncodeError:
-        return None
-    if value.count("@") != 1 or any(character.isspace() for character in value):
-        return None
-    local, domain = value.split("@")
-    if not local or not domain or any(character in "<>,;" for character in value):
-        return None
-    return value.lower()
-
-
 def _canonical_address_tuple(values: object) -> Optional[Tuple[str, ...]]:
     if type(values) is not tuple:
         return None
-    canonical = tuple(_canonical_email_address(value) for value in values)
-    if any(value is None for value in canonical):
+    try:
+        canonical = tuple(canonical_email_address(value) for value in values)
+    except (TypeError, ValueError):
         return None
     return canonical
 
@@ -98,19 +86,21 @@ def _manual_reply_authority_document(
     if not is_canonical_document_id(thread_id):
         return None
 
-    graph_lookup_message_id = _canonical_opaque(source.graph_lookup_message_id)
     conversation_id = _canonical_opaque(source.conversation_id)
-    immutable_graph_message_id = source.immutable_graph_message_id
-    if immutable_graph_message_id is not None:
-        immutable_graph_message_id = _canonical_opaque(immutable_graph_message_id)
-    if (
-        graph_lookup_message_id is None
-        or conversation_id is None
-        or (
-            source.immutable_graph_message_id is not None
-            and immutable_graph_message_id is None
+    try:
+        graph_lookup_message_id = canonical_graph_message_id(
+            source.graph_lookup_message_id,
+            "graph_lookup_message_id",
         )
-    ):
+        immutable_graph_message_id = source.immutable_graph_message_id
+        if immutable_graph_message_id is not None:
+            immutable_graph_message_id = canonical_graph_message_id(
+                immutable_graph_message_id,
+                "immutable_graph_message_id",
+            )
+    except (TypeError, ValueError):
+        return None
+    if conversation_id is None:
         return None
 
     try:
@@ -135,10 +125,17 @@ def _manual_reply_authority_document(
     ):
         return None
 
-    authenticated_mailbox = _canonical_email_address(
-        source.authenticated_mailbox_address
-    )
-    notification_recipient = _canonical_email_address(email)
+    try:
+        authenticated_mailbox = canonical_email_address(
+            source.authenticated_mailbox_address,
+            "authenticated_mailbox_address",
+        )
+        notification_recipient = canonical_email_address(
+            email,
+            "notification_recipient",
+        )
+    except (TypeError, ValueError):
+        return None
     from_addresses = _canonical_address_tuple(source.from_addresses)
     sender_addresses = _canonical_address_tuple(source.sender_addresses)
     reply_to_addresses = _canonical_address_tuple(source.reply_to_addresses)

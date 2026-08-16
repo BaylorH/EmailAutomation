@@ -24,6 +24,34 @@ THREAD_ID = "thread-1"
 NOTIFICATION_ID = hashlib.sha1(b"manual-authority:test").hexdigest()
 AUTHORITY_DOMAIN = "sitesift-manual-reply-authority:v1"
 RESOLVED_COMMIT_TIME = datetime(2026, 8, 15, 12, 34, 56, tzinfo=timezone.utc)
+TASK4_REJECTED_BOUNDARY_CODE_POINTS = (
+    0x0009,
+    0x000A,
+    0x000B,
+    0x000C,
+    0x000D,
+    0x0020,
+    0x0085,
+    0x00A0,
+    0x1680,
+    0x2000,
+    0x2001,
+    0x2002,
+    0x2003,
+    0x2004,
+    0x2005,
+    0x2006,
+    0x2007,
+    0x2008,
+    0x2009,
+    0x200A,
+    0x2028,
+    0x2029,
+    0x202F,
+    0x205F,
+    0x3000,
+    0xFEFF,
+)
 
 
 def _path(*parts):
@@ -311,6 +339,123 @@ def _expected_authority_doc(
 
 
 class ManualReplyAuthorityNotificationTests(unittest.TestCase):
+    def test_authority_producer_imports_the_shared_public_canonicalizers(self):
+        graph_canonicalizer = getattr(
+            manual_reply,
+            "canonical_graph_message_id",
+            None,
+        )
+        address_canonicalizer = getattr(
+            manual_reply,
+            "canonical_email_address",
+            None,
+        )
+
+        self.assertTrue(callable(graph_canonicalizer))
+        self.assertTrue(callable(address_canonicalizer))
+        self.assertIs(
+            graph_canonicalizer,
+            getattr(notifications, "canonical_graph_message_id", None),
+        )
+        self.assertIs(
+            address_canonicalizer,
+            getattr(notifications, "canonical_email_address", None),
+        )
+
+    def test_authority_producer_rejects_every_task4_graph_id_boundary(self):
+        for code_point in TASK4_REJECTED_BOUNDARY_CODE_POINTS:
+            boundary = chr(code_point)
+            for position, candidate in (
+                ("prefix", f"{boundary}source-alias-1"),
+                ("suffix", f"source-alias-1{boundary}"),
+            ):
+                for field in ("lookup", "optional_immutable"):
+                    with self.subTest(
+                        code_point=f"U+{code_point:04X}",
+                        position=position,
+                        field=field,
+                    ):
+                        if field == "lookup":
+                            source = _manual_reply_source(
+                                graph_lookup_message_id=candidate,
+                            )
+                            meta = _meta(
+                                replyToMessageId=candidate,
+                                sourceMessageId=candidate,
+                                sourceGraphMessageId=candidate,
+                            )
+                        else:
+                            source = _manual_reply_source(
+                                immutable_graph_message_id=candidate,
+                            )
+                            meta = _meta()
+                        store = _MemoryFirestore({_client_path(): {}})
+
+                        _write(
+                            store,
+                            meta=meta,
+                            source_marker=source,
+                        )
+
+                        self.assertIn(_notification_path(), store.documents)
+                        self.assertNotIn(_authority_path(), store.documents)
+                        self.assertNotIn(
+                            "manualReplyAuthorityKey",
+                            store.documents[_notification_path()],
+                        )
+
+    def test_shared_address_contract_accepts_dotless_and_rejects_invalid_matrix(self):
+        canonicalize = getattr(manual_reply, "canonical_email_address", None)
+        self.assertTrue(callable(canonicalize))
+        self.assertEqual("broker@localhost", canonicalize("Broker@LOCALHOST"))
+
+        invalid_addresses = (
+            None,
+            b"broker@localhost",
+            "",
+            " broker@localhost",
+            "broker@localhost ",
+            "brokerlocalhost",
+            "@localhost",
+            "broker@",
+            "broker@@localhost",
+            "bro ker@localhost",
+            "broker@local host",
+            "broker\x00@localhost",
+            "broker@local\x7fhost",
+            "br\N{LATIN SMALL LETTER O WITH ACUTE}ker@localhost",
+            "<broker>@localhost",
+            "broker>@localhost",
+            "bro,ker@localhost",
+            "bro;ker@localhost",
+        )
+        for value in invalid_addresses:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises((TypeError, ValueError)):
+                    canonicalize(value)
+
+    def test_dotless_authority_addresses_are_persisted_canonically(self):
+        store = _MemoryFirestore({_client_path(): {}})
+        source = _manual_reply_source(
+            authenticated_mailbox_address="Sender@LOCALHOST",
+            from_addresses=("Broker@LOCALHOST",),
+            sender_addresses=("broker@localhost",),
+            to_addresses=("sender@localhost",),
+        )
+
+        _write(
+            store,
+            email="Broker@LOCALHOST",
+            source_marker=source,
+        )
+
+        authority = store.documents[_authority_path()]
+        self.assertEqual("sender@localhost", authority["authenticatedMailboxAddress"])
+        self.assertEqual("broker@localhost", authority["fromAddress"])
+        self.assertEqual("broker@localhost", authority["senderAddress"])
+        self.assertEqual(["sender@localhost"], authority["sourceAudience"]["to"])
+        self.assertEqual(["broker@localhost"], authority["audience"]["to"])
+
     def test_authority_key_is_length_framed_and_shared_with_manual_reply(self):
         key_function = getattr(manual_reply, "manual_reply_authority_key", None)
         self.assertIsNotNone(

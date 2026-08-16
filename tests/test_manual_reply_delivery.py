@@ -20,6 +20,34 @@ from email_automation import manual_reply
 IMMUTABLE_PREFER = 'IdType="ImmutableId"'
 PRODUCER_TIME = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 CLAIM_COMMIT_TIME = datetime(2026, 8, 15, 12, 1, tzinfo=timezone.utc)
+TASK4_REJECTED_BOUNDARY_CODE_POINTS = (
+    0x0009,
+    0x000A,
+    0x000B,
+    0x000C,
+    0x000D,
+    0x0020,
+    0x0085,
+    0x00A0,
+    0x1680,
+    0x2000,
+    0x2001,
+    0x2002,
+    0x2003,
+    0x2004,
+    0x2005,
+    0x2006,
+    0x2007,
+    0x2008,
+    0x2009,
+    0x200A,
+    0x2028,
+    0x2029,
+    0x202F,
+    0x205F,
+    0x3000,
+    0xFEFF,
+)
 
 TASK7_MANUAL_REPLY_ALLOWED_FIELDS = frozenset({
     "manualReplyLaneVersion",
@@ -274,6 +302,146 @@ class ManualReplyGraphDeliveryTests(unittest.TestCase):
             recipient="broker@example.invalid",
             body=body,
         )
+
+    def test_shared_graph_id_contract_rejects_every_task4_boundary_and_invalid_matrix(self):
+        canonicalize = _required_callable(self, "canonical_graph_message_id")
+        self.assertEqual("source-id", canonicalize("source-id"))
+
+        for code_point in TASK4_REJECTED_BOUNDARY_CODE_POINTS:
+            boundary = chr(code_point)
+            for position, candidate in (
+                ("prefix", f"{boundary}source-id"),
+                ("suffix", f"source-id{boundary}"),
+            ):
+                with self.subTest(
+                    code_point=f"U+{code_point:04X}",
+                    position=position,
+                ):
+                    with self.assertRaises((TypeError, ValueError)):
+                        canonicalize(candidate)
+
+        invalid_ids = (
+            None,
+            b"source-id",
+            "",
+            "x" * 2049,
+            "source\x00id",
+            "source\x7fid",
+            "\ud800",
+        )
+        for value in invalid_ids:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises((TypeError, ValueError)):
+                    canonicalize(value)
+
+    def test_shared_address_contract_accepts_dotless_and_rejects_invalid_matrix(self):
+        canonicalize = _required_callable(self, "canonical_email_address")
+        self.assertEqual("broker@localhost", canonicalize("Broker@LOCALHOST"))
+
+        invalid_addresses = (
+            None,
+            b"broker@localhost",
+            "",
+            " broker@localhost",
+            "broker@localhost ",
+            "brokerlocalhost",
+            "@localhost",
+            "broker@",
+            "broker@@localhost",
+            "bro ker@localhost",
+            "broker@local host",
+            "broker\x00@localhost",
+            "broker@local\x7fhost",
+            "br\N{LATIN SMALL LETTER O WITH ACUTE}ker@localhost",
+            "<broker>@localhost",
+            "broker>@localhost",
+            "bro,ker@localhost",
+            "bro;ker@localhost",
+        )
+        for value in invalid_addresses:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises((TypeError, ValueError)):
+                    canonicalize(value)
+
+    def test_dotless_addresses_prepare_but_graph_me_identity_remains_exact(self):
+        prepare = _required_callable(self, "prepare_canonical_manual_reply_draft")
+        source_binding = deepcopy(_source_binding())
+        source_binding.update({
+            "fromAddress": "broker@localhost",
+            "senderAddress": "broker@localhost",
+            "sender": "broker@localhost",
+            "audience": {
+                "to": ["broker@localhost"],
+                "cc": [],
+                "bcc": [],
+            },
+        })
+        selected_account = {
+            **_selected_account(),
+            "username": "sender@localhost",
+        }
+        exact_http = _RecordingHttp(
+            draft_recipient="broker@localhost",
+            source_sender="broker@localhost",
+            source_from="broker@localhost",
+            source_to=["sender@localhost"],
+            graph_upn="sender@localhost",
+            graph_mail="mail-alias@localhost",
+        )
+
+        result = prepare(
+            http_client=exact_http,
+            headers={"Authorization": "Bearer synthetic"},
+            source_binding=source_binding,
+            selected_account=selected_account,
+            recipient="broker@localhost",
+            body="Synthetic reviewed reply.",
+        )
+
+        self.assertEqual("prepared", result["status"])
+        self.assertFalse(any(call["path"].endswith("/send") for call in exact_http.calls))
+
+        mismatches = (
+            (
+                _RecordingHttp(
+                    graph_upn="sender@localhost",
+                    graph_mail="mail-alias@localhost",
+                ),
+                {**selected_account, "username": "other@localhost"},
+            ),
+            (
+                _RecordingHttp(
+                    graph_me_id="other-local-account",
+                    graph_upn="sender@localhost",
+                    graph_mail="mail-alias@localhost",
+                ),
+                selected_account,
+            ),
+            (
+                _RecordingHttp(
+                    graph_upn="other@localhost",
+                    graph_mail="mail-alias@localhost",
+                ),
+                selected_account,
+            ),
+        )
+        for http, account in mismatches:
+            with self.subTest(
+                graph_me_id=http.graph_me_id,
+                graph_upn=http.graph_upn,
+                username=account["username"],
+            ):
+                mismatch = prepare(
+                    http_client=http,
+                    headers={"Authorization": "Bearer synthetic"},
+                    source_binding=source_binding,
+                    selected_account=account,
+                    recipient="broker@localhost",
+                    body="Synthetic reviewed reply.",
+                )
+
+                self.assertEqual("manual_review", mismatch["status"])
+                self.assertEqual(["/me"], [call["path"] for call in http.calls])
 
     def test_exact_create_reply_prepares_one_recipient_without_sending(self):
         http = _RecordingHttp()
@@ -1227,6 +1395,38 @@ class ManualReplyFirestoreDeliveryTests(unittest.TestCase):
         )
         self.assertEqual(_producer_authority_document(), authority)
         self.assertNotIn("immutableGraphMessageId", authority)
+
+    def test_authority_consumer_accepts_the_producer_dotless_address_contract(self):
+        outbox = _task7_outbox_document()
+        outbox["assignedEmails"] = ["broker@localhost"]
+        authority = _producer_authority_document()
+        authority.update({
+            "authenticatedMailboxAddress": "sender@localhost",
+            "fromAddress": "broker@localhost",
+            "senderAddress": "broker@localhost",
+            "sourceAudience": {
+                "to": ["sender@localhost"],
+                "cc": [],
+                "bcc": [],
+                "replyTo": [],
+            },
+            "audience": {
+                "to": ["broker@localhost"],
+                "cc": [],
+                "bcc": [],
+            },
+        })
+
+        canonical = manual_reply._eligible_authority_source(
+            authority,
+            uid=UID,
+            outbox=outbox,
+        )
+
+        self.assertEqual("sender@localhost", canonical["authenticatedMailboxAddress"])
+        self.assertEqual("broker@localhost", canonical["fromAddress"])
+        self.assertEqual("broker@localhost", canonical["senderAddress"])
+        self.assertEqual(["broker@localhost"], canonical["audience"]["to"])
 
     def test_task7_audit_outbox_id_is_optional_but_mismatch_blocks(self):
         for label, audit_outbox_id, expected_status in (
