@@ -6075,9 +6075,16 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         run = self._run_process(attachments=attachments, body="")
 
         self.assertIsNone(run["error"])
-        vision_manifest = run["propose"].call_args.kwargs["pdf_manifest"][0]
-        self.assertEqual(2, len(vision_manifest["images"]))
-        self.assertEqual(2, len(vision_manifest["image_meta"]))
+        vision_manifests = run["propose"].call_args.kwargs["pdf_manifest"]
+        self.assertEqual(2, len(vision_manifests))
+        self.assertEqual([1, 1], [
+            len(entry["images"])
+            for entry in vision_manifests
+        ])
+        self.assertEqual([1, 1], [
+            len(entry["image_meta"])
+            for entry in vision_manifests
+        ])
         run["host"].assert_called_once()
         upload_name, upload_bytes = run["host"].call_args.args[:2]
         self.assertEqual(expected["data"], upload_bytes)

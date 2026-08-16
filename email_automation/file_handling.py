@@ -2639,12 +2639,25 @@ def fetch_and_process_pdfs(
     )
     if native_positions:
         if native_batch.get("status") == "accepted":
-            native_entry = build_native_image_manifest_entry(native_batch)
+            native_assets = native_batch.get("assets")
+            if (
+                not isinstance(native_assets, list)
+                or len(native_assets) != len(native_positions)
+            ):
+                raise ValueError("Native image snapshot projection failed closed")
+            for position, native_asset in zip(native_positions, native_assets):
+                native_entry = build_native_image_manifest_entry({
+                    "status": "accepted",
+                    "assets": [native_asset],
+                })
+                if native_entry is None:
+                    raise ValueError("Native image manifest projection failed closed")
+                positioned_entries.append((position, 0, native_entry))
         else:
             native_entry = build_native_image_failure_manifest_entry(native_batch)
-        if native_entry is None:
-            raise ValueError("Native image manifest projection failed closed")
-        positioned_entries.append((native_positions[0], 0, native_entry))
+            if native_entry is None:
+                raise ValueError("Native image manifest projection failed closed")
+            positioned_entries.append((native_positions[0], 0, native_entry))
 
     positioned_entries.sort(key=lambda item: (item[0], item[1]))
     return [entry for _position, _priority, entry in positioned_entries]
