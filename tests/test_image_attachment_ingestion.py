@@ -3,6 +3,8 @@ import hashlib
 import io
 import os
 import unittest
+from collections import UserDict
+from types import MappingProxyType
 from unittest import mock
 
 from PIL import Image, PngImagePlugin
@@ -91,6 +93,14 @@ class _ClaimingNativeManifestDict(dict):
         if key == "source_type":
             return "native_image"
         return super().get(key, default)
+
+
+class _ExplodingGetterManifest:
+    def __init__(self, private_sentinel):
+        self.private_sentinel = private_sentinel
+
+    def get(self, key, default=None):
+        raise AssertionError(self.private_sentinel)
 
 
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
@@ -2656,7 +2666,40 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "native-image",
                 "openai_upload",
             ),
+            (
+                "newline_native_marker",
+                "\nnative_image",
+                "openai_upload",
+            ),
+            (
+                "spaced_native_marker",
+                "native image",
+                "openai_upload",
+            ),
+            (
+                "trailing_space_native_marker",
+                "native_image ",
+                "openai_upload",
+            ),
             ("bytes_native_marker", b"native_image", "openai_upload"),
+            (
+                "bytearray_native_marker",
+                bytearray(b"native_image"),
+                "openai_upload",
+            ),
+            (
+                "string_subclass_source_marker",
+                _PrivateHashString(
+                    "google_drive_pdf",
+                    "PRIVATE_SOURCE_TYPE_SUBCLASS_SENTINEL",
+                ),
+                "local_extraction",
+            ),
+            (
+                "object_native_marker",
+                object(),
+                "openai_upload",
+            ),
             ("failed_google_drive_pdf", "google_drive_pdf", "failed"),
             ("failed_dropbox_pdf", "dropbox_pdf", "failed"),
             ("failed_public_pdf", "public_pdf", "failed"),
@@ -2693,33 +2736,118 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 (label, manifest, sentinel)
             )
 
+        known_pair_with_native_key_sentinel = (
+            "PRIVATE_KNOWN_PAIR_NATIVE_KEY_SENTINEL"
+        )
+        known_pair_with_native_key = {
+            "name": "linked.pdf",
+            "text": known_pair_with_native_key_sentinel,
+            "images": [],
+            "method": "local_extraction",
+            "source_type": "google_drive_pdf",
+            "image_meta": [],
+            "id": known_pair_with_native_key_sentinel,
+        }
+        method_subclass_sentinel = "PRIVATE_METHOD_SUBCLASS_LEGACY_SENTINEL"
+        method_subclass_legacy = {
+            "name": "legacy.pdf",
+            "text": method_subclass_sentinel,
+            "images": [],
+            "method": _PrivateHashString(
+                "local_extraction",
+                method_subclass_sentinel,
+            ),
+            "id": method_subclass_sentinel,
+        }
+        malformed_source_type_manifests.extend((
+            (
+                "known_pair_with_native_key",
+                known_pair_with_native_key,
+                known_pair_with_native_key_sentinel,
+            ),
+            (
+                "method_subclass_legacy",
+                method_subclass_legacy,
+                method_subclass_sentinel,
+            ),
+        ))
+
+        def assert_strict_rejection(manifest, sentinel=None):
+            run = self._run_proposal([manifest], dry_run=False)
+            persist_call = (
+                run["firestore"].collection.return_value
+                .document.return_value
+                .collection.return_value
+                .document.return_value
+                .set
+            )
+            observable = repr((
+                run["client"].responses.create.call_args_list,
+                run["client"].files.create.call_args_list,
+                persist_call.call_args_list,
+                run["print_call"].call_args_list,
+            ))
+            print_observable = repr(run["print_call"].call_args_list)
+            self.assertEqual(
+                (None, 0, 0, 0, 0, False, True, False),
+                (
+                    run["proposal"],
+                    run["client"].responses.create.call_count,
+                    run["client"].files.create.call_count,
+                    run["usage_call"].call_count,
+                    persist_call.call_count,
+                    bool(sentinel and sentinel in observable),
+                    "Refusing malformed native-image attachment manifest"
+                    in print_observable,
+                    "Failed to propose sheet updates" in print_observable,
+                ),
+            )
+
         for label, manifest, sentinel in malformed_source_type_manifests:
             with self.subTest(case=label):
-                run = self._run_proposal([manifest], dry_run=False)
-                persist_call = (
-                    run["firestore"].collection.return_value
-                    .document.return_value
-                    .collection.return_value
-                    .document.return_value
-                    .set
-                )
-                observable = repr((
-                    run["client"].responses.create.call_args_list,
-                    run["client"].files.create.call_args_list,
-                    persist_call.call_args_list,
-                    run["print_call"].call_args_list,
-                ))
-                self.assertEqual(
-                    (None, 0, 0, 0, 0, False),
-                    (
-                        run["proposal"],
-                        run["client"].responses.create.call_count,
-                        run["client"].files.create.call_count,
-                        run["usage_call"].call_count,
-                        persist_call.call_count,
-                        sentinel in observable,
-                    ),
-                )
+                assert_strict_rejection(manifest, sentinel)
+
+        def legacy_mapping_values(sentinel):
+            return {
+                "name": "linked.pdf",
+                "text": sentinel,
+                "images": [],
+                "method": "local_extraction",
+                "source_type": "google_drive_pdf",
+                "id": sentinel,
+                "raw_filename": f"{sentinel}.pdf",
+            }
+
+        hostile_mapping_cases = []
+        for label, factory in (
+            (
+                "legacy_pair_dict_subclass",
+                lambda values, sentinel: _PrivateNativeManifestDict(values),
+            ),
+            (
+                "legacy_pair_user_dict",
+                lambda values, sentinel: UserDict(values),
+            ),
+            (
+                "legacy_pair_mapping_proxy",
+                lambda values, sentinel: MappingProxyType(values),
+            ),
+            (
+                "exploding_getter_object",
+                lambda values, sentinel: _ExplodingGetterManifest(sentinel),
+            ),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            hostile_mapping_cases.append((
+                label,
+                factory(legacy_mapping_values(sentinel), sentinel),
+                sentinel,
+            ))
+        hostile_mapping_cases.append(("none_manifest", None, None))
+
+        for label, manifest, sentinel in hostile_mapping_cases:
+            with self.subTest(hostile_mapping=label):
+                assert_strict_rejection(manifest, sentinel)
 
         legacy_page = base64.b64encode(
             _png_bytes(size=(4, 3))

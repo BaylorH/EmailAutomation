@@ -4376,8 +4376,6 @@ _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS = {
 
 def _is_native_image_manifest_candidate(manifest: Any) -> bool:
     """Recognize canonical or malformed entries that claim the native channel."""
-    if not isinstance(manifest, dict):
-        return False
     if type(manifest) is not dict:
         return True
     if any(
@@ -4400,9 +4398,11 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
             return False
         return True
 
-    return (
-        isinstance(method, str)
-        and str.startswith(str.casefold(method), "native_image")
+    if isinstance(method, str) and type(method) is not str:
+        return True
+    return type(method) is str and str.startswith(
+        str.casefold(method),
+        "native_image",
     )
 
 
