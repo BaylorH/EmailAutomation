@@ -4404,6 +4404,8 @@ def _bounded_attachment_routing_token(value: Any) -> Optional[str]:
         return None
     if len(value) > _ATTACHMENT_ROUTING_TOKEN_MAX_CHARS:
         return None
+    if not str.isascii(value):
+        return None
     folded = str.casefold(value)
     return "".join(
         character

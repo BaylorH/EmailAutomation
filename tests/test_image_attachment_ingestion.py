@@ -2977,6 +2977,10 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "unicode_confusable_native_method",
                 "nat\u0131ve_image_normalized",
             ),
+            (
+                "greek_omicron_native_method",
+                "native_image_n\u03bfrmalized",
+            ),
             ("unknown_method", "private_custom_parser"),
             ("unscoped_direct_image_method", "direct_image_link"),
         ):
@@ -3039,6 +3043,70 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                     "source_type": "public_pdf",
                     "method": "local_extraction+images",
                 },
+            ),
+            (
+                "greek_omicron_source_type_key",
+                "s\u03bfurce_type",
+                "native_image",
+                {"method": "local_extraction"},
+            ),
+            (
+                "greek_omicron_method_key",
+                "meth\u03bfd",
+                "native_image_normalized",
+                {},
+            ),
+            (
+                "cyrillic_i_property_binding_key",
+                "property_bind\u0456ng",
+                "target",
+                {"method": "local_extraction"},
+            ),
+            (
+                "cyrillic_i_binding_method_key",
+                "b\u0456nding_method",
+                "structured_filename_address",
+                {"method": "local_extraction"},
+            ),
+            (
+                "cyrillic_a_image_meta_key",
+                "image_met\u0430",
+                [],
+                {"method": "local_extraction"},
+            ),
+            (
+                "fullwidth_source_type_key",
+                "\uff53\uff4f\uff55\uff52\uff43\uff45\uff3f"
+                "\uff54\uff59\uff50\uff45",
+                "native_image",
+                {"method": "local_extraction"},
+            ),
+            (
+                "fullwidth_method_key",
+                "\uff4d\uff45\uff54\uff48\uff4f\uff44",
+                "native_image_normalized",
+                {},
+            ),
+            (
+                "fullwidth_property_binding_key",
+                "\uff50\uff52\uff4f\uff50\uff45\uff52\uff54\uff59\uff3f"
+                "\uff42\uff49\uff4e\uff44\uff49\uff4e\uff47",
+                "target",
+                {"method": "local_extraction"},
+            ),
+            (
+                "fullwidth_binding_method_key",
+                "\uff42\uff49\uff4e\uff44\uff49\uff4e\uff47\uff3f"
+                "\uff4d\uff45\uff54\uff48\uff4f\uff44",
+                "structured_filename_address",
+                {"method": "local_extraction"},
+            ),
+            (
+                "fullwidth_image_meta_key",
+                "\uff49\uff4d\uff41\uff47\uff45\uff3f"
+                "\uff4d\uff45\uff54\uff41",
+                [],
+                {"method": "local_extraction"},
             ),
         ):
             sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
