@@ -4406,6 +4406,7 @@ _LEGACY_ATTACHMENT_METHODS_WITHOUT_SOURCE_TYPE = frozenset({
 _LEGACY_DIRECT_IMAGE_EXTENSIONS = (
     ".png", ".jpg", ".jpeg", ".webp", ".gif",
 )
+_DIRECT_IMAGE_FALLBACK_NAME = "broker property image.png"
 _LINKED_PDF_PRODUCER_KEYS = frozenset({
     "name", "filename", "text", "images", "method", "file_id", "id",
     "source_url", "source_type", "drive_link",
@@ -4760,12 +4761,27 @@ def _has_direct_image_producer_shape(manifest: dict) -> bool:
     images = dict.get(manifest, "images")
     method = dict.get(manifest, "method")
     source_type = dict.get(manifest, "source_type")
+    raw_source_identity = _linked_source_url_identity(
+        dict.get(manifest, "source_url")
+    )
     source_identity = _linked_source_url_identity(
         dict.get(manifest, "source_url"),
-        empty_basename_fallback="broker property image.png",
+        empty_basename_fallback=_DIRECT_IMAGE_FALLBACK_NAME,
     )
     source_host = source_identity[0] if source_identity is not None else None
     source_name = source_identity[1] if source_identity is not None else None
+    raw_source_name = (
+        raw_source_identity[1]
+        if raw_source_identity is not None
+        else None
+    )
+    source_has_image_extension = (
+        type(raw_source_name) is str
+        and str.endswith(
+            str.casefold(raw_source_name),
+            _LEGACY_DIRECT_IMAGE_EXTENSIONS,
+        )
+    )
     reserved_generic_name = _is_reserved_native_image_generic_name(name)
     property_image_url = dict.get(manifest, "property_image_url")
     property_image_source_type = dict.get(
@@ -4794,8 +4810,12 @@ def _has_direct_image_producer_shape(manifest: dict) -> bool:
         or (
             reserved_generic_name
             and not (
-                source_host == "googleusercontent.com"
-                or source_host.endswith(".googleusercontent.com")
+                name == _DIRECT_IMAGE_FALLBACK_NAME
+                and (
+                    source_host == "googleusercontent.com"
+                    or source_host.endswith(".googleusercontent.com")
+                )
+                and not source_has_image_extension
             )
         )
         or (not reserved_generic_name and source_name != name)

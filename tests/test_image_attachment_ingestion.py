@@ -3577,6 +3577,52 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             arbitrary_direct_sentinel,
         ))
 
+        for label, name, source_url in (
+            (
+                "generic_jpg_name_for_opaque_google_source",
+                f"{GENERIC_IMAGE_NAME}.jpg",
+                "https://lh3.googleusercontent.com/p/"
+                "PRIVATE_GENERIC_JPG_OPAQUE_SENTINEL",
+            ),
+            (
+                "generic_png_name_for_suffixed_google_source",
+                f"{GENERIC_IMAGE_NAME}.png",
+                "https://lh3.googleusercontent.com/p/"
+                "PRIVATE_GENERIC_PNG_SUFFIXED_SENTINEL.jpg",
+            ),
+        ):
+            sentinel = source_url.rsplit("/", 1)[-1].removesuffix(".jpg")
+            malformed_source_type_manifests.append((
+                label,
+                {
+                    "name": name,
+                    "text": "",
+                    "images": [],
+                    "method": "direct_image_link",
+                    "source_type": "direct_image",
+                    "source_url": source_url,
+                    "drive_link": None,
+                    "property_image_url": (
+                        "https://drive.google.com/uc?export=view&id=impossible"
+                    ),
+                    "property_image_source": f"Broker image link: {name}",
+                    "property_image_source_type": "broker_image_link",
+                    "property_image_meta": {
+                        "strategy": "direct_image_link_v1",
+                        "selectionReason": (
+                            "broker-provided public image link"
+                        ),
+                        "contentType": "image/png",
+                        "byteCount": 17,
+                        "sha256": "9" * 64,
+                        "driveLink": (
+                            "https://drive.google.com/file/d/impossible/view"
+                        ),
+                    },
+                },
+                sentinel,
+            ))
+
         custom_value_sentinel = "PRIVATE_NESTED_CUSTOM_VALUE_SENTINEL"
         malformed_source_type_manifests.append((
             "legacy_nested_custom_value",
@@ -4322,6 +4368,78 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                     [
                         item.get("type")
                         for item in direct_image_content
+                        if item.get("type")
+                        in ("input_image", "input_file")
+                    ],
+                ),
+            )
+
+        normal_direct_image_url = (
+            "https://assets.example.test/normal-property-photo.jpg"
+        )
+        with mock.patch.object(
+            file_handling,
+            "_download_linked_asset",
+            return_value=(b"normal linked image fixture", "image/jpeg"),
+        ), mock.patch.object(
+            file_handling,
+            "_image_link_to_png_preview",
+            return_value=b"normalized normal linked image fixture",
+        ), mock.patch.object(
+            file_handling,
+            "upload_property_image_to_drive",
+            return_value={
+                "url": (
+                    "https://drive.google.com/uc?export=view&id=normal-image"
+                ),
+                "driveLink": (
+                    "https://drive.google.com/file/d/normal-image/view"
+                ),
+                "contentType": "image/png",
+                "byteCount": 38,
+                "sha256": "8" * 64,
+            },
+        ), mock.patch(
+            "builtins.print",
+        ):
+            normal_direct_manifest = (
+                file_handling.fetch_and_process_linked_assets(
+                    [normal_direct_image_url]
+                )
+            )
+
+        with self.subTest(
+            legacy_source_pair="actual_extension_direct_image"
+        ):
+            normal_direct_run = self._run_proposal(normal_direct_manifest)
+            normal_direct_content = (
+                normal_direct_run["client"].responses.create.call_args.kwargs
+                ["input"][0]["content"]
+                if normal_direct_run["client"].responses.create.call_count
+                else []
+            )
+            self.assertEqual(
+                (
+                    1,
+                    "normal-property-photo.jpg",
+                    "direct_image",
+                    "direct_image_link",
+                    True,
+                    1,
+                    0,
+                    [],
+                ),
+                (
+                    len(normal_direct_manifest),
+                    (normal_direct_manifest[0] or {}).get("name"),
+                    (normal_direct_manifest[0] or {}).get("source_type"),
+                    (normal_direct_manifest[0] or {}).get("method"),
+                    normal_direct_run["proposal"] is not None,
+                    normal_direct_run["client"].responses.create.call_count,
+                    normal_direct_run["client"].files.create.call_count,
+                    [
+                        item.get("type")
+                        for item in normal_direct_content
                         if item.get("type")
                         in ("input_image", "input_file")
                     ],
