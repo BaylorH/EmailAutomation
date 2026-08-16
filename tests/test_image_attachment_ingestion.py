@@ -1777,6 +1777,54 @@ class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
                     self._validate(filename, target=target)
                 )
 
+    def test_allows_compatibility_digits_only_in_structured_metadata(self):
+        target = "125 Main Road, Example City, Arizona 85001"
+        base = "125 Main Rd Example City AZ 85001"
+        accepted_suffixes = (
+            "photo \u2461",
+            "copy \u00b3",
+            "(\u00b2)",
+            "page \u2084",
+        )
+
+        for suffix in accepted_suffixes:
+            filename = f"{base} {suffix}.png"
+            with self.subTest(suffix=suffix, surface="classifier"):
+                self._assert_target(self._classify(filename, target=target))
+            with self.subTest(suffix=suffix, surface="batch"):
+                self.assertEqual(
+                    "accepted",
+                    self._validate(filename, target=target)["status"],
+                )
+
+        matching_filename = f"{base}.png"
+        competing_numbers = (
+            ("circled", "\u2460\u2461\u2462"),
+            ("superscript", "\u00b9\u00b2\u00b3"),
+            ("subscript", "\u2081\u2082\u2083"),
+        )
+        for label, competing_number in competing_numbers:
+            ranged = (
+                f"{competing_number}-125 Main Rd "
+                "Example City AZ 85001"
+            )
+            with self.subTest(label=label, surface="filename_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(f"{ranged}.png", target=target)
+                )
+            with self.subTest(label=label, surface="filename_batch"):
+                self._assert_unbound_batch(
+                    self._validate(f"{ranged}.png", target=target)
+                )
+            with self.subTest(label=label, surface="target_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(matching_filename, target=ranged)
+                )
+            with self.subTest(label=label, surface="target_batch"):
+                self._assert_unbound_batch(
+                    self._validate(matching_filename, target=ranged)
+                )
+
     def test_rejects_malformed_zip_plus_three(self):
         malformed_filename = (
             "123 N Sample Rd Example City AZ 85001-123.png"
