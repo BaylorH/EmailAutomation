@@ -8824,6 +8824,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                         authenticated_mailbox_email=authenticated_mailbox_email,
                     )
                     if has_attachments:
+                        msg["hasAttachments"] = True
                         process_inbox_message(
                             user_id,
                             headers,
