@@ -2581,6 +2581,180 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             with self.subTest(sentinel=sentinel):
                 self.assertNotIn(sentinel, observable)
 
+        mutating_manifest = self._single_manifest("sealed-snapshot")
+        mutating_batch = [mutating_manifest]
+        original_image = mutating_manifest["images"][0]
+        original_content_type = (
+            mutating_manifest["image_meta"][0]["content_type"]
+        )
+        original_source_bytes = (
+            mutating_manifest["image_meta"][0]["source_bytes"]
+        )
+        transport_sentinel = "PRIVATE_POST_PREFLIGHT_IMAGE_SENTINEL"
+        metadata_sentinel = "PRIVATE_POST_PREFLIGHT_META_SENTINEL"
+        attachment_sentinel = "PRIVATE_POST_PREFLIGHT_ATTACHMENT_SENTINEL"
+        mutated_source_bytes = (
+            file_handling.NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES + 1
+        )
+        original_project_preflighted = (
+            file_handling._project_preflighted_native_image_manifest
+        )
+        mutation_calls = []
+
+        def mutate_source_after_preflight(preflight):
+            mutation_calls.append(preflight)
+            if len(mutation_calls) == 1:
+                mutating_manifest["images"].extend(
+                    [transport_sentinel] * 3
+                )
+                mutating_manifest["image_meta"][0]["content_type"] = (
+                    metadata_sentinel
+                )
+                mutating_manifest["image_meta"][0]["source_bytes"] = (
+                    mutated_source_bytes
+                )
+                mutating_batch.append({
+                    "name": f"{attachment_sentinel}.pdf",
+                    "text": attachment_sentinel,
+                    "images": [],
+                    "method": "local_extraction",
+                })
+            return original_project_preflighted(preflight)
+
+        with mock.patch.object(
+            file_handling,
+            "_project_preflighted_native_image_manifest",
+            side_effect=mutate_source_after_preflight,
+        ):
+            sealed_run = self._run_proposal(
+                mutating_batch,
+                output_text=(
+                    '{"updates": [{"column": "Total SF", '
+                    '"value": "20000", "confidence": 0.98, '
+                    '"reason": "Visible in target image."}], '
+                    '"events": [], "response_email": null, "notes": ""}'
+                ),
+                dry_run=False,
+            )
+
+        sealed_request_content = (
+            sealed_run["client"].responses.create.call_args.kwargs["input"]
+            [0]["content"]
+        )
+        sealed_persist_call = (
+            sealed_run["firestore"].collection.return_value
+            .document.return_value
+            .collection.return_value
+            .document.return_value
+            .set
+        )
+        sealed_persisted = sealed_persist_call.call_args.args[0]
+        sealed_observable = repr((
+            sealed_request_content,
+            sealed_persisted,
+            sealed_run["print_call"].call_args_list,
+        ))
+        with self.subTest(snapshot="post_preflight_source_mutation"):
+            self.assertEqual(
+                (
+                    [f"data:image/png;base64,{original_image}"],
+                    original_content_type,
+                    original_source_bytes,
+                    ["20000"],
+                    1,
+                    0,
+                    1,
+                    1,
+                    False,
+                    False,
+                    1,
+                    4,
+                    metadata_sentinel,
+                    mutated_source_bytes,
+                    2,
+                    1,
+                    True,
+                    1,
+                    False,
+                ),
+                (
+                    [
+                        item["image_url"]
+                        for item in sealed_request_content
+                        if item.get("type") == "input_image"
+                    ],
+                    sealed_persisted["pdfManifest"][0]["image_meta"]
+                    [0]["content_type"],
+                    sealed_persisted["pdfManifest"][0]["image_meta"]
+                    [0]["source_bytes"],
+                    [
+                        update.get("value")
+                        for update in (
+                            sealed_run["proposal"] or {}
+                        ).get("updates", [])
+                    ],
+                    sealed_run["client"].responses.create.call_count,
+                    sealed_run["client"].files.create.call_count,
+                    sealed_run["usage_call"].call_count,
+                    sealed_persist_call.call_count,
+                    transport_sentinel in sealed_observable,
+                    metadata_sentinel in sealed_observable,
+                    len(mutation_calls),
+                    len(mutating_manifest["images"]),
+                    mutating_manifest["image_meta"][0]["content_type"],
+                    mutating_manifest["image_meta"][0]["source_bytes"],
+                    len(mutating_batch),
+                    sealed_run["usage_call"].call_args.kwargs["metadata"]
+                    ["pdfCount"],
+                    sealed_run["usage_call"].call_args.kwargs["metadata"]
+                    ["hasPdfManifest"],
+                    len(sealed_persisted["pdfManifest"]),
+                    attachment_sentinel in sealed_observable,
+                ),
+            )
+
+        cycle_manifest = self._single_manifest("single-cycle")
+        with mock.patch.object(
+            file_handling.base64,
+            "b64decode",
+            wraps=file_handling.base64.b64decode,
+        ) as decode_call, mock.patch.object(
+            file_handling,
+            "_inspect_native_image_header",
+            wraps=file_handling._inspect_native_image_header,
+        ) as header_call, mock.patch.object(
+            file_handling,
+            "_inspect_native_image_pillow_format",
+            wraps=file_handling._inspect_native_image_pillow_format,
+        ) as pillow_call, mock.patch.object(
+            file_handling.hashlib,
+            "sha256",
+            wraps=file_handling.hashlib.sha256,
+        ) as hash_call, mock.patch.object(
+            file_handling,
+            "_verify_native_image",
+            wraps=file_handling._verify_native_image,
+        ) as verify_call, mock.patch.object(
+            file_handling,
+            "_normalize_native_image",
+            wraps=file_handling._normalize_native_image,
+        ) as normalize_call:
+            cycle_run = self._run_proposal([cycle_manifest])
+
+        with self.subTest(snapshot="single_validation_cycle"):
+            self.assertEqual(
+                (1, 1, 1, 1, 1, 1, 1),
+                (
+                    decode_call.call_count,
+                    header_call.call_count,
+                    pillow_call.call_count,
+                    hash_call.call_count,
+                    verify_call.call_count,
+                    normalize_call.call_count,
+                    cycle_run["client"].responses.create.call_count,
+                ),
+            )
+
     def test_malformed_native_manifest_fails_before_model_or_persistence(self):
         wrong_binding = self._single_manifest("wrong-binding")
         wrong_binding["property_binding"] = "competing"

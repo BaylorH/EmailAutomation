@@ -4456,7 +4456,7 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
 
 def _prepare_ai_attachment_manifest(
     pdf_manifest: Optional[List[dict]],
-) -> Optional[List[Tuple[dict, Optional[dict]]]]:
+) -> Optional[List[Tuple[Optional[dict], Optional[Any]]]]:
     """Validate native entries while leaving legacy PDF entries unchanged."""
     attachments = list(pdf_manifest or [])
     native_positions = []
@@ -4466,17 +4466,21 @@ def _prepare_ai_attachment_manifest(
             native_positions.append(position)
             native_manifests.append(attachment)
 
-    native_projections = _file_handling.project_safe_native_image_manifests(
+    prepared_natives = _file_handling._prepare_safe_native_image_manifests(
         native_manifests
     )
-    if native_projections is None:
+    if prepared_natives is None:
         return None
-    projection_by_position = dict(zip(
+    prepared_by_position = dict(zip(
         native_positions,
-        native_projections,
+        prepared_natives,
     ))
     return [
-        (attachment, projection_by_position.get(position))
+        (
+            (None, prepared_by_position[position])
+            if position in prepared_by_position
+            else (attachment, None)
+        )
         for position, attachment in enumerate(attachments)
     ]
 
@@ -4544,7 +4548,10 @@ def _suppress_competing_attachment_updates(
     proposal: dict,
     conversation: List[dict],
     target_anchor: str,
-    pdf_manifest: List[dict],
+    pdf_manifest: Optional[List[dict]],
+    prepared_attachment_manifest: Optional[
+        List[Tuple[Optional[dict], Optional[Any]]]
+    ] = None,
 ) -> dict:
     """Keep mixed attachment evidence from leaking onto the current row.
 
@@ -4552,14 +4559,24 @@ def _suppress_competing_attachment_updates(
     or mixed, every proposed value must also occur in a target-bound source
     segment (or target-bound fresh message segment) before it can survive.
     """
-    if not proposal or not pdf_manifest:
+    attachment_entries = (
+        prepared_attachment_manifest
+        if prepared_attachment_manifest is not None
+        else [(pdf, None) for pdf in (pdf_manifest or [])]
+    )
+    if not proposal or not attachment_entries:
         return proposal
 
     fresh_text = _fresh_inbound_text(conversation)
-    multiple_attachments = len(pdf_manifest) > 1
+    multiple_attachments = len(attachment_entries) > 1
     classified_sources = []
     has_valid_native = False
-    for pdf in pdf_manifest:
+    for pdf, prepared_native in attachment_entries:
+        if prepared_native is not None:
+            has_valid_native = True
+            classified_sources.append(("", "target"))
+            continue
+
         if _is_native_image_manifest_candidate(pdf):
             native_projection = project_safe_native_image_manifest(pdf)
             has_valid_native = has_valid_native or native_projection is not None
@@ -6369,8 +6386,12 @@ def propose_sheet_updates(uid: str,
             print("❌ Refusing malformed native-image attachment manifest")
             return None
         analysis_attachment_manifest = [
-            safe_projection if safe_projection is not None else attachment
-            for attachment, safe_projection in prepared_attachment_manifest
+            (
+                prepared_native.safe_projection()
+                if prepared_native is not None
+                else attachment
+            )
+            for attachment, prepared_native in prepared_attachment_manifest
         ]
 
         COLUMN_RULES = build_column_rules_prompt(effective_config)
@@ -6813,18 +6834,18 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
 {json.dumps(conversation, indent=2)}
 """.rstrip()]
 
-        native_projections = [
-            safe_projection
-            for _, safe_projection in prepared_attachment_manifest
-            if safe_projection is not None
+        prepared_natives = [
+            prepared_native
+            for _, prepared_native in prepared_attachment_manifest
+            if prepared_native is not None
         ]
-        if native_projections:
-            for attachment_index, (attachment, projection) in enumerate(
+        if prepared_natives:
+            for attachment_index, (attachment, prepared_native) in enumerate(
                 prepared_attachment_manifest,
                 start=1,
             ):
-                if projection is not None:
-                    image_count = len(projection["image_meta"])
+                if prepared_native is not None:
+                    image_count = len(prepared_native.image_meta)
                     prompt_parts.append(
                         "\n\n=== NATIVE IMAGE ATTACHMENTS ==="
                     )
@@ -6879,8 +6900,8 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
             # PDF attachments - include extracted text directly in prompt
             legacy_pdf_entries = [
                 attachment
-                for attachment, safe_projection in prepared_attachment_manifest
-                if safe_projection is None
+                for attachment, prepared_native in prepared_attachment_manifest
+                if prepared_native is None
             ]
             if legacy_pdf_entries:
                 prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
@@ -6947,11 +6968,12 @@ OUTPUT ONLY valid JSON in this exact format:
 
         # Add native images inline and retain the existing PDF request behavior.
         if prepared_attachment_manifest:
-            for pdf, native_projection in prepared_attachment_manifest:
-                images = pdf.get("images") or []
-
-                if native_projection is not None:
-                    for image_number, img_b64 in enumerate(images, start=1):
+            for pdf, prepared_native in prepared_attachment_manifest:
+                if prepared_native is not None:
+                    for image_number, img_b64 in enumerate(
+                        prepared_native.images,
+                        start=1,
+                    ):
                         input_content.append({
                             "type": "input_image",
                             "image_url": f"data:image/png;base64,{img_b64}",
@@ -6962,6 +6984,7 @@ OUTPUT ONLY valid JSON in this exact format:
                         )
                     continue
 
+                images = pdf.get("images") or []
                 name = pdf.get("name", "PDF")
 
                 # Add images for vision (pages with little extractable text)
@@ -7001,8 +7024,8 @@ OUTPUT ONLY valid JSON in this exact format:
                     "rowNumber": rownum,
                     "headerCount": len(header or []),
                     "conversationMessageCount": len(conversation or []),
-                    "hasPdfManifest": bool(pdf_manifest),
-                    "pdfCount": len(pdf_manifest or []),
+                    "hasPdfManifest": bool(prepared_attachment_manifest),
+                    "pdfCount": len(prepared_attachment_manifest),
                     "urlTextCount": len(url_texts or []),
                     "configuredExtractionFieldCount": len(extraction_fields or []),
                 },
@@ -7092,10 +7115,8 @@ OUTPUT ONLY valid JSON in this exact format:
             proposal,
             conversation,
             target_anchor,
-            [
-                attachment
-                for attachment, _ in prepared_attachment_manifest
-            ],
+            None,
+            prepared_attachment_manifest=prepared_attachment_manifest,
         )
 
         # ---- Log + store in sheetChangeLog -----------------------------------
@@ -7137,17 +7158,17 @@ OUTPUT ONLY valid JSON in this exact format:
                 "status": "proposed",
                 "threadId": thread_id,
                 "pdfManifest": [
-                    safe_projection
-                    if safe_projection is not None
+                    prepared_native.safe_projection()
+                    if prepared_native is not None
                     else {k: v for k, v in attachment.items() if k != "images"}
-                    for attachment, safe_projection
+                    for attachment, prepared_native
                     in prepared_attachment_manifest
                 ],
                 "fileIds": [
                     attachment["id"]
-                    for attachment, safe_projection
+                    for attachment, prepared_native
                     in prepared_attachment_manifest
-                    if safe_projection is None and attachment.get("id")
+                    if prepared_native is None and attachment.get("id")
                 ],
                 "urlTexts": url_texts or [],
                 "createdAt": SERVER_TIMESTAMP

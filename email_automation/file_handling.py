@@ -8,6 +8,7 @@ import requests
 import socket
 import tempfile
 import unicodedata
+from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import unquote, urljoin, urlparse
 from googleapiclient.discovery import build
@@ -1145,9 +1146,73 @@ def build_native_image_manifest_entry(
     }
 
 
+@dataclass(frozen=True)
+class _NativeImageMetadataSnapshot:
+    content_type: str
+    width: int
+    height: int
+    source_bytes: int
+    normalized_bytes: int
+    normalized_sha256: str
+
+    def safe_projection(self) -> Dict[str, Any]:
+        safe_values = {
+            "content_type": self.content_type,
+            "width": self.width,
+            "height": self.height,
+            "source_bytes": self.source_bytes,
+            "normalized_bytes": self.normalized_bytes,
+            "normalized_sha256": self.normalized_sha256,
+        }
+        return {
+            key: safe_values[key]
+            for key in _NATIVE_IMAGE_SAFE_META_KEYS
+        }
+
+
+@dataclass(frozen=True)
+class _NativeImagePreflightAsset:
+    encoded_image: str
+    metadata: _NativeImageMetadataSnapshot
+    projected_decoded_size: int
+
+
+@dataclass(frozen=True)
+class _NativeImageManifestPreflight:
+    images: Tuple[_NativeImagePreflightAsset, ...]
+    source_bytes: int
+    normalized_bytes: int
+
+
+@dataclass(frozen=True)
+class _PreparedNativeImageManifest:
+    """Validated immutable transport plus fresh safe audit projections."""
+
+    images: Tuple[str, ...]
+    image_meta: Tuple[_NativeImageMetadataSnapshot, ...]
+
+    def safe_projection(self) -> Dict[str, Any]:
+        safe_values = {
+            "name": _NATIVE_IMAGE_GENERIC_NAME,
+            "text": "",
+            "method": "native_image_normalized",
+            "source_type": "native_image",
+            "property_binding": "target",
+            "binding_method": "structured_filename_address",
+            "image_meta": [
+                metadata.safe_projection()
+                for metadata in self.image_meta
+            ],
+        }
+        return {
+            key: safe_values[key]
+            for key in _NATIVE_IMAGE_SAFE_MANIFEST_KEYS
+        }
+
+
 def _preflight_native_image_manifest_metadata(
     manifest: Any,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[_NativeImageManifestPreflight]:
     """Validate bounded manifest metadata without decoding image payloads."""
     if type(manifest) is not dict:
         return None
@@ -1178,8 +1243,8 @@ def _preflight_native_image_manifest_metadata(
     ):
         return None
 
-    # These are bounded references to at most three existing strings/dicts; no
-    # encoded or decoded payload is copied during this request-wide first pass.
+    # Snapshot only bounded immutable scalars. No source mapping or mutable list
+    # reference survives this request-wide first pass.
     preflight_images = []
     aggregate_source_bytes = 0
     aggregate_normalized_bytes = 0
@@ -1226,25 +1291,36 @@ def _preflight_native_image_manifest_metadata(
 
         aggregate_source_bytes += source_bytes
         aggregate_normalized_bytes += projected_decoded_size
-        preflight_images.append((
-            encoded_image,
-            metadata,
-            projected_decoded_size,
+        preflight_images.append(_NativeImagePreflightAsset(
+            encoded_image=encoded_image,
+            metadata=_NativeImageMetadataSnapshot(
+                content_type=content_type,
+                width=width,
+                height=height,
+                source_bytes=source_bytes,
+                normalized_bytes=normalized_bytes,
+                normalized_sha256=normalized_sha256,
+            ),
+            projected_decoded_size=projected_decoded_size,
         ))
 
-    return {
-        "images": preflight_images,
-        "source_bytes": aggregate_source_bytes,
-        "normalized_bytes": aggregate_normalized_bytes,
-    }
+    return _NativeImageManifestPreflight(
+        images=tuple(preflight_images),
+        source_bytes=aggregate_source_bytes,
+        normalized_bytes=aggregate_normalized_bytes,
+    )
 
 
 def _project_preflighted_native_image_manifest(
-    preflight: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+    preflight: _NativeImageManifestPreflight,
+) -> Optional[_PreparedNativeImageManifest]:
     """Fully validate one manifest after all request-wide bounds pass."""
     safe_meta = []
-    for encoded_image, metadata, projected_decoded_size in preflight["images"]:
+    transport_images = []
+    for asset in preflight.images:
+        encoded_image = asset.encoded_image
+        metadata = asset.metadata
+        projected_decoded_size = asset.projected_decoded_size
         try:
             normalized_data = _strict_native_image_base64_decode(
                 encoded_image,
@@ -1252,10 +1328,10 @@ def _project_preflighted_native_image_manifest(
             )
         except ValueError:
             return None
-        width = metadata["width"]
-        height = metadata["height"]
-        normalized_bytes = metadata["normalized_bytes"]
-        normalized_sha256 = metadata["normalized_sha256"]
+        width = metadata.width
+        height = metadata.height
+        normalized_bytes = metadata.normalized_bytes
+        normalized_sha256 = metadata.normalized_sha256
         if (
             len(normalized_data) != normalized_bytes
             or hashlib.sha256(normalized_data).hexdigest()
@@ -1304,30 +1380,19 @@ def _project_preflighted_native_image_manifest(
         ):
             return None
 
-        safe_meta.append({
-            key: metadata[key]
-            for key in _NATIVE_IMAGE_SAFE_META_KEYS
-        })
+        transport_images.append(encoded_image)
+        safe_meta.append(metadata)
 
-    safe_values = {
-        "name": _NATIVE_IMAGE_GENERIC_NAME,
-        "text": "",
-        "method": "native_image_normalized",
-        "source_type": "native_image",
-        "property_binding": "target",
-        "binding_method": "structured_filename_address",
-        "image_meta": safe_meta,
-    }
-    return {
-        key: safe_values[key]
-        for key in _NATIVE_IMAGE_SAFE_MANIFEST_KEYS
-    }
+    return _PreparedNativeImageManifest(
+        images=tuple(transport_images),
+        image_meta=tuple(safe_meta),
+    )
 
 
-def project_safe_native_image_manifests(
+def _prepare_safe_native_image_manifests(
     manifests: List[Dict[str, Any]],
-) -> Optional[List[Dict[str, Any]]]:
-    """Project a request batch only after metadata-only global preflight."""
+) -> Optional[Tuple[_PreparedNativeImageManifest, ...]]:
+    """Seal a request batch only after metadata-only global preflight."""
     if type(manifests) is not list:
         return None
 
@@ -1339,9 +1404,9 @@ def project_safe_native_image_manifests(
         preflight = _preflight_native_image_manifest_metadata(manifest)
         if preflight is None:
             return None
-        aggregate_asset_count += len(preflight["images"])
-        aggregate_source_bytes += preflight["source_bytes"]
-        aggregate_normalized_bytes += preflight["normalized_bytes"]
+        aggregate_asset_count += len(preflight.images)
+        aggregate_source_bytes += preflight.source_bytes
+        aggregate_normalized_bytes += preflight.normalized_bytes
         if (
             aggregate_asset_count > NATIVE_IMAGE_MAX_COUNT
             or aggregate_source_bytes > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
@@ -1351,13 +1416,23 @@ def project_safe_native_image_manifests(
             return None
         preflighted.append(preflight)
 
-    projections = []
+    prepared = []
     for preflight in preflighted:
-        projection = _project_preflighted_native_image_manifest(preflight)
-        if projection is None:
+        sealed_manifest = _project_preflighted_native_image_manifest(preflight)
+        if sealed_manifest is None:
             return None
-        projections.append(projection)
-    return projections
+        prepared.append(sealed_manifest)
+    return tuple(prepared)
+
+
+def project_safe_native_image_manifests(
+    manifests: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Validate a request batch and return fresh safe audit projections."""
+    prepared = _prepare_safe_native_image_manifests(manifests)
+    if prepared is None:
+        return None
+    return [manifest.safe_projection() for manifest in prepared]
 
 
 def project_safe_native_image_manifest(
