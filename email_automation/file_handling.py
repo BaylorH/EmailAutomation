@@ -38,10 +38,406 @@ except ImportError:
     print("⚠️ PyMuPDF not installed - PDF image extraction limited")
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
     HAS_PILLOW = True
 except ImportError:
     HAS_PILLOW = False
+
+
+NATIVE_IMAGE_FILE_ATTACHMENT_TYPE = "#microsoft.graph.fileAttachment"
+NATIVE_IMAGE_EXTENSION_MIME_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+}
+NATIVE_IMAGE_MIME_FORMATS = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+}
+NATIVE_IMAGE_MAX_COUNT = 3
+NATIVE_IMAGE_MAX_SOURCE_BYTES = 10 * 1024 * 1024
+NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES = 20 * 1024 * 1024
+NATIVE_IMAGE_MAX_PIXELS = 20_000_000
+NATIVE_IMAGE_MAX_EDGE = 1400
+
+_NATIVE_IMAGE_GENERIC_NAME = "Broker property image"
+_NATIVE_IMAGE_FAILURE_PRECEDENCE = (
+    "image_attachment_too_many",
+    "image_attachment_too_large",
+    "image_attachment_type_mismatch",
+    "image_attachment_invalid_base64",
+    "image_attachment_bad_magic",
+    "image_attachment_decode_failed",
+)
+_NATIVE_IMAGE_STRICT_BASE64_RE = re.compile(
+    rb"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
+)
+_NATIVE_IMAGE_JPEG_SOF_MARKERS = frozenset(
+    (
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    )
+)
+
+
+def _native_image_failure(code: str) -> Dict[str, Any]:
+    return {
+        "status": "quarantined",
+        "assets": [],
+        "failure": {
+            "name": _NATIVE_IMAGE_GENERIC_NAME,
+            "code": code,
+        },
+    }
+
+
+def _select_native_image_failure(codes) -> Optional[str]:
+    present = set(codes or [])
+    for code in _NATIVE_IMAGE_FAILURE_PRECEDENCE:
+        if code in present:
+            return code
+    return None
+
+
+def _native_image_size_failure(
+    decoded_sizes: List[int],
+    pixel_counts: List[int],
+) -> Optional[str]:
+    if any(size > NATIVE_IMAGE_MAX_SOURCE_BYTES for size in decoded_sizes):
+        return "image_attachment_too_large"
+    if sum(decoded_sizes) > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES:
+        return "image_attachment_too_large"
+    if any(pixel_count > NATIVE_IMAGE_MAX_PIXELS for pixel_count in pixel_counts):
+        return "image_attachment_too_large"
+    return None
+
+
+def _strict_native_image_base64_payload(value: Any) -> Tuple[bytes, int]:
+    if isinstance(value, str):
+        try:
+            encoded = value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("invalid base64") from exc
+    elif isinstance(value, (bytes, bytearray)):
+        encoded = bytes(value)
+    else:
+        raise ValueError("invalid base64")
+
+    if not _NATIVE_IMAGE_STRICT_BASE64_RE.fullmatch(encoded):
+        raise ValueError("invalid base64")
+
+    padding = 2 if encoded.endswith(b"==") else 1 if encoded.endswith(b"=") else 0
+    decoded_size = (len(encoded) // 4) * 3 - padding
+    return encoded, decoded_size
+
+
+def _native_image_magic_format(content: bytes) -> Optional[str]:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "JPEG"
+    return None
+
+
+def _inspect_native_image_header(content: bytes) -> Tuple[str, int, int]:
+    image_format = _native_image_magic_format(content)
+    if image_format == "PNG":
+        if len(content) < 24 or content[12:16] != b"IHDR":
+            raise ValueError("invalid PNG header")
+        width = int.from_bytes(content[16:20], "big")
+        height = int.from_bytes(content[20:24], "big")
+        return image_format, width, height
+
+    if image_format == "JPEG":
+        offset = 2
+        while offset < len(content):
+            while offset < len(content) and content[offset] != 0xFF:
+                offset += 1
+            while offset < len(content) and content[offset] == 0xFF:
+                offset += 1
+            if offset >= len(content):
+                break
+
+            marker = content[offset]
+            offset += 1
+            if marker in (0x01, 0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                continue
+            if offset + 2 > len(content):
+                break
+            segment_length = int.from_bytes(content[offset:offset + 2], "big")
+            if segment_length < 2 or offset + segment_length > len(content):
+                break
+            if marker in _NATIVE_IMAGE_JPEG_SOF_MARKERS:
+                if segment_length < 7:
+                    break
+                height = int.from_bytes(content[offset + 3:offset + 5], "big")
+                width = int.from_bytes(content[offset + 5:offset + 7], "big")
+                return image_format, width, height
+            if marker == 0xDA:
+                break
+            offset += segment_length
+
+    raise ValueError("invalid image header")
+
+
+def _inspect_native_image_pillow_format(content: bytes) -> str:
+    if not HAS_PILLOW:
+        raise RuntimeError("Pillow unavailable")
+    with Image.open(io.BytesIO(content)) as image:
+        return str(image.format or "").upper()
+
+
+def _verify_native_image(content: bytes) -> None:
+    if not HAS_PILLOW:
+        raise RuntimeError("Pillow unavailable")
+    with Image.open(io.BytesIO(content)) as image:
+        image.verify()
+
+
+def _normalize_native_image(content: bytes) -> Tuple[bytes, int, int]:
+    if not HAS_PILLOW:
+        raise RuntimeError("Pillow unavailable")
+
+    with Image.open(io.BytesIO(content)) as source:
+        oriented = ImageOps.exif_transpose(source)
+        oriented.load()
+        if max(oriented.size) > NATIVE_IMAGE_MAX_EDGE:
+            oriented.thumbnail(
+                (NATIVE_IMAGE_MAX_EDGE, NATIVE_IMAGE_MAX_EDGE),
+                Image.Resampling.LANCZOS,
+            )
+
+        rgba = oriented.convert("RGBA")
+        alpha_minimum, _ = rgba.getchannel("A").getextrema()
+        normalized_mode = "RGBA" if alpha_minimum < 255 else "RGB"
+        normalized_pixels = (
+            rgba if normalized_mode == "RGBA" else oriented.convert("RGB")
+        )
+        pixel_only = Image.frombytes(
+            normalized_mode,
+            normalized_pixels.size,
+            normalized_pixels.tobytes(),
+        )
+
+    output = io.BytesIO()
+    pixel_only.save(
+        output,
+        format="PNG",
+        optimize=False,
+        compress_level=9,
+    )
+    normalized_bytes = output.getvalue()
+    width, height = pixel_only.size
+    pixel_only.close()
+    return normalized_bytes, int(width), int(height)
+
+
+def _native_image_candidate(attachment: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(attachment, dict):
+        return None
+    if attachment.get("@odata.type") != NATIVE_IMAGE_FILE_ATTACHMENT_TYPE:
+        return None
+    if attachment.get("isInline") is True:
+        return None
+
+    raw_name = attachment.get("name")
+    name = raw_name if isinstance(raw_name, str) else ""
+    extension = os.path.splitext(name)[1].lower()
+    raw_content_type = attachment.get("contentType")
+    content_type = (
+        raw_content_type.strip().lower()
+        if isinstance(raw_content_type, str)
+        else ""
+    )
+    if (
+        extension not in NATIVE_IMAGE_EXTENSION_MIME_TYPES
+        and content_type not in NATIVE_IMAGE_MIME_FORMATS
+    ):
+        return None
+
+    return {
+        "extension": extension,
+        "content_type": content_type,
+        "content_bytes": attachment.get("contentBytes"),
+    }
+
+
+def validate_and_normalize_native_image_content_batch(
+    attachments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return binding-neutral normalized native-image content or one failure."""
+    candidates = [
+        candidate
+        for candidate in (
+            _native_image_candidate(attachment)
+            for attachment in (attachments or [])
+        )
+        if candidate is not None
+    ]
+
+    if len(candidates) > NATIVE_IMAGE_MAX_COUNT:
+        return _native_image_failure("image_attachment_too_many")
+
+    errors = set()
+    decoded_sizes: List[int] = []
+    prepared = []
+    for candidate in candidates:
+        expected_mime = NATIVE_IMAGE_EXTENSION_MIME_TYPES.get(
+            candidate["extension"]
+        )
+        types_match = bool(
+            expected_mime and expected_mime == candidate["content_type"]
+        )
+        if not types_match:
+            errors.add("image_attachment_type_mismatch")
+
+        try:
+            encoded, decoded_size = _strict_native_image_base64_payload(
+                candidate["content_bytes"]
+            )
+        except ValueError:
+            errors.add("image_attachment_invalid_base64")
+            encoded = None
+            decoded_size = None
+
+        if decoded_size is not None:
+            decoded_sizes.append(decoded_size)
+        prepared.append(
+            {
+                **candidate,
+                "expected_mime": expected_mime,
+                "types_match": types_match,
+                "encoded": encoded,
+                "decoded_size": decoded_size,
+            }
+        )
+
+    size_failure = _native_image_size_failure(decoded_sizes, [])
+    if size_failure:
+        return _native_image_failure(size_failure)
+
+    decoded = []
+    for candidate in prepared:
+        if candidate["encoded"] is None:
+            continue
+        try:
+            content = base64.b64decode(candidate["encoded"], validate=True)
+        except Exception:
+            errors.add("image_attachment_invalid_base64")
+            continue
+        if len(content) != candidate["decoded_size"]:
+            errors.add("image_attachment_invalid_base64")
+            continue
+
+        expected_format = NATIVE_IMAGE_MIME_FORMATS.get(
+            candidate["expected_mime"]
+        ) or NATIVE_IMAGE_MIME_FORMATS.get(candidate["content_type"])
+        magic_format = _native_image_magic_format(content)
+        if magic_format is None:
+            errors.add("image_attachment_bad_magic")
+            continue
+        magic_matches_expected = magic_format == expected_format
+        if candidate["types_match"] and not magic_matches_expected:
+            errors.add("image_attachment_bad_magic")
+        decoded.append(
+            {
+                **candidate,
+                "content": content,
+                "expected_format": expected_format,
+                "magic_matches_expected": magic_matches_expected,
+            }
+        )
+
+    pixel_counts: List[int] = []
+    inspected = []
+    for candidate in decoded:
+        try:
+            image_format, width, height = _inspect_native_image_header(
+                candidate["content"]
+            )
+        except Exception:
+            errors.add("image_attachment_decode_failed")
+            continue
+        if width <= 0 or height <= 0:
+            errors.add("image_attachment_decode_failed")
+            continue
+        if (
+            candidate["magic_matches_expected"]
+            and image_format != candidate["expected_format"]
+        ):
+            errors.add("image_attachment_type_mismatch")
+        pixel_counts.append(width * height)
+        inspected.append(candidate)
+
+    size_failure = _native_image_size_failure(decoded_sizes, pixel_counts)
+    if size_failure:
+        errors.add(size_failure)
+    first_failure = _select_native_image_failure(errors)
+    if first_failure:
+        return _native_image_failure(first_failure)
+
+    for candidate in inspected:
+        try:
+            pillow_format = _inspect_native_image_pillow_format(
+                candidate["content"]
+            )
+        except Exception:
+            errors.add("image_attachment_decode_failed")
+            continue
+        if pillow_format != candidate["expected_format"]:
+            errors.add("image_attachment_type_mismatch")
+
+    first_failure = _select_native_image_failure(errors)
+    if first_failure:
+        return _native_image_failure(first_failure)
+
+    for candidate in inspected:
+        try:
+            _verify_native_image(candidate["content"])
+        except Exception:
+            errors.add("image_attachment_decode_failed")
+
+    first_failure = _select_native_image_failure(errors)
+    if first_failure:
+        return _native_image_failure(first_failure)
+
+    assets = []
+    for candidate in inspected:
+        try:
+            normalized_data, width, height = _normalize_native_image(
+                candidate["content"]
+            )
+        except Exception:
+            errors.add("image_attachment_decode_failed")
+            continue
+        assets.append(
+            {
+                "name": _NATIVE_IMAGE_GENERIC_NAME,
+                "content_type": "image/png",
+                "data": normalized_data,
+                "width": width,
+                "height": height,
+                "source_bytes": len(candidate["content"]),
+                "normalized_bytes": len(normalized_data),
+                "normalized_sha256": hashlib.sha256(normalized_data).hexdigest(),
+            }
+        )
+
+    first_failure = _select_native_image_failure(errors)
+    if first_failure:
+        return _native_image_failure(first_failure)
+    return {"status": "accepted", "assets": assets}
 
 def extract_pdf_text(content: bytes, filename: str = "document.pdf") -> Tuple[str, List[bytes]]:
     """
