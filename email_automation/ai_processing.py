@@ -4347,11 +4347,31 @@ _ATTACHMENT_COPY_SUFFIX_RE = re.compile(
 )
 
 _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS = frozenset({
-    "source_type",
     "property_binding",
     "binding_method",
     "image_meta",
 })
+_LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS = {
+    "google_drive_pdf": frozenset({
+        "local_extraction",
+        "local_extraction+images",
+        "openai_upload",
+        "openai_upload+images",
+    }),
+    "dropbox_pdf": frozenset({
+        "local_extraction",
+        "local_extraction+images",
+        "openai_upload",
+        "openai_upload+images",
+    }),
+    "public_pdf": frozenset({
+        "local_extraction",
+        "local_extraction+images",
+        "openai_upload",
+        "openai_upload+images",
+    }),
+    "direct_image": frozenset({"direct_image_link"}),
+}
 
 
 def _is_native_image_manifest_candidate(manifest: Any) -> bool:
@@ -4367,6 +4387,19 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
         return True
 
     method = dict.get(manifest, "method")
+    if dict.__contains__(manifest, "source_type"):
+        source_type = dict.get(manifest, "source_type")
+        if (
+            type(source_type) is str
+            and type(method) is str
+            and method in _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS.get(
+                source_type,
+                (),
+            )
+        ):
+            return False
+        return True
+
     return (
         isinstance(method, str)
         and str.startswith(str.casefold(method), "native_image")

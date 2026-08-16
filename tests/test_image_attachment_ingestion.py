@@ -2640,20 +2640,51 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             routing_sentinels[label] = sentinel
 
         malformed_source_type_manifests = []
-        for label, marker in (
-            ("space_prefixed_native_marker", " native_image"),
-            ("tab_prefixed_native_marker", "\tnative_image"),
-            ("hyphenated_native_marker", "native-image"),
-            ("bytes_native_marker", b"native_image"),
+        for label, marker, method in (
+            (
+                "space_prefixed_native_marker",
+                " native_image",
+                "openai_upload",
+            ),
+            (
+                "tab_prefixed_native_marker",
+                "\tnative_image",
+                "openai_upload",
+            ),
+            (
+                "hyphenated_native_marker",
+                "native-image",
+                "openai_upload",
+            ),
+            ("bytes_native_marker", b"native_image", "openai_upload"),
+            ("failed_google_drive_pdf", "google_drive_pdf", "failed"),
+            ("failed_dropbox_pdf", "dropbox_pdf", "failed"),
+            ("failed_public_pdf", "public_pdf", "failed"),
+            ("failed_direct_image", "direct_image", "failed"),
+            (
+                "broker_file_share_stub",
+                "broker_file_share_link",
+                "manual_review_required",
+            ),
+            (
+                "broker_unverified_stub",
+                "broker_unverified_property_link",
+                "manual_review_required",
+            ),
+            (
+                "unknown_source_type",
+                "unknown_linked_asset",
+                "openai_upload",
+            ),
         ):
             sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
-            manifest = self._single_manifest(label)
+            manifest = self._single_manifest("exterior")
             manifest.pop("property_binding")
             manifest.pop("binding_method")
             manifest.pop("image_meta")
             manifest.update({
                 "source_type": marker,
-                "method": "openai_upload",
+                "method": method,
                 "id": sentinel,
                 "raw_filename": f"{sentinel}.png",
                 "text": sentinel,
@@ -2687,6 +2718,97 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                         run["usage_call"].call_count,
                         persist_call.call_count,
                         sentinel in observable,
+                    ),
+                )
+
+        legacy_page = base64.b64encode(
+            _png_bytes(size=(4, 3))
+        ).decode("ascii")
+        legacy_manifests = []
+        for source_type in (
+            "google_drive_pdf",
+            "dropbox_pdf",
+            "public_pdf",
+        ):
+            for method in (
+                "local_extraction",
+                "local_extraction+images",
+                "openai_upload",
+                "openai_upload+images",
+            ):
+                has_images = method.endswith("+images")
+                has_file = method.startswith("openai_upload")
+                file_id = (
+                    f"legacy-{source_type}-{method}"
+                    if has_file
+                    else None
+                )
+                legacy_manifests.append((
+                    f"{source_type}:{method}",
+                    {
+                        "name": f"{source_type}.pdf",
+                        "text": f"{self.TARGET}\nLegacy linked PDF text.",
+                        "images": [legacy_page] if has_images else [],
+                        "method": method,
+                        "file_id": file_id,
+                        "id": file_id,
+                        "source_type": source_type,
+                    },
+                    (
+                        [
+                            (
+                                "input_image",
+                                f"data:image/png;base64,{legacy_page}",
+                            )
+                        ]
+                        if has_images
+                        else []
+                    ) + (
+                        [("input_file", file_id)] if has_file else []
+                    ),
+                ))
+
+        for source_type, method in (
+            ("direct_image", "direct_image_link"),
+        ):
+            legacy_manifests.append((
+                f"{source_type}:{method}",
+                {
+                    "name": "broker linked asset",
+                    "text": "",
+                    "images": [],
+                    "method": method,
+                    "file_id": None,
+                    "id": None,
+                    "source_type": source_type,
+                },
+                [],
+            ))
+
+        for label, manifest, expected_transport in legacy_manifests:
+            with self.subTest(legacy_source_pair=label):
+                run = self._run_proposal([manifest])
+                request_content = (
+                    run["client"].responses.create.call_args.kwargs["input"]
+                    [0]["content"]
+                    if run["client"].responses.create.call_count
+                    else []
+                )
+                transport = [
+                    (
+                        item["type"],
+                        item.get("image_url") or item.get("file_id"),
+                    )
+                    for item in request_content
+                    if item.get("type") in ("input_image", "input_file")
+                ]
+                self.assertEqual(
+                    (True, 1, 0, expected_transport),
+                    (
+                        run["proposal"] is not None,
+                        run["client"].responses.create.call_count,
+                        run["client"].files.create.call_count,
+                        transport,
                     ),
                 )
 
