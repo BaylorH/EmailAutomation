@@ -2639,6 +2639,57 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             casefold_marker_manifests.append((label, manifest))
             routing_sentinels[label] = sentinel
 
+        malformed_source_type_manifests = []
+        for label, marker in (
+            ("space_prefixed_native_marker", " native_image"),
+            ("tab_prefixed_native_marker", "\tnative_image"),
+            ("hyphenated_native_marker", "native-image"),
+            ("bytes_native_marker", b"native_image"),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            manifest = self._single_manifest(label)
+            manifest.pop("property_binding")
+            manifest.pop("binding_method")
+            manifest.pop("image_meta")
+            manifest.update({
+                "source_type": marker,
+                "method": "openai_upload",
+                "id": sentinel,
+                "raw_filename": f"{sentinel}.png",
+                "text": sentinel,
+            })
+            malformed_source_type_manifests.append(
+                (label, manifest, sentinel)
+            )
+
+        for label, manifest, sentinel in malformed_source_type_manifests:
+            with self.subTest(case=label):
+                run = self._run_proposal([manifest], dry_run=False)
+                persist_call = (
+                    run["firestore"].collection.return_value
+                    .document.return_value
+                    .collection.return_value
+                    .document.return_value
+                    .set
+                )
+                observable = repr((
+                    run["client"].responses.create.call_args_list,
+                    run["client"].files.create.call_args_list,
+                    persist_call.call_args_list,
+                    run["print_call"].call_args_list,
+                ))
+                self.assertEqual(
+                    (None, 0, 0, 0, 0, False),
+                    (
+                        run["proposal"],
+                        run["client"].responses.create.call_count,
+                        run["client"].files.create.call_count,
+                        run["usage_call"].call_count,
+                        persist_call.call_count,
+                        sentinel in observable,
+                    ),
+                )
+
         claiming_subclass_sentinel = (
             "PRIVATE_CLAIMING_DICT_SUBCLASS_SENTINEL"
         )

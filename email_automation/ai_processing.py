@@ -4347,6 +4347,7 @@ _ATTACHMENT_COPY_SUFFIX_RE = re.compile(
 )
 
 _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS = frozenset({
+    "source_type",
     "property_binding",
     "binding_method",
     "image_meta",
@@ -4366,13 +4367,9 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
         return True
 
     method = dict.get(manifest, "method")
-    source_type = dict.get(manifest, "source_type")
     return (
         isinstance(method, str)
         and str.startswith(str.casefold(method), "native_image")
-    ) or (
-        isinstance(source_type, str)
-        and str.startswith(str.casefold(source_type), "native_image")
     )
 
 
