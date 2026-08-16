@@ -3022,6 +3022,16 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
         request_content = (
             fake_client.responses.create.call_args.kwargs["input"][0]["content"]
         )
+        def transport_signature(content):
+            return [
+                (
+                    item["type"],
+                    item.get("image_url") or item.get("file_id"),
+                )
+                for item in content
+                if item.get("type") in ("input_image", "input_file")
+            ]
+
         self.assertEqual(
             [native_url, scanned_page_url],
             [
@@ -3038,12 +3048,73 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 if item.get("type") == "input_file"
             ],
         )
+        self.assertEqual(
+            [
+                ("input_image", native_url),
+                ("input_image", scanned_page_url),
+                ("input_file", "scanned-pdf-file"),
+            ],
+            transport_signature(request_content),
+        )
         prompt = next(
             item["text"]
             for item in request_content
             if item.get("type") == "input_text"
         )
         self.assertIn("LEGACY_PDF_TEXT_SENTINEL", prompt)
+        native_first_descriptor = (
+            "Attachment 1: type=prevalidated_native_target_images; "
+            "image_count=1"
+        )
+        pdf_second_descriptor = (
+            "Attachment 2: type=legacy_pdf; preview_image_count=1; "
+            "input_file_fallback=yes"
+        )
+        with self.subTest(order="native_then_pdf"):
+            self.assertIn(native_first_descriptor, prompt)
+            self.assertIn(pdf_second_descriptor, prompt)
+            self.assertLess(
+                prompt.index(native_first_descriptor),
+                prompt.index(pdf_second_descriptor),
+            )
+
+        reversed_run = self._run_proposal(
+            [pdf_manifest, native_manifest],
+            fake_client=self._fake_client(file_id="scanned-pdf-file"),
+        )
+        reversed_content = (
+            reversed_run["client"].responses.create.call_args.kwargs["input"]
+            [0]["content"]
+        )
+        self.assertEqual(
+            [
+                ("input_image", scanned_page_url),
+                ("input_file", "scanned-pdf-file"),
+                ("input_image", native_url),
+            ],
+            transport_signature(reversed_content),
+        )
+        self.assertEqual(0, reversed_run["client"].files.create.call_count)
+        reversed_prompt = next(
+            item["text"]
+            for item in reversed_content
+            if item.get("type") == "input_text"
+        )
+        pdf_first_descriptor = (
+            "Attachment 1: type=legacy_pdf; preview_image_count=1; "
+            "input_file_fallback=yes"
+        )
+        native_second_descriptor = (
+            "Attachment 2: type=prevalidated_native_target_images; "
+            "image_count=1"
+        )
+        with self.subTest(order="pdf_then_native"):
+            self.assertIn(pdf_first_descriptor, reversed_prompt)
+            self.assertIn(native_second_descriptor, reversed_prompt)
+            self.assertLess(
+                reversed_prompt.index(pdf_first_descriptor),
+                reversed_prompt.index(native_second_descriptor),
+            )
         persist_call = (
             fake_fs.collection.return_value
             .document.return_value

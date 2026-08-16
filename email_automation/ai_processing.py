@@ -6745,42 +6745,82 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
             if safe_projection is not None
         ]
         if native_projections:
-            prompt_parts.append("\n\n=== NATIVE IMAGE ATTACHMENTS ===")
-            prompt_parts.append(
-                "\nThese are prevalidated native images bound explicitly to "
-                "the TARGET PROPERTY. Treat every image in each batch as "
-                "target-row visual evidence; do not reinterpret them as "
-                "addressless or competing attachments."
-            )
-            for batch_number, projection in enumerate(
-                native_projections,
+            for attachment_index, (attachment, projection) in enumerate(
+                prepared_attachment_manifest,
                 start=1,
             ):
-                image_count = len(projection["image_meta"])
-                prompt_parts.append(
-                    f"\n--- Prevalidated target native image batch "
-                    f"{batch_number}: {image_count} image(s) ---"
+                if projection is not None:
+                    image_count = len(projection["image_meta"])
+                    prompt_parts.append(
+                        "\n\n=== NATIVE IMAGE ATTACHMENTS ==="
+                    )
+                    prompt_parts.append(
+                        "\nThese are prevalidated native images bound "
+                        "explicitly to the TARGET PROPERTY. Treat every "
+                        "image in this attachment as target-row visual "
+                        "evidence; do not reinterpret it as addressless or "
+                        "competing."
+                    )
+                    prompt_parts.append(
+                        f"\n--- Attachment {attachment_index}: "
+                        "type=prevalidated_native_target_images; "
+                        f"image_count={image_count} ---"
+                    )
+                    continue
+
+                images = attachment.get("images") or []
+                file_id = attachment.get("file_id") or attachment.get("id")
+                has_file_fallback = bool(
+                    file_id
+                    and attachment.get("method") in (
+                        "openai_upload",
+                        "openai_upload+images",
+                        "failed",
+                    )
                 )
-
-        # PDF attachments - include extracted text directly in prompt
-        legacy_pdf_entries = [
-            attachment
-            for attachment, safe_projection in prepared_attachment_manifest
-            if safe_projection is None
-        ]
-        if legacy_pdf_entries:
-            prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
-            for pdf in legacy_pdf_entries:
-                name = pdf.get("name") or "<unnamed.pdf>"
-                text = pdf.get("text") or ""
-                method = pdf.get("method", "unknown")
-
-                prompt_parts.append(f"\n--- PDF: {name} (extraction method: {method}) ---")
+                prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
+                prompt_parts.append(
+                    f"\n--- Attachment {attachment_index}: "
+                    "type=legacy_pdf; "
+                    f"preview_image_count={len(images[:3])}; "
+                    "input_file_fallback="
+                    f"{'yes' if has_file_fallback else 'no'} ---"
+                )
+                name = attachment.get("name") or "<unnamed.pdf>"
+                text = attachment.get("text") or ""
+                method = attachment.get("method", "unknown")
+                prompt_parts.append(
+                    f"\n--- PDF: {name} (extraction method: {method}) ---"
+                )
                 if text:
                     # Include extracted text; clip but retain deep field-bearing lines.
-                    prompt_parts.append(_clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT))
+                    prompt_parts.append(
+                        _clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT)
+                    )
                 else:
-                    prompt_parts.append("[No text extracted - see images below if available]")
+                    prompt_parts.append(
+                        "[No text extracted - see images below if available]"
+                    )
+        else:
+            # PDF attachments - include extracted text directly in prompt
+            legacy_pdf_entries = [
+                attachment
+                for attachment, safe_projection in prepared_attachment_manifest
+                if safe_projection is None
+            ]
+            if legacy_pdf_entries:
+                prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
+                for pdf in legacy_pdf_entries:
+                    name = pdf.get("name") or "<unnamed.pdf>"
+                    text = pdf.get("text") or ""
+                    method = pdf.get("method", "unknown")
+
+                    prompt_parts.append(f"\n--- PDF: {name} (extraction method: {method}) ---")
+                    if text:
+                        # Include extracted text; clip but retain deep field-bearing lines.
+                        prompt_parts.append(_clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT))
+                    else:
+                        prompt_parts.append("[No text extracted - see images below if available]")
 
         # URL content (already fetched)
         if url_texts:
