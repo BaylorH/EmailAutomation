@@ -4356,6 +4356,8 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
     """Recognize canonical or malformed entries that claim the native channel."""
     if not isinstance(manifest, dict):
         return False
+    if type(manifest) is not dict:
+        return True
     if any(
         dict.__contains__(manifest, key)
         for key in _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS
@@ -4366,10 +4368,10 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
     source_type = dict.get(manifest, "source_type")
     return (
         isinstance(method, str)
-        and str.startswith(method, "native_image")
+        and str.startswith(str.casefold(method), "native_image")
     ) or (
         isinstance(source_type, str)
-        and str.startswith(source_type, "native_image")
+        and str.startswith(str.casefold(source_type), "native_image")
     )
 
 

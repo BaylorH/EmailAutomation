@@ -86,6 +86,13 @@ class _PrivateNativeManifestDict(dict):
     pass
 
 
+class _ClaimingNativeManifestDict(dict):
+    def get(self, key, default=None):
+        if key == "source_type":
+            return "native_image"
+        return super().get(key, default)
+
+
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
     image = Image.new("RGB", size, (28, 96, 164))
     output = io.BytesIO()
@@ -2611,6 +2618,47 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             "id": "PRIVATE_SUBCLASS_FILE_ID_SENTINEL",
         })
 
+        casefold_marker_manifests = []
+        routing_sentinels = {}
+        for label, marker in (
+            ("uppercase_native_marker", "NATIVE_IMAGE"),
+            ("mixed_case_native_marker", "NaTiVe_ImAgE"),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            manifest = self._single_manifest(label)
+            manifest.pop("property_binding")
+            manifest.pop("binding_method")
+            manifest.pop("image_meta")
+            manifest.update({
+                "source_type": marker,
+                "method": "openai_upload",
+                "id": sentinel,
+                "raw_filename": f"{sentinel}.png",
+                "text": sentinel,
+            })
+            casefold_marker_manifests.append((label, manifest))
+            routing_sentinels[label] = sentinel
+
+        claiming_subclass_sentinel = (
+            "PRIVATE_CLAIMING_DICT_SUBCLASS_SENTINEL"
+        )
+        claiming_subclass = _ClaimingNativeManifestDict(
+            self._single_manifest("claiming-subclass")
+        )
+        claiming_subclass.pop("source_type")
+        claiming_subclass.pop("property_binding")
+        claiming_subclass.pop("binding_method")
+        claiming_subclass.pop("image_meta")
+        claiming_subclass.update({
+            "method": "openai_upload",
+            "id": claiming_subclass_sentinel,
+            "raw_filename": f"{claiming_subclass_sentinel}.png",
+            "text": claiming_subclass_sentinel,
+        })
+        routing_sentinels["claiming_native_subclass"] = (
+            claiming_subclass_sentinel
+        )
+
         hostile_false_marker = self._single_manifest("false-marker")
         hostile_raising_marker = self._single_manifest("raising-marker")
         for hostile, marker_type, sentinel in (
@@ -2648,6 +2696,8 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             ("corrupt_markers", corrupt_markers),
             ("marker_subclasses", marker_subclasses),
             ("manifest_subclass", manifest_subclass),
+            *casefold_marker_manifests,
+            ("claiming_native_subclass", claiming_subclass),
             ("hostile_false_marker", hostile_false_marker),
             ("hostile_raising_marker", hostile_raising_marker),
         ):
@@ -2665,6 +2715,17 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                     .set
                 )
                 self.assertEqual(0, persist_call.call_count)
+                routing_sentinel = routing_sentinels.get(name)
+                if routing_sentinel:
+                    self.assertNotIn(
+                        routing_sentinel,
+                        repr((
+                            run["client"].responses.create.call_args_list,
+                            run["client"].files.create.call_args_list,
+                            persist_call.call_args_list,
+                            run["print_call"].call_args_list,
+                        )),
+                    )
                 self.assertNotIn(
                     "PRIVATE_FALSE_MARKER_SENTINEL",
                     repr(run["print_call"].call_args_list),
