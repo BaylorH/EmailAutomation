@@ -3,9 +3,11 @@ import json
 import hashlib
 import ipaddress
 import logging
+import math
 import re
 import socket
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -4364,6 +4366,32 @@ _ATTACHMENT_ROUTING_KEY_TOKENS = frozenset({
     "imagemeta",
 })
 _ATTACHMENT_ROUTING_TOKEN_MAX_CHARS = 96
+_NATIVE_IMAGE_GENERIC_NAME_TOKEN = "brokerpropertyimage"
+_NATIVE_IMAGE_GENERIC_NAME_MAX_CHARS = 96
+_NATIVE_IMAGE_NAME_CONFUSABLES = str.maketrans({
+    # Bounded common Greek/Cyrillic homoglyphs in the reserved English marker.
+    "\u03b1": "a",
+    "\u03b2": "b",
+    "\u03b5": "e",
+    "\u03b9": "i",
+    "\u03ba": "k",
+    "\u03bc": "m",
+    "\u03bf": "o",
+    "\u03c1": "p",
+    "\u03c4": "t",
+    "\u03c5": "y",
+    "\u0430": "a",
+    "\u0432": "b",
+    "\u0435": "e",
+    "\u0456": "i",
+    "\u043a": "k",
+    "\u043c": "m",
+    "\u043e": "o",
+    "\u0440": "p",
+    "\u0441": "c",
+    "\u0442": "t",
+    "\u0443": "y",
+})
 _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS = {
     "google_drive_pdf": frozenset({
         "local_extraction",
@@ -4396,6 +4424,9 @@ _LEGACY_ATTACHMENT_METHODS_WITHOUT_SOURCE_TYPE = frozenset({
     "text",
     "production-replay",
 })
+_LEGACY_DIRECT_IMAGE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".webp", ".gif",
+)
 
 
 def _bounded_attachment_routing_token(value: Any) -> Optional[str]:
@@ -4414,6 +4445,46 @@ def _bounded_attachment_routing_token(value: Any) -> Optional[str]:
     )
 
 
+def _is_reserved_native_image_generic_name(value: Any) -> bool:
+    """Recognize bounded canonical and confusable forms of the native name."""
+    if type(value) is not str:
+        return False
+    if len(value) > _NATIVE_IMAGE_GENERIC_NAME_MAX_CHARS:
+        return False
+    folded = unicodedata.normalize("NFKC", value).casefold().translate(
+        _NATIVE_IMAGE_NAME_CONFUSABLES
+    )
+    return (
+        str.isascii(folded)
+        and _bounded_attachment_routing_token(folded)
+        == _NATIVE_IMAGE_GENERIC_NAME_TOKEN
+    )
+
+
+def _legacy_attachment_filename(manifest: dict) -> Optional[str]:
+    """Return an exact producer filename without invoking caller protocols."""
+    if dict.__contains__(manifest, "name"):
+        filename = dict.get(manifest, "name")
+    else:
+        filename = dict.get(manifest, "filename")
+    return filename if type(filename) is str else None
+
+
+def _has_legacy_attachment_filename_shape(
+    manifest: dict,
+    *,
+    direct_image: bool = False,
+) -> bool:
+    """Grant legacy routing only to the bounded real producer file shapes."""
+    filename = _legacy_attachment_filename(manifest)
+    if filename is None:
+        return False
+    folded = str.casefold(filename)
+    if direct_image:
+        return str.endswith(folded, _LEGACY_DIRECT_IMAGE_EXTENSIONS)
+    return str.endswith(folded, ".pdf")
+
+
 def _is_native_image_manifest_candidate(manifest: Any) -> bool:
     """Recognize canonical or malformed entries that claim the native channel."""
     if type(manifest) is not dict:
@@ -4429,6 +4500,8 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
             and key not in _ATTACHMENT_ROUTING_KEYS
         ):
             return True
+    if _is_reserved_native_image_generic_name(dict.get(manifest, "name")):
+        return True
     if any(
         dict.__contains__(manifest, key)
         for key in _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS
@@ -4446,27 +4519,166 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
                 (),
             )
         ):
-            return False
+            return not _has_legacy_attachment_filename_shape(
+                manifest,
+                direct_image=source_type == "direct_image",
+            )
         return True
 
     if not dict.__contains__(manifest, "method"):
-        return False
+        return not _has_legacy_attachment_filename_shape(manifest)
     if type(method) is not str:
         return True
-    return method not in _LEGACY_ATTACHMENT_METHODS_WITHOUT_SOURCE_TYPE
+    return (
+        method not in _LEGACY_ATTACHMENT_METHODS_WITHOUT_SOURCE_TYPE
+        or not _has_legacy_attachment_filename_shape(manifest)
+    )
+
+
+_LEGACY_ATTACHMENT_SNAPSHOT_MAX_DEPTH = 16
+
+
+class _UnsafeLegacyAttachmentSnapshot(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _FrozenLegacyList:
+    items: Tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class _FrozenLegacyDict:
+    items: Tuple[Tuple[str, Any], ...]
+
+
+def _freeze_legacy_json_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    active_container_ids: Optional[set] = None,
+) -> Any:
+    """Freeze exact JSON-safe types without invoking caller protocols."""
+    if depth > _LEGACY_ATTACHMENT_SNAPSHOT_MAX_DEPTH:
+        raise _UnsafeLegacyAttachmentSnapshot()
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise _UnsafeLegacyAttachmentSnapshot()
+        return value
+
+    if active_container_ids is None:
+        active_container_ids = set()
+    container_id = id(value)
+    if container_id in active_container_ids:
+        raise _UnsafeLegacyAttachmentSnapshot()
+
+    if type(value) is list:
+        active_container_ids.add(container_id)
+        try:
+            return _FrozenLegacyList(tuple(
+                _freeze_legacy_json_value(
+                    item,
+                    depth=depth + 1,
+                    active_container_ids=active_container_ids,
+                )
+                for item in list.__iter__(value)
+            ))
+        finally:
+            active_container_ids.remove(container_id)
+
+    if type(value) is dict:
+        active_container_ids.add(container_id)
+        try:
+            frozen_items = []
+            for key, item in dict.items(value):
+                if type(key) is not str:
+                    raise _UnsafeLegacyAttachmentSnapshot()
+                frozen_items.append((
+                    key,
+                    _freeze_legacy_json_value(
+                        item,
+                        depth=depth + 1,
+                        active_container_ids=active_container_ids,
+                    ),
+                ))
+            return _FrozenLegacyDict(tuple(frozen_items))
+        finally:
+            active_container_ids.remove(container_id)
+
+    raise _UnsafeLegacyAttachmentSnapshot()
+
+
+def _thaw_legacy_json_value(value: Any) -> Any:
+    """Materialize fresh plain containers from an internal frozen tree."""
+    if type(value) is _FrozenLegacyList:
+        return [
+            _thaw_legacy_json_value(item)
+            for item in value.items
+        ]
+    if type(value) is _FrozenLegacyDict:
+        return {
+            key: _thaw_legacy_json_value(item)
+            for key, item in value.items
+        }
+    return value
+
+
+@dataclass(frozen=True)
+class _PreparedAIAttachment:
+    legacy: Optional[_FrozenLegacyDict] = None
+    native: Optional[Any] = None
+
+    @property
+    def is_native(self) -> bool:
+        return self.native is not None
+
+    def fresh_analysis_manifest(self) -> dict:
+        if self.native is not None:
+            return self.native.safe_projection()
+        return self.fresh_legacy_manifest()
+
+    def fresh_legacy_manifest(self) -> dict:
+        if self.legacy is None:
+            raise _UnsafeLegacyAttachmentSnapshot()
+        return _thaw_legacy_json_value(self.legacy)
+
+    def fresh_persisted_manifest(self) -> dict:
+        if self.native is not None:
+            return self.native.safe_projection()
+        return {
+            key: value
+            for key, value in self.fresh_legacy_manifest().items()
+            if key != "images"
+        }
+
+    def legacy_file_id(self) -> Any:
+        if self.native is not None:
+            return None
+        return self.fresh_legacy_manifest().get("id")
 
 
 def _prepare_ai_attachment_manifest(
     pdf_manifest: Optional[List[dict]],
-) -> Optional[List[Tuple[Optional[dict], Optional[Any]]]]:
-    """Validate native entries while leaving legacy PDF entries unchanged."""
+) -> Optional[List[_PreparedAIAttachment]]:
+    """Seal native and legacy entries without retaining caller aliases."""
     attachments = list(pdf_manifest or [])
     native_positions = []
     native_manifests = []
+    legacy_by_position = {}
     for position, attachment in enumerate(attachments):
         if _is_native_image_manifest_candidate(attachment):
             native_positions.append(position)
             native_manifests.append(attachment)
+            continue
+        try:
+            frozen_legacy = _freeze_legacy_json_value(attachment)
+        except _UnsafeLegacyAttachmentSnapshot:
+            return None
+        if type(frozen_legacy) is not _FrozenLegacyDict:
+            return None
+        legacy_by_position[position] = frozen_legacy
 
     prepared_natives = _file_handling._prepare_safe_native_image_manifests(
         native_manifests
@@ -4479,11 +4691,11 @@ def _prepare_ai_attachment_manifest(
     ))
     return [
         (
-            (None, prepared_by_position[position])
+            _PreparedAIAttachment(native=prepared_by_position[position])
             if position in prepared_by_position
-            else (attachment, None)
+            else _PreparedAIAttachment(legacy=legacy_by_position[position])
         )
-        for position, attachment in enumerate(attachments)
+        for position in range(len(attachments))
     ]
 
 
@@ -4551,9 +4763,7 @@ def _suppress_competing_attachment_updates(
     conversation: List[dict],
     target_anchor: str,
     pdf_manifest: Optional[List[dict]],
-    prepared_attachment_manifest: Optional[
-        List[Tuple[Optional[dict], Optional[Any]]]
-    ] = None,
+    prepared_attachment_manifest: Optional[List[_PreparedAIAttachment]] = None,
 ) -> dict:
     """Keep mixed attachment evidence from leaking onto the current row.
 
@@ -4561,11 +4771,21 @@ def _suppress_competing_attachment_updates(
     or mixed, every proposed value must also occur in a target-bound source
     segment (or target-bound fresh message segment) before it can survive.
     """
-    attachment_entries = (
-        prepared_attachment_manifest
-        if prepared_attachment_manifest is not None
-        else [(pdf, None) for pdf in (pdf_manifest or [])]
-    )
+    if prepared_attachment_manifest is not None:
+        attachment_entries = [
+            (
+                None,
+                prepared_attachment.native,
+            )
+            if prepared_attachment.is_native
+            else (
+                prepared_attachment.fresh_legacy_manifest(),
+                None,
+            )
+            for prepared_attachment in prepared_attachment_manifest
+        ]
+    else:
+        attachment_entries = [(pdf, None) for pdf in (pdf_manifest or [])]
     if not proposal or not attachment_entries:
         return proposal
 
@@ -6388,12 +6608,8 @@ def propose_sheet_updates(uid: str,
             print("❌ Refusing malformed native-image attachment manifest")
             return None
         analysis_attachment_manifest = [
-            (
-                prepared_native.safe_projection()
-                if prepared_native is not None
-                else attachment
-            )
-            for attachment, prepared_native in prepared_attachment_manifest
+            prepared_attachment.fresh_analysis_manifest()
+            for prepared_attachment in prepared_attachment_manifest
         ]
 
         COLUMN_RULES = build_column_rules_prompt(effective_config)
@@ -6837,17 +7053,19 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
 """.rstrip()]
 
         prepared_natives = [
-            prepared_native
-            for _, prepared_native in prepared_attachment_manifest
-            if prepared_native is not None
+            prepared_attachment.native
+            for prepared_attachment in prepared_attachment_manifest
+            if prepared_attachment.is_native
         ]
         if prepared_natives:
-            for attachment_index, (attachment, prepared_native) in enumerate(
+            for attachment_index, prepared_attachment in enumerate(
                 prepared_attachment_manifest,
                 start=1,
             ):
-                if prepared_native is not None:
-                    image_count = len(prepared_native.image_meta)
+                if prepared_attachment.is_native:
+                    image_count = len(
+                        prepared_attachment.native.image_meta
+                    )
                     prompt_parts.append(
                         "\n\n=== NATIVE IMAGE ATTACHMENTS ==="
                     )
@@ -6865,6 +7083,7 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
                     )
                     continue
 
+                attachment = prepared_attachment.fresh_legacy_manifest()
                 images = attachment.get("images") or []
                 file_id = attachment.get("file_id") or attachment.get("id")
                 has_file_fallback = bool(
@@ -6901,9 +7120,9 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
         else:
             # PDF attachments - include extracted text directly in prompt
             legacy_pdf_entries = [
-                attachment
-                for attachment, prepared_native in prepared_attachment_manifest
-                if prepared_native is None
+                prepared_attachment.fresh_legacy_manifest()
+                for prepared_attachment in prepared_attachment_manifest
+                if not prepared_attachment.is_native
             ]
             if legacy_pdf_entries:
                 prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
@@ -6970,10 +7189,10 @@ OUTPUT ONLY valid JSON in this exact format:
 
         # Add native images inline and retain the existing PDF request behavior.
         if prepared_attachment_manifest:
-            for pdf, prepared_native in prepared_attachment_manifest:
-                if prepared_native is not None:
+            for prepared_attachment in prepared_attachment_manifest:
+                if prepared_attachment.is_native:
                     for image_number, img_b64 in enumerate(
-                        prepared_native.images,
+                        prepared_attachment.native.images,
                         start=1,
                     ):
                         input_content.append({
@@ -6986,6 +7205,7 @@ OUTPUT ONLY valid JSON in this exact format:
                         )
                     continue
 
+                pdf = prepared_attachment.fresh_legacy_manifest()
                 images = pdf.get("images") or []
                 name = pdf.get("name", "PDF")
 
@@ -7160,17 +7380,13 @@ OUTPUT ONLY valid JSON in this exact format:
                 "status": "proposed",
                 "threadId": thread_id,
                 "pdfManifest": [
-                    prepared_native.safe_projection()
-                    if prepared_native is not None
-                    else {k: v for k, v in attachment.items() if k != "images"}
-                    for attachment, prepared_native
-                    in prepared_attachment_manifest
+                    prepared_attachment.fresh_persisted_manifest()
+                    for prepared_attachment in prepared_attachment_manifest
                 ],
                 "fileIds": [
-                    attachment["id"]
-                    for attachment, prepared_native
-                    in prepared_attachment_manifest
-                    if prepared_native is None and attachment.get("id")
+                    prepared_attachment.legacy_file_id()
+                    for prepared_attachment in prepared_attachment_manifest
+                    if prepared_attachment.legacy_file_id()
                 ],
                 "urlTexts": url_texts or [],
                 "createdAt": SERVER_TIMESTAMP

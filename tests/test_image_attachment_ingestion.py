@@ -103,6 +103,17 @@ class _ExplodingGetterManifest:
         raise AssertionError(self.private_sentinel)
 
 
+class _ExplodingCopyValue:
+    def __init__(self, private_sentinel):
+        self.private_sentinel = private_sentinel
+
+    def __deepcopy__(self, memo):
+        raise AssertionError(self.private_sentinel)
+
+    def __repr__(self):
+        return f"<private-copy-value {self.private_sentinel}>"
+
+
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
     image = Image.new("RGB", size, (28, 96, 164))
     output = io.BytesIO()
@@ -2755,6 +2766,152 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 ),
             )
 
+        legacy_page = base64.b64encode(
+            _png_bytes(size=(4, 3))
+        ).decode("ascii")
+        legacy_manifest = {
+            "name": "sealed legacy brochure.pdf",
+            "text": f"{self.TARGET} - Total SF: 20,000.",
+            "images": [legacy_page],
+            "method": "local_extraction",
+            "file_id": None,
+            "id": None,
+            "nested": {
+                "labels": ["original"],
+                "flags": {"verified": True},
+            },
+        }
+        legacy_batch = [legacy_manifest]
+        expected_legacy_persistence = {
+            "name": "sealed legacy brochure.pdf",
+            "text": f"{self.TARGET} - Total SF: 20,000.",
+            "method": "local_extraction",
+            "file_id": None,
+            "id": None,
+            "nested": {
+                "labels": ["original"],
+                "flags": {"verified": True},
+            },
+        }
+        legacy_mutation_sentinel = "PRIVATE_POST_PREPARE_LEGACY_SENTINEL"
+        original_prepare_attachments = (
+            ai_processing._prepare_ai_attachment_manifest
+        )
+        legacy_prepare_calls = []
+
+        def prepare_then_mutate_legacy(source_manifest):
+            prepared = original_prepare_attachments(source_manifest)
+            legacy_prepare_calls.append(prepared)
+            legacy_manifest.update({
+                "name": f"{legacy_mutation_sentinel}.png",
+                "text": legacy_mutation_sentinel,
+                "method": "openai_upload",
+                "source_type": "native_image",
+                "file_id": legacy_mutation_sentinel,
+                "id": legacy_mutation_sentinel,
+                "private": legacy_mutation_sentinel,
+            })
+            legacy_manifest["images"].extend(
+                [legacy_mutation_sentinel] * 3
+            )
+            legacy_manifest["nested"]["labels"].append(
+                legacy_mutation_sentinel
+            )
+            legacy_manifest["nested"]["flags"]["verified"] = False
+            return prepared
+
+        with mock.patch.object(
+            ai_processing,
+            "_prepare_ai_attachment_manifest",
+            side_effect=prepare_then_mutate_legacy,
+        ):
+            sealed_legacy_run = self._run_proposal(
+                legacy_batch,
+                output_text=(
+                    '{"updates": [{"column": "Total SF", '
+                    '"value": "20000", "confidence": 0.98, '
+                    '"reason": "Stated in target brochure."}], '
+                    '"events": [], "response_email": null, "notes": ""}'
+                ),
+                dry_run=False,
+            )
+
+        sealed_legacy_content = (
+            sealed_legacy_run["client"].responses.create.call_args.kwargs
+            ["input"][0]["content"]
+        )
+        sealed_legacy_prompt = next(
+            item["text"]
+            for item in sealed_legacy_content
+            if item.get("type") == "input_text"
+        )
+        sealed_legacy_persist_call = (
+            sealed_legacy_run["firestore"].collection.return_value
+            .document.return_value
+            .collection.return_value
+            .document.return_value
+            .set
+        )
+        sealed_legacy_persisted = (
+            sealed_legacy_persist_call.call_args.args[0]
+        )
+        sealed_legacy_observable = repr((
+            sealed_legacy_content,
+            sealed_legacy_run["print_call"].call_args_list,
+            sealed_legacy_persisted,
+        ))
+        with self.subTest(snapshot="post_prepare_legacy_mutation"):
+            self.assertEqual(
+                (
+                    [("input_image", f"data:image/png;base64,{legacy_page}")],
+                    True,
+                    True,
+                    ["20000"],
+                    [expected_legacy_persistence],
+                    [],
+                    1,
+                    0,
+                    1,
+                    1,
+                    1,
+                    4,
+                    2,
+                    False,
+                    False,
+                    False,
+                ),
+                (
+                    [
+                        (
+                            item["type"],
+                            item.get("image_url") or item.get("file_id"),
+                        )
+                        for item in sealed_legacy_content
+                        if item.get("type") in ("input_image", "input_file")
+                    ],
+                    "sealed legacy brochure.pdf" in sealed_legacy_prompt,
+                    "Total SF: 20,000." in sealed_legacy_prompt,
+                    [
+                        update.get("value")
+                        for update in (
+                            sealed_legacy_run["proposal"] or {}
+                        ).get("updates", [])
+                    ],
+                    sealed_legacy_persisted["pdfManifest"],
+                    sealed_legacy_persisted["fileIds"],
+                    sealed_legacy_run["client"].responses.create.call_count,
+                    sealed_legacy_run["client"].files.create.call_count,
+                    sealed_legacy_run["usage_call"].call_count,
+                    sealed_legacy_persist_call.call_count,
+                    len(legacy_prepare_calls),
+                    len(legacy_manifest["images"]),
+                    len(legacy_manifest["nested"]["labels"]),
+                    legacy_mutation_sentinel in sealed_legacy_observable,
+                    "input_file" in repr(sealed_legacy_content),
+                    "openai_upload" in sealed_legacy_prompt,
+                ),
+            )
+
     def test_malformed_native_manifest_fails_before_model_or_persistence(self):
         wrong_binding = self._single_manifest("wrong-binding")
         wrong_binding["property_binding"] = "competing"
@@ -3139,6 +3296,113 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             non_plain_key_sentinel,
         ))
 
+        for label, reserved_name in (
+            ("exact_reserved_native_name", GENERIC_IMAGE_NAME),
+            ("casefold_reserved_native_name", "BROKER PROPERTY IMAGE"),
+            ("separator_reserved_native_name", "Broker-property_image"),
+            (
+                "fullwidth_reserved_native_name",
+                "\uff22\uff52\uff4f\uff4b\uff45\uff52\u3000"
+                "\uff50\uff52\uff4f\uff50\uff45\uff52\uff54\uff59\u3000"
+                "\uff49\uff4d\uff41\uff47\uff45",
+            ),
+            (
+                "greek_omicron_reserved_native_name",
+                "Br\u03bfker property image",
+            ),
+            (
+                "unicode_hyphen_reserved_native_name",
+                "Broker\u2010property image",
+            ),
+            (
+                "zero_width_reserved_native_name",
+                "Broker\u200b property image",
+            ),
+            (
+                "variation_selector_reserved_native_name",
+                "Broker\ufe0f property image",
+            ),
+            (
+                "grapheme_joiner_reserved_native_name",
+                "Broker\u034f property image",
+            ),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            downgraded = self._single_manifest(label)
+            downgraded.pop("property_binding")
+            downgraded.pop("binding_method")
+            downgraded.pop("image_meta")
+            downgraded.update({
+                "name": reserved_name,
+                "source_type": "google_drive_pdf",
+                "method": "openai_upload",
+                "id": sentinel,
+                "file_id": sentinel,
+                "raw_filename": f"{sentinel}.png",
+            })
+            malformed_source_type_manifests.append(
+                (label, downgraded, sentinel)
+            )
+
+        custom_value_sentinel = "PRIVATE_NESTED_CUSTOM_VALUE_SENTINEL"
+        malformed_source_type_manifests.append((
+            "legacy_nested_custom_value",
+            {
+                "name": "legacy.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "nested": _ExplodingCopyValue(custom_value_sentinel),
+            },
+            custom_value_sentinel,
+        ))
+
+        nested_subclass_sentinel = "PRIVATE_NESTED_DICT_SUBCLASS_SENTINEL"
+        malformed_source_type_manifests.append((
+            "legacy_nested_dict_subclass",
+            {
+                "name": "legacy.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "nested": _PrivateNativeManifestDict({
+                    "private": nested_subclass_sentinel,
+                }),
+            },
+            nested_subclass_sentinel,
+        ))
+
+        cycle_sentinel = "PRIVATE_LEGACY_CYCLE_SENTINEL"
+        cyclic_list = [cycle_sentinel]
+        cyclic_list.append(cyclic_list)
+        malformed_source_type_manifests.append((
+            "legacy_nested_cycle",
+            {
+                "name": "legacy.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "nested": cyclic_list,
+            },
+            cycle_sentinel,
+        ))
+
+        depth_sentinel = "PRIVATE_LEGACY_DEPTH_SENTINEL"
+        deeply_nested = depth_sentinel
+        for _ in range(33):
+            deeply_nested = [deeply_nested]
+        malformed_source_type_manifests.append((
+            "legacy_nested_depth",
+            {
+                "name": "legacy.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "nested": deeply_nested,
+            },
+            depth_sentinel,
+        ))
+
         def assert_strict_rejection(manifest, sentinel=None):
             run = self._run_proposal([manifest], dry_run=False)
             persist_call = (
@@ -3269,7 +3533,7 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             legacy_manifests.append((
                 f"{source_type}:{method}",
                 {
-                    "name": "broker linked asset",
+                    "name": "broker linked asset.png",
                     "text": "",
                     "images": [],
                     "method": method,
