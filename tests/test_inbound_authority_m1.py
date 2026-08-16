@@ -640,7 +640,7 @@ class BatchedInboundAuthorityTests(unittest.TestCase):
             processing,
             "process_inbox_message",
             return_value=None,
-        ), patch.object(processing, "mark_processed"), patch.object(
+        ), patch.object(processing, "mark_processed", return_value=True), patch.object(
             processing,
             "set_last_scan_iso",
         ), patch(
@@ -699,6 +699,7 @@ class BatchedInboundAuthorityTests(unittest.TestCase):
 
         def record_processed(_user_id, message_id):
             trace.append(("processed", message_id))
+            return True
 
         with patch.object(
             processing,
