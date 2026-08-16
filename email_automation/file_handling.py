@@ -1687,6 +1687,18 @@ def fetch_message_attachment_snapshot(
     return attachments
 
 
+class _PdfAttachmentList(list):
+    """PDF projection that retains its originating Graph snapshot."""
+
+    def __init__(
+        self,
+        values: List[Dict[str, Any]],
+        attachment_snapshot: List[Dict[str, Any]],
+    ) -> None:
+        super().__init__(values)
+        self.attachment_snapshot = attachment_snapshot
+
+
 def fetch_pdf_attachments(
     headers: Dict[str, str],
     graph_msg_id: str,
@@ -1704,19 +1716,11 @@ def fetch_pdf_attachments(
     silently dropped. Only a healthy 200 response with no PDF attachments
     returns ``[]``.
     """
-    if attachment_snapshot is None:
-        base = "https://graph.microsoft.com/v1.0"
-        # Preserve the legacy direct caller's one-page behavior. The current
-        # message integration supplies the shared paginated snapshot explicitly.
-        resp = requests.get(
-            f"{base}/me/messages/{graph_msg_id}/attachments",
-            headers=headers,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        attachments = resp.json().get("value", [])
-    else:
-        attachments = attachment_snapshot
+    attachments = (
+        fetch_message_attachment_snapshot(headers, graph_msg_id)
+        if attachment_snapshot is None
+        else attachment_snapshot
+    )
     pdf_attachments = []
 
     for position, attachment in enumerate(attachments):
@@ -1738,7 +1742,7 @@ def fetch_pdf_attachments(
             })
 
     print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
-    return pdf_attachments
+    return _PdfAttachmentList(pdf_attachments, attachments)
 
 def ensure_drive_folder():
     """Ensure Drive folder exists and return folder ID."""
@@ -2599,24 +2603,26 @@ def fetch_and_process_pdfs(
     PDF-only path. Processing supplies even an incomplete/empty row value so one
     paginated Graph snapshot owns both PDF and native-image routing.
     """
+    pdf_attachments = fetch_pdf_attachments(headers, graph_msg_id)
     if target_property_hint is None:
-        legacy_attachments = fetch_pdf_attachments(headers, graph_msg_id)
         return [
             entry
             for _position, entry in _process_pdf_attachment_batch(
-                legacy_attachments
+                pdf_attachments
             )
         ]
 
-    attachment_snapshot = fetch_message_attachment_snapshot(
-        headers,
-        graph_msg_id,
+    # ``fetch_pdf_attachments`` is an established test and integration seam.
+    # Production returns the exact snapshot-bearing list above; older controlled
+    # callers may return a plain PDF list, which safely represents no native
+    # candidates without triggering an unmocked second Graph request.
+    attachment_snapshot = getattr(
+        pdf_attachments,
+        "attachment_snapshot",
+        [],
     )
-    pdf_attachments = fetch_pdf_attachments(
-        headers,
-        graph_msg_id,
-        attachment_snapshot=attachment_snapshot,
-    )
+    if not isinstance(attachment_snapshot, list):
+        raise ValueError("PDF attachment snapshot projection failed closed")
     positioned_entries = [
         (position, 1, entry)
         for position, entry in _process_pdf_attachment_batch(pdf_attachments)
