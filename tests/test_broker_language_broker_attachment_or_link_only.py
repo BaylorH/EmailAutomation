@@ -1405,6 +1405,25 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
         )
         self.assertEqual(0, marker_failure["result"]["processed"])
 
+        plain_messages = self._messages(predecessor_has_attachments=False)
+        plain_marker_failure = self._scan_with_mocked_save(
+            plain_messages,
+            save_side_effect=lambda *_args, **_kwargs: False,
+            mark_return_value=False,
+        )
+        plain_marker_failure["process"].assert_not_called()
+        plain_marker_failure["mark"].assert_called_once_with(
+            self.USER_ID,
+            plain_messages[0]["internetMessageId"],
+        )
+        plain_marker_failure["clear"].assert_not_called()
+        plain_marker_failure["record"].assert_called_once()
+        self.assertIs(
+            plain_messages[0],
+            plain_marker_failure["record"].call_args.args[5],
+        )
+        self.assertEqual(0, plain_marker_failure["result"]["processed"])
+
     def test_failure_marks_neither_attachment_message_nor_later_message(self):
         messages = self._messages()
         failure = proc.RetryableProcessingError("native image extraction failed")
