@@ -1659,9 +1659,18 @@ def fetch_message_attachment_snapshot(
             )
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
-        payload = response.json() or {}
-        values = payload.get("value", []) if isinstance(payload, dict) else []
-        if not isinstance(values, list):
+        try:
+            payload = response.json()
+        except Exception:
+            raise requests.exceptions.RequestException(
+                "Graph attachment snapshot returned an invalid page"
+            ) from None
+        if type(payload) is not dict or "value" not in payload:
+            raise requests.exceptions.RequestException(
+                "Graph attachment snapshot returned an invalid page"
+            )
+        values = payload["value"]
+        if type(values) is not list:
             raise requests.exceptions.RequestException(
                 "Graph attachment snapshot returned an invalid page"
             )
@@ -1671,7 +1680,7 @@ def fetch_message_attachment_snapshot(
                 "Graph attachment snapshot exceeded the item limit"
             )
 
-        next_link = payload.get("@odata.nextLink") if isinstance(payload, dict) else None
+        next_link = payload.get("@odata.nextLink")
         if next_link is None:
             url = ""
         elif (
