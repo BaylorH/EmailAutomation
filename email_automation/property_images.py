@@ -505,15 +505,18 @@ def _safe_candidate_from_manifest_item(item: Dict[str, Any]) -> Optional[Dict[st
     safe_signals = _safe_signals(meta.get("signals"))
     if safe_signals:
         safe_meta["signals"] = safe_signals
-    return {
+    candidate = {
         "url": image_url,
         "sourceLabel": _clean(item.get("property_image_source"))
         or f"Broker flyer preview: {_clean(item.get('name')) or 'attachment.pdf'}, page {safe_meta.get('pageNumber') or 1}",
         "sourceType": _clean(item.get("property_image_source_type")) or "broker_pdf_preview",
         "sourceFilename": _clean(item.get("name")),
-        "sourceDriveLink": _clean(item.get("drive_link")),
         "meta": safe_meta,
     }
+    source_drive_link = _clean(item.get("drive_link"))
+    if source_drive_link:
+        candidate["sourceDriveLink"] = source_drive_link
+    return candidate
 
 
 def _match_tokens(*values: Any) -> List[str]:

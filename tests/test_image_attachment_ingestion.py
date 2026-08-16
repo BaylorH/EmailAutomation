@@ -5586,6 +5586,8 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         graph_pages=None,
         host_result=None,
         proposal_side_effect=None,
+        include_property_image_column=True,
+        boundary_order=None,
     ):
         from tests.test_compound_nonviable_processing import (
             FakeDocumentRef,
@@ -5607,8 +5609,6 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             "City",
             "Leasing Contact",
             "Email",
-            "Property Image",
-            "Property Image Source",
             "Total SF",
         ]
         rowvals = [
@@ -5616,10 +5616,11 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             city,
             "Dana",
             "broker@example.test",
-            property_image,
-            "",
             "",
         ]
+        if include_property_image_column:
+            header[4:4] = ["Property Image", "Property Image Source"]
+            rowvals[4:4] = [property_image, ""]
         msg = {
             "id": "native-image-message",
             "subject": "RE: target property",
@@ -5674,7 +5675,7 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         linked_assets = mock.MagicMock(return_value=[])
         warning_recorder = mock.MagicMock(return_value=True)
         send_reply = mock.MagicMock(return_value=True)
-        host_upload = mock.MagicMock(return_value=(
+        resolved_host_result = (
             host_result
             if host_result is not None
             else {
@@ -5684,14 +5685,28 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
                 "byteCount": 123,
                 "sha256": "host-returned-sha",
             }
-        ))
+        )
+
+        def host_side_effect(*_args, **_kwargs):
+            if boundary_order is not None:
+                boundary_order.append("host")
+            return resolved_host_result
+
+        host_upload = mock.MagicMock(side_effect=host_side_effect)
         image_writer = mock.MagicMock(
             side_effect=lambda _sheets, _sheet_id, _header, _rownum, updates: updates
         )
         image_change_store = mock.MagicMock(return_value="image-change")
-        validator_spy = mock.MagicMock(
-            wraps=file_handling.validate_and_normalize_native_image_attachments
+        real_validator = (
+            file_handling.validate_and_normalize_native_image_attachments
         )
+
+        def validator_side_effect(*args, **kwargs):
+            if boundary_order is not None:
+                boundary_order.append("validate")
+            return real_validator(*args, **kwargs)
+
+        validator_spy = mock.MagicMock(side_effect=validator_side_effect)
 
         campaign_decision = CampaignAutomationDecision(
             state="allow",
@@ -5866,12 +5881,59 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             ["https://example.com/details"],
             target_property_hint=self.TARGET,
         )
+        self.assertIs(
+            run["validator"].call_args.kwargs["target_property_hint"],
+            run["linked"].call_args.kwargs["target_property_hint"],
+        )
 
     def test_valid_image_only_message_reaches_vision_not_processed_noop(self):
-        run = self._run_process(
-            attachments=[self._valid_attachment()],
-            body="",
+        response = mock.MagicMock()
+        response.output_text = (
+            '{"updates": [{"column": "Total SF", "value": "18500", '
+            '"confidence": 0.99}], "events": [], "response_email": null, '
+            '"notes": ""}'
         )
+        response.usage = None
+        response.id = "native-processing-vision-response"
+        fake_client = mock.MagicMock()
+        fake_client.responses.create.return_value = response
+
+        def real_vision_proposal(*args, **kwargs):
+            return ai_processing.propose_sheet_updates(
+                uid=args[0],
+                client_id=args[1],
+                email=args[2],
+                sheet_id=args[3],
+                header=args[4],
+                rownum=args[5],
+                rowvals=args[6],
+                thread_id=args[7],
+                pdf_manifest=kwargs["pdf_manifest"],
+                url_texts=kwargs["url_texts"],
+                contact_name=kwargs["contact_name"],
+                conversation=[{
+                    "direction": "inbound",
+                    "from": "broker@example.test",
+                    "content": "",
+                }],
+                column_config=kwargs["column_config"],
+                extraction_fields=kwargs["extraction_fields"],
+                dry_run=True,
+            )
+
+        with mock.patch.object(
+            ai_processing,
+            "client",
+            fake_client,
+        ), mock.patch.object(
+            ai_processing,
+            "track_openai_usage_safely",
+        ):
+            run = self._run_process(
+                attachments=[self._valid_attachment()],
+                body="",
+                proposal_side_effect=real_vision_proposal,
+            )
 
         self.assertIsNone(run["error"])
         run["propose"].assert_called_once()
@@ -5879,6 +5941,20 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         self.assertEqual(1, len(manifests))
         self.assertEqual("native_image_normalized", manifests[0]["method"])
         self.assertEqual("target", manifests[0]["property_binding"])
+        self.assertEqual(1, fake_client.responses.create.call_count)
+        request_content = (
+            fake_client.responses.create.call_args.kwargs["input"][0]["content"]
+        )
+        self.assertEqual(
+            1,
+            sum(item.get("type") == "input_image" for item in request_content),
+        )
+        self.assertFalse(any(
+            item.get("type") == "input_file" for item in request_content
+        ))
+        fake_client.files.create.assert_not_called()
+        applied_proposal = run["apply"].call_args.args[-1]
+        self.assertEqual("18500", applied_proposal["updates"][0]["value"])
 
     def test_malformed_image_only_is_retryable_unprocessed_and_sends_nothing(self):
         raw_filename = f"{self.MATCHING_FILENAME} PRIVATE_RAW_NAME.png"
@@ -5932,44 +6008,38 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         self.assertNotIn("contentBytes", serialized)
         self.assertNotIn("drive_link", serialized)
         self.assertEqual([], run["propose"].call_args.kwargs["pdf_manifest"])
+
+        warning_fs = mock.MagicMock()
+        with mock.patch.object(processing, "_fs", warning_fs):
+            self.assertTrue(processing._record_asset_extraction_warning(
+                "native-image-user",
+                "native-image-client",
+                "native-image-processing-thread",
+                "native-image-message",
+                failures,
+            ))
+        warning_set = (
+            warning_fs.collection.return_value
+            .document.return_value
+            .collection.return_value
+            .document.return_value
+            .set
+        )
+        warning_payload = warning_set.call_args.args[0]
+        self.assertEqual("degraded_text_processed", warning_payload["status"])
+        self.assertEqual([{
+            "name": GENERIC_IMAGE_NAME,
+            "sourceType": "native_image",
+            "method": "native_image_quarantined",
+            "failureCode": "image_attachment_invalid_base64",
+        }], warning_payload["assets"])
+        self.assertNotIn(private_name, repr(warning_payload))
         run["host"].assert_not_called()
         run["image_writer"].assert_not_called()
         run["send"].assert_not_called()
 
     def test_hosting_waits_for_full_validation_and_safe_model_classification(self):
-        observed = {}
-
-        def classify_after_validation(*_args, **_kwargs):
-            observed["host_calls_during_model"] = run_host.call_count
-            observed["validator_calls_during_model"] = run_validator.call_count
-            return {
-                "updates": [],
-                "events": [],
-                "response_email": None,
-                "notes": "",
-                "skip_response": True,
-            }
-
-        # These references are rebound to the mocks created by _run_process before
-        # the side effect executes.
-        run_host = mock.MagicMock()
-        run_validator = mock.MagicMock()
-
-        def proposal_side_effect(*args, **kwargs):
-            run_host._mock_call_count = current_run["host"].call_count
-            run_validator._mock_call_count = current_run["validator"].call_count
-            return classify_after_validation(*args, **kwargs)
-
-        current_run = {}
-        # Use a small closure seam: _run_process installs the proposal mock before
-        # invoking production; validation must happen before that call and hosting
-        # after it. A direct order list is filled by wrapping those boundaries.
         order = []
-        original_validator = file_handling.validate_and_normalize_native_image_attachments
-
-        def validator(*args, **kwargs):
-            order.append("validate")
-            return original_validator(*args, **kwargs)
 
         def proposal(*_args, **_kwargs):
             order.append("model")
@@ -5981,19 +6051,15 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
                 "skip_response": True,
             }
 
-        with mock.patch.object(
-            file_handling,
-            "validate_and_normalize_native_image_attachments",
-            side_effect=validator,
-        ):
-            run = self._run_process(
-                attachments=[self._valid_attachment()],
-                body="",
-                proposal_side_effect=proposal,
-            )
+        run = self._run_process(
+            attachments=[self._valid_attachment()],
+            body="",
+            proposal_side_effect=proposal,
+            boundary_order=order,
+        )
 
         self.assertIsNone(run["error"])
-        self.assertEqual(["validate", "model"], order[:2])
+        self.assertEqual(["validate", "model", "host"], order)
         run["host"].assert_called_once()
 
     def test_hosts_only_first_eligible_image_when_property_image_blank(self):
@@ -6009,6 +6075,9 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         run = self._run_process(attachments=attachments, body="")
 
         self.assertIsNone(run["error"])
+        vision_manifest = run["propose"].call_args.kwargs["pdf_manifest"][0]
+        self.assertEqual(2, len(vision_manifest["images"]))
+        self.assertEqual(2, len(vision_manifest["image_meta"]))
         run["host"].assert_called_once()
         upload_name, upload_bytes = run["host"].call_args.args[:2]
         self.assertEqual(expected["data"], upload_bytes)
@@ -6032,6 +6101,19 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
         run["host"].assert_not_called()
         run["image_writer"].assert_not_called()
 
+        absent = self._run_process(
+            attachments=[self._valid_attachment()],
+            body="",
+            include_property_image_column=False,
+        )
+        self.assertIsNone(absent["error"])
+        self.assertEqual(
+            "native_image_normalized",
+            absent["propose"].call_args.kwargs["pdf_manifest"][0]["method"],
+        )
+        absent["host"].assert_not_called()
+        absent["image_writer"].assert_not_called()
+
     def test_model_multi_property_or_image_failure_prevents_host_and_row_mutation(self):
         with self.subTest(reason="model_multi_property"):
             run = self._run_process(
@@ -6048,7 +6130,24 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             )
             self.assertIsNone(run["error"])
             run["host"].assert_not_called()
+            run["apply"].assert_not_called()
             run["image_writer"].assert_not_called()
+            run["send"].assert_not_called()
+
+        with self.subTest(reason="model_none"):
+            run = self._run_process(
+                attachments=[self._valid_attachment()],
+                body="",
+                proposal_side_effect=lambda *_args, **_kwargs: None,
+            )
+            self.assertIsInstance(
+                run["error"],
+                processing.RetryableProcessingError,
+            )
+            run["host"].assert_not_called()
+            run["apply"].assert_not_called()
+            run["image_writer"].assert_not_called()
+            run["send"].assert_not_called()
 
         with self.subTest(reason="image_failure"):
             run = self._run_process(
@@ -6071,6 +6170,7 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             run["apply"].assert_not_called()
             run["host"].assert_not_called()
             run["image_writer"].assert_not_called()
+            run["send"].assert_not_called()
 
     def test_native_image_result_has_property_image_url_and_never_drive_link(self):
         private_drive_link = "PRIVATE_UPLOADER_DRIVE_LINK_SENTINEL"
@@ -6094,8 +6194,28 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             candidate["url"],
         )
         self.assertNotIn(private_drive_link, repr(candidate))
-        self.assertFalse(candidate.get("sourceDriveLink"))
-        self.assertNotIn("driveLink", candidate.get("meta") or {})
+        self.assertNotIn("sourceDriveLink", candidate)
+
+        def recursive_keys(value):
+            if isinstance(value, dict):
+                return set(value) | {
+                    nested_key
+                    for nested in value.values()
+                    for nested_key in recursive_keys(nested)
+                }
+            if isinstance(value, list):
+                return {
+                    nested_key
+                    for nested in value
+                    for nested_key in recursive_keys(nested)
+                }
+            return set()
+
+        self.assertTrue(
+            {"drive_link", "driveLink", "sourceDriveLink"}.isdisjoint(
+                recursive_keys(candidate)
+            )
+        )
 
     def test_standard_address_city_row_quarantines_without_filename_or_body_rescue(self):
         run = self._run_process(
@@ -6181,6 +6301,73 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
                 for entry in manifest
                 if entry.get("method") == "local_extraction"
             ],
+        )
+
+        failing_later_page = mock.MagicMock()
+        failing_later_page.raise_for_status.side_effect = (
+            file_handling.requests.exceptions.HTTPError("Graph page 2 failed")
+        )
+        with mock.patch.object(
+            file_handling.requests,
+            "get",
+            side_effect=[self._graph_page([], next_link), failing_later_page],
+        ):
+            with self.assertRaises(file_handling.requests.exceptions.RequestException):
+                file_handling.fetch_and_process_pdfs(
+                    {"Authorization": "Bearer fake"},
+                    "graph-message-page-failure",
+                    target_property_hint=self.TARGET,
+                )
+
+        four_native = [
+            self._valid_attachment(f"angle-{index}", (8 + index, 6))
+            for index in range(4)
+        ]
+        with mock.patch.object(
+            file_handling.requests,
+            "get",
+            side_effect=[
+                self._graph_page(four_native[:2], next_link),
+                self._graph_page(four_native[2:]),
+            ],
+        ), mock.patch.object(
+            file_handling,
+            "process_pdf_for_ai",
+        ) as capped_pdf_processor:
+            over_count = file_handling.fetch_and_process_pdfs(
+                {"Authorization": "Bearer fake"},
+                "graph-message-over-count",
+                target_property_hint=self.TARGET,
+            )
+        capped_pdf_processor.assert_not_called()
+        self.assertEqual(1, len(over_count))
+        self.assertEqual(
+            "image_attachment_too_many",
+            over_count[0]["failure_code"],
+        )
+
+        native_claim_with_pdf_type = _attachment(
+            f"{self.MATCHING_FILENAME} mismatched.jpg",
+            "application/pdf",
+            b"%PDF-1.7 not an image",
+        )
+        with mock.patch.object(
+            file_handling.requests,
+            "get",
+            return_value=self._graph_page([native_claim_with_pdf_type]),
+        ), mock.patch.object(
+            file_handling,
+            "process_pdf_for_ai",
+        ) as mismatched_pdf_processor:
+            mismatch = file_handling.fetch_and_process_pdfs(
+                {"Authorization": "Bearer fake"},
+                "graph-message-type-mismatch",
+                target_property_hint=self.TARGET,
+            )
+        mismatched_pdf_processor.assert_not_called()
+        self.assertEqual(
+            "image_attachment_type_mismatch",
+            mismatch[0]["failure_code"],
         )
 
     def test_prevalidated_native_target_remains_current_when_body_emits_new_property(self):
