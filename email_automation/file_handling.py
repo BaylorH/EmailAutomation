@@ -413,6 +413,11 @@ def _normalize_native_image_address_text(
     ):
         return None
     text = os.path.splitext(value)[0] if strip_extension else value
+    if any(
+        character.isnumeric() and not character.isdecimal()
+        for character in text
+    ):
+        return None
     text = unicodedata.normalize("NFKD", text)
     characters = []
     for character in text:

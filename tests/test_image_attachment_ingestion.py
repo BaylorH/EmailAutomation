@@ -1705,6 +1705,40 @@ class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
                     self._validate(matching_filename, target=ranged)
                 )
 
+    def test_never_drops_raw_nondecimal_numeric_prefixes(self):
+        target_125 = "125 Main Road, Example City, Arizona 85001"
+        matching_filename = "125 Main Rd Example City AZ 85001.png"
+        numeric_cases = (
+            ("chinese", "\u4e00\u4e8c\u4e09"),
+            ("roman", "\u216d\u2169\u2169\u2162"),
+            ("hangzhou", "\u3021\u3022\u3023"),
+            ("ethiopic", "\u137b\u1373\u136b"),
+            ("circled_control", "\u2460\u2461\u2462"),
+            ("superscript_control", "\u00b9\u00b2\u00b3"),
+        )
+
+        for label, competing_number in numeric_cases:
+            ranged = (
+                f"{competing_number}-125 Main Rd "
+                "Example City AZ 85001"
+            )
+            with self.subTest(label=label, surface="filename_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(f"{ranged}.png", target=target_125)
+                )
+            with self.subTest(label=label, surface="filename_batch"):
+                self._assert_unbound_batch(
+                    self._validate(f"{ranged}.png", target=target_125)
+                )
+            with self.subTest(label=label, surface="target_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(matching_filename, target=ranged)
+                )
+            with self.subTest(label=label, surface="target_batch"):
+                self._assert_unbound_batch(
+                    self._validate(matching_filename, target=ranged)
+                )
+
     def test_allows_only_structured_trailing_numeric_metadata(self):
         target = "125 Main Road, Example City, Arizona 85001"
         base = "125 Main Rd Example City AZ 85001"
