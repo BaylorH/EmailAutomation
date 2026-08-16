@@ -6224,6 +6224,43 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
             )
         )
 
+        private_host_exception = "PRIVATE_NATIVE_HOST_EXCEPTION_SENTINEL"
+        native_batch = (
+            file_handling.validate_and_normalize_native_image_attachments(
+                [self._valid_attachment()],
+                target_property_hint=self.TARGET,
+            )
+        )
+        native_manifest = file_handling.build_native_image_manifest_entry(
+            native_batch
+        )
+        native_host_output = io.StringIO()
+        with mock.patch.object(
+            file_handling,
+            "_helper_google_creds",
+            side_effect=RuntimeError(private_host_exception),
+        ), contextlib.redirect_stdout(native_host_output):
+            self.assertIsNone(
+                file_handling.host_first_native_image_manifest_asset(
+                    native_manifest
+                )
+            )
+        self.assertNotIn(private_host_exception, native_host_output.getvalue())
+        self.assertIn("native_image_host_failed", native_host_output.getvalue())
+
+        legacy_host_output = io.StringIO()
+        legacy_exception_detail = "LEGACY_PROPERTY_PREVIEW_FAILURE_DETAIL"
+        with mock.patch.object(
+            file_handling,
+            "_helper_google_creds",
+            side_effect=RuntimeError(legacy_exception_detail),
+        ), contextlib.redirect_stdout(legacy_host_output):
+            self.assertIsNone(file_handling.upload_property_image_to_drive(
+                "legacy-preview.png",
+                b"legacy-preview",
+            ))
+        self.assertIn(legacy_exception_detail, legacy_host_output.getvalue())
+
     def test_standard_address_city_row_quarantines_without_filename_or_body_rescue(self):
         run = self._run_process(
             attachments=[self._valid_attachment()],
