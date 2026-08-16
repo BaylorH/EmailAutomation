@@ -9151,8 +9151,14 @@ def _save_message_to_thread(
 
     # Save to Firestore
     if internet_message_id:
-        save_message(user_id, thread_id, internet_message_id, message_record)
-        index_message_id(user_id, internet_message_id, thread_id)
+        if save_message(user_id, thread_id, internet_message_id, message_record) is not True:
+            raise RetryableProcessingError(
+                "Batched predecessor message persistence failed"
+            )
+        if index_message_id(user_id, internet_message_id, thread_id) is not True:
+            raise RetryableProcessingError(
+                "Batched predecessor message index persistence failed"
+            )
 
     # Update thread timestamp
     try:
