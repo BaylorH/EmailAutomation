@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import hashlib
 import io
 import os
@@ -18,6 +19,8 @@ os.environ.setdefault("E2E_TEST_MODE", "true")
 from email_automation import file_handling
 from email_automation import ai_processing
 from email_automation import property_images
+from email_automation import processing
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 FILE_ATTACHMENT_TYPE = "#microsoft.graph.fileAttachment"
@@ -5543,6 +5546,666 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             persisted["pdfManifest"][1],
         )
         self.assertEqual(["scanned-pdf-file"], persisted["fileIds"])
+
+
+class NativeImageProcessingIntegrationTests(unittest.TestCase):
+    TARGET = "123 North Sample Road, Example City, AZ 85001"
+    MATCHING_FILENAME = "123 N Sample Rd Example City AZ 85001"
+
+    @staticmethod
+    def _column_config():
+        return {
+            "mappings": {"total_sf": "Total SF"},
+            "extractionFields": ["total_sf"],
+            "requiredFields": [],
+            "formulaFields": [],
+            "neverRequest": [],
+            "customFields": {},
+        }
+
+    @staticmethod
+    def _graph_page(values, next_link=None):
+        response = mock.MagicMock()
+        response.status_code = 200
+        payload = {"value": list(values)}
+        if next_link:
+            payload["@odata.nextLink"] = next_link
+        response.json.return_value = payload
+        return response
+
+    def _run_process(
+        self,
+        *,
+        attachments,
+        body="",
+        property_address=None,
+        city="",
+        property_image="",
+        proposal=None,
+        apply_result=None,
+        graph_pages=None,
+        host_result=None,
+        proposal_side_effect=None,
+    ):
+        from tests.test_compound_nonviable_processing import (
+            FakeDocumentRef,
+            FakeFirestore,
+        )
+
+        property_address = (
+            self.TARGET if property_address is None else property_address
+        )
+        thread_id = "native-image-processing-thread"
+        thread_ref = FakeDocumentRef({
+            "status": "active",
+            "clientId": "native-image-client",
+            "email": ["broker@example.test"],
+        })
+        client_ref = FakeDocumentRef({"criteria": "Industrial search"})
+        header = [
+            "Property Address",
+            "City",
+            "Leasing Contact",
+            "Email",
+            "Property Image",
+            "Property Image Source",
+            "Total SF",
+        ]
+        rowvals = [
+            property_address,
+            city,
+            "Dana",
+            "broker@example.test",
+            property_image,
+            "",
+            "",
+        ]
+        msg = {
+            "id": "native-image-message",
+            "subject": "RE: target property",
+            "from": {
+                "emailAddress": {
+                    "address": "broker@example.test",
+                    "name": "Dana",
+                }
+            },
+            "toRecipients": [
+                {"emailAddress": {"address": "me@ourdomain.test"}}
+            ],
+            "internetMessageId": "<native-image-message@example.test>",
+            "conversationId": "native-image-conversation",
+            "receivedDateTime": "2026-08-16T08:00:00Z",
+            "bodyPreview": body[:200],
+            "hasAttachments": True,
+            "internetMessageHeaders": [
+                {"name": "In-Reply-To", "value": "<our-outbound@example.test>"},
+            ],
+        }
+
+        full_body_response = mock.MagicMock()
+        full_body_response.json.return_value = {
+            "body": {"content": body, "contentType": "Text"},
+            "hasAttachments": True,
+        }
+        pages = list(graph_pages or [self._graph_page(attachments)])
+        graph_get = mock.MagicMock(side_effect=pages)
+
+        default_proposal = {
+            "updates": [],
+            "events": [],
+            "response_email": None,
+            "notes": "",
+            "skip_response": True,
+        }
+        proposal_value = dict(default_proposal)
+        if proposal is not None:
+            proposal_value.update(proposal)
+        propose = mock.MagicMock(
+            side_effect=proposal_side_effect,
+            return_value=proposal_value,
+        )
+        applied = apply_result
+        if applied is None:
+            applied = {
+                "applied": list(proposal_value.get("updates") or []),
+                "skipped": [],
+            }
+        apply_proposal = mock.MagicMock(return_value=applied)
+        linked_assets = mock.MagicMock(return_value=[])
+        warning_recorder = mock.MagicMock(return_value=True)
+        send_reply = mock.MagicMock(return_value=True)
+        host_upload = mock.MagicMock(return_value=(
+            host_result
+            if host_result is not None
+            else {
+                "url": "https://drive.google.com/uc?export=view&id=native-hosted",
+                "driveLink": "PRIVATE_DRIVE_VIEW_LINK",
+                "contentType": "image/png",
+                "byteCount": 123,
+                "sha256": "host-returned-sha",
+            }
+        ))
+        image_writer = mock.MagicMock(
+            side_effect=lambda _sheets, _sheet_id, _header, _rownum, updates: updates
+        )
+        image_change_store = mock.MagicMock(return_value="image-change")
+        validator_spy = mock.MagicMock(
+            wraps=file_handling.validate_and_normalize_native_image_attachments
+        )
+
+        campaign_decision = CampaignAutomationDecision(
+            state="allow",
+            reason="",
+            client_data={"status": "live", "automationPaused": False},
+            metadata={
+                "source": "systemConfig/campaignAccess",
+                "terminal": False,
+            },
+        )
+        fake_sheets = mock.MagicMock()
+        patchers = [
+            mock.patch.object(
+                processing,
+                "_fs",
+                FakeFirestore(thread_ref, client_ref),
+            ),
+            mock.patch.object(
+                processing,
+                "get_client_automation_decision",
+                return_value=campaign_decision,
+            ),
+            mock.patch.object(
+                processing,
+                "exponential_backoff_request",
+                return_value=full_body_response,
+            ),
+            mock.patch.object(
+                processing,
+                "lookup_thread_by_message_id",
+                return_value=thread_id,
+            ),
+            mock.patch.object(
+                processing,
+                "lookup_thread_by_conversation_id",
+                return_value=None,
+            ),
+            mock.patch.object(
+                processing,
+                "get_thread_status",
+                return_value=processing.THREAD_STATUS["active"],
+            ),
+            mock.patch.object(processing, "save_message", return_value=True),
+            mock.patch.object(processing, "index_message_id", return_value=True),
+            mock.patch.object(processing, "dump_thread_from_firestore"),
+            mock.patch("email_automation.followup.cancel_followup_on_response"),
+            mock.patch.object(
+                processing,
+                "fetch_and_log_sheet_for_thread",
+                return_value=(
+                    "native-image-client",
+                    "native-image-sheet",
+                    header,
+                    3,
+                    rowvals,
+                    self._column_config(),
+                    ["total_sf"],
+                ),
+            ),
+            mock.patch.object(
+                processing,
+                "_resolve_reply_identity",
+                return_value={
+                    "recipient_email": "broker@example.test",
+                    "contact_name": "Dana",
+                    "original_email": "broker@example.test",
+                    "source": "test",
+                },
+            ),
+            mock.patch.object(processing, "write_message_order_test"),
+            mock.patch.object(processing, "fetch_url_as_text", return_value=None),
+            mock.patch.object(
+                processing,
+                "fetch_and_process_linked_assets",
+                new=linked_assets,
+            ),
+            mock.patch.object(
+                processing,
+                "propose_sheet_updates",
+                new=propose,
+            ),
+            mock.patch.object(
+                processing,
+                "apply_proposal_to_sheet",
+                new=apply_proposal,
+            ),
+            mock.patch.object(processing, "add_client_notifications"),
+            mock.patch.object(
+                processing,
+                "_record_asset_extraction_warning",
+                new=warning_recorder,
+            ),
+            mock.patch.object(processing, "_sheets_client", return_value=fake_sheets),
+            mock.patch.object(processing, "_get_first_tab_title", return_value="Sheet1"),
+            mock.patch.object(processing, "_read_header_row2", return_value=header),
+            mock.patch.object(processing, "format_sheet_columns_autosize_with_exceptions"),
+            mock.patch.object(processing, "write_property_image_columns", new=image_writer),
+            mock.patch.object(
+                processing,
+                "_store_property_image_sheet_change",
+                new=image_change_store,
+            ),
+            mock.patch.object(processing, "_append_ai_meta"),
+            mock.patch.object(processing, "write_notification", return_value="notification"),
+            mock.patch.object(processing, "is_event_handled", return_value=False),
+            mock.patch.object(processing, "mark_event_handled"),
+            mock.patch.object(processing, "update_thread_status"),
+            mock.patch.object(processing, "highlight_row"),
+            mock.patch.object(processing, "send_reply_in_thread", new=send_reply),
+            mock.patch.object(file_handling.requests, "get", new=graph_get),
+            mock.patch.object(
+                file_handling,
+                "validate_and_normalize_native_image_attachments",
+                new=validator_spy,
+            ),
+            mock.patch.object(
+                file_handling,
+                "upload_property_image_to_drive",
+                new=host_upload,
+            ),
+        ]
+
+        raised = None
+        with contextlib.ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
+            try:
+                processing.process_inbox_message(
+                    "native-image-user",
+                    {"Authorization": "Bearer fake"},
+                    msg,
+                    allow_outbound_reply=False,
+                    authenticated_mailbox_email="me@ourdomain.test",
+                )
+            except Exception as exc:  # noqa: BLE001 - assertion inspects boundary
+                raised = exc
+
+        return {
+            "error": raised,
+            "propose": propose,
+            "apply": apply_proposal,
+            "linked": linked_assets,
+            "warning": warning_recorder,
+            "send": send_reply,
+            "host": host_upload,
+            "image_writer": image_writer,
+            "image_store": image_change_store,
+            "validator": validator_spy,
+            "graph_get": graph_get,
+        }
+
+    def _valid_attachment(self, descriptor="exterior", size=(9, 7)):
+        return _attachment(
+            f"{self.MATCHING_FILENAME} {descriptor}.png",
+            "image/png",
+            _png_bytes(size=size),
+        )
+
+    def test_row_anchor_reaches_native_binding_and_linked_asset_hint(self):
+        run = self._run_process(
+            attachments=[self._valid_attachment()],
+            body="Photos are attached. https://example.com/details",
+        )
+
+        self.assertIsNone(run["error"])
+        run["validator"].assert_called_once()
+        self.assertEqual(
+            self.TARGET,
+            run["validator"].call_args.kwargs["target_property_hint"],
+        )
+        run["linked"].assert_called_once_with(
+            ["https://example.com/details"],
+            target_property_hint=self.TARGET,
+        )
+
+    def test_valid_image_only_message_reaches_vision_not_processed_noop(self):
+        run = self._run_process(
+            attachments=[self._valid_attachment()],
+            body="",
+        )
+
+        self.assertIsNone(run["error"])
+        run["propose"].assert_called_once()
+        manifests = run["propose"].call_args.kwargs["pdf_manifest"]
+        self.assertEqual(1, len(manifests))
+        self.assertEqual("native_image_normalized", manifests[0]["method"])
+        self.assertEqual("target", manifests[0]["property_binding"])
+
+    def test_malformed_image_only_is_retryable_unprocessed_and_sends_nothing(self):
+        raw_filename = f"{self.MATCHING_FILENAME} PRIVATE_RAW_NAME.png"
+        run = self._run_process(
+            attachments=[_attachment(
+                raw_filename,
+                "image/png",
+                content_bytes="not strict base64!!",
+            )],
+            body="",
+        )
+
+        self.assertIsInstance(run["error"], processing.RetryableProcessingError)
+        self.assertFalse(processing._should_mark_processed_after_error(run["error"]))
+        run["propose"].assert_not_called()
+        run["host"].assert_not_called()
+        run["image_writer"].assert_not_called()
+        run["send"].assert_not_called()
+        self.assertNotIn(raw_filename, str(run["error"]))
+
+    def test_independent_text_plus_bad_image_commits_text_and_sanitized_warning_only(self):
+        private_name = (
+            f"{self.MATCHING_FILENAME} PRIVATE_NATIVE_FILENAME_SENTINEL.png"
+        )
+        proposal = {
+            "updates": [{
+                "column": "Total SF",
+                "value": "18500",
+                "confidence": 0.99,
+            }],
+            "events": [],
+        }
+        run = self._run_process(
+            attachments=[_attachment(
+                private_name,
+                "image/png",
+                content_bytes="invalid!",
+            )],
+            body="The target space contains 18,500 square feet.",
+            proposal=proposal,
+        )
+
+        self.assertIsNone(run["error"])
+        run["apply"].assert_called_once()
+        run["warning"].assert_called_once()
+        failures = run["warning"].call_args.args[4]
+        self.assertEqual(1, len(failures))
+        serialized = repr(failures[0])
+        self.assertIn("image_attachment_invalid_base64", serialized)
+        self.assertNotIn(private_name, serialized)
+        self.assertNotIn("contentBytes", serialized)
+        self.assertNotIn("drive_link", serialized)
+        self.assertEqual([], run["propose"].call_args.kwargs["pdf_manifest"])
+        run["host"].assert_not_called()
+        run["image_writer"].assert_not_called()
+        run["send"].assert_not_called()
+
+    def test_hosting_waits_for_full_validation_and_safe_model_classification(self):
+        observed = {}
+
+        def classify_after_validation(*_args, **_kwargs):
+            observed["host_calls_during_model"] = run_host.call_count
+            observed["validator_calls_during_model"] = run_validator.call_count
+            return {
+                "updates": [],
+                "events": [],
+                "response_email": None,
+                "notes": "",
+                "skip_response": True,
+            }
+
+        # These references are rebound to the mocks created by _run_process before
+        # the side effect executes.
+        run_host = mock.MagicMock()
+        run_validator = mock.MagicMock()
+
+        def proposal_side_effect(*args, **kwargs):
+            run_host._mock_call_count = current_run["host"].call_count
+            run_validator._mock_call_count = current_run["validator"].call_count
+            return classify_after_validation(*args, **kwargs)
+
+        current_run = {}
+        # Use a small closure seam: _run_process installs the proposal mock before
+        # invoking production; validation must happen before that call and hosting
+        # after it. A direct order list is filled by wrapping those boundaries.
+        order = []
+        original_validator = file_handling.validate_and_normalize_native_image_attachments
+
+        def validator(*args, **kwargs):
+            order.append("validate")
+            return original_validator(*args, **kwargs)
+
+        def proposal(*_args, **_kwargs):
+            order.append("model")
+            return {
+                "updates": [],
+                "events": [],
+                "response_email": None,
+                "notes": "",
+                "skip_response": True,
+            }
+
+        with mock.patch.object(
+            file_handling,
+            "validate_and_normalize_native_image_attachments",
+            side_effect=validator,
+        ):
+            run = self._run_process(
+                attachments=[self._valid_attachment()],
+                body="",
+                proposal_side_effect=proposal,
+            )
+
+        self.assertIsNone(run["error"])
+        self.assertEqual(["validate", "model"], order[:2])
+        run["host"].assert_called_once()
+
+    def test_hosts_only_first_eligible_image_when_property_image_blank(self):
+        attachments = [
+            self._valid_attachment("front", (11, 7)),
+            self._valid_attachment("rear", (8, 6)),
+        ]
+        expected = file_handling.validate_and_normalize_native_image_attachments(
+            attachments,
+            target_property_hint=self.TARGET,
+        )["assets"][0]
+
+        run = self._run_process(attachments=attachments, body="")
+
+        self.assertIsNone(run["error"])
+        run["host"].assert_called_once()
+        upload_name, upload_bytes = run["host"].call_args.args[:2]
+        self.assertEqual(expected["data"], upload_bytes)
+        self.assertRegex(
+            upload_name,
+            rf"^broker-property-image-{expected['normalized_sha256'][:16]}\.png$",
+        )
+        run["image_writer"].assert_called_once()
+
+    def test_existing_property_image_skips_hosting(self):
+        run = self._run_process(
+            attachments=[self._valid_attachment()],
+            body="",
+            property_image="https://images.example.test/existing.png",
+        )
+
+        self.assertIsNone(run["error"])
+        manifests = run["propose"].call_args.kwargs["pdf_manifest"]
+        self.assertEqual(1, len(manifests))
+        self.assertEqual("native_image_normalized", manifests[0]["method"])
+        run["host"].assert_not_called()
+        run["image_writer"].assert_not_called()
+
+    def test_model_multi_property_or_image_failure_prevents_host_and_row_mutation(self):
+        with self.subTest(reason="model_multi_property"):
+            run = self._run_process(
+                attachments=[self._valid_attachment()],
+                body="",
+                proposal={
+                    "updates": [],
+                    "events": [{
+                        "type": "needs_user_input",
+                        "reason": "multi_property_attachment",
+                        "question": "Which property?",
+                    }],
+                },
+            )
+            self.assertIsNone(run["error"])
+            run["host"].assert_not_called()
+            run["image_writer"].assert_not_called()
+
+        with self.subTest(reason="image_failure"):
+            run = self._run_process(
+                attachments=[_attachment(
+                    f"{self.MATCHING_FILENAME} corrupt.png",
+                    "image/png",
+                    content_bytes="corrupt!",
+                )],
+                body="",
+                proposal={
+                    "updates": [{"column": "Total SF", "value": "99999"}],
+                    "events": [],
+                },
+            )
+            self.assertIsInstance(
+                run["error"],
+                processing.RetryableProcessingError,
+            )
+            run["propose"].assert_not_called()
+            run["apply"].assert_not_called()
+            run["host"].assert_not_called()
+            run["image_writer"].assert_not_called()
+
+    def test_native_image_result_has_property_image_url_and_never_drive_link(self):
+        private_drive_link = "PRIVATE_UPLOADER_DRIVE_LINK_SENTINEL"
+        run = self._run_process(
+            attachments=[self._valid_attachment()],
+            body="",
+            host_result={
+                "url": "https://drive.google.com/uc?export=view&id=safe-native",
+                "driveLink": private_drive_link,
+                "contentType": "image/png",
+                "byteCount": 321,
+                "sha256": "uploader-sha",
+            },
+        )
+
+        self.assertIsNone(run["error"])
+        run["image_store"].assert_called_once()
+        candidate = run["image_store"].call_args.args[9]
+        self.assertEqual(
+            "https://drive.google.com/uc?export=view&id=safe-native",
+            candidate["url"],
+        )
+        self.assertNotIn(private_drive_link, repr(candidate))
+        self.assertFalse(candidate.get("sourceDriveLink"))
+        self.assertNotIn("driveLink", candidate.get("meta") or {})
+
+    def test_standard_address_city_row_quarantines_without_filename_or_body_rescue(self):
+        run = self._run_process(
+            attachments=[self._valid_attachment()],
+            body=(
+                "These photos are for 123 North Sample Road, Example City, "
+                "AZ 85001."
+            ),
+            property_address="123 North Sample Road",
+            city="Example City, AZ 85001",
+        )
+
+        self.assertIsInstance(run["error"], processing.RetryableProcessingError)
+        run["propose"].assert_not_called()
+        run["host"].assert_not_called()
+        run["image_writer"].assert_not_called()
+
+    def test_current_message_graph_snapshot_preserves_pdf_native_order_and_later_page_count(self):
+        next_link = "https://graph.microsoft.com/v1.0/next-page-token"
+        first_pdf = _attachment(
+            "first.pdf",
+            "application/pdf",
+            b"first-pdf",
+        )
+        native = self._valid_attachment()
+        later_pdf = _attachment(
+            "later.pdf",
+            "application/pdf",
+            b"later-pdf",
+        )
+        first_page = self._graph_page([first_pdf, native], next_link)
+        second_page = self._graph_page([later_pdf])
+
+        with mock.patch.object(
+            file_handling.requests,
+            "get",
+            side_effect=[first_page, second_page],
+        ) as graph_get, mock.patch.object(
+            file_handling,
+            "process_pdf_for_ai",
+            side_effect=lambda content, name: {
+                "text": content.decode("ascii"),
+                "images": [],
+                "method": "local_extraction",
+                "file_id": None,
+                "id": None,
+            },
+        ) as process_pdf, mock.patch.object(
+            file_handling,
+            "upload_pdf_to_drive",
+            side_effect=lambda name, _content: f"https://drive/{name}",
+        ), mock.patch.object(
+            file_handling,
+            "_attach_pdf_property_preview",
+        ):
+            try:
+                manifest = file_handling.fetch_and_process_pdfs(
+                    {"Authorization": "Bearer fake"},
+                    "graph-message",
+                    target_property_hint=self.TARGET,
+                )
+            except TypeError as exc:
+                self.fail(
+                    "current-message attachment assembly does not yet accept "
+                    f"a target property hint: {exc}"
+                )
+
+        self.assertEqual(2, graph_get.call_count)
+        self.assertEqual(next_link, graph_get.call_args_list[1].args[0])
+        self.assertEqual(2, process_pdf.call_count)
+        self.assertEqual(
+            ["first.pdf", GENERIC_IMAGE_NAME, "later.pdf"],
+            [entry["name"] for entry in manifest],
+        )
+        self.assertEqual(
+            ["first-pdf", "later-pdf"],
+            [
+                entry["text"]
+                for entry in manifest
+                if entry.get("method") == "local_extraction"
+            ],
+        )
+
+    def test_prevalidated_native_target_remains_current_when_body_emits_new_property(self):
+        attachment = self._valid_attachment()
+        batch = file_handling.validate_and_normalize_native_image_attachments(
+            [attachment],
+            target_property_hint=self.TARGET,
+        )
+        native_manifest = file_handling.build_native_image_manifest_entry(batch)
+        alternate_pdf = {
+            "name": "999 Alternate Road Flyer.pdf",
+            "text": "999 Alternate Road, Other City, AZ 85002",
+            "images": [],
+            "method": "local_extraction",
+        }
+        event = {
+            "type": "new_property",
+            "address": "999 Alternate Road",
+            "city": "Other City",
+        }
+
+        current, by_event = processing._partition_property_attachments(
+            [native_manifest, alternate_pdf],
+            current_anchor=self.TARGET,
+            events=[event],
+        )
+
+        self.assertEqual([native_manifest], current)
+        self.assertEqual([[alternate_pdf]], by_event)
 
 
 if __name__ == "__main__":
