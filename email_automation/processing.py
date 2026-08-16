@@ -8808,24 +8808,59 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             print(f"📦 Batching {len(messages)} messages for thread {thread_id[:20]}...")
             batched_count += len(messages) - 1  # Count the extras
 
-            # Process only the LAST message (most recent), but include all message content
-            # in the conversation history (which is already handled by build_conversation_payload)
-            # First, save all the messages to Firestore so they appear in conversation
+            # Process only the LAST message (most recent) unless an earlier message
+            # carries an attachment. Attachment-bearing predecessors must run the
+            # extraction pipeline themselves: saving them only as conversation
+            # history would mark their assets processed without ever reading them.
+            attachment_predecessor_handled = False
             for msg in messages[:-1]:  # All but the last
+                processed_key = msg.get("internetMessageId") or msg.get("id")
                 try:
-                    _save_message_to_thread(
+                    has_attachments = _save_message_to_thread(
                         user_id,
                         thread_id,
                         msg,
                         headers,
                         authenticated_mailbox_email=authenticated_mailbox_email,
                     )
-                    processed_key = msg.get("internetMessageId") or msg.get("id")
+                    if has_attachments:
+                        process_inbox_message(
+                            user_id,
+                            headers,
+                            msg,
+                            allow_outbound_reply=False,
+                            authenticated_mailbox_email=authenticated_mailbox_email,
+                        )
+                        processed_count += 1
+                        mark_processed(user_id, processed_key)
+                        _clear_ai_processing_failure(
+                            user_id,
+                            thread_id,
+                            processed_key,
+                        )
+                        attachment_predecessor_handled = True
+                        break
                     mark_processed(user_id, processed_key)
-                except RetryableProcessingError:
-                    raise
                 except Exception as e:
-                    print(f"⚠️ Failed to save batched message: {e}")
+                    print(f"❌ Failed to process batched predecessor: {e}")
+                    _record_inbox_processing_failure(
+                        user_id,
+                        _client_id_for_processing_failure(user_id, thread_id),
+                        thread_id,
+                        processed_key,
+                        e,
+                        msg,
+                    )
+                    attachment_predecessor_handled = True
+                    break
+
+            # Whether extraction succeeded or failed, defer the rest of this
+            # thread to the next scan. This prevents a later message from
+            # triggering a reply before the predecessor's assets are settled.
+            if attachment_predecessor_handled:
+                if idx < len(thread_list) - 1:
+                    time.sleep(RATE_LIMIT_DELAY)
+                continue
 
             # Process the last message (which will see all previous in conversation)
             last_msg = messages[-1]
@@ -9065,8 +9100,10 @@ def _save_message_to_thread(
         _raw_content = full_body_resp.get("content", "") or ""
         _ctype = (full_body_resp.get("contentType") or "Text").upper()
         _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
-    except Exception:
-        _full_text = msg.get("bodyPreview", "")
+    except Exception as e:
+        raise RetryableProcessingError(
+            "Batched message full readback failed; leaving the thread retryable"
+        ) from e
 
     # Get headers for in_reply_to and references
     internet_message_headers = merged_msg.get("internetMessageHeaders", [])
@@ -9155,6 +9192,7 @@ def _save_message_to_thread(
         cancel_followup_on_response(user_id, thread_id)
 
     print(f"  📝 Saved batched message from {from_addr} to thread {thread_id[:20]}...")
+    return has_attachments
 
 def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], top: int = 50):
     """
