@@ -4410,31 +4410,27 @@ def _prepare_ai_attachment_manifest(
     pdf_manifest: Optional[List[dict]],
 ) -> Optional[List[Tuple[dict, Optional[dict]]]]:
     """Validate native entries while leaving legacy PDF entries unchanged."""
-    prepared = []
-    native_asset_count = 0
-    native_source_bytes = 0
-    native_normalized_bytes = 0
-    for attachment in (pdf_manifest or []):
+    attachments = list(pdf_manifest or [])
+    native_positions = []
+    native_manifests = []
+    for position, attachment in enumerate(attachments):
         if _is_native_image_manifest_candidate(attachment):
-            safe_projection = project_safe_native_image_manifest(attachment)
-            if safe_projection is None:
-                return None
-            for metadata in safe_projection["image_meta"]:
-                native_asset_count += 1
-                native_source_bytes += metadata["source_bytes"]
-                native_normalized_bytes += metadata["normalized_bytes"]
-            if (
-                native_asset_count > _file_handling.NATIVE_IMAGE_MAX_COUNT
-                or native_source_bytes
-                > _file_handling.NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
-                or native_normalized_bytes
-                > _file_handling.NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
-            ):
-                return None
-            prepared.append((attachment, safe_projection))
-        else:
-            prepared.append((attachment, None))
-    return prepared
+            native_positions.append(position)
+            native_manifests.append(attachment)
+
+    native_projections = _file_handling.project_safe_native_image_manifests(
+        native_manifests
+    )
+    if native_projections is None:
+        return None
+    projection_by_position = dict(zip(
+        native_positions,
+        native_projections,
+    ))
+    return [
+        (attachment, projection_by_position.get(position))
+        for position, attachment in enumerate(attachments)
+    ]
 
 
 def _canonicalize_native_multi_property_attachment(proposal: dict) -> dict:

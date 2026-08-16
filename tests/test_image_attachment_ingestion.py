@@ -3202,14 +3202,32 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             )
 
         def assert_request_rejected_before_effects(manifests):
-            rejected = self._run_proposal(manifests, dry_run=False)
-            self.assertIsNone(rejected["proposal"])
-            self.assertEqual(
-                0,
-                rejected["client"].responses.create.call_count,
-            )
-            self.assertEqual(0, rejected["client"].files.create.call_count)
-            self.assertEqual(0, rejected["usage_call"].call_count)
+            with mock.patch.object(
+                file_handling.base64,
+                "b64decode",
+                wraps=file_handling.base64.b64decode,
+            ) as request_decode, mock.patch.object(
+                file_handling,
+                "_inspect_native_image_header",
+                wraps=file_handling._inspect_native_image_header,
+            ) as request_header, mock.patch.object(
+                file_handling,
+                "_inspect_native_image_pillow_format",
+                wraps=file_handling._inspect_native_image_pillow_format,
+            ) as request_pillow, mock.patch.object(
+                file_handling.hashlib,
+                "sha256",
+                wraps=file_handling.hashlib.sha256,
+            ) as request_hash, mock.patch.object(
+                file_handling,
+                "_verify_native_image",
+                wraps=file_handling._verify_native_image,
+            ) as request_verify, mock.patch.object(
+                file_handling,
+                "_normalize_native_image",
+                wraps=file_handling._normalize_native_image,
+            ) as request_normalize:
+                rejected = self._run_proposal(manifests, dry_run=False)
             rejected_persist = (
                 rejected["firestore"].collection.return_value
                 .document.return_value
@@ -3217,12 +3235,50 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 .document.return_value
                 .set
             )
-            self.assertEqual(0, rejected_persist.call_count)
+            self.assertEqual(
+                (None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                (
+                    rejected["proposal"],
+                    request_decode.call_count,
+                    request_header.call_count,
+                    request_pillow.call_count,
+                    request_hash.call_count,
+                    request_verify.call_count,
+                    request_normalize.call_count,
+                    rejected["client"].responses.create.call_count,
+                    rejected["client"].files.create.call_count,
+                    rejected["usage_call"].call_count,
+                    rejected_persist.call_count,
+                ),
+            )
 
         with self.subTest(resource_case="request_native_asset_count_four"):
-            assert_request_rejected_before_effects([
+            count_manifests = [
                 self._single_manifest(f"request-count-{label}")
                 for label in ("alpha", "beta", "gamma", "delta")
+            ]
+            legacy_interleaved = {
+                "name": "legacy.pdf",
+                "text": f"{self.TARGET}\nLegacy text.",
+                "images": [],
+                "method": "local_extraction",
+                "file_id": None,
+                "id": None,
+            }
+            assert_request_rejected_before_effects([
+                count_manifests[0],
+                legacy_interleaved,
+                *count_manifests[1:],
+            ])
+
+        malformed_after_valid = self._single_manifest(
+            "request-malformed-second"
+        )
+        malformed_after_valid["method"] = "native_image_unvalidated"
+        with self.subTest(resource_case="valid_then_malformed_native"):
+            assert_request_rejected_before_effects([
+                self._single_manifest("request-valid-first"),
+                malformed_after_valid,
             ])
 
         request_source_manifests = [
@@ -3240,15 +3296,20 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
         request_source_manifests[1]["image_meta"][0]["source_bytes"] = (
             request_source_cap + 1 - first_request_source
         )
-        with self.subTest(resource_case="request_source_one_over"):
-            with mock.patch.object(
-                file_handling,
-                "NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES",
-                request_source_cap,
+        for order, manifests in (
+            ("forward", request_source_manifests),
+            ("reverse", list(reversed(request_source_manifests))),
+        ):
+            with self.subTest(
+                resource_case="request_source_one_over",
+                order=order,
             ):
-                assert_request_rejected_before_effects(
-                    request_source_manifests
-                )
+                with mock.patch.object(
+                    file_handling,
+                    "NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES",
+                    request_source_cap,
+                ):
+                    assert_request_rejected_before_effects(manifests)
 
         request_normalized_manifests = [
             self._single_manifest("request-normalized-a"),
@@ -3260,15 +3321,91 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             manifest["image_meta"][0]["normalized_bytes"]
             for manifest in request_normalized_manifests
         )
-        with self.subTest(resource_case="request_normalized_one_over"):
+        for order, manifests in (
+            ("forward", request_normalized_manifests),
+            ("reverse", list(reversed(request_normalized_manifests))),
+        ):
+            with self.subTest(
+                resource_case="request_normalized_one_over",
+                order=order,
+            ):
+                with mock.patch.object(
+                    file_handling,
+                    "NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES",
+                    request_normalized_total - 1,
+                ):
+                    assert_request_rejected_before_effects(manifests)
+
+        exact_count_manifests = [
+            self._single_manifest(f"exact-count-{label}")
+            for label in ("alpha", "beta", "gamma")
+        ]
+        with self.subTest(resource_case="request_count_exact_boundary"):
+            exact_count_run = self._run_proposal([
+                exact_count_manifests[0],
+                legacy_interleaved,
+                *exact_count_manifests[1:],
+            ])
+            self.assertIsNotNone(exact_count_run["proposal"])
+            self.assertEqual(
+                1,
+                exact_count_run["client"].responses.create.call_count,
+            )
+
+        exact_source_manifests = [
+            self._single_manifest("exact-source-a"),
+            self._single_manifest("exact-source-b"),
+        ]
+        exact_normalized_total = sum(
+            manifest["image_meta"][0]["normalized_bytes"]
+            for manifest in exact_source_manifests
+        )
+        exact_source_cap = exact_normalized_total + 2
+        exact_source_manifests[0]["image_meta"][0]["source_bytes"] = 1
+        exact_source_manifests[1]["image_meta"][0]["source_bytes"] = (
+            exact_source_cap - 1
+        )
+        with self.subTest(resource_case="request_source_exact_boundary"):
             with mock.patch.object(
                 file_handling,
                 "NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES",
-                request_normalized_total - 1,
+                exact_source_cap,
             ):
-                assert_request_rejected_before_effects(
-                    request_normalized_manifests
+                exact_source_run = self._run_proposal(
+                    exact_source_manifests
                 )
+            self.assertIsNotNone(exact_source_run["proposal"])
+            self.assertEqual(
+                1,
+                exact_source_run["client"].responses.create.call_count,
+            )
+
+        exact_normalized_manifests = [
+            self._single_manifest("exact-normalized-a"),
+            self._single_manifest("exact-normalized-b"),
+        ]
+        for manifest in exact_normalized_manifests:
+            manifest["image_meta"][0]["source_bytes"] = 1
+        exact_normalized_cap = sum(
+            manifest["image_meta"][0]["normalized_bytes"]
+            for manifest in exact_normalized_manifests
+        )
+        with self.subTest(
+            resource_case="request_normalized_exact_boundary"
+        ):
+            with mock.patch.object(
+                file_handling,
+                "NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES",
+                exact_normalized_cap,
+            ):
+                exact_normalized_run = self._run_proposal(
+                    exact_normalized_manifests
+                )
+            self.assertIsNotNone(exact_normalized_run["proposal"])
+            self.assertEqual(
+                1,
+                exact_normalized_run["client"].responses.create.call_count,
+            )
 
     def test_mixed_native_and_scanned_pdf_preserves_pdf_file_semantics(self):
         native_manifest = self._single_manifest()

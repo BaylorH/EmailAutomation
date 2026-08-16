@@ -1145,15 +1145,10 @@ def build_native_image_manifest_entry(
     }
 
 
-def project_safe_native_image_manifest(
-    manifest: Dict[str, Any],
+def _preflight_native_image_manifest_metadata(
+    manifest: Any,
 ) -> Optional[Dict[str, Any]]:
-    """Validate a canonical native-image entry and return its safe projection.
-
-    The returned dictionaries are newly allocated from explicit allowlists. Raw
-    image bytes remain available only to the request assembler that already has
-    the validated input manifest; they never enter prompts, logs, or persistence.
-    """
+    """Validate bounded manifest metadata without decoding image payloads."""
     if type(manifest) is not dict:
         return None
 
@@ -1183,6 +1178,8 @@ def project_safe_native_image_manifest(
     ):
         return None
 
+    # These are bounded references to at most three existing strings/dicts; no
+    # encoded or decoded payload is copied during this request-wide first pass.
     preflight_images = []
     aggregate_source_bytes = 0
     aggregate_normalized_bytes = 0
@@ -1229,20 +1226,25 @@ def project_safe_native_image_manifest(
 
         aggregate_source_bytes += source_bytes
         aggregate_normalized_bytes += projected_decoded_size
-        if (
-            aggregate_source_bytes > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
-            or aggregate_normalized_bytes
-            > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
-        ):
-            return None
         preflight_images.append((
             encoded_image,
             metadata,
             projected_decoded_size,
         ))
 
+    return {
+        "images": preflight_images,
+        "source_bytes": aggregate_source_bytes,
+        "normalized_bytes": aggregate_normalized_bytes,
+    }
+
+
+def _project_preflighted_native_image_manifest(
+    preflight: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Fully validate one manifest after all request-wide bounds pass."""
     safe_meta = []
-    for encoded_image, metadata, projected_decoded_size in preflight_images:
+    for encoded_image, metadata, projected_decoded_size in preflight["images"]:
         try:
             normalized_data = _strict_native_image_base64_decode(
                 encoded_image,
@@ -1320,6 +1322,52 @@ def project_safe_native_image_manifest(
         key: safe_values[key]
         for key in _NATIVE_IMAGE_SAFE_MANIFEST_KEYS
     }
+
+
+def project_safe_native_image_manifests(
+    manifests: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Project a request batch only after metadata-only global preflight."""
+    if type(manifests) is not list:
+        return None
+
+    preflighted = []
+    aggregate_asset_count = 0
+    aggregate_source_bytes = 0
+    aggregate_normalized_bytes = 0
+    for manifest in manifests:
+        preflight = _preflight_native_image_manifest_metadata(manifest)
+        if preflight is None:
+            return None
+        aggregate_asset_count += len(preflight["images"])
+        aggregate_source_bytes += preflight["source_bytes"]
+        aggregate_normalized_bytes += preflight["normalized_bytes"]
+        if (
+            aggregate_asset_count > NATIVE_IMAGE_MAX_COUNT
+            or aggregate_source_bytes > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
+            or aggregate_normalized_bytes
+            > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES
+        ):
+            return None
+        preflighted.append(preflight)
+
+    projections = []
+    for preflight in preflighted:
+        projection = _project_preflighted_native_image_manifest(preflight)
+        if projection is None:
+            return None
+        projections.append(projection)
+    return projections
+
+
+def project_safe_native_image_manifest(
+    manifest: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Validate one canonical native-image entry and safely project it."""
+    projections = project_safe_native_image_manifests([manifest])
+    if projections is None or len(projections) != 1:
+        return None
+    return projections[0]
 
 
 def extract_pdf_text(content: bytes, filename: str = "document.pdf") -> Tuple[str, List[bytes]]:
