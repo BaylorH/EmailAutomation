@@ -6239,19 +6239,15 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
 
     def test_current_message_graph_snapshot_preserves_pdf_native_order_and_later_page_count(self):
         next_link = "https://graph.microsoft.com/v1.0/next-page-token"
-        first_pdf = _attachment(
-            "first.pdf",
+        first_native = self._valid_attachment("front", (8, 6))
+        middle_pdf = _attachment(
+            "middle.pdf",
             "application/pdf",
-            b"first-pdf",
+            b"middle-pdf",
         )
-        native = self._valid_attachment()
-        later_pdf = _attachment(
-            "later.pdf",
-            "application/pdf",
-            b"later-pdf",
-        )
-        first_page = self._graph_page([first_pdf, native], next_link)
-        second_page = self._graph_page([later_pdf])
+        later_native = self._valid_attachment("rear", (9, 6))
+        first_page = self._graph_page([first_native, middle_pdf], next_link)
+        second_page = self._graph_page([later_native])
 
         with mock.patch.object(
             file_handling.requests,
@@ -6289,17 +6285,35 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
 
         self.assertEqual(2, graph_get.call_count)
         self.assertEqual(next_link, graph_get.call_args_list[1].args[0])
-        self.assertEqual(2, process_pdf.call_count)
+        self.assertEqual(1, process_pdf.call_count)
         self.assertEqual(
-            ["first.pdf", GENERIC_IMAGE_NAME, "later.pdf"],
+            [GENERIC_IMAGE_NAME, "middle.pdf", GENERIC_IMAGE_NAME],
             [entry["name"] for entry in manifest],
         )
         self.assertEqual(
-            ["first-pdf", "later-pdf"],
+            ["middle-pdf"],
             [
                 entry["text"]
                 for entry in manifest
                 if entry.get("method") == "local_extraction"
+            ],
+        )
+        native_manifests = [
+            entry
+            for entry in manifest
+            if entry.get("method") == "native_image_normalized"
+        ]
+        self.assertEqual([1, 1], [
+            len(entry["images"])
+            for entry in native_manifests
+        ])
+        model_transport = ai_processing._prepare_ai_attachment_manifest(manifest)
+        self.assertIsNotNone(model_transport)
+        self.assertEqual(
+            ["native", "legacy", "native"],
+            [
+                "native" if entry.native is not None else "legacy"
+                for entry in model_transport
             ],
         )
 
