@@ -4917,11 +4917,20 @@ class _FrozenLegacyDict:
     items: Tuple[Tuple[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class _FrozenUnsafeAttachmentLeaf:
+    pass
+
+
+_FROZEN_UNSAFE_ATTACHMENT_LEAF = _FrozenUnsafeAttachmentLeaf()
+
+
 def _freeze_legacy_json_value(
     value: Any,
     *,
     depth: int = 0,
     active_container_ids: Optional[set] = None,
+    allow_unsafe_leaf: bool = False,
 ) -> Any:
     """Freeze exact JSON-safe types without invoking caller protocols."""
     if depth > _LEGACY_ATTACHMENT_SNAPSHOT_MAX_DEPTH:
@@ -4930,6 +4939,8 @@ def _freeze_legacy_json_value(
         return value
     if type(value) is float:
         if not math.isfinite(value):
+            if allow_unsafe_leaf:
+                return _FROZEN_UNSAFE_ATTACHMENT_LEAF
             raise _UnsafeLegacyAttachmentSnapshot()
         return value
 
@@ -4947,6 +4958,7 @@ def _freeze_legacy_json_value(
                     item,
                     depth=depth + 1,
                     active_container_ids=active_container_ids,
+                    allow_unsafe_leaf=allow_unsafe_leaf,
                 )
                 for item in list.__iter__(value)
             ))
@@ -4966,13 +4978,33 @@ def _freeze_legacy_json_value(
                         item,
                         depth=depth + 1,
                         active_container_ids=active_container_ids,
+                        allow_unsafe_leaf=allow_unsafe_leaf,
                     ),
                 ))
             return _FrozenLegacyDict(tuple(frozen_items))
         finally:
             active_container_ids.remove(container_id)
 
+    if allow_unsafe_leaf:
+        return _FROZEN_UNSAFE_ATTACHMENT_LEAF
     raise _UnsafeLegacyAttachmentSnapshot()
+
+
+def _frozen_attachment_contains_unsafe_leaf(value: Any) -> bool:
+    """Inspect only internal frozen values; never invoke caller protocols."""
+    if type(value) is _FrozenUnsafeAttachmentLeaf:
+        return True
+    if type(value) is _FrozenLegacyList:
+        return any(
+            _frozen_attachment_contains_unsafe_leaf(item)
+            for item in value.items
+        )
+    if type(value) is _FrozenLegacyDict:
+        return any(
+            _frozen_attachment_contains_unsafe_leaf(item)
+            for _, item in value.items
+        )
+    return False
 
 
 def _thaw_legacy_json_value(value: Any) -> Any:
@@ -5028,22 +5060,36 @@ def _prepare_ai_attachment_manifest(
     pdf_manifest: Optional[List[dict]],
 ) -> Optional[List[_PreparedAIAttachment]]:
     """Seal native and legacy entries without retaining caller aliases."""
-    attachments = list(pdf_manifest or [])
+    if pdf_manifest is None:
+        raw_attachments = []
+    elif type(pdf_manifest) is list:
+        raw_attachments = pdf_manifest
+    else:
+        return None
+    try:
+        frozen_attachments = _freeze_legacy_json_value(
+            raw_attachments,
+            allow_unsafe_leaf=True,
+        )
+    except _UnsafeLegacyAttachmentSnapshot:
+        return None
+    if type(frozen_attachments) is not _FrozenLegacyList:
+        return None
+
     native_positions = []
     native_manifests = []
     legacy_by_position = {}
-    for position, attachment in enumerate(attachments):
-        if _is_native_image_manifest_candidate(attachment):
+    for position, frozen_attachment in enumerate(frozen_attachments.items):
+        if type(frozen_attachment) is not _FrozenLegacyDict:
+            return None
+        sealed_attachment = _thaw_legacy_json_value(frozen_attachment)
+        if _is_native_image_manifest_candidate(sealed_attachment):
             native_positions.append(position)
-            native_manifests.append(attachment)
+            native_manifests.append(sealed_attachment)
             continue
-        try:
-            frozen_legacy = _freeze_legacy_json_value(attachment)
-        except _UnsafeLegacyAttachmentSnapshot:
+        if _frozen_attachment_contains_unsafe_leaf(frozen_attachment):
             return None
-        if type(frozen_legacy) is not _FrozenLegacyDict:
-            return None
-        legacy_by_position[position] = frozen_legacy
+        legacy_by_position[position] = frozen_attachment
 
     prepared_natives = _file_handling._prepare_safe_native_image_manifests(
         native_manifests
@@ -5060,7 +5106,7 @@ def _prepare_ai_attachment_manifest(
             if position in prepared_by_position
             else _PreparedAIAttachment(legacy=legacy_by_position[position])
         )
-        for position in range(len(attachments))
+        for position in range(len(frozen_attachments.items))
     ]
 
 

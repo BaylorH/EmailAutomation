@@ -2927,6 +2927,232 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 ),
             )
 
+        classifier_race_page = base64.b64encode(
+            _png_bytes(size=(5, 4))
+        ).decode("ascii")
+        classifier_race_manifest = {
+            "name": "classifier race brochure.pdf",
+            "text": f"{self.TARGET} - Total SF: 20,000.",
+            "images": [classifier_race_page],
+            "method": "local_extraction",
+            "file_id": None,
+            "id": None,
+            "nested": {"labels": ["sealed-before-classification"]},
+        }
+        classifier_race_batch = [classifier_race_manifest]
+        classifier_race_sentinel = "PRIVATE_CLASSIFIER_RACE_SENTINEL"
+        original_classifier = (
+            ai_processing._is_native_image_manifest_candidate
+        )
+        classifier_aliases = []
+
+        def classify_then_mutate_original(candidate):
+            decision = original_classifier(candidate)
+            classifier_aliases.append(candidate is classifier_race_manifest)
+            if len(classifier_aliases) == 1:
+                classifier_race_manifest.clear()
+                classifier_race_manifest.update({
+                    "name": GENERIC_IMAGE_NAME,
+                    "text": "",
+                    "images": [classifier_race_sentinel] * 4,
+                    "method": "native_image_normalized",
+                    "source_type": "native_image",
+                    "property_binding": "target",
+                    "binding_method": "structured_filename_address",
+                    "image_meta": [
+                        {"private": classifier_race_sentinel}
+                        for _ in range(4)
+                    ],
+                    "id": classifier_race_sentinel,
+                    "file_id": classifier_race_sentinel,
+                    "private": classifier_race_sentinel,
+                })
+            return decision
+
+        with mock.patch.object(
+            ai_processing,
+            "_is_native_image_manifest_candidate",
+            side_effect=classify_then_mutate_original,
+        ):
+            classifier_race_run = self._run_proposal(
+                classifier_race_batch,
+                output_text=(
+                    '{"updates": [{"column": "Total SF", '
+                    '"value": "20000", "confidence": 0.98, '
+                    '"reason": "Stated in target brochure."}], '
+                    '"events": [], "response_email": null, "notes": ""}'
+                ),
+                dry_run=False,
+            )
+
+        classifier_race_content = (
+            classifier_race_run["client"].responses.create.call_args.kwargs
+            ["input"][0]["content"]
+        )
+        classifier_race_prompt = next(
+            item["text"]
+            for item in classifier_race_content
+            if item.get("type") == "input_text"
+        )
+        classifier_race_persist_call = (
+            classifier_race_run["firestore"].collection.return_value
+            .document.return_value
+            .collection.return_value
+            .document.return_value
+            .set
+        )
+        classifier_race_persisted = (
+            classifier_race_persist_call.call_args.args[0]
+        )
+        classifier_race_observable = repr((
+            classifier_race_content,
+            classifier_race_run["proposal"],
+            classifier_race_run["usage_call"].call_args_list,
+            classifier_race_run["print_call"].call_args_list,
+            classifier_race_persisted,
+        ))
+        with self.subTest(snapshot="preclassification_legacy_snapshot"):
+            self.assertEqual(
+                (
+                    [(
+                        "input_image",
+                        f"data:image/png;base64,{classifier_race_page}",
+                    )],
+                    True,
+                    True,
+                    ["20000"],
+                    [],
+                    [{
+                        "name": "classifier race brochure.pdf",
+                        "text": f"{self.TARGET} - Total SF: 20,000.",
+                        "method": "local_extraction",
+                        "file_id": None,
+                        "id": None,
+                        "nested": {
+                            "labels": ["sealed-before-classification"],
+                        },
+                    }],
+                    [],
+                    1,
+                    0,
+                    1,
+                    1,
+                    1,
+                    True,
+                    True,
+                    False,
+                    False,
+                    [False, False],
+                    4,
+                ),
+                (
+                    [
+                        (
+                            item["type"],
+                            item.get("image_url") or item.get("file_id"),
+                        )
+                        for item in classifier_race_content
+                        if item.get("type") in ("input_image", "input_file")
+                    ],
+                    "classifier race brochure.pdf" in classifier_race_prompt,
+                    "Total SF: 20,000." in classifier_race_prompt,
+                    [
+                        update.get("value")
+                        for update in (
+                            classifier_race_run["proposal"] or {}
+                        ).get("updates", [])
+                    ],
+                    (
+                        classifier_race_run["proposal"] or {}
+                    ).get("events", []),
+                    classifier_race_persisted["pdfManifest"],
+                    classifier_race_persisted["fileIds"],
+                    classifier_race_run["client"].responses.create.call_count,
+                    classifier_race_run["client"].files.create.call_count,
+                    classifier_race_run["usage_call"].call_count,
+                    classifier_race_persist_call.call_count,
+                    classifier_race_run["usage_call"].call_args.kwargs
+                    ["metadata"]["pdfCount"],
+                    classifier_race_run["usage_call"].call_args.kwargs
+                    ["metadata"]["hasPdfManifest"],
+                    len(classifier_race_persisted["pdfManifest"]) == 1,
+                    classifier_race_sentinel in classifier_race_observable,
+                    "native_image_normalized" in classifier_race_observable,
+                    classifier_aliases,
+                    len(classifier_race_manifest["images"]),
+                ),
+            )
+
+        protocol_sentinel = "PRIVATE_PREFREEZE_PROTOCOL_SENTINEL"
+        protocol_value = _ExplodingCopyValue(protocol_sentinel)
+        protocol_manifest = {
+            "name": "protocol control.pdf",
+            "text": f"{self.TARGET} - protocol control.",
+            "images": [],
+            "method": "local_extraction",
+            "nested": protocol_value,
+        }
+        protocol_classifier_inputs = []
+
+        def inspect_protocol_snapshot(candidate):
+            protocol_classifier_inputs.append((
+                candidate is protocol_manifest,
+                dict.get(candidate, "nested") is protocol_value,
+            ))
+            return original_classifier(candidate)
+
+        with mock.patch.object(
+            ai_processing,
+            "_is_native_image_manifest_candidate",
+            side_effect=inspect_protocol_snapshot,
+        ):
+            protocol_run = self._run_proposal([protocol_manifest])
+
+        with self.subTest(snapshot="protocol_leaf_is_not_aliased"):
+            self.assertEqual(
+                (None, 0, 0, 0, [(False, False)], False),
+                (
+                    protocol_run["proposal"],
+                    protocol_run["client"].responses.create.call_count,
+                    protocol_run["client"].files.create.call_count,
+                    protocol_run["usage_call"].call_count,
+                    protocol_classifier_inputs,
+                    protocol_sentinel in repr(
+                        protocol_run["print_call"].call_args_list
+                    ),
+                ),
+            )
+
+        cyclic_value = []
+        cyclic_value.append(cyclic_value)
+        cycle_control_manifest = {
+            "name": "cycle control.pdf",
+            "text": f"{self.TARGET} - cycle control.",
+            "images": [],
+            "method": "local_extraction",
+            "nested": cyclic_value,
+        }
+        with mock.patch.object(
+            ai_processing,
+            "_is_native_image_manifest_candidate",
+            wraps=original_classifier,
+        ) as cycle_classifier:
+            cycle_control_run = self._run_proposal(
+                [cycle_control_manifest]
+            )
+
+        with self.subTest(snapshot="cycle_rejected_before_classification"):
+            self.assertEqual(
+                (None, 0, 0, 0, 0),
+                (
+                    cycle_control_run["proposal"],
+                    cycle_control_run["client"].responses.create.call_count,
+                    cycle_control_run["client"].files.create.call_count,
+                    cycle_control_run["usage_call"].call_count,
+                    cycle_classifier.call_count,
+                ),
+            )
+
     def test_malformed_native_manifest_fails_before_model_or_persistence(self):
         wrong_binding = self._single_manifest("wrong-binding")
         wrong_binding["property_binding"] = "competing"
