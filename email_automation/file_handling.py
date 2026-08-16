@@ -356,8 +356,8 @@ _NATIVE_IMAGE_TRAILING_NUMBER_METADATA_RE = re.compile(
     r"(?:^|[-_\s]+)"
     r"(?:(?:copy|page|photo)[-_\s]+\d+|\(\s*\d+\s*\))\s*$"
 )
-_NATIVE_IMAGE_UNCLAIMED_NUMBER_RE = re.compile(
-    r"(?<![a-z0-9])\d+[a-z]?(?![a-z0-9])"
+_NATIVE_IMAGE_UNCLAIMED_ALPHANUMERIC_NUMBER_RE = re.compile(
+    r"(?<![a-z0-9])[a-z0-9]*\d[a-z0-9]*(?![a-z0-9])"
 )
 
 
@@ -528,7 +528,7 @@ def _native_image_filename_address_claims(
         or _NATIVE_IMAGE_PARTIAL_STATE_ZIP_RE.search(unclaimed)
         or _NATIVE_IMAGE_PARTIAL_NUMBER_STREET_TOKEN_RE.search(unclaimed)
         or _NATIVE_IMAGE_PARTIAL_STREET_WITHOUT_NUMBER_RE.search(unclaimed)
-        or _NATIVE_IMAGE_UNCLAIMED_NUMBER_RE.search(unclaimed)
+        or _NATIVE_IMAGE_UNCLAIMED_ALPHANUMERIC_NUMBER_RE.search(unclaimed)
     )
     return claims, has_incomplete_claim
 

@@ -1825,6 +1825,44 @@ class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
                     self._validate(matching_filename, target=ranged)
                 )
 
+    def test_rejects_compact_alphanumeric_numeric_prefixes(self):
+        target = "125 Main Road, Example City, Arizona 85001"
+        matching_filename = "125 Main Rd Example City AZ 85001.png"
+        compact_prefixes = (
+            "Suite123",
+            "Unit456",
+            "456Front",
+            "id1234567",
+            "Suite\u2460\u2461\u2462",
+            "Unit\u2463\u2464\u2465",
+        )
+
+        for compact_prefix in compact_prefixes:
+            ranged = (
+                f"{compact_prefix}-125 Main Rd Example City AZ 85001"
+            )
+            with self.subTest(
+                compact_prefix=compact_prefix,
+                surface="filename_classifier",
+            ):
+                self._assert_unbound_classification(
+                    self._classify(f"{ranged}.png", target=target)
+                )
+            with self.subTest(
+                compact_prefix=compact_prefix,
+                surface="target_classifier",
+            ):
+                self._assert_unbound_classification(
+                    self._classify(matching_filename, target=ranged)
+                )
+            with self.subTest(
+                compact_prefix=compact_prefix,
+                surface="real_batch",
+            ):
+                self._assert_unbound_batch(
+                    self._validate(f"{ranged}.png", target=target)
+                )
+
     def test_rejects_malformed_zip_plus_three(self):
         malformed_filename = (
             "123 N Sample Rd Example City AZ 85001-123.png"
