@@ -392,16 +392,22 @@ def manual_reply_authority_key(
     client_id: str,
     notification_id: str,
 ) -> str:
-    """Return the user/client/notification-scoped authority document key."""
+    """Return the user-scoped, length-framed manual-reply authority key."""
 
-    members = (
-        _AUTHORITY_DOMAIN,
-        _validate_document_id(uid, "uid"),
-        _validate_document_id(client_id, "client_id"),
-        _validate_document_id(notification_id, "notification_id"),
+    canonical_uid = _validate_document_id(uid, "uid")
+    canonical_client_id = _validate_document_id(client_id, "client_id")
+    canonical_notification_id = _validate_document_id(
+        notification_id,
+        "notification_id",
     )
+
     digest = hashlib.sha256()
-    for member in members:
+    for member in (
+        _AUTHORITY_DOMAIN,
+        canonical_uid,
+        canonical_client_id,
+        canonical_notification_id,
+    ):
         encoded = member.encode("utf-8")
         digest.update(len(encoded).to_bytes(4, "big"))
         digest.update(encoded)

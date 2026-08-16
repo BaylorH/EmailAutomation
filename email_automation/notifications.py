@@ -1,12 +1,227 @@
 import hashlib
 import logging
 import re
-from typing import Optional, List, Dict, Any
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs
 from google.cloud import firestore
+from .manual_reply import (
+    is_canonical_document_id,
+    manual_reply_authority_key,
+    normalize_internet_message_id,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ManualReplySource:
+    """Trusted notification-time inputs for one possible manual reply."""
+
+    graph_lookup_message_id: str
+    immutable_graph_message_id: Optional[str]
+    internet_message_id: str
+    conversation_id: str
+    authenticated_mailbox_address: str
+    from_addresses: Tuple[str, ...]
+    sender_addresses: Tuple[str, ...]
+    reply_to_addresses: Tuple[str, ...]
+    to_addresses: Tuple[str, ...]
+    cc_addresses: Tuple[str, ...]
+    bcc_addresses: Tuple[str, ...]
+
+
+def _canonical_opaque(value: object, maximum_bytes: int = 2048) -> Optional[str]:
+    if type(value) is not str or not value:
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if not 1 <= len(encoded) <= maximum_bytes:
+        return None
+    if value != value.strip(" \t\r\n"):
+        return None
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        return None
+    return value
+
+
+def _canonical_email_address(value: object) -> Optional[str]:
+    if type(value) is not str or not value or value != value.strip():
+        return None
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    if value.count("@") != 1 or any(character.isspace() for character in value):
+        return None
+    local, domain = value.split("@")
+    if not local or not domain or any(character in "<>,;" for character in value):
+        return None
+    return value.lower()
+
+
+def _canonical_address_tuple(values: object) -> Optional[Tuple[str, ...]]:
+    if type(values) is not tuple:
+        return None
+    canonical = tuple(_canonical_email_address(value) for value in values)
+    if any(value is None for value in canonical):
+        return None
+    return canonical
+
+
+def _manual_reply_authority_document(
+    *,
+    uid: str,
+    client_id: str,
+    thread_id: str,
+    notification_id: str,
+    kind: str,
+    email: str,
+    meta: object,
+    source: Optional[ManualReplySource],
+) -> Optional[Dict[str, Any]]:
+    if kind != "action_needed" or source is None or type(meta) is not dict:
+        return None
+
+    reason = meta.get("reason")
+    if (
+        type(reason) is not str
+        or not reason.startswith("needs_user_input:")
+        or not reason.removeprefix("needs_user_input:")
+    ):
+        return None
+    if not is_canonical_document_id(thread_id):
+        return None
+
+    graph_lookup_message_id = _canonical_opaque(source.graph_lookup_message_id)
+    conversation_id = _canonical_opaque(source.conversation_id)
+    immutable_graph_message_id = source.immutable_graph_message_id
+    if immutable_graph_message_id is not None:
+        immutable_graph_message_id = _canonical_opaque(immutable_graph_message_id)
+    if (
+        graph_lookup_message_id is None
+        or conversation_id is None
+        or (
+            source.immutable_graph_message_id is not None
+            and immutable_graph_message_id is None
+        )
+    ):
+        return None
+
+    try:
+        normalized_internet_message_id = normalize_internet_message_id(
+            source.internet_message_id
+        )
+        meta_internet_message_id = normalize_internet_message_id(
+            meta.get("sourceInternetMessageId")
+        )
+    except (TypeError, ValueError):
+        return None
+    if normalized_internet_message_id != meta_internet_message_id:
+        return None
+
+    if any(
+        meta.get(field) != graph_lookup_message_id
+        for field in (
+            "replyToMessageId",
+            "sourceMessageId",
+            "sourceGraphMessageId",
+        )
+    ):
+        return None
+
+    authenticated_mailbox = _canonical_email_address(
+        source.authenticated_mailbox_address
+    )
+    notification_recipient = _canonical_email_address(email)
+    from_addresses = _canonical_address_tuple(source.from_addresses)
+    sender_addresses = _canonical_address_tuple(source.sender_addresses)
+    reply_to_addresses = _canonical_address_tuple(source.reply_to_addresses)
+    to_addresses = _canonical_address_tuple(source.to_addresses)
+    cc_addresses = _canonical_address_tuple(source.cc_addresses)
+    bcc_addresses = _canonical_address_tuple(source.bcc_addresses)
+    if (
+        authenticated_mailbox is None
+        or notification_recipient is None
+        or from_addresses is None
+        or sender_addresses is None
+        or reply_to_addresses is None
+        or to_addresses is None
+        or cc_addresses is None
+        or bcc_addresses is None
+        or len(from_addresses) != 1
+        or len(sender_addresses) != 1
+        or from_addresses != sender_addresses
+        or notification_recipient != from_addresses[0]
+        or reply_to_addresses
+        or to_addresses != (authenticated_mailbox,)
+        or cc_addresses
+        or bcc_addresses
+    ):
+        return None
+
+    authority_doc: Dict[str, Any] = {
+        "schemaVersion": 1,
+        "status": "eligible",
+        "uid": uid,
+        "clientId": client_id,
+        "threadId": thread_id,
+        "notificationId": notification_id,
+        "source": "dashboard_inline_reply",
+        "graphLookupMessageId": graph_lookup_message_id,
+        "normalizedInternetMessageId": normalized_internet_message_id,
+        "conversationId": conversation_id,
+        "authenticatedMailboxAddress": authenticated_mailbox,
+        "fromAddress": from_addresses[0],
+        "senderAddress": sender_addresses[0],
+        "sourceAudience": {
+            "to": list(to_addresses),
+            "cc": [],
+            "bcc": [],
+            "replyTo": [],
+        },
+        "audience": {
+            "to": [notification_recipient],
+            "cc": [],
+            "bcc": [],
+        },
+        "createdAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    }
+    if immutable_graph_message_id is not None:
+        authority_doc["immutableGraphMessageId"] = immutable_graph_message_id
+    return authority_doc
+
+
+def _matches_created_document(
+    actual: object,
+    expected: Dict[str, Any],
+    *,
+    timestamp_fields: Tuple[str, ...],
+) -> bool:
+    if type(actual) is not dict or set(actual) != set(expected):
+        return False
+    for field, expected_value in expected.items():
+        if field in timestamp_fields:
+            timestamp = actual.get(field)
+            try:
+                timezone_aware = (
+                    isinstance(timestamp, datetime)
+                    and timestamp.tzinfo is not None
+                    and timestamp.utcoffset() is not None
+                )
+            except (OverflowError, ValueError):
+                timezone_aware = False
+            if not timezone_aware:
+                return False
+        elif actual.get(field) != expected_value:
+            return False
+    return True
 
 
 def _decrement_notification_rollups(client_data: Dict[str, Any], kind: Optional[str]) -> Dict[str, Any]:
@@ -80,13 +295,30 @@ def extract_row_number_from_update(update: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def write_notification(uid: str, client_id: str, *, kind: str, priority: str, email: str, 
-                      thread_id: str, row_number: int = None, row_anchor: str = None, 
-                      meta: dict = None, dedupe_key: str = None) -> str:
+def write_notification(
+    uid: str,
+    client_id: str,
+    *,
+    kind: str,
+    priority: str,
+    email: str,
+    thread_id: str,
+    row_number: int = None,
+    row_anchor: str = None,
+    meta: dict = None,
+    dedupe_key: str = None,
+    manual_reply_source: Optional[ManualReplySource] = None,
+) -> str:
     """
     Write notification and bump counters atomically.
     Returns the notification document ID.
     """
+    if (
+        manual_reply_source is not None
+        and type(manual_reply_source) is not ManualReplySource
+    ):
+        raise TypeError("manual_reply_source must be a ManualReplySource")
+
     try:
         # Use dedupe_key as doc ID if provided
         if dedupe_key:
@@ -125,13 +357,87 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
             "dedupeKey": dedupe_key
         }
 
+        authority_doc = _manual_reply_authority_document(
+            uid=uid,
+            client_id=client_id,
+            thread_id=thread_id,
+            notification_id=notif_ref.id,
+            kind=kind,
+            email=email,
+            meta=meta,
+            source=manual_reply_source,
+        )
+        if authority_doc is not None and (
+            type(dedupe_key) is not str or not dedupe_key
+        ):
+            raise ValueError("manual_reply_source requires dedupe_key")
+        authority_ref = None
+        if authority_doc is not None:
+            authority_id = manual_reply_authority_key(
+                uid=uid,
+                client_id=client_id,
+                notification_id=notif_ref.id,
+            )
+            notification_doc["manualReplyAuthorityKey"] = authority_id
+            authority_ref = (
+                _fs.collection("users")
+                .document(uid)
+                .collection("manualReplyAuthorities")
+                .document(authority_id)
+            )
+
         @firestore.transactional
         def update_with_counters(transaction):
             # READS FIRST
             client_snapshot = client_ref.get(transaction=transaction)
 
-            # Dedupe check must also be a read before any WRITE
-            if dedupe_key:
+            # A qualifying notification and its server authority are one
+            # idempotent pair. Any partial or drifting pair fails closed.
+            if authority_ref is not None:
+                notif_snapshot = notif_ref.get(transaction=transaction)
+                authority_snapshot = authority_ref.get(transaction=transaction)
+                if notif_snapshot.exists or authority_snapshot.exists:
+                    notification_data = (
+                        notif_snapshot.to_dict() or {}
+                        if notif_snapshot.exists
+                        else {}
+                    )
+                    authority_data = (
+                        authority_snapshot.to_dict() or {}
+                        if authority_snapshot.exists
+                        else {}
+                    )
+                    notification_matches = (
+                        notif_snapshot.exists
+                        and _matches_created_document(
+                            notification_data,
+                            notification_doc,
+                            timestamp_fields=("createdAt",),
+                        )
+                    )
+                    authority_matches = (
+                        authority_snapshot.exists
+                        and _matches_created_document(
+                            authority_data,
+                            authority_doc,
+                            timestamp_fields=("createdAt", "updatedAt"),
+                        )
+                    )
+                    one_commit = (
+                        notification_data.get("createdAt")
+                        == authority_data.get("createdAt")
+                        == authority_data.get("updatedAt")
+                    )
+                    if (
+                        not notification_matches
+                        or not authority_matches
+                        or not one_commit
+                    ):
+                        raise ValueError("manual reply authority conflict")
+                    print(f"📋 Skipped duplicate notification: {dedupe_key}")
+                    return notif_ref.id  # No-op
+            elif dedupe_key:
+                # Preserve the legacy notification-only dedupe behavior.
                 notif_snapshot = notif_ref.get(transaction=transaction)
                 if notif_snapshot.exists:
                     print(f"📋 Skipped duplicate notification: {dedupe_key}")
@@ -148,6 +454,8 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
 
             # WRITES AFTER ALL READS
             transaction.set(notif_ref, notification_doc)
+            if authority_ref is not None:
+                transaction.set(authority_ref, authority_doc)
             transaction.set(
                 client_ref,
                 {
