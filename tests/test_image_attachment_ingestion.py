@@ -2791,6 +2791,105 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 sentinel,
             ))
 
+        for label, method in (
+            ("space_prefixed_native_method", " native_image_normalized"),
+            ("tab_prefixed_native_method", "\tnative_image_normalized"),
+            ("newline_prefixed_native_method", "\nnative_image_normalized"),
+            ("hyphenated_native_method", "native-image-normalized"),
+            ("spaced_native_method", "native image normalized"),
+            ("mixed_separator_native_method", "NaTiVe-Image_Normalized"),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            malformed_source_type_manifests.append((
+                label,
+                {
+                    "name": "legacy-looking.pdf",
+                    "text": sentinel,
+                    "images": [],
+                    "method": method,
+                    "id": sentinel,
+                    "raw_filename": f"{sentinel}.png",
+                },
+                sentinel,
+            ))
+
+        for label, variant_key, variant_value, exact_fields in (
+            (
+                "capitalized_source_type_key",
+                "Source_Type",
+                "native_image",
+                {"method": "openai_upload"},
+            ),
+            (
+                "hyphenated_source_type_key",
+                "source-type",
+                "native_image",
+                {"method": "openai_upload"},
+            ),
+            (
+                "capitalized_method_key",
+                "Method",
+                "native_image_normalized",
+                {},
+            ),
+            (
+                "hyphenated_property_binding_key",
+                "Property-Binding",
+                "target",
+                {
+                    "source_type": "google_drive_pdf",
+                    "method": "local_extraction",
+                },
+            ),
+            (
+                "spaced_binding_method_key",
+                "Binding Method",
+                "structured_filename_address",
+                {
+                    "source_type": "dropbox_pdf",
+                    "method": "openai_upload",
+                },
+            ),
+            (
+                "hyphenated_image_meta_key",
+                "Image-Meta",
+                [],
+                {
+                    "source_type": "public_pdf",
+                    "method": "local_extraction+images",
+                },
+            ),
+        ):
+            sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
+            manifest = {
+                "name": "legacy-looking.pdf",
+                "text": sentinel,
+                "images": [],
+                "id": sentinel,
+                "raw_filename": f"{sentinel}.png",
+                variant_key: variant_value,
+            }
+            manifest.update(exact_fields)
+            malformed_source_type_manifests.append(
+                (label, manifest, sentinel)
+            )
+
+        non_plain_key_sentinel = "PRIVATE_NON_PLAIN_KEY_SENTINEL"
+        malformed_source_type_manifests.append((
+            "non_plain_string_key",
+            {
+                "name": "legacy-looking.pdf",
+                "text": non_plain_key_sentinel,
+                "images": [],
+                "method": "local_extraction",
+                _PrivateHashString(
+                    "private_extension",
+                    non_plain_key_sentinel,
+                ): non_plain_key_sentinel,
+            },
+            non_plain_key_sentinel,
+        ))
+
         def assert_strict_rejection(manifest, sentinel=None):
             run = self._run_proposal([manifest], dry_run=False)
             persist_call = (

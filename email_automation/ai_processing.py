@@ -4351,6 +4351,19 @@ _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS = frozenset({
     "binding_method",
     "image_meta",
 })
+_ATTACHMENT_ROUTING_KEYS = frozenset({
+    "source_type",
+    "method",
+    *_NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS,
+})
+_ATTACHMENT_ROUTING_KEY_TOKENS = frozenset({
+    "sourcetype",
+    "method",
+    "propertybinding",
+    "bindingmethod",
+    "imagemeta",
+})
+_ATTACHMENT_ROUTING_TOKEN_MAX_CHARS = 96
 _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS = {
     "google_drive_pdf": frozenset({
         "local_extraction",
@@ -4374,10 +4387,35 @@ _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS = {
 }
 
 
+def _bounded_attachment_routing_token(value: Any) -> Optional[str]:
+    """Collapse bounded ASCII routing markers without invoking protocols."""
+    if type(value) is not str:
+        return None
+    if len(value) > _ATTACHMENT_ROUTING_TOKEN_MAX_CHARS:
+        return None
+    folded = str.casefold(value)
+    return "".join(
+        character
+        for character in folded
+        if "a" <= character <= "z" or "0" <= character <= "9"
+    )
+
+
 def _is_native_image_manifest_candidate(manifest: Any) -> bool:
     """Recognize canonical or malformed entries that claim the native channel."""
     if type(manifest) is not dict:
         return True
+    for key in dict.keys(manifest):
+        if type(key) is not str:
+            return True
+        key_token = _bounded_attachment_routing_token(key)
+        if key_token is None:
+            return True
+        if (
+            key_token in _ATTACHMENT_ROUTING_KEY_TOKENS
+            and key not in _ATTACHMENT_ROUTING_KEYS
+        ):
+            return True
     if any(
         dict.__contains__(manifest, key)
         for key in _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS
@@ -4400,9 +4438,12 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
 
     if dict.__contains__(manifest, "method") and type(method) is not str:
         return True
-    return type(method) is str and str.startswith(
-        str.casefold(method),
-        "native_image",
+    if type(method) is not str:
+        return False
+    method_token = _bounded_attachment_routing_token(method)
+    return method_token is None or str.startswith(
+        method_token,
+        "nativeimage",
     )
 
 
