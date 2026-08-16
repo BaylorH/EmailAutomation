@@ -6,6 +6,7 @@ import unittest
 from collections import UserDict
 from types import MappingProxyType
 from unittest import mock
+from urllib.parse import quote
 
 from PIL import Image, PngImagePlugin
 
@@ -112,6 +113,20 @@ class _ExplodingCopyValue:
 
     def __repr__(self):
         return f"<private-copy-value {self.private_sentinel}>"
+
+
+class _ExplodingEqualityValue:
+    def __init__(self, private_sentinel):
+        self.private_sentinel = private_sentinel
+
+    def __eq__(self, other):
+        raise AssertionError(self.private_sentinel)
+
+    def __ne__(self, other):
+        raise AssertionError(self.private_sentinel)
+
+    def __repr__(self):
+        return f"<private-equality-value {self.private_sentinel}>"
 
 
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
@@ -3326,6 +3341,36 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "grapheme_joiner_reserved_native_name",
                 "Broker\u034f property image",
             ),
+            (
+                "exact_reserved_native_name_pdf_suffix",
+                f"{GENERIC_IMAGE_NAME}.pdf",
+            ),
+            (
+                "fullwidth_reserved_native_name_pdf_suffix",
+                "\uff22\uff52\uff4f\uff4b\uff45\uff52\u3000"
+                "\uff50\uff52\uff4f\uff50\uff45\uff52\uff54\uff59\u3000"
+                "\uff49\uff4d\uff41\uff47\uff45.pdf",
+            ),
+            (
+                "greek_omicron_reserved_native_name_pdf_suffix",
+                "Br\u03bfker property image.pdf",
+            ),
+            (
+                "unicode_hyphen_reserved_native_name_pdf_suffix",
+                "Broker\u2010property image.pdf",
+            ),
+            (
+                "zero_width_reserved_native_name_pdf_suffix",
+                "Broker\u200b property image.pdf",
+            ),
+            (
+                "variation_selector_reserved_native_name_pdf_suffix",
+                "Broker\ufe0f property image.pdf",
+            ),
+            (
+                "grapheme_joiner_reserved_native_name_pdf_suffix",
+                "Broker\u034f property image.pdf",
+            ),
         ):
             sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
             downgraded = self._single_manifest(label)
@@ -3338,7 +3383,12 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "method": "openai_upload",
                 "id": sentinel,
                 "file_id": sentinel,
-                "raw_filename": f"{sentinel}.png",
+                "filename": reserved_name,
+                "source_url": (
+                    "https://drive.google.com/file/d/forged-native/"
+                    f"{quote(reserved_name)}"
+                ),
+                "drive_link": None,
             })
             malformed_source_type_manifests.append(
                 (label, downgraded, sentinel)
@@ -3401,6 +3451,39 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 "nested": deeply_nested,
             },
             depth_sentinel,
+        ))
+
+        preview_protocol_sentinel = (
+            "PRIVATE_LINKED_PREVIEW_PROTOCOL_SENTINEL"
+        )
+        malformed_source_type_manifests.append((
+            "linked_preview_non_plain_source_type",
+            {
+                "name": "linked-preview.pdf",
+                "filename": "linked-preview.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "file_id": None,
+                "id": None,
+                "source_type": "google_drive_pdf",
+                "source_url": (
+                    "https://drive.google.com/file/d/fixture/"
+                    "linked-preview.pdf"
+                ),
+                "drive_link": None,
+                "property_image_url": (
+                    "https://drive.google.com/uc?export=view&id=preview"
+                ),
+                "property_image_source": (
+                    "Broker flyer link preview: linked-preview.pdf, page 1"
+                ),
+                "property_image_source_type": _ExplodingEqualityValue(
+                    preview_protocol_sentinel
+                ),
+                "property_image_meta": {},
+            },
+            preview_protocol_sentinel,
         ))
 
         def assert_strict_rejection(manifest, sentinel=None):
@@ -3502,16 +3585,35 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                     if has_file
                     else None
                 )
+                if source_type == "google_drive_pdf":
+                    linked_name = "view"
+                    source_url = (
+                        "https://drive.google.com/file/d/legacy-fixture/view"
+                    )
+                elif source_type == "dropbox_pdf":
+                    linked_name = "dropbox-linked.pdf"
+                    source_url = (
+                        "https://www.dropbox.com/scl/fi/key/"
+                        "dropbox-linked.pdf?dl=0"
+                    )
+                else:
+                    linked_name = "public-linked.pdf"
+                    source_url = (
+                        "https://assets.example.test/public-linked.pdf"
+                    )
                 legacy_manifests.append((
                     f"{source_type}:{method}",
                     {
-                        "name": f"{source_type}.pdf",
+                        "name": linked_name,
+                        "filename": linked_name,
                         "text": f"{self.TARGET}\nLegacy linked PDF text.",
                         "images": [legacy_page] if has_images else [],
                         "method": method,
                         "file_id": file_id,
                         "id": file_id,
                         "source_type": source_type,
+                        "source_url": source_url,
+                        "drive_link": None,
                     },
                     (
                         [
@@ -3527,6 +3629,36 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                     ),
                 ))
 
+        legacy_manifests.append((
+            "public_pdf:local_extraction:preview",
+            {
+                "name": "public-preview.pdf",
+                "filename": "public-preview.pdf",
+                "text": f"{self.TARGET}\nLegacy linked PDF text.",
+                "images": [],
+                "method": "local_extraction",
+                "file_id": None,
+                "id": None,
+                "source_type": "public_pdf",
+                "source_url": (
+                    "https://assets.example.test/public-preview.pdf"
+                ),
+                "drive_link": None,
+                "property_image_url": (
+                    "https://drive.google.com/uc?export=view&id=preview"
+                ),
+                "property_image_source": (
+                    "Broker flyer link preview: public-preview.pdf, page 1"
+                ),
+                "property_image_source_type": "broker_pdf_link_preview",
+                "property_image_meta": {
+                    "pageNumber": 1,
+                    "strategy": "first_page_preview_fallback",
+                },
+            },
+            [],
+        ))
+
         for source_type, method in (
             ("direct_image", "direct_image_link"),
         ):
@@ -3537,9 +3669,28 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                     "text": "",
                     "images": [],
                     "method": method,
-                    "file_id": None,
-                    "id": None,
                     "source_type": source_type,
+                    "source_url": (
+                        "https://assets.example.test/broker-linked-asset.png"
+                    ),
+                    "drive_link": None,
+                    "property_image_url": (
+                        "https://drive.google.com/uc?export=view&id=image"
+                    ),
+                    "property_image_source": (
+                        "Broker image link: broker linked asset.png"
+                    ),
+                    "property_image_source_type": "broker_image_link",
+                    "property_image_meta": {
+                        "strategy": "direct_image_link_v1",
+                        "selectionReason": (
+                            "broker-provided public image link"
+                        ),
+                        "contentType": "image/png",
+                        "byteCount": 17,
+                        "sha256": "direct-image-sha",
+                        "driveLink": None,
+                    },
                 },
                 [],
             ))
@@ -3615,6 +3766,166 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                         transport,
                     ),
                 )
+
+        drive_view_url = (
+            "https://drive.google.com/file/d/actual-producer-fixture/view"
+        )
+        drive_view_text = (
+            f"{self.TARGET}\n"
+            + "Actual Google Drive linked PDF producer text. " * 4
+        )
+        with mock.patch.object(
+            file_handling,
+            "_download_linked_asset",
+            return_value=(b"%PDF-1.4 linked fixture", "application/pdf"),
+        ), mock.patch.object(
+            file_handling,
+            "extract_pdf_text",
+            return_value=(drive_view_text, []),
+        ), mock.patch.object(
+            file_handling,
+            "upload_pdf_to_drive",
+            return_value=None,
+        ), mock.patch.object(
+            file_handling,
+            "render_pdf_property_preview",
+            return_value=None,
+        ), mock.patch.object(
+            file_handling,
+            "render_pdf_first_page_preview",
+            return_value=None,
+        ), mock.patch(
+            "builtins.print",
+        ):
+            drive_view_manifest = (
+                file_handling.fetch_and_process_linked_assets(
+                    [drive_view_url]
+                )
+            )
+
+        with self.subTest(legacy_source_pair="actual_google_drive_view"):
+            drive_view_run = self._run_proposal(
+                drive_view_manifest,
+                dry_run=False,
+            )
+            drive_view_content = (
+                drive_view_run["client"].responses.create.call_args.kwargs
+                ["input"][0]["content"]
+                if drive_view_run["client"].responses.create.call_count
+                else []
+            )
+            drive_view_prompt = next((
+                item.get("text", "")
+                for item in drive_view_content
+                if item.get("type") == "input_text"
+            ), "")
+            drive_view_persist_call = (
+                drive_view_run["firestore"].collection.return_value
+                .document.return_value
+                .collection.return_value
+                .document.return_value
+                .set
+            )
+            self.assertEqual(
+                (
+                    1,
+                    "view",
+                    "view",
+                    "google_drive_pdf",
+                    "local_extraction",
+                    True,
+                    1,
+                    0,
+                    1,
+                    1,
+                    True,
+                ),
+                (
+                    len(drive_view_manifest),
+                    (drive_view_manifest[0] or {}).get("name"),
+                    (drive_view_manifest[0] or {}).get("filename"),
+                    (drive_view_manifest[0] or {}).get("source_type"),
+                    (drive_view_manifest[0] or {}).get("method"),
+                    drive_view_run["proposal"] is not None,
+                    drive_view_run["client"].responses.create.call_count,
+                    drive_view_run["client"].files.create.call_count,
+                    drive_view_run["usage_call"].call_count,
+                    drive_view_persist_call.call_count,
+                    "Actual Google Drive linked PDF producer text."
+                    in drive_view_prompt,
+                ),
+            )
+
+        direct_image_url = (
+            "https://lh3.googleusercontent.com/p/"
+            "AF1QipActualProducer=w1200-h800"
+        )
+        with mock.patch.object(
+            file_handling,
+            "_download_linked_asset",
+            return_value=(b"linked image fixture", "image/jpeg"),
+        ), mock.patch.object(
+            file_handling,
+            "_image_link_to_png_preview",
+            return_value=b"normalized linked image fixture",
+        ), mock.patch.object(
+            file_handling,
+            "upload_property_image_to_drive",
+            return_value={
+                "url": (
+                    "https://drive.google.com/uc?export=view&id=linked-image"
+                ),
+                "driveLink": (
+                    "https://drive.google.com/file/d/linked-image/view"
+                ),
+                "contentType": "image/png",
+                "byteCount": 31,
+                "sha256": "actual-direct-image-sha",
+            },
+        ), mock.patch(
+            "builtins.print",
+        ):
+            direct_image_manifest = (
+                file_handling.fetch_and_process_linked_assets(
+                    [direct_image_url]
+                )
+            )
+
+        with self.subTest(legacy_source_pair="actual_direct_image_fallback"):
+            direct_image_run = self._run_proposal(direct_image_manifest)
+            direct_image_content = (
+                direct_image_run["client"].responses.create.call_args.kwargs
+                ["input"][0]["content"]
+                if direct_image_run["client"].responses.create.call_count
+                else []
+            )
+            self.assertEqual(
+                (
+                    1,
+                    "broker property image.png",
+                    "direct_image",
+                    "direct_image_link",
+                    True,
+                    1,
+                    0,
+                    [],
+                ),
+                (
+                    len(direct_image_manifest),
+                    (direct_image_manifest[0] or {}).get("name"),
+                    (direct_image_manifest[0] or {}).get("source_type"),
+                    (direct_image_manifest[0] or {}).get("method"),
+                    direct_image_run["proposal"] is not None,
+                    direct_image_run["client"].responses.create.call_count,
+                    direct_image_run["client"].files.create.call_count,
+                    [
+                        item.get("type")
+                        for item in direct_image_content
+                        if item.get("type")
+                        in ("input_image", "input_file")
+                    ],
+                ),
+            )
 
         claiming_subclass_sentinel = (
             "PRIVATE_CLAIMING_DICT_SUBCLASS_SENTINEL"

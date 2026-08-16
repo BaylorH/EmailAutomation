@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
 from .messaging import build_conversation_payload
@@ -4427,6 +4427,19 @@ _LEGACY_ATTACHMENT_METHODS_WITHOUT_SOURCE_TYPE = frozenset({
 _LEGACY_DIRECT_IMAGE_EXTENSIONS = (
     ".png", ".jpg", ".jpeg", ".webp", ".gif",
 )
+_LINKED_PDF_PRODUCER_KEYS = frozenset({
+    "name", "filename", "text", "images", "method", "file_id", "id",
+    "source_url", "source_type", "drive_link",
+})
+_LINKED_PDF_PREVIEW_KEYS = frozenset({
+    "property_image_url", "property_image_source",
+    "property_image_source_type", "property_image_meta",
+})
+_DIRECT_IMAGE_PRODUCER_KEYS = frozenset({
+    "name", "text", "images", "method", "source_url", "source_type",
+    "drive_link", "property_image_url", "property_image_source",
+    "property_image_source_type", "property_image_meta",
+})
 
 
 def _bounded_attachment_routing_token(value: Any) -> Optional[str]:
@@ -4454,11 +4467,24 @@ def _is_reserved_native_image_generic_name(value: Any) -> bool:
     folded = unicodedata.normalize("NFKC", value).casefold().translate(
         _NATIVE_IMAGE_NAME_CONFUSABLES
     )
-    return (
-        str.isascii(folded)
-        and _bounded_attachment_routing_token(folded)
-        == _NATIVE_IMAGE_GENERIC_NAME_TOKEN
-    )
+    token = []
+    for character in folded:
+        if str.isascii(character):
+            if (
+                "a" <= character <= "z"
+                or "0" <= character <= "9"
+            ):
+                token.append(character)
+            continue
+        if str.isalnum(character):
+            return False
+        # Non-ASCII punctuation, marks, symbols, and format controls cannot
+        # turn the reserved generic marker into a trusted legacy filename.
+    collapsed = "".join(token)
+    return collapsed in {
+        _NATIVE_IMAGE_GENERIC_NAME_TOKEN,
+        f"{_NATIVE_IMAGE_GENERIC_NAME_TOKEN}pdf",
+    }
 
 
 def _legacy_attachment_filename(manifest: dict) -> Optional[str]:
@@ -4483,6 +4509,174 @@ def _has_legacy_attachment_filename_shape(
     if direct_image:
         return str.endswith(folded, _LEGACY_DIRECT_IMAGE_EXTENSIONS)
     return str.endswith(folded, ".pdf")
+
+
+def _linked_source_url_identity(source_url: Any) -> Optional[Tuple[str, str]]:
+    """Return the exact HTTPS host and producer-derived basename."""
+    if type(source_url) is not str or not source_url:
+        return None
+    try:
+        parsed = urlsplit(source_url)
+        host = parsed.hostname
+        if (
+            str.casefold(parsed.scheme) != "https"
+            or type(host) is not str
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        basename = unquote(parsed.path).rsplit("/", 1)[-1].strip()
+    except (TypeError, ValueError):
+        return None
+    if not basename:
+        return None
+    return str.casefold(host), basename
+
+
+def _has_linked_pdf_producer_shape(
+    manifest: dict,
+    source_type: str,
+) -> bool:
+    """Validate the immutable fields emitted by linked-PDF production."""
+    manifest_keys = frozenset(dict.keys(manifest))
+    if manifest_keys not in {
+        _LINKED_PDF_PRODUCER_KEYS,
+        _LINKED_PDF_PRODUCER_KEYS | _LINKED_PDF_PREVIEW_KEYS,
+    }:
+        return False
+
+    name = dict.get(manifest, "name")
+    filename = dict.get(manifest, "filename")
+    text = dict.get(manifest, "text")
+    images = dict.get(manifest, "images")
+    file_id = dict.get(manifest, "file_id")
+    legacy_id = dict.get(manifest, "id")
+    drive_link = dict.get(manifest, "drive_link")
+    method = dict.get(manifest, "method")
+    source_identity = _linked_source_url_identity(
+        dict.get(manifest, "source_url")
+    )
+    if (
+        type(name) is not str
+        or not name
+        or name != str.strip(name)
+        or type(filename) is not str
+        or filename != name
+        or type(text) is not str
+        or type(images) is not list
+        or type(file_id) not in (type(None), str)
+        or type(legacy_id) not in (type(None), str)
+        or legacy_id != file_id
+        or type(drive_link) not in (type(None), str)
+        or type(source_type) is not str
+        or type(method) is not str
+        or method not in _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS.get(
+            source_type,
+            (),
+        )
+        or source_identity is None
+    ):
+        return False
+    has_file_fallback = method.startswith("openai_upload")
+    has_preview_images = method.endswith("+images")
+    if (
+        has_file_fallback != bool(file_id)
+        or has_preview_images != bool(images)
+    ):
+        return False
+
+    if manifest_keys == (
+        _LINKED_PDF_PRODUCER_KEYS | _LINKED_PDF_PREVIEW_KEYS
+    ):
+        property_image_url = dict.get(manifest, "property_image_url")
+        property_image_source = dict.get(
+            manifest,
+            "property_image_source",
+        )
+        property_image_source_type = dict.get(
+            manifest,
+            "property_image_source_type",
+        )
+        if (
+            type(property_image_url) is not str
+            or not property_image_url
+            or type(property_image_source) is not str
+            or not property_image_source.startswith(
+                f"Broker flyer link preview: {name}, page "
+            )
+            or type(property_image_source_type) is not str
+            or property_image_source_type != "broker_pdf_link_preview"
+            or type(dict.get(manifest, "property_image_meta")) is not dict
+        ):
+            return False
+
+    host, source_name = source_identity
+    if source_name != name:
+        return False
+    if source_type == "google_drive_pdf":
+        return host == "drive.google.com" or host.endswith(
+            ".drive.google.com"
+        )
+    if source_type == "dropbox_pdf":
+        return host == "dropbox.com" or host.endswith(".dropbox.com")
+    return source_type == "public_pdf"
+
+
+def _has_direct_image_producer_shape(manifest: dict) -> bool:
+    """Validate the non-transport manifest emitted for a linked image."""
+    if frozenset(dict.keys(manifest)) != _DIRECT_IMAGE_PRODUCER_KEYS:
+        return False
+
+    name = dict.get(manifest, "name")
+    images = dict.get(manifest, "images")
+    method = dict.get(manifest, "method")
+    source_type = dict.get(manifest, "source_type")
+    source_identity = _linked_source_url_identity(
+        dict.get(manifest, "source_url")
+    )
+    property_image_url = dict.get(manifest, "property_image_url")
+    property_image_source_type = dict.get(
+        manifest,
+        "property_image_source_type",
+    )
+    property_image_meta = dict.get(manifest, "property_image_meta")
+    if (
+        type(name) is not str
+        or not name
+        or name != str.strip(name)
+        or type(method) is not str
+        or method != "direct_image_link"
+        or type(source_type) is not str
+        or source_type != "direct_image"
+        or not str.endswith(
+            str.casefold(name),
+            _LEGACY_DIRECT_IMAGE_EXTENSIONS,
+        )
+        or type(dict.get(manifest, "text")) is not str
+        or dict.get(manifest, "text") != ""
+        or type(images) is not list
+        or len(images) != 0
+        or source_identity is None
+        or dict.get(manifest, "drive_link") is not None
+        or type(property_image_url) is not str
+        or not property_image_url
+        or _linked_source_url_identity(property_image_url) is None
+        or type(dict.get(manifest, "property_image_source")) is not str
+        or dict.get(manifest, "property_image_source")
+        != f"Broker image link: {name}"
+        or type(property_image_source_type) is not str
+        or property_image_source_type != "broker_image_link"
+        or type(property_image_meta) is not dict
+        or type(dict.get(property_image_meta, "strategy")) is not str
+        or dict.get(property_image_meta, "strategy")
+        != "direct_image_link_v1"
+        or type(dict.get(property_image_meta, "selectionReason")) is not str
+        or dict.get(property_image_meta, "selectionReason")
+        != "broker-provided public image link"
+    ):
+        return False
+    return True
 
 
 def _is_native_image_manifest_candidate(manifest: Any) -> bool:
@@ -4519,9 +4713,11 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
                 (),
             )
         ):
-            return not _has_legacy_attachment_filename_shape(
+            if source_type == "direct_image":
+                return not _has_direct_image_producer_shape(manifest)
+            return not _has_linked_pdf_producer_shape(
                 manifest,
-                direct_image=source_type == "direct_image",
+                source_type,
             )
         return True
 
