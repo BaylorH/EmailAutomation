@@ -1672,6 +1672,77 @@ class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
                     self._validate(matching_filename, target=ranged)
                 )
 
+    def test_never_drops_unicode_decimal_competing_prefixes(self):
+        target_125 = "125 Main Road, Example City, Arizona 85001"
+        matching_filename = "125 Main Rd Example City AZ 85001.png"
+        digit_cases = (
+            ("arabic_indic", "\u0661\u0662\u0663"),
+            ("eastern_arabic", "\u06f1\u06f2\u06f3"),
+            ("devanagari", "\u0967\u0968\u0969"),
+            ("bengali", "\u09e7\u09e8\u09e9"),
+            ("fullwidth_control", "\uff11\uff12\uff13"),
+        )
+
+        for label, competing_number in digit_cases:
+            ranged = (
+                f"{competing_number}-125 Main Rd "
+                "Example City AZ 85001"
+            )
+            with self.subTest(label=label, surface="filename_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(f"{ranged}.png", target=target_125)
+                )
+            with self.subTest(label=label, surface="filename_batch"):
+                self._assert_unbound_batch(
+                    self._validate(f"{ranged}.png", target=target_125)
+                )
+            with self.subTest(label=label, surface="target_classifier"):
+                self._assert_unbound_classification(
+                    self._classify(matching_filename, target=ranged)
+                )
+            with self.subTest(label=label, surface="target_batch"):
+                self._assert_unbound_batch(
+                    self._validate(matching_filename, target=ranged)
+                )
+
+    def test_allows_only_structured_trailing_numeric_metadata(self):
+        target = "125 Main Road, Example City, Arizona 85001"
+        base = "125 Main Rd Example City AZ 85001"
+        accepted_suffixes = (
+            "photo 2",
+            "copy 3",
+            "(2)",
+            "page 4",
+            "2026-08-16",
+        )
+
+        for suffix in accepted_suffixes:
+            filename = f"{base} {suffix}.png"
+            with self.subTest(suffix=suffix, surface="classifier"):
+                self._assert_target(self._classify(filename, target=target))
+            with self.subTest(suffix=suffix, surface="batch"):
+                self.assertEqual(
+                    "accepted",
+                    self._validate(filename, target=target)["status"],
+                )
+
+        rejected_suffixes = (
+            "5",
+            "front 6",
+            "2026-02-31",
+            "2026-13-40",
+        )
+        for suffix in rejected_suffixes:
+            filename = f"{base} {suffix}.png"
+            with self.subTest(suffix=suffix, surface="classifier"):
+                self._assert_unbound_classification(
+                    self._classify(filename, target=target)
+                )
+            with self.subTest(suffix=suffix, surface="batch"):
+                self._assert_unbound_batch(
+                    self._validate(filename, target=target)
+                )
+
     def test_rejects_malformed_zip_plus_three(self):
         malformed_filename = (
             "123 N Sample Rd Example City AZ 85001-123.png"

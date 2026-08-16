@@ -349,6 +349,13 @@ _NATIVE_IMAGE_PARTIAL_STREET_WITHOUT_NUMBER_RE = re.compile(
 _NATIVE_IMAGE_LEADING_ISO_DATE_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})(?:-+|\s+)"
 )
+_NATIVE_IMAGE_TRAILING_ISO_DATE_RE = re.compile(
+    r"(?:^|[-_\s]+)(?P<date>\d{4}-\d{2}-\d{2})\s*$"
+)
+_NATIVE_IMAGE_TRAILING_NUMBER_METADATA_RE = re.compile(
+    r"(?:^|[-_\s]+)"
+    r"(?:(?:copy|page|photo)[-_\s]+\d+|\(\s*\d+\s*\))\s*$"
+)
 _NATIVE_IMAGE_UNCLAIMED_NUMBER_RE = re.compile(
     r"(?<![a-z0-9])\d+[a-z]?(?![a-z0-9])"
 )
@@ -386,6 +393,14 @@ def _native_image_size_failure(
     return None
 
 
+def _native_image_iso_date_is_valid(value: str) -> bool:
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _normalize_native_image_address_text(
     value: Any,
     *,
@@ -399,20 +414,37 @@ def _normalize_native_image_address_text(
         return None
     text = os.path.splitext(value)[0] if strip_extension else value
     text = unicodedata.normalize("NFKD", text)
-    text = "".join(
-        character
-        for character in text
-        if not unicodedata.combining(character)
-    )
+    characters = []
+    for character in text:
+        if unicodedata.combining(character):
+            continue
+        if character.isdecimal():
+            character = str(unicodedata.decimal(character))
+        characters.append(character)
+    text = "".join(characters)
     text = text.casefold()
     date_match = _NATIVE_IMAGE_LEADING_ISO_DATE_RE.match(text)
-    if date_match:
-        try:
-            datetime.date.fromisoformat(date_match.group("date"))
-        except ValueError:
-            pass
+    if date_match and _native_image_iso_date_is_valid(
+        date_match.group("date")
+    ):
+        text = text[date_match.end():]
+    if strip_extension:
+        metadata_match = _NATIVE_IMAGE_TRAILING_NUMBER_METADATA_RE.search(
+            text
+        )
+        if metadata_match:
+            text = text[:metadata_match.start()]
         else:
-            text = text[date_match.end():]
+            trailing_date_match = _NATIVE_IMAGE_TRAILING_ISO_DATE_RE.search(
+                text
+            )
+            if (
+                trailing_date_match
+                and _native_image_iso_date_is_valid(
+                    trailing_date_match.group("date")
+                )
+            ):
+                text = text[:trailing_date_match.start()]
     text = re.sub(
         r"\b([a-z])\s*\.\s*([a-z])\s*\.?(?=\s|$)",
         r"\1\2",
