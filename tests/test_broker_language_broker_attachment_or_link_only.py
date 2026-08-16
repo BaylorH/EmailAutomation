@@ -1259,6 +1259,104 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
             "record": record_failure,
         }
 
+    def _scan_with_real_save(
+        self,
+        messages,
+        *,
+        save_return=True,
+        index_return=True,
+    ):
+        graph_responses = iter([
+            self._response({"value": messages}),
+            self._response({
+                "body": {
+                    "contentType": "Text",
+                    "content": "The details are in the attached image.",
+                },
+                "hasAttachments": True,
+            }),
+        ])
+        save_message = mock.MagicMock(return_value=save_return)
+        index_message = mock.MagicMock(return_value=index_return)
+        process_message = mock.MagicMock()
+        mark_processed = mock.MagicMock(return_value=True)
+        clear_failure = mock.MagicMock()
+        record_failure = mock.MagicMock()
+        record_authority = mock.MagicMock()
+
+        patchers = [
+            mock.patch.object(
+                proc,
+                "exponential_backoff_request",
+                side_effect=lambda _request: next(graph_responses),
+            ),
+            mock.patch.object(proc, "has_processed", return_value=False),
+            mock.patch.object(
+                proc,
+                "_match_message_to_thread",
+                return_value=self.THREAD_ID,
+            ),
+            mock.patch.object(
+                proc,
+                "_has_pending_reply_review_projection_recovery",
+                return_value=False,
+            ),
+            mock.patch.object(
+                proc,
+                "_resolve_current_mailbox_email",
+                return_value=self.MAILBOX,
+            ),
+            mock.patch.object(
+                proc,
+                "_skip_inbox_retry_after_manual_continuation",
+                return_value=False,
+            ),
+            mock.patch.object(proc, "save_message", new=save_message),
+            mock.patch.object(proc, "index_message_id", new=index_message),
+            mock.patch.object(proc, "_fs"),
+            mock.patch(
+                "email_automation.followup.cancel_followup_on_response",
+                new=record_authority,
+            ),
+            mock.patch.object(proc, "process_inbox_message", new=process_message),
+            mock.patch.object(proc, "mark_processed", new=mark_processed),
+            mock.patch.object(
+                proc,
+                "_clear_ai_processing_failure",
+                new=clear_failure,
+            ),
+            mock.patch.object(
+                proc,
+                "_record_inbox_processing_failure",
+                new=record_failure,
+            ),
+            mock.patch.object(
+                proc,
+                "_client_id_for_processing_failure",
+                return_value="client-native-batch",
+            ),
+            mock.patch.object(proc, "set_last_scan_iso"),
+            mock.patch.object(proc.time, "sleep"),
+        ]
+        with contextlib_nested(patchers):
+            result = proc.scan_inbox_against_index(
+                self.USER_ID,
+                self.HEADERS,
+                only_unread=False,
+                top=len(messages),
+            )
+
+        return {
+            "result": result,
+            "save": save_message,
+            "index": index_message,
+            "process": process_message,
+            "mark": mark_processed,
+            "clear": clear_failure,
+            "record": record_failure,
+            "authority": record_authority,
+        }
+
     def test_oldest_visible_attachment_message_runs_extraction_only_then_stops(self):
         messages = self._messages(count=3)
         calls = self._scan_with_mocked_save(
@@ -1444,6 +1542,37 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
             messages[0],
         )
         self.assertEqual(0, calls["result"]["processed"])
+
+        for failed_step in ("save", "index"):
+            with self.subTest(failed_step=failed_step):
+                persistence_failure = self._scan_with_real_save(
+                    messages,
+                    save_return=failed_step != "save",
+                    index_return=failed_step != "index",
+                )
+                persistence_failure["process"].assert_not_called()
+                persistence_failure["authority"].assert_not_called()
+                persistence_failure["mark"].assert_not_called()
+                persistence_failure["clear"].assert_not_called()
+                persistence_failure["record"].assert_called_once()
+                failure_call = persistence_failure["record"].call_args
+                self.assertEqual(
+                    (
+                        self.USER_ID,
+                        "client-native-batch",
+                        self.THREAD_ID,
+                        messages[0]["internetMessageId"],
+                    ),
+                    failure_call.args[:4],
+                )
+                self.assertIsInstance(
+                    failure_call.args[4],
+                    proc.RetryableProcessingError,
+                )
+                self.assertIs(messages[0], failure_call.args[5])
+                self.assertEqual(0, persistence_failure["result"]["processed"])
+                if failed_step == "save":
+                    persistence_failure["index"].assert_not_called()
 
     def test_extraction_only_predecessor_suppresses_outbound_reply(self):
         messages = self._messages()
