@@ -722,7 +722,10 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
         )
 
         self.assertIsNone(error)
-        linked_assets.assert_called_once_with([])
+        linked_assets.assert_called_once_with(
+            [],
+            target_property_hint="4402 Rex Rd",
+        )
         self.assertEqual([], self.propose_sheet_updates.call_args.kwargs["url_texts"])
         send_reply.assert_not_called()
 
