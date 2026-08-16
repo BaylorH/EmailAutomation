@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -171,6 +172,48 @@ class ScannedPdfExtractionTests(unittest.TestCase):
         self.assertTrue(
             all(base64.b64decode(image).startswith(b"\x89PNG") for image in processed["images"])
         )
+
+    def test_failed_scanned_pdf_upload_removes_full_temporary_file_and_stays_fail_closed(self):
+        with tempfile.TemporaryDirectory() as scratch_dir, mock.patch.object(
+            file_handling.tempfile,
+            "tempdir",
+            scratch_dir,
+        ), mock.patch.object(
+            file_handling,
+            "fetch_pdf_attachments",
+            return_value=[{"name": SCANNED_PDF_NAME, "bytes": self.scanned_pdf}],
+        ), mock.patch.object(
+            file_handling.client.files,
+            "create",
+            side_effect=RuntimeError("fictional OpenAI upload failure"),
+        ):
+            manifest = file_handling.fetch_and_process_pdfs(
+                headers={},
+                graph_msg_id="fictional-message",
+            )
+
+            leftover_files = sorted(
+                (name, os.path.getsize(os.path.join(scratch_dir, name)))
+                for name in os.listdir(scratch_dir)
+            )
+
+        self.assertEqual(
+            [
+                {
+                    "name": SCANNED_PDF_NAME,
+                    "text": "",
+                    "images": [],
+                    "method": "failed_extraction",
+                    "file_id": None,
+                    "id": None,
+                    "drive_link": None,
+                    "extraction_failed": True,
+                    "error": "PDF text extraction and OpenAI upload both failed",
+                }
+            ],
+            manifest,
+        )
+        self.assertEqual([], leftover_files)
 
     def test_real_scanned_manifest_reaches_ai_as_file_three_images_and_prompt(self):
         with mock.patch.object(

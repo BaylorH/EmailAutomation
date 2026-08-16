@@ -953,18 +953,18 @@ def fetch_and_process_linked_assets(
 
 def upload_pdf_user_data(filename: str, content: bytes) -> str:
     """Upload PDF to OpenAI with purpose='user_data' and return file_id."""
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
             tmp_file.write(content)
             tmp_file.flush()
 
-            with open(tmp_file.name, "rb") as f:
+            with open(tmp_path, "rb") as f:
                 file_response = client.files.create(
                     file=f,
                     purpose="user_data"
                 )
-
-            os.unlink(tmp_file.name)  # Clean up
 
             file_id = file_response.id
             print(f"📤 Uploaded to OpenAI: {filename} -> {file_id}")
@@ -973,6 +973,12 @@ def upload_pdf_user_data(filename: str, content: bytes) -> str:
     except Exception as e:
         print(f"❌ Failed to upload PDF to OpenAI: {e}")
         raise
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
 
 def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[Dict[str, Any]]:
