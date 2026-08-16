@@ -1059,6 +1059,7 @@ def build_native_image_manifest_entry(
             or normalized_bytes <= 0
             or normalized_bytes != len(data)
             or normalized_bytes > NATIVE_IMAGE_MAX_SOURCE_BYTES
+            or type(asset.get("normalized_sha256")) is not str
             or hashlib.sha256(data).hexdigest()
             != asset.get("normalized_sha256")
         ):

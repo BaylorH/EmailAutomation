@@ -44,6 +44,33 @@ class _ExplodingAddressRegex:
         raise AssertionError("oversized address text reached residual regex")
 
 
+class _EqualitySpoofingHash:
+    def __init__(self, private_sentinel):
+        self.private_sentinel = private_sentinel
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    def __repr__(self):
+        return f"<spoofed-hash {self.private_sentinel}>"
+
+
+class _PrivateHashString(str):
+    def __new__(cls, value, private_sentinel):
+        instance = super().__new__(cls, value)
+        instance.private_sentinel = private_sentinel
+        return instance
+
+    def __repr__(self):
+        return (
+            f"{super().__repr__()}"
+            f"<{self.private_sentinel}>"
+        )
+
+
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
     image = Image.new("RGB", size, (28, 96, 164))
     output = io.BytesIO()
@@ -1425,6 +1452,40 @@ class NativeImageManifestIntegrityTests(unittest.TestCase):
         ):
             with self.subTest(keys=sorted(asset)):
                 self.assertIsNone(self._adapt([asset]))
+
+    def test_requires_exact_plain_lowercase_hash_string(self):
+        canonical_data, _, _ = file_handling._normalize_native_image(
+            _png_bytes()
+        )
+        exact_hash = hashlib.sha256(canonical_data).hexdigest()
+        honest_manifest = self._adapt(
+            [self._asset(data=canonical_data, normalized_sha256=exact_hash)]
+        )
+        self.assertIsNotNone(honest_manifest)
+        projected_hash = honest_manifest["image_meta"][0][
+            "normalized_sha256"
+        ]
+        self.assertIs(type(projected_hash), str)
+        self.assertEqual(exact_hash, projected_hash)
+        self.assertEqual(exact_hash.lower(), projected_hash)
+
+        private_sentinel = "PRIVATE_HASH_TYPE_SENTINEL"
+        hostile_values = (
+            _EqualitySpoofingHash(private_sentinel),
+            _PrivateHashString(exact_hash, private_sentinel),
+        )
+        for hostile_value in hostile_values:
+            with self.subTest(hostile_type=type(hostile_value).__name__):
+                manifest = self._adapt(
+                    [
+                        self._asset(
+                            data=canonical_data,
+                            normalized_sha256=hostile_value,
+                        )
+                    ]
+                )
+                self.assertIsNone(manifest)
+                self.assertNotIn(private_sentinel, repr(manifest))
 
 
 class NativeImageSecondSuccessorBindingTests(unittest.TestCase):
