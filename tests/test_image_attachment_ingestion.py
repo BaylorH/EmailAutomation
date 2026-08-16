@@ -2798,6 +2798,13 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
             ("hyphenated_native_method", "native-image-normalized"),
             ("spaced_native_method", "native image normalized"),
             ("mixed_separator_native_method", "NaTiVe-Image_Normalized"),
+            ("embedded_letter_native_method", "nativeXimage_normalized"),
+            (
+                "unicode_confusable_native_method",
+                "nat\u0131ve_image_normalized",
+            ),
+            ("unknown_method", "private_custom_parser"),
+            ("unscoped_direct_image_method", "direct_image_link"),
         ):
             sentinel = f"PRIVATE_{label.upper()}_SENTINEL"
             malformed_source_type_manifests.append((
@@ -3030,6 +3037,51 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
                 },
                 [],
             ))
+
+        for method in (
+            "local_extraction",
+            "local_extraction+images",
+            "openai_upload",
+            "openai_upload+images",
+            "pdfplumber",
+            "local",
+            "text",
+            "production-replay",
+        ):
+            has_images = method.endswith("+images")
+            has_file = method.startswith("openai_upload")
+            file_id = f"legacy-no-source-{method}" if has_file else None
+            legacy_manifests.append((
+                f"no-source:{method}",
+                {
+                    "name": "legacy-no-source.pdf",
+                    "text": f"{self.TARGET}\nLegacy PDF text.",
+                    "images": [legacy_page] if has_images else [],
+                    "method": method,
+                    "file_id": file_id,
+                    "id": file_id,
+                },
+                (
+                    [(
+                        "input_image",
+                        f"data:image/png;base64,{legacy_page}",
+                    )]
+                    if has_images
+                    else []
+                ) + ([('input_file', file_id)] if has_file else []),
+            ))
+
+        legacy_manifests.append((
+            "no-source:missing-method",
+            {
+                "name": "legacy-no-source.pdf",
+                "text": f"{self.TARGET}\nLegacy PDF text.",
+                "images": [],
+                "file_id": None,
+                "id": None,
+            },
+            [],
+        ))
 
         for label, manifest, expected_transport in legacy_manifests:
             with self.subTest(legacy_source_pair=label):

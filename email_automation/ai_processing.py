@@ -4385,6 +4385,17 @@ _LEGACY_LINKED_ATTACHMENT_SOURCE_METHODS = {
     }),
     "direct_image": frozenset({"direct_image_link"}),
 }
+_LEGACY_ATTACHMENT_METHODS_WITHOUT_SOURCE_TYPE = frozenset({
+    "local_extraction",
+    "local_extraction+images",
+    "openai_upload",
+    "openai_upload+images",
+    # Historical successful manifest shapes retained by existing workflows.
+    "pdfplumber",
+    "local",
+    "text",
+    "production-replay",
+})
 
 
 def _bounded_attachment_routing_token(value: Any) -> Optional[str]:
@@ -4436,15 +4447,11 @@ def _is_native_image_manifest_candidate(manifest: Any) -> bool:
             return False
         return True
 
-    if dict.__contains__(manifest, "method") and type(method) is not str:
-        return True
-    if type(method) is not str:
+    if not dict.__contains__(manifest, "method"):
         return False
-    method_token = _bounded_attachment_routing_token(method)
-    return method_token is None or str.startswith(
-        method_token,
-        "nativeimage",
-    )
+    if type(method) is not str:
+        return True
+    return method not in _LEGACY_ATTACHMENT_METHODS_WITHOUT_SOURCE_TYPE
 
 
 def _prepare_ai_attachment_manifest(
