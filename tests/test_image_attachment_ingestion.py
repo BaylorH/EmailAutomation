@@ -13,6 +13,7 @@ os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "email-automation-cache")
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 from email_automation import file_handling
+from email_automation import ai_processing
 from email_automation import property_images
 
 
@@ -69,6 +70,20 @@ class _PrivateHashString(str):
             f"{super().__repr__()}"
             f"<{self.private_sentinel}>"
         )
+
+
+class _FalseNativeMarkerString(_PrivateHashString):
+    def startswith(self, *args, **kwargs):
+        return False
+
+
+class _RaisingNativeMarkerString(_PrivateHashString):
+    def startswith(self, *args, **kwargs):
+        raise RuntimeError(self.private_sentinel)
+
+
+class _PrivateNativeManifestDict(dict):
+    pass
 
 
 def _jpeg_bytes(size=(8, 6), *, orientation=None):
@@ -2093,6 +2108,766 @@ class NativeImageCanonicalManifestReviewTests(unittest.TestCase):
         self.assertIsNone(manifest)
         verify_call.assert_not_called()
         normalize_call.assert_not_called()
+
+
+class NativeImageAIPrivacyTests(unittest.TestCase):
+    TARGET = "123 North Sample Road, Example City, Arizona 85001"
+    MATCHING_FILENAME = "123 N Sample Rd Example City AZ 85001"
+    CANONICAL_REVIEW_EVENT = {
+        "type": "needs_user_input",
+        "reason": "multi_property_attachment",
+        "question": (
+            "The broker offered multiple properties or suites in an attachment, "
+            "but the details could not be bound safely to one row."
+        ),
+    }
+
+    def _manifest(self, image_specs):
+        attachments = [
+            _attachment(
+                f"{self.MATCHING_FILENAME} {descriptor}.{extension}",
+                content_type,
+                content,
+            )
+            for descriptor, extension, content_type, content in image_specs
+        ]
+        batch = file_handling.validate_and_normalize_native_image_attachments(
+            attachments,
+            target_property_hint=self.TARGET,
+        )
+        self.assertEqual("accepted", batch["status"])
+        manifest = file_handling.build_native_image_manifest_entry(batch)
+        self.assertIsNotNone(manifest)
+        return manifest
+
+    def _single_manifest(self, descriptor="exterior", size=(8, 6)):
+        return self._manifest([
+            (descriptor, "png", "image/png", _png_bytes(size=size)),
+        ])
+
+    def _column_config(self):
+        return {
+            "mappings": {"total_sf": "Total SF"},
+            "extractionFields": ["total_sf"],
+            "requiredFields": [],
+            "formulaFields": [],
+            "neverRequest": [],
+            "customFields": {},
+        }
+
+    def _fake_client(self, output_text=None, file_id="scanned-pdf-file"):
+        response = mock.Mock()
+        response.output_text = output_text or (
+            '{"updates": [], "events": [], "response_email": null, '
+            '"notes": ""}'
+        )
+        response.usage = None
+        response.id = "native-image-response"
+        fake_client = mock.Mock()
+        fake_client.responses.create.return_value = response
+        fake_client.files.create.return_value = mock.Mock(id=file_id)
+        return fake_client
+
+    def _run_proposal(
+        self,
+        manifests,
+        *,
+        output_text=None,
+        dry_run=True,
+        fake_client=None,
+    ):
+        fake_client = fake_client or self._fake_client(output_text)
+        if output_text is not None:
+            fake_client.responses.create.return_value.output_text = output_text
+        fake_fs = mock.Mock()
+        with mock.patch.object(
+            ai_processing,
+            "client",
+            fake_client,
+        ), mock.patch.object(
+            file_handling,
+            "client",
+            fake_client,
+        ), mock.patch.object(
+            ai_processing,
+            "_fs",
+            fake_fs,
+        ), mock.patch.object(
+            ai_processing,
+            "track_openai_usage_safely",
+        ) as usage_call, mock.patch(
+            "builtins.print",
+        ) as print_call:
+            proposal = ai_processing.propose_sheet_updates(
+                uid="native-image-user",
+                client_id="native-image-client",
+                email="broker@example.com",
+                sheet_id="native-image-sheet",
+                header=["Property Address", "Total SF"],
+                rownum=3,
+                rowvals=[self.TARGET, ""],
+                thread_id="native-image-thread",
+                pdf_manifest=manifests,
+                conversation=[{
+                    "direction": "inbound",
+                    "from": "broker@example.com",
+                    "content": "Photos for the target property are attached.",
+                }],
+                column_config=self._column_config(),
+                extraction_fields=["total_sf"],
+                dry_run=dry_run,
+            )
+        return {
+            "proposal": proposal,
+            "client": fake_client,
+            "firestore": fake_fs,
+            "usage_call": usage_call,
+            "print_call": print_call,
+        }
+
+    def test_vision_uses_one_normalized_data_png_input_image_per_asset(self):
+        manifest = self._manifest([
+            ("front", "jpg", "image/jpeg", _jpeg_bytes(size=(9, 7))),
+            ("rear", "png", "image/png", _png_bytes(size=(7, 5))),
+        ])
+        expected_urls = [
+            f"data:image/png;base64,{image}"
+            for image in manifest["images"]
+        ]
+        run = self._run_proposal(
+            [manifest],
+            output_text=(
+                '{"updates": [{"column": "Total SF", "value": "20000", '
+                '"confidence": 0.98, "reason": "Visible in target image."}], '
+                '"events": [], "response_email": null, '
+                '"notes": ""}'
+            ),
+        )
+
+        self.assertEqual(1, run["client"].responses.create.call_count)
+        request_content = (
+            run["client"].responses.create.call_args.kwargs["input"][0]["content"]
+        )
+        self.assertEqual(
+            expected_urls,
+            [
+                item["image_url"]
+                for item in request_content
+                if item.get("type") == "input_image"
+            ],
+        )
+        self.assertTrue(all(
+            item["image_url"].startswith("data:image/png;base64,")
+            for item in request_content
+            if item.get("type") == "input_image"
+        ))
+        prompt = next(
+            item["text"]
+            for item in request_content
+            if item.get("type") == "input_text"
+        )
+        self.assertIn("=== NATIVE IMAGE ATTACHMENTS ===", prompt)
+        self.assertNotIn("=== PDF ATTACHMENTS ===", prompt)
+        self.assertNotIn("--- PDF: Broker property image", prompt)
+        self.assertIn(
+            "client_question | negotiation | confidential | legal_contract | "
+            "unclear | multi_property_attachment",
+            prompt,
+        )
+        self.assertEqual(
+            "20000",
+            run["proposal"]["updates"][0]["value"],
+            "a benign non-door field extracted from native vision must survive",
+        )
+
+    def test_native_images_never_use_input_file_or_files_create(self):
+        private_file_id = "PRIVATE_NATIVE_FILE_ID_SENTINEL"
+        manifest = self._single_manifest()
+        manifest["id"] = private_file_id
+        manifest["file_id"] = private_file_id
+
+        run = self._run_proposal([manifest])
+
+        self.assertEqual(1, run["client"].responses.create.call_count)
+        self.assertEqual(0, run["client"].files.create.call_count)
+        request_content = (
+            run["client"].responses.create.call_args.kwargs["input"][0]["content"]
+        )
+        self.assertFalse(any(
+            item.get("type") == "input_file"
+            for item in request_content
+        ))
+        self.assertNotIn(private_file_id, repr(request_content))
+
+    def test_multiple_prevalidated_target_images_are_not_addressless_competitors(self):
+        native_manifest = self._manifest([
+            ("front", "png", "image/png", _png_bytes(size=(8, 6))),
+            ("rear", "png", "image/png", _png_bytes(size=(7, 5))),
+        ])
+        target_pdf = {
+            "name": "123 North Sample Road brochure.pdf",
+            "text": f"{self.TARGET} - Total SF: 20,000.",
+            "images": [],
+            "method": "local_extraction",
+            "file_id": None,
+            "id": None,
+        }
+        expected_update = {
+            "column": "Total SF",
+            "value": "20000",
+            "confidence": 0.98,
+        }
+        proposal = {
+            "updates": [expected_update],
+            "events": [],
+            "response_email": "Thanks for the target-property photos.",
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            [{
+                "direction": "inbound",
+                "content": "The requested target-property photos are attached.",
+            }],
+            self.TARGET,
+            [native_manifest, target_pdf],
+        )
+
+        self.assertEqual([expected_update], result["updates"])
+        self.assertEqual([], result["events"])
+        self.assertEqual(
+            "Thanks for the target-property photos.",
+            result["response_email"],
+        )
+
+    def test_model_multi_property_strips_updates_and_reply_and_pauses(self):
+        manifests = [
+            self._single_manifest("front", (8, 6)),
+            self._single_manifest("rear", (7, 5)),
+        ]
+        proposal = {
+            "updates": [{
+                "column": "Total SF",
+                "value": "20000",
+                "confidence": 0.99,
+            }],
+            "events": [
+                {
+                    "type": "new_property",
+                    "address": "999 Hostile Early Return Road",
+                },
+                {
+                    "type": "needs_user_input",
+                    "reason": "multi_property_attachment",
+                    "question": "Which row should receive 20,000 SF?",
+                },
+                {
+                    "type": "call_requested",
+                    "question": "Call about the ambiguous images.",
+                },
+            ],
+            "response_email": "I will write 20,000 SF to the target row.",
+            "notes": "PRIVATE_UNTRUSTED_NATIVE_NOTE",
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            [{
+                "direction": "inbound",
+                "content": (
+                    f"For {self.TARGET}, the target is 20,000 SF. "
+                    "The photos are attached."
+                ),
+            }],
+            self.TARGET,
+            manifests,
+        )
+
+        self.assertEqual([], result["updates"])
+        self.assertEqual([self.CANONICAL_REVIEW_EVENT], result["events"])
+        self.assertIsNone(result["response_email"])
+        self.assertEqual("", result["notes"])
+
+        wrong_pdf = {
+            "name": "999 Hostile Early Return Road brochure.pdf",
+            "text": "999 Hostile Early Return Road - Total SF: 20,000.",
+            "images": [],
+            "method": "local_extraction",
+            "file_id": None,
+            "id": None,
+        }
+        omitted_model_pause = {
+            "updates": [{"column": "Total SF", "value": "20000"}],
+            "events": [{
+                "type": "new_property",
+                "address": "999 Hostile Early Return Road",
+            }],
+            "response_email": "I will write the competing PDF value.",
+            "notes": "PRIVATE_UNTRUSTED_MIXED_NOTE",
+        }
+        mixed_result = ai_processing._suppress_competing_attachment_updates(
+            omitted_model_pause,
+            [{
+                "direction": "inbound",
+                "content": "The target photo and alternate brochure are attached.",
+            }],
+            self.TARGET,
+            [self._single_manifest("mixed-target"), wrong_pdf],
+        )
+        self.assertEqual([], mixed_result["updates"])
+        self.assertEqual(
+            [self.CANONICAL_REVIEW_EVENT],
+            mixed_result["events"],
+        )
+        self.assertIsNone(mixed_result["response_email"])
+        self.assertEqual("", mixed_result["notes"])
+
+        legacy_pdf_only = {
+            "updates": [{"column": "Total SF", "value": "20000"}],
+            "events": [{
+                "type": "new_property",
+                "address": "999 Hostile Early Return Road",
+            }],
+            "response_email": "Legacy PDF referral response.",
+        }
+        legacy_result = ai_processing._suppress_competing_attachment_updates(
+            legacy_pdf_only,
+            [{"direction": "inbound", "content": "Alternate brochure attached."}],
+            self.TARGET,
+            [wrong_pdf],
+        )
+        self.assertIs(legacy_pdf_only, legacy_result)
+        self.assertEqual(
+            "Legacy PDF referral response.",
+            legacy_result["response_email"],
+        )
+
+        optout = {"type": "contact_optout", "reason": "unsubscribe"}
+        native_optout = {
+            "updates": [{"column": "Total SF", "value": "20000"}],
+            "events": [
+                {"type": "new_property", "address": "999 Hostile Early Return Road"},
+                optout,
+                {
+                    "type": "needs_user_input",
+                    "reason": "multi_property_attachment",
+                },
+            ],
+            "response_email": "This must not send.",
+        }
+        optout_result = ai_processing._suppress_competing_attachment_updates(
+            native_optout,
+            [{"direction": "inbound", "content": "Unsubscribe me."}],
+            self.TARGET,
+            [self._single_manifest("optout"), wrong_pdf],
+        )
+        self.assertEqual([], optout_result["updates"])
+        self.assertEqual([optout], optout_result["events"])
+        self.assertIsNone(optout_result["response_email"])
+
+    def test_safe_manifest_projection_excludes_raw_pixel_exif_and_exception_sentinels(self):
+        projector = getattr(
+            file_handling,
+            "project_safe_native_image_manifest",
+            None,
+        )
+        self.assertTrue(
+            callable(projector),
+            "safe native-image manifest projector has not been implemented",
+        )
+        manifest = self._single_manifest()
+        pixel_payload = manifest["images"][0]
+        manifest.update({
+            "raw_filename": "PRIVATE_FILENAME_SENTINEL.png",
+            "pixels": "PRIVATE_PIXEL_SENTINEL",
+            "exif": {"Owner": "PRIVATE_EXIF_SENTINEL"},
+            "icc_profile": "PRIVATE_ICC_SENTINEL",
+            "comments": "PRIVATE_COMMENT_SENTINEL",
+            "exception": RuntimeError("PRIVATE_EXCEPTION_SENTINEL"),
+            "id": "PRIVATE_FILE_ID_SENTINEL",
+            "file_id": "PRIVATE_FILE_ID_SENTINEL",
+        })
+        manifest["image_meta"][0].update({
+            "raw_filename": "PRIVATE_META_FILENAME_SENTINEL.png",
+            "pixels": "PRIVATE_META_PIXEL_SENTINEL",
+            "exif": "PRIVATE_META_EXIF_SENTINEL",
+            "icc_profile": "PRIVATE_META_ICC_SENTINEL",
+            "comments": "PRIVATE_META_COMMENT_SENTINEL",
+            "exception": RuntimeError("PRIVATE_META_EXCEPTION_SENTINEL"),
+        })
+
+        projection = projector(manifest)
+
+        self.assertEqual(
+            {
+                "name",
+                "text",
+                "method",
+                "source_type",
+                "property_binding",
+                "binding_method",
+                "image_meta",
+            },
+            set(projection),
+        )
+        self.assertEqual(
+            {
+                "content_type",
+                "width",
+                "height",
+                "source_bytes",
+                "normalized_bytes",
+                "normalized_sha256",
+            },
+            set(projection["image_meta"][0]),
+        )
+        run = self._run_proposal([manifest], dry_run=False)
+        persist_call = (
+            run["firestore"].collection.return_value
+            .document.return_value
+            .collection.return_value
+            .document.return_value
+            .set
+        )
+        self.assertEqual(1, persist_call.call_count)
+        persisted = persist_call.call_args.args[0]
+        self.assertEqual([projection], persisted["pdfManifest"])
+        self.assertEqual([], persisted["fileIds"])
+        self.assertEqual(1, run["usage_call"].call_count)
+
+        persisted_observable = repr((
+            projection,
+            run["print_call"].call_args_list,
+            persisted,
+        ))
+        self.assertNotIn(pixel_payload, persisted_observable)
+        observable = repr((
+            run["client"].responses.create.call_args,
+            run["print_call"].call_args_list,
+            persisted,
+        ))
+        for sentinel in (
+            "PRIVATE_FILENAME_SENTINEL",
+            "PRIVATE_PIXEL_SENTINEL",
+            "PRIVATE_EXIF_SENTINEL",
+            "PRIVATE_ICC_SENTINEL",
+            "PRIVATE_COMMENT_SENTINEL",
+            "PRIVATE_EXCEPTION_SENTINEL",
+            "PRIVATE_FILE_ID_SENTINEL",
+            "PRIVATE_META_FILENAME_SENTINEL",
+            "PRIVATE_META_PIXEL_SENTINEL",
+            "PRIVATE_META_EXIF_SENTINEL",
+            "PRIVATE_META_ICC_SENTINEL",
+            "PRIVATE_META_COMMENT_SENTINEL",
+            "PRIVATE_META_EXCEPTION_SENTINEL",
+        ):
+            with self.subTest(sentinel=sentinel):
+                self.assertNotIn(sentinel, observable)
+
+    def test_malformed_native_manifest_fails_before_model_or_persistence(self):
+        wrong_binding = self._single_manifest("wrong-binding")
+        wrong_binding["property_binding"] = "competing"
+
+        wrong_method = self._single_manifest("wrong-method")
+        wrong_method["method"] = "native_image_unvalidated"
+
+        bad_cardinality = self._single_manifest("bad-cardinality")
+        bad_cardinality["images"].append(bad_cardinality["images"][0])
+
+        bad_hash = self._single_manifest("bad-hash")
+        bad_hash["image_meta"][0]["normalized_sha256"] = "0" * 64
+
+        bad_png = self._single_manifest("bad-png")
+        invalid_png = b"not a canonical PNG"
+        bad_png["images"][0] = base64.b64encode(invalid_png).decode("ascii")
+        bad_png["image_meta"][0]["normalized_bytes"] = len(invalid_png)
+        bad_png["image_meta"][0]["normalized_sha256"] = hashlib.sha256(
+            invalid_png
+        ).hexdigest()
+
+        missing_markers = self._single_manifest("missing-markers")
+        missing_markers.pop("method")
+        missing_markers.pop("source_type")
+
+        corrupt_markers = self._single_manifest("corrupt-markers")
+        corrupt_markers["method"] = "native_image_normalized_CORRUPT"
+        corrupt_markers["source_type"] = "native_image_CORRUPT"
+
+        marker_subclasses = self._single_manifest("marker-subclasses")
+        marker_subclasses["method"] = _PrivateHashString(
+            "native_image_normalized",
+            "PRIVATE_METHOD_MARKER_SENTINEL",
+        )
+        marker_subclasses["source_type"] = _PrivateHashString(
+            "native_image",
+            "PRIVATE_SOURCE_MARKER_SENTINEL",
+        )
+
+        manifest_subclass = _PrivateNativeManifestDict(
+            self._single_manifest("manifest-subclass")
+        )
+        manifest_subclass.update({
+            "raw_filename": "PRIVATE_SUBCLASS_FILENAME_SENTINEL.png",
+            "id": "PRIVATE_SUBCLASS_FILE_ID_SENTINEL",
+        })
+
+        hostile_false_marker = self._single_manifest("false-marker")
+        hostile_raising_marker = self._single_manifest("raising-marker")
+        for hostile, marker_type, sentinel in (
+            (
+                hostile_false_marker,
+                _FalseNativeMarkerString,
+                "PRIVATE_FALSE_MARKER_SENTINEL",
+            ),
+            (
+                hostile_raising_marker,
+                _RaisingNativeMarkerString,
+                "PRIVATE_RAISING_MARKER_SENTINEL",
+            ),
+        ):
+            hostile["method"] = marker_type(
+                "native_image_normalized",
+                sentinel,
+            )
+            hostile.pop("source_type")
+            hostile.pop("property_binding")
+            hostile.pop("binding_method")
+            hostile.pop("image_meta")
+            hostile.update({
+                "raw_filename": f"{sentinel}.png",
+                "id": sentinel,
+            })
+
+        for name, manifest in (
+            ("binding", wrong_binding),
+            ("method", wrong_method),
+            ("cardinality", bad_cardinality),
+            ("hash", bad_hash),
+            ("png", bad_png),
+            ("missing_markers", missing_markers),
+            ("corrupt_markers", corrupt_markers),
+            ("marker_subclasses", marker_subclasses),
+            ("manifest_subclass", manifest_subclass),
+            ("hostile_false_marker", hostile_false_marker),
+            ("hostile_raising_marker", hostile_raising_marker),
+        ):
+            with self.subTest(case=name):
+                run = self._run_proposal([manifest], dry_run=False)
+                self.assertIsNone(run["proposal"])
+                self.assertEqual(0, run["client"].responses.create.call_count)
+                self.assertEqual(0, run["client"].files.create.call_count)
+                self.assertEqual(0, run["usage_call"].call_count)
+                persist_call = (
+                    run["firestore"].collection.return_value
+                    .document.return_value
+                    .collection.return_value
+                    .document.return_value
+                    .set
+                )
+                self.assertEqual(0, persist_call.call_count)
+                self.assertNotIn(
+                    "PRIVATE_FALSE_MARKER_SENTINEL",
+                    repr(run["print_call"].call_args_list),
+                )
+                self.assertNotIn(
+                    "PRIVATE_RAISING_MARKER_SENTINEL",
+                    repr(run["print_call"].call_args_list),
+                )
+
+        projector = getattr(
+            file_handling,
+            "project_safe_native_image_manifest",
+            None,
+        )
+        self.assertTrue(
+            callable(projector),
+            "safe native-image manifest projector has not been implemented",
+        )
+        forged_dimensions = self._single_manifest("forged-dimensions")
+        actual_over_edge = _png_bytes(
+            size=(file_handling.NATIVE_IMAGE_MAX_EDGE + 1, 1)
+        )
+        forged_dimensions["images"][0] = base64.b64encode(
+            actual_over_edge
+        ).decode("ascii")
+        forged_dimensions["image_meta"][0]["normalized_bytes"] = len(
+            actual_over_edge
+        )
+        forged_dimensions["image_meta"][0]["normalized_sha256"] = (
+            hashlib.sha256(actual_over_edge).hexdigest()
+        )
+        forbidden = AssertionError(
+            "over-limit actual dimensions reached verify/normalization"
+        )
+        with mock.patch.object(
+            file_handling,
+            "_verify_native_image",
+            side_effect=forbidden,
+        ) as verify_call, mock.patch.object(
+            file_handling,
+            "_normalize_native_image",
+            side_effect=forbidden,
+        ) as normalize_call:
+            try:
+                projection = projector(forged_dimensions)
+            except AssertionError as exc:
+                self.fail(str(exc))
+        self.assertIsNone(projection)
+        verify_call.assert_not_called()
+        normalize_call.assert_not_called()
+
+        oversized_encoded = self._single_manifest("oversized-encoded")
+        oversized_payload = b"X" * 12
+        oversized_encoded["images"][0] = base64.b64encode(
+            oversized_payload
+        ).decode("ascii")
+        oversized_encoded["image_meta"][0].update({
+            "source_bytes": 1,
+            "normalized_bytes": 1,
+            "normalized_sha256": hashlib.sha256(
+                oversized_payload
+            ).hexdigest(),
+        })
+        forbidden_decode = AssertionError(
+            "over-limit encoded payload reached base64 decode"
+        )
+        with mock.patch.object(
+            file_handling,
+            "NATIVE_IMAGE_MAX_SOURCE_BYTES",
+            10,
+        ), mock.patch.object(
+            file_handling.base64,
+            "b64decode",
+            side_effect=forbidden_decode,
+        ) as decode_call:
+            try:
+                projection = projector(oversized_encoded)
+            except AssertionError as exc:
+                self.fail(str(exc))
+        self.assertIsNone(projection)
+        decode_call.assert_not_called()
+
+    def test_mixed_native_and_scanned_pdf_preserves_pdf_file_semantics(self):
+        native_manifest = self._single_manifest()
+        native_url = f"data:image/png;base64,{native_manifest['images'][0]}"
+        scanned_page = _png_bytes(size=(4, 3))
+        scanned_page_url = (
+            "data:image/png;base64,"
+            + base64.b64encode(scanned_page).decode("ascii")
+        )
+        fake_client = self._fake_client(file_id="scanned-pdf-file")
+        fake_fs = mock.Mock()
+
+        with mock.patch.object(
+            ai_processing,
+            "client",
+            fake_client,
+        ), mock.patch.object(
+            file_handling,
+            "client",
+            fake_client,
+        ), mock.patch.object(
+            ai_processing,
+            "_fs",
+            fake_fs,
+        ), mock.patch.object(
+            ai_processing,
+            "track_openai_usage_safely",
+        ) as usage_call, mock.patch.object(
+            file_handling,
+            "extract_pdf_text",
+            return_value=("", [scanned_page]),
+        ), mock.patch(
+            "builtins.print",
+        ):
+            pdf_manifest = file_handling.process_pdf_for_ai(
+                b"%PDF-1.4 bounded scanned fixture",
+                "scanned.pdf",
+            )
+            pdf_manifest["name"] = "scanned.pdf"
+            pdf_manifest["text"] = (
+                f"{self.TARGET}\nLEGACY_PDF_TEXT_SENTINEL"
+            )
+            proposal = ai_processing.propose_sheet_updates(
+                uid="native-image-user",
+                client_id="native-image-client",
+                email="broker@example.com",
+                sheet_id="native-image-sheet",
+                header=["Property Address", "Total SF"],
+                rownum=3,
+                rowvals=[self.TARGET, ""],
+                thread_id="native-image-thread",
+                pdf_manifest=[native_manifest, pdf_manifest],
+                conversation=[{
+                    "direction": "inbound",
+                    "from": "broker@example.com",
+                    "content": "The target image and scanned PDF are attached.",
+                }],
+                column_config=self._column_config(),
+                extraction_fields=["total_sf"],
+                dry_run=False,
+            )
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(1, fake_client.files.create.call_count)
+        self.assertEqual(
+            "user_data",
+            fake_client.files.create.call_args.kwargs["purpose"],
+        )
+        self.assertEqual(1, fake_client.responses.create.call_count)
+        self.assertEqual(1, usage_call.call_count)
+        request_content = (
+            fake_client.responses.create.call_args.kwargs["input"][0]["content"]
+        )
+        self.assertEqual(
+            [native_url, scanned_page_url],
+            [
+                item["image_url"]
+                for item in request_content
+                if item.get("type") == "input_image"
+            ],
+        )
+        self.assertEqual(
+            [{"type": "input_file", "file_id": "scanned-pdf-file"}],
+            [
+                item
+                for item in request_content
+                if item.get("type") == "input_file"
+            ],
+        )
+        prompt = next(
+            item["text"]
+            for item in request_content
+            if item.get("type") == "input_text"
+        )
+        self.assertIn("LEGACY_PDF_TEXT_SENTINEL", prompt)
+        persist_call = (
+            fake_fs.collection.return_value
+            .document.return_value
+            .collection.return_value
+            .document.return_value
+            .set
+        )
+        self.assertEqual(1, persist_call.call_count)
+        persisted = persist_call.call_args.args[0]
+        projector = getattr(
+            file_handling,
+            "project_safe_native_image_manifest",
+            None,
+        )
+        self.assertTrue(
+            callable(projector),
+            "safe native-image manifest projector has not been implemented",
+        )
+        self.assertEqual(
+            projector(native_manifest),
+            persisted["pdfManifest"][0],
+        )
+        self.assertEqual(
+            {key: value for key, value in pdf_manifest.items() if key != "images"},
+            persisted["pdfManifest"][1],
+        )
+        self.assertEqual(["scanned-pdf-file"], persisted["fileIds"])
 
 
 if __name__ == "__main__":

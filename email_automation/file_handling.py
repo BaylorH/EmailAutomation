@@ -66,6 +66,23 @@ NATIVE_IMAGE_MAX_EDGE = 1400
 NATIVE_IMAGE_MAX_ADDRESS_TEXT_CHARS = 1024
 
 _NATIVE_IMAGE_GENERIC_NAME = "Broker property image"
+_NATIVE_IMAGE_SAFE_MANIFEST_KEYS = (
+    "name",
+    "text",
+    "method",
+    "source_type",
+    "property_binding",
+    "binding_method",
+    "image_meta",
+)
+_NATIVE_IMAGE_SAFE_META_KEYS = (
+    "content_type",
+    "width",
+    "height",
+    "source_bytes",
+    "normalized_bytes",
+    "normalized_sha256",
+)
 _NATIVE_IMAGE_BOUND_ASSET_KEYS = frozenset(
     (
         "name",
@@ -1125,6 +1142,164 @@ def build_native_image_manifest_entry(
         "property_binding": "target",
         "binding_method": "structured_filename_address",
         "image_meta": image_meta,
+    }
+
+
+def project_safe_native_image_manifest(
+    manifest: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Validate a canonical native-image entry and return its safe projection.
+
+    The returned dictionaries are newly allocated from explicit allowlists. Raw
+    image bytes remain available only to the request assembler that already has
+    the validated input manifest; they never enter prompts, logs, or persistence.
+    """
+    if type(manifest) is not dict:
+        return None
+
+    exact_markers = (
+        ("name", _NATIVE_IMAGE_GENERIC_NAME),
+        ("text", ""),
+        ("method", "native_image_normalized"),
+        ("source_type", "native_image"),
+        ("property_binding", "target"),
+        ("binding_method", "structured_filename_address"),
+    )
+    if any(
+        type(manifest.get(key)) is not str
+        or manifest.get(key) != expected
+        for key, expected in exact_markers
+    ):
+        return None
+
+    encoded_images = manifest.get("images")
+    image_meta = manifest.get("image_meta")
+    if (
+        type(encoded_images) is not list
+        or type(image_meta) is not list
+        or not encoded_images
+        or len(encoded_images) > NATIVE_IMAGE_MAX_COUNT
+        or len(encoded_images) != len(image_meta)
+    ):
+        return None
+
+    safe_meta = []
+    aggregate_source_bytes = 0
+    for encoded_image, metadata in zip(encoded_images, image_meta):
+        if type(encoded_image) is not str or type(metadata) is not dict:
+            return None
+
+        content_type = metadata.get("content_type")
+        width = metadata.get("width")
+        height = metadata.get("height")
+        source_bytes = metadata.get("source_bytes")
+        normalized_bytes = metadata.get("normalized_bytes")
+        normalized_sha256 = metadata.get("normalized_sha256")
+        if (
+            type(content_type) is not str
+            or content_type != "image/png"
+            or type(width) is not int
+            or type(height) is not int
+            or width <= 0
+            or height <= 0
+            or max(width, height) > NATIVE_IMAGE_MAX_EDGE
+            or width * height > NATIVE_IMAGE_MAX_PIXELS
+            or type(source_bytes) is not int
+            or source_bytes <= 0
+            or source_bytes > NATIVE_IMAGE_MAX_SOURCE_BYTES
+            or type(normalized_bytes) is not int
+            or normalized_bytes <= 0
+            or normalized_bytes > NATIVE_IMAGE_MAX_SOURCE_BYTES
+            or type(normalized_sha256) is not str
+        ):
+            return None
+
+        try:
+            projected_decoded_size = _native_image_base64_decoded_size(
+                encoded_image
+            )
+        except ValueError:
+            return None
+        if (
+            projected_decoded_size != normalized_bytes
+            or projected_decoded_size > NATIVE_IMAGE_MAX_SOURCE_BYTES
+        ):
+            return None
+        try:
+            normalized_data = _strict_native_image_base64_decode(
+                encoded_image,
+                projected_decoded_size,
+            )
+        except ValueError:
+            return None
+        if (
+            len(normalized_data) != normalized_bytes
+            or hashlib.sha256(normalized_data).hexdigest()
+            != normalized_sha256
+        ):
+            return None
+
+        # Inspect both independent dimension sources before any full decode or
+        # canonical re-normalization. Forged declared dimensions therefore fail
+        # closed without allowing an oversized image into expensive pixel work.
+        try:
+            header_format, header_width, header_height = (
+                _inspect_native_image_header(normalized_data)
+            )
+            pillow_format, pillow_width, pillow_height = (
+                _inspect_native_image_pillow_format(normalized_data)
+            )
+        except Exception:
+            return None
+        if (
+            header_format != "PNG"
+            or pillow_format != "PNG"
+            or header_width <= 0
+            or header_height <= 0
+            or pillow_width <= 0
+            or pillow_height <= 0
+            or max(header_width, header_height) > NATIVE_IMAGE_MAX_EDGE
+            or header_width * header_height > NATIVE_IMAGE_MAX_PIXELS
+            or max(pillow_width, pillow_height) > NATIVE_IMAGE_MAX_EDGE
+            or pillow_width * pillow_height > NATIVE_IMAGE_MAX_PIXELS
+            or (header_width, header_height) != (pillow_width, pillow_height)
+            or (header_width, header_height) != (width, height)
+        ):
+            return None
+
+        try:
+            _verify_native_image(normalized_data)
+            canonical_data, canonical_width, canonical_height = (
+                _normalize_native_image(normalized_data)
+            )
+        except Exception:
+            return None
+        if (
+            canonical_data != normalized_data
+            or (canonical_width, canonical_height) != (width, height)
+        ):
+            return None
+
+        aggregate_source_bytes += source_bytes
+        if aggregate_source_bytes > NATIVE_IMAGE_MAX_BATCH_SOURCE_BYTES:
+            return None
+        safe_meta.append({
+            key: metadata[key]
+            for key in _NATIVE_IMAGE_SAFE_META_KEYS
+        })
+
+    safe_values = {
+        "name": _NATIVE_IMAGE_GENERIC_NAME,
+        "text": "",
+        "method": "native_image_normalized",
+        "source_type": "native_image",
+        "property_binding": "target",
+        "binding_method": "structured_filename_address",
+        "image_meta": safe_meta,
+    }
+    return {
+        key: safe_values[key]
+        for key in _NATIVE_IMAGE_SAFE_MANIFEST_KEYS
     }
 
 

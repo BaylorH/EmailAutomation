@@ -28,6 +28,7 @@ from .column_config import (
 )
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
+from .file_handling import project_safe_native_image_manifest
 from .property_images import STREET_SUFFIX_TOKENS
 from .tour_scheduling import (
     TOUR_INTENT_COURTESY,
@@ -4344,6 +4345,69 @@ _ATTACHMENT_COPY_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS = frozenset({
+    "property_binding",
+    "binding_method",
+    "image_meta",
+})
+
+
+def _is_native_image_manifest_candidate(manifest: Any) -> bool:
+    """Recognize canonical or malformed entries that claim the native channel."""
+    if not isinstance(manifest, dict):
+        return False
+    if any(
+        dict.__contains__(manifest, key)
+        for key in _NATIVE_IMAGE_MANIFEST_UNIQUE_KEYS
+    ):
+        return True
+
+    method = dict.get(manifest, "method")
+    source_type = dict.get(manifest, "source_type")
+    return (
+        isinstance(method, str)
+        and str.startswith(method, "native_image")
+    ) or (
+        isinstance(source_type, str)
+        and str.startswith(source_type, "native_image")
+    )
+
+
+def _prepare_ai_attachment_manifest(
+    pdf_manifest: Optional[List[dict]],
+) -> Optional[List[Tuple[dict, Optional[dict]]]]:
+    """Validate native entries while leaving legacy PDF entries unchanged."""
+    prepared = []
+    for attachment in (pdf_manifest or []):
+        if _is_native_image_manifest_candidate(attachment):
+            safe_projection = project_safe_native_image_manifest(attachment)
+            if safe_projection is None:
+                return None
+            prepared.append((attachment, safe_projection))
+        else:
+            prepared.append((attachment, None))
+    return prepared
+
+
+def _canonicalize_native_multi_property_attachment(proposal: dict) -> dict:
+    """Fail a native-bearing ambiguous proposal closed for operator review."""
+    contact_optout = next((
+        event for event in (proposal.get("events") or [])
+        if (event or {}).get("type") == "contact_optout"
+    ), None)
+    proposal["updates"] = []
+    proposal["events"] = [contact_optout or {
+        "type": "needs_user_input",
+        "reason": "multi_property_attachment",
+        "question": (
+            "The broker offered multiple properties or suites in an attachment, "
+            "but the details could not be bound safely to one row."
+        ),
+    }]
+    proposal["response_email"] = None
+    proposal["notes"] = ""
+    return proposal
+
 
 def _attachment_name_tokens(name: str) -> List[str]:
     normalized_name = _ATTACHMENT_COPY_SUFFIX_RE.sub("", name or "")
@@ -4398,16 +4462,21 @@ def _suppress_competing_attachment_updates(
     """
     if not proposal or not pdf_manifest:
         return proposal
-    if any(
-        (event or {}).get("type") == "new_property"
-        for event in proposal.get("events") or []
-    ):
-        return proposal
 
     fresh_text = _fresh_inbound_text(conversation)
     multiple_attachments = len(pdf_manifest) > 1
     classified_sources = []
+    has_valid_native = False
     for pdf in pdf_manifest:
+        if _is_native_image_manifest_candidate(pdf):
+            native_projection = project_safe_native_image_manifest(pdf)
+            has_valid_native = has_valid_native or native_projection is not None
+            classified_sources.append((
+                "",
+                "target" if native_projection is not None else "mixed",
+            ))
+            continue
+
         name = str((pdf or {}).get("name") or "")
         source = "\n".join((
             name,
@@ -4440,6 +4509,14 @@ def _suppress_competing_attachment_updates(
         and (event or {}).get("reason") == "multi_property_attachment"
         for event in proposal.get("events") or []
     )
+    if has_valid_native and (explicitly_other or already_escalated):
+        return _canonicalize_native_multi_property_attachment(proposal)
+
+    if any(
+        (event or {}).get("type") == "new_property"
+        for event in proposal.get("events") or []
+    ):
+        return proposal
     if not explicitly_other and not already_escalated:
         return proposal
 
@@ -6193,6 +6270,17 @@ def propose_sheet_updates(uid: str,
             configured_extraction_fields,
         )
 
+        prepared_attachment_manifest = _prepare_ai_attachment_manifest(
+            pdf_manifest
+        )
+        if prepared_attachment_manifest is None:
+            print("❌ Refusing malformed native-image attachment manifest")
+            return None
+        analysis_attachment_manifest = [
+            safe_projection if safe_projection is not None else attachment
+            for attachment, safe_projection in prepared_attachment_manifest
+        ]
+
         COLUMN_RULES = build_column_rules_prompt(effective_config)
 
         DOC_SELECTION_RULES = """
@@ -6309,6 +6397,7 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • "confidential" - asking for CLIENT IDENTITY specifically (who is your client / what company). Do NOT use "confidential" for benign tour logistics such as attendee names for a building gate/visitor list — that is not a client-identity question.
   • "legal_contract" - contract/LOI/lease questions
   • "unclear" - message is confusing or unclear
+  • "multi_property_attachment" - attachment details cannot be bound safely to one property or suite
   • A request to reschedule or set up a PHONE CALL is call_requested, NOT needs_user_input.
 
 - "contact_optout": Emit when the contact explicitly indicates they don't want further communication.
@@ -6632,10 +6721,38 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
 {json.dumps(conversation, indent=2)}
 """.rstrip()]
 
+        native_projections = [
+            safe_projection
+            for _, safe_projection in prepared_attachment_manifest
+            if safe_projection is not None
+        ]
+        if native_projections:
+            prompt_parts.append("\n\n=== NATIVE IMAGE ATTACHMENTS ===")
+            prompt_parts.append(
+                "\nThese are prevalidated native images bound explicitly to "
+                "the TARGET PROPERTY. Treat every image in each batch as "
+                "target-row visual evidence; do not reinterpret them as "
+                "addressless or competing attachments."
+            )
+            for batch_number, projection in enumerate(
+                native_projections,
+                start=1,
+            ):
+                image_count = len(projection["image_meta"])
+                prompt_parts.append(
+                    f"\n--- Prevalidated target native image batch "
+                    f"{batch_number}: {image_count} image(s) ---"
+                )
+
         # PDF attachments - include extracted text directly in prompt
-        if pdf_manifest:
+        legacy_pdf_entries = [
+            attachment
+            for attachment, safe_projection in prepared_attachment_manifest
+            if safe_projection is None
+        ]
+        if legacy_pdf_entries:
             prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
-            for pdf in pdf_manifest:
+            for pdf in legacy_pdf_entries:
                 name = pdf.get("name") or "<unnamed.pdf>"
                 text = pdf.get("text") or ""
                 method = pdf.get("method", "unknown")
@@ -6677,7 +6794,7 @@ OUTPUT ONLY valid JSON in this exact format:
       "contactName": "<for new_property: full name of the new contact if mentioned, e.g., 'Joe Smith' from 'email Joe Smith at joe@email.com'. Use first name only if that's all available>",
       "link": "<for new_property: include URL if mentioned>",
       "notes": "<for new_property: additional context about the property>",
-      "reason": "<for needs_user_input: client_question | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company> OR <for tour_requested: tour_offer | tour_slot_reply | tour_unavailable>",
+      "reason": "<for needs_user_input: client_question | negotiation | confidential | legal_contract | unclear | multi_property_attachment> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company> OR <for tour_requested: tour_offer | tour_slot_reply | tour_unavailable>",
       "question": "<for needs_user_input: the specific question/request that needs user attention; for tour_requested: the exact broker-authored sentence that triggered the event, copied verbatim without paraphrasing>",
       "suggestedContact": "<for wrong_contact: name of correct person to contact>",
       "suggestedEmail": "<for wrong_contact: email of correct person if provided>",
@@ -6696,10 +6813,23 @@ OUTPUT ONLY valid JSON in this exact format:
         # ---- Prepare inputs (images for vision, files as fallback, then text) --------------------------
         input_content = []
 
-        # Add PDF page images for vision processing (scanned PDFs, complex layouts)
-        if pdf_manifest:
-            for pdf in pdf_manifest:
+        # Add native images inline and retain the existing PDF request behavior.
+        if prepared_attachment_manifest:
+            for pdf, native_projection in prepared_attachment_manifest:
                 images = pdf.get("images") or []
+
+                if native_projection is not None:
+                    for image_number, img_b64 in enumerate(images, start=1):
+                        input_content.append({
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{img_b64}",
+                        })
+                        print(
+                            "📷 Added prevalidated target native image "
+                            f"{image_number} for vision analysis"
+                        )
+                    continue
+
                 name = pdf.get("name", "PDF")
 
                 # Add images for vision (pages with little extractable text)
@@ -6779,13 +6909,15 @@ OUTPUT ONLY valid JSON in this exact format:
         # Flyer/linked-PDF text is evidence for extraction + the fabricated-count
         # guard: a count stated only in the flyer is REAL, not invented.
         _evidence_extra_texts = [
-            (pdf or {}).get("text") or "" for pdf in (pdf_manifest or [])
+            (pdf or {}).get("text") or ""
+            for pdf in analysis_attachment_manifest
         ] + [
             (u or {}).get("text") or "" for u in (url_texts or [])
         ]
         proposal = _augment_proposal_with_deterministic_extractions(
             proposal, rowvals, header, effective_config, conversation,
-            pdf_manifest=pdf_manifest, extra_texts=_evidence_extra_texts,
+            pdf_manifest=analysis_attachment_manifest,
+            extra_texts=_evidence_extra_texts,
         )
         proposal = _augment_proposal_opex_basis(
             proposal, rowvals, header, effective_config, conversation
@@ -6828,7 +6960,10 @@ OUTPUT ONLY valid JSON in this exact format:
             proposal,
             conversation,
             target_anchor,
-            pdf_manifest or [],
+            [
+                attachment
+                for attachment, _ in prepared_attachment_manifest
+            ],
         )
 
         # ---- Log + store in sheetChangeLog -----------------------------------
@@ -6869,8 +7004,19 @@ OUTPUT ONLY valid JSON in this exact format:
                 "proposalHash": proposal_hash,
                 "status": "proposed",
                 "threadId": thread_id,
-                "pdfManifest": [{k: v for k, v in p.items() if k != 'images'} for p in (pdf_manifest or [])],  # exclude images from log
-                "fileIds": [p["id"] for p in (pdf_manifest or []) if p.get("id")],  # keep old field for compatibility
+                "pdfManifest": [
+                    safe_projection
+                    if safe_projection is not None
+                    else {k: v for k, v in attachment.items() if k != "images"}
+                    for attachment, safe_projection
+                    in prepared_attachment_manifest
+                ],
+                "fileIds": [
+                    attachment["id"]
+                    for attachment, safe_projection
+                    in prepared_attachment_manifest
+                    if safe_projection is None and attachment.get("id")
+                ],
                 "urlTexts": url_texts or [],
                 "createdAt": SERVER_TIMESTAMP
             })
