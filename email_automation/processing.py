@@ -8831,8 +8831,11 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                             allow_outbound_reply=False,
                             authenticated_mailbox_email=authenticated_mailbox_email,
                         )
+                        if mark_processed(user_id, processed_key) is not True:
+                            raise RetryableProcessingError(
+                                "Batched attachment predecessor processed marker write failed"
+                            )
                         processed_count += 1
-                        mark_processed(user_id, processed_key)
                         _clear_ai_processing_failure(
                             user_id,
                             thread_id,
