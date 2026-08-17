@@ -786,6 +786,51 @@ class RollbackRunbookContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self._traffic_targets(), [])
 
+    def test_wrong_rollback_revision_name_fails_before_traffic_mutation(self):
+        result = self._run(scenario="wrong_rollback_revision_name")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_missing_rollback_revision_name_fails_before_traffic_mutation(self):
+        result = self._run(scenario="missing_rollback_revision_name")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_wrong_rollback_image_digest_fails_before_traffic_mutation(self):
+        result = self._run(scenario="wrong_rollback_image_digest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_missing_rollback_image_digest_fails_before_traffic_mutation(self):
+        result = self._run(scenario="missing_rollback_image_digest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_malformed_rollback_conditions_fail_before_traffic_mutation(self):
+        result = self._run(scenario="malformed_rollback_conditions")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_missing_rollback_ready_condition_fails_before_traffic_mutation(self):
+        result = self._run(scenario="missing_rollback_ready_condition")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_duplicate_rollback_ready_conditions_fail_before_traffic_mutation(self):
+        result = self._run(scenario="duplicate_rollback_ready_conditions")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_lowercase_rollback_ready_status_fails_before_traffic_mutation(self):
+        result = self._run(scenario="lowercase_rollback_ready_status")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_boolean_rollback_ready_status_fails_before_traffic_mutation(self):
+        result = self._run(scenario="boolean_rollback_ready_status")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
     def test_rollback_mutation_failure_still_restores_release_a(self):
         result = self._run(scenario="rollback_update_failure")
         self.assertNotEqual(result.returncode, 0)
@@ -924,9 +969,42 @@ class RollbackRunbookContractTests(unittest.TestCase):
                         if scenario == "mismatched_rollback_image"
                         else "{ROLLBACK_IMAGE}"
                     )
-                    print(json.dumps({{
+                    rollback_revision = {{
+                        "metadata": {{"name": "{ROLLBACK_REVISION}"}},
                         "spec": {{"containers": [{{"image": rollback_image}}]}},
-                    }}))
+                        "status": {{
+                            "imageDigest": "{ROLLBACK_DIGEST}",
+                            "conditions": [{{"type": "Ready", "status": "True"}}],
+                        }},
+                    }}
+                    if scenario == "wrong_rollback_revision_name":
+                        rollback_revision["metadata"]["name"] = "unexpected-revision"
+                    elif scenario == "missing_rollback_revision_name":
+                        rollback_revision["metadata"].pop("name")
+                    elif scenario == "wrong_rollback_image_digest":
+                        rollback_revision["status"]["imageDigest"] = "sha256:" + "d" * 64
+                    elif scenario == "missing_rollback_image_digest":
+                        rollback_revision["status"].pop("imageDigest")
+                    elif scenario == "malformed_rollback_conditions":
+                        rollback_revision["status"]["conditions"] = {{
+                            "type": "Ready",
+                            "status": "True",
+                        }}
+                    elif scenario == "missing_rollback_ready_condition":
+                        rollback_revision["status"]["conditions"] = [{{
+                            "type": "ContainerHealthy",
+                            "status": "True",
+                        }}]
+                    elif scenario == "duplicate_rollback_ready_conditions":
+                        rollback_revision["status"]["conditions"].append({{
+                            "type": "Ready",
+                            "status": "True",
+                        }})
+                    elif scenario == "lowercase_rollback_ready_status":
+                        rollback_revision["status"]["conditions"][0]["status"] = "true"
+                    elif scenario == "boolean_rollback_ready_status":
+                        rollback_revision["status"]["conditions"][0]["status"] = True
+                    print(json.dumps(rollback_revision))
                     raise SystemExit(0)
                 release_image = (
                     "us-central1-docker.pkg.dev/email-automation-cache/"
