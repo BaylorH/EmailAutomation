@@ -97,6 +97,7 @@ gcloud run jobs execute email-automation-scheduler --region "$REGION"
 | `AZURE_API_APP_ID` | job env | Non-secret app id. **Hard startup gate** (`main._validate_startup_env`, parity with the legacy 'Validate CLIENT_ID prefix' step): the job exits non-zero before lease acquisition unless it starts with `54cec`. |
 | `AZURE_API_CLIENT_SECRET`, `FIREBASE_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | Secret Manager | Referenced via `secretKeyRef`, never inlined. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | — | **Deliberately unset.** ADC via the job SA replaces the Actions `sa.json` file. |
+| `SITESIFT_NATIVE_IMAGE_INGESTION` | `process-user` service env | Fail-closed feature gate. Only exact lowercase `true` enables native JPG/PNG effects. The 2026-08-16 production release pins exact lowercase `false`; an unset or malformed value is also disabled but is not an acceptable release readback. |
 
 ### Intentionally omitted legacy env vars
 
@@ -278,6 +279,20 @@ command above.
 
 ### Tagless `process-user` staging gate
 
+Current 2026-08-16 release packet:
+
+- source branch: `feat/native-image-attachment-ingestion-20260816`;
+- production native-image state:
+  `SITESIFT_NATIVE_IMAGE_INGESTION=false`;
+- rollback revision: `process-user-stage-9491133f15d5`;
+- rollback image:
+  `us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968`.
+
+The final deployment SHA and candidate digest are resolved from the clean,
+reviewed implementation HEAD. Native image code is present but dormant; no
+native provider/mailbox/image/model/Drive/Sheets effect is claimed live, and
+the release record says `provider-canary=not-run`.
+
 `scripts/deploy_process_user.sh` is intentionally limited to staging. Its
 default `--dry-run` executes zero `gcloud` commands and reports the deterministic
 `process-user-stage-<12-character-HEAD>` revision identity. `--apply` first
@@ -293,9 +308,13 @@ It deploys that digest with `--no-traffic` and the deterministic
 `--revision-suffix`, without any `--tag`, and fails unless service and revision
 readback prove all of the following:
 
-- the candidate is Ready, has the exact immutable image, matches the baseline
-  revision configuration apart from immutable image and revision identity,
-  remains untagged, and has 0 percent traffic; and
+The candidate matches the baseline revision configuration apart from its
+immutable image and exactly one plain candidate-only environment entry,
+`SITESIFT_NATIVE_IMAGE_INGESTION=false`. Missing, duplicate, secret-bound,
+extra-keyed, non-lowercase, padded, or enabled values fail closed.
+
+- the candidate is Ready, has the exact immutable image, remains untagged, and
+  has 0 percent traffic; and
 - the prior revision remains the sole 100 percent target with its stable
   `release-a` mapping, every auxiliary tag, and canonical `spec.traffic`
   unchanged.
@@ -406,6 +425,9 @@ traffic and its image/readback checks have passed. The block refuses to mutate
 traffic otherwise. It restores that same Release A revision on every exit after
 traffic mutation, including rollback-command and readback failures.
 
+This is a separately authorized maintenance proof, not an automatic
+post-release step and not a provider canary.
+
 ```bash
 set -Eeuo pipefail
 
@@ -413,13 +435,9 @@ PREFLIGHT_HELPER="${PREFLIGHT_HELPER:-$PWD/scripts/process_user_gcloud_preflight
 REGION="us-central1"
 SERVICE="process-user"
 REPOSITORY="cloud-run-source-deploy"
-ROLLBACK_REVISION="REPLACE_ME_ROLLBACK_REVISION"
-EXPECTED_ROLLBACK_IMAGE="REPLACE_ME_ROLLBACK_IMAGE@sha256:REPLACE_ME_ROLLBACK_DIGEST"
+ROLLBACK_REVISION="process-user-stage-9491133f15d5"
+EXPECTED_ROLLBACK_IMAGE="us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
 
-if [[ "$ROLLBACK_REVISION" == *REPLACE_ME* || "$EXPECTED_ROLLBACK_IMAGE" == *REPLACE_ME* ]]; then
-  printf 'Refusing: replace every REPLACE_ME rollback target before running.\n' >&2
-  exit 65
-fi
 if [[ ! -f "$PREFLIGHT_HELPER" ]]; then
   printf 'Refusing: run from the repository root or set PREFLIGHT_HELPER explicitly.\n' >&2
   exit 66
@@ -610,3 +628,18 @@ printf 'Rollback revision %s proven at 100%% traffic.\n' "$ROLLBACK_REVISION"
 
 restore_release_a 0
 ```
+
+### Release evidence labels
+
+- **Proved offline:** deterministic tests and static checks.
+- **Proved live by control plane:** revision, digest, exact false gate,
+  readiness, traffic, IAM, queue, switches, and authenticated health.
+- **Observed in routine live operation:** sanitized facts backed by production
+  metrics or an earlier release receipt.
+- **Dormant and unproved live:** native image ingestion and all downstream
+  native effects.
+- **Needs more examination:** any behavior without deterministic proof or
+  suitable routine-live evidence.
+
+A health check is not a provider, mailbox, PDF, image, model, Drive, Sheets,
+or reply canary.
