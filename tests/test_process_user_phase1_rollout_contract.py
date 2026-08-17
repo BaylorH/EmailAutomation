@@ -18,11 +18,12 @@ sys.modules[SPEC.name] = phase1_rollout
 SPEC.loader.exec_module(phase1_rollout)
 
 
-OLD_REVISION = "process-user-stage-f6f716e71845"
+RELEASE_BRANCH = "feat/native-image-attachment-ingestion-20260816"
+OLD_REVISION = "process-user-stage-9491133f15d5"
 CANDIDATE = "process-user-stage-1234567890ab"
 OLD_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
-    "process-user@sha256:9876351289fc63c148dea949924552977341e9389c3c8e76c4e320fdd60740cd"
+    "process-user@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
 )
 CANDIDATE_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
@@ -73,6 +74,17 @@ def service(positive_revision=OLD_REVISION, release_revision=OLD_REVISION, extra
 
 def revision(name, image):
     is_candidate = name == CANDIDATE
+    environment = [
+        {"name": "FIREBASE_BUCKET", "value": "bucket"},
+        {"name": "OPENAI_API_KEY", "valueFrom": {
+            "secretKeyRef": {"name": "OPENAI_API_KEY", "key": "latest"}
+        }},
+    ]
+    if is_candidate:
+        environment.append({
+            "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+            "value": "false",
+        })
     return {
         "metadata": {
             "name": name,
@@ -105,12 +117,7 @@ def revision(name, image):
                     "--max-requests=1", "--timeout=0", "service:app",
                 ],
                 "resources": {"limits": {"memory": "2Gi"}},
-                "env": [
-                    {"name": "FIREBASE_BUCKET", "value": "bucket"},
-                    {"name": "OPENAI_API_KEY", "valueFrom": {
-                        "secretKeyRef": {"name": "OPENAI_API_KEY", "key": "latest"}
-                    }},
-                ],
+                "env": environment,
             }],
         },
         "status": {
@@ -182,6 +189,10 @@ class FakeOps:
         self.lose_lock_on_assert = None
         self.fail_acquire_lock = False
         self.acquire_error = None
+        self.post_tag_removal_fault = None
+        self.tag_removed = False
+        self.post_tag_service_calls = 0
+        self.post_tag_lock_assertions = 0
 
     def preflight(self):
         self.events.append("preflight")
@@ -206,6 +217,16 @@ class FakeOps:
     def assert_lock(self, lock):
         self.events.append("lock:assert")
         self.lock_assertions += 1
+        if self.tag_removed:
+            self.post_tag_lock_assertions += 1
+            if (
+                self.post_tag_removal_fault == "lock_before"
+                and self.post_tag_lock_assertions == 2
+            ) or (
+                self.post_tag_removal_fault == "lock_after"
+                and self.post_tag_lock_assertions == 3
+            ):
+                self.lock_held = False
         if self.lose_lock_on_assert == self.lock_assertions:
             self.lock_held = False
         if not self.lock_held or lock.owner_nonce != self.lock_nonce:
@@ -220,6 +241,8 @@ class FakeOps:
     def verify_rules_ui_switches(self):
         self.prerequisite_calls += 1
         self.events.append("prerequisites")
+        if self.tag_removed and self.post_tag_removal_fault == "switches":
+            raise phase1_rollout.RolloutError("post-tag switches failed")
         if self.fail_prerequisites or (
             self.fail_prerequisites_after is not None
             and self.prerequisite_calls > self.fail_prerequisites_after
@@ -228,28 +251,59 @@ class FakeOps:
 
     def verify_service_access(self, topology):
         self.events.append("service-access")
+        if self.tag_removed and self.post_tag_removal_fault == "IAM":
+            raise phase1_rollout.RolloutError("post-tag IAM failed")
         if topology.service_url != SERVICE_URL:
             raise phase1_rollout.RolloutError("wrong service URL")
 
     def artifact_image(self):
         self.events.append("artifact")
+        if self.tag_removed and self.post_tag_removal_fault == "candidate_artifact":
+            return "not-an-immutable-candidate-image"
         return CANDIDATE_IMAGE
 
     def get_service(self):
         self.events.append("service")
-        return json.loads(json.dumps(self.service))
+        result = json.loads(json.dumps(self.service))
+        if self.tag_removed:
+            self.post_tag_service_calls += 1
+            if (
+                self.post_tag_removal_fault == "topology"
+                and self.post_tag_service_calls == 2
+            ):
+                result["metadata"]["name"] = "wrong-service"
+        return result
 
     def get_revision(self, name):
         self.events.append(f"revision:{name}")
         source = self.candidate_revision if name == CANDIDATE else self.old_revision
-        return json.loads(json.dumps(source))
+        result = json.loads(json.dumps(source))
+        if not self.tag_removed:
+            return result
+        if name == CANDIDATE:
+            if self.post_tag_removal_fault == "candidate_revision":
+                result["metadata"]["name"] = "wrong-candidate"
+            elif self.post_tag_removal_fault == "candidate_digest":
+                result["status"]["imageDigest"] = OLD_IMAGE
+            elif self.post_tag_removal_fault == "candidate_gate":
+                result["spec"]["containers"][0]["env"][-1]["value"] = "true"
+        elif self.post_tag_removal_fault == "rollback_revision":
+            result["metadata"]["name"] = "wrong-rollback"
+        elif self.post_tag_removal_fault == "rollback_digest":
+            result["status"]["imageDigest"] = CANDIDATE_IMAGE
+        return result
 
     def get_queue(self):
         self.events.append("queue")
-        return json.loads(json.dumps(self.queue))
+        result = json.loads(json.dumps(self.queue))
+        if self.tag_removed and self.post_tag_removal_fault == "queue":
+            result["state"] = "RUNNING"
+        return result
 
     def list_tasks(self):
         self.events.append("tasks")
+        if self.tag_removed and self.post_tag_removal_fault == "task_read":
+            raise phase1_rollout.RolloutError("post-tag task read failed")
         if not self.task_snapshots:
             return []
         return self.task_snapshots.pop(0)
@@ -273,6 +327,9 @@ class FakeOps:
         if self.fail_remove:
             raise phase1_rollout.RolloutError("remove failed")
         self.service = service()
+        self.tag_removed = True
+        self.post_tag_service_calls = 0
+        self.post_tag_lock_assertions = 0
 
     def promote(self, candidate, old):
         self.events.append("promote")
@@ -300,9 +357,23 @@ class FakeOps:
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_release_packet_pins_exact_branch_and_rollback_identity(self):
+        self.assertEqual(
+            {
+                "branch": RELEASE_BRANCH,
+                "rollback revision": OLD_REVISION,
+                "rollback image": OLD_IMAGE,
+            },
+            {
+                "branch": phase1_rollout.BRANCH,
+                "rollback revision": phase1_rollout.OLD_REVISION,
+                "rollback image": phase1_rollout.OLD_IMAGE,
+            },
+        )
+
     def test_controller_pins_current_promoted_production_baseline(self):
         expected = {
-            "branch": "fix/scanned-pdf-production-candidate-20260816",
+            "branch": RELEASE_BRANCH,
             "old revision": OLD_REVISION,
             "old image": OLD_IMAGE,
             "rules hash": (
@@ -441,6 +512,69 @@ class ValidatorTests(unittest.TestCase):
                         changed, baseline, CANDIDATE, CANDIDATE_IMAGE
                     )
 
+    def test_candidate_gate_is_exact_false_and_absent_from_baseline(self):
+        baseline = revision(OLD_REVISION, OLD_IMAGE)
+        phase1_rollout.validate_candidate(
+            revision(CANDIDATE, CANDIDATE_IMAGE),
+            baseline,
+            CANDIDATE,
+            CANDIDATE_IMAGE,
+        )
+
+        def candidate_with_gate(gate):
+            value = revision(CANDIDATE, CANDIDATE_IMAGE)
+            environment = value["spec"]["containers"][0]["env"]
+            environment[-1:] = gate
+            return value
+
+        invalid_candidates = {
+            "missing": candidate_with_gate([]),
+            "true": candidate_with_gate([{
+                "name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "true",
+            }]),
+            "capitalized": candidate_with_gate([{
+                "name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "False",
+            }]),
+            "boolean": candidate_with_gate([{
+                "name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": False,
+            }]),
+            "padded": candidate_with_gate([{
+                "name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": " false ",
+            }]),
+            "duplicate": candidate_with_gate([
+                {"name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "false"},
+                {"name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "false"},
+            ]),
+            "secret-bound": candidate_with_gate([{
+                "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+                "valueFrom": {"secretKeyRef": {"name": "gate", "key": "latest"}},
+            }]),
+            "extra-keyed": candidate_with_gate([{
+                "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+                "value": "false",
+                "unexpected": "field",
+            }]),
+        }
+        for label, candidate in invalid_candidates.items():
+            with self.subTest(label=label):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_candidate(
+                        candidate, baseline, CANDIDATE, CANDIDATE_IMAGE
+                    )
+
+        polluted_baseline = revision(OLD_REVISION, OLD_IMAGE)
+        polluted_baseline["spec"]["containers"][0]["env"].append({
+            "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+            "value": "false",
+        })
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_candidate(
+                revision(CANDIDATE, CANDIDATE_IMAGE),
+                polluted_baseline,
+                CANDIDATE,
+                CANDIDATE_IMAGE,
+            )
+
 
 class StateMachineTests(unittest.TestCase):
     def make_rollout(self, ops, nonce="a" * 64):
@@ -495,7 +629,73 @@ class StateMachineTests(unittest.TestCase):
                 with self.subTest(event=event, index=index):
                     self.assertEqual("lock:assert", ops.events[index - 1])
                     self.assertEqual("lock:assert", ops.events[index + 1])
+        remove_index = ops.events.index("tag:remove")
+        promote_index = ops.events.index("promote")
+        self.assertEqual(
+            [
+                "lock:assert",
+                "tag:remove",
+                "lock:assert",
+                "service",
+                "lock:assert",
+                "artifact",
+                f"revision:{CANDIDATE}",
+                f"revision:{OLD_REVISION}",
+                "prerequisites",
+                "service",
+                "service-access",
+                "queue",
+                "tasks",
+                "lock:assert",
+                "lock:assert",
+                "promote",
+                "lock:assert",
+            ],
+            ops.events[remove_index - 1:promote_index + 2],
+        )
         self.assertEqual("RUNNING", ops.queue["state"])
+
+    def test_every_post_tag_authorization_fault_stops_before_promotion(self):
+        faults = (
+            "candidate_artifact",
+            "candidate_revision",
+            "candidate_digest",
+            "candidate_gate",
+            "rollback_revision",
+            "rollback_digest",
+            "switches",
+            "topology",
+            "IAM",
+            "queue",
+            "task_read",
+            "lock_before",
+            "lock_after",
+        )
+        candidate_faults = {
+            "candidate_artifact",
+            "candidate_revision",
+            "candidate_digest",
+            "candidate_gate",
+        }
+        for fault in faults:
+            with self.subTest(fault=fault):
+                ops = FakeOps()
+                ops.post_tag_removal_fault = fault
+                rollout, _ = self.make_rollout(ops)
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    rollout.apply()
+                self.assertIn("tag:remove", ops.events)
+                self.assertNotIn("promote", ops.events)
+                after_remove = ops.events[ops.events.index("tag:remove") + 1:]
+                candidate_event = f"revision:{CANDIDATE}"
+                rollback_event = f"revision:{OLD_REVISION}"
+                if fault in candidate_faults:
+                    self.assertNotIn(rollback_event, after_remove)
+                if candidate_event in after_remove and rollback_event in after_remove:
+                    self.assertLess(
+                        after_remove.index(candidate_event),
+                        after_remove.index(rollback_event),
+                    )
 
     def test_staging_prerequisites_prove_old_running_empty_without_mutation(self):
         ops = FakeOps()
