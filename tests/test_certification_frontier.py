@@ -813,5 +813,67 @@ class RankerFailClosedTests(unittest.TestCase):
         self.assertEqual(MANIFEST_PATH.read_bytes(), manifest_before)
 
 
+class ManifestRuntimeParityTests(unittest.TestCase):
+    """Task 1's joint-GREEN gate: the planning manifest and the in-image runtime
+    registry must agree exactly.
+
+    Task 0 validated the manifest alone because the runtime registry did not yet
+    exist. Now that it does, neither task is GREEN unless the two are one-for-one.
+    The runtime registry is the authority the deployed route actually loads; the
+    manifest is planning input. A divergence means the image would certify
+    something the approved plan never described.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = load_manifest()
+        from email_automation.certification import scenarios
+
+        cls.scenarios = scenarios
+
+    def _manifest_by_id(self):
+        by_id = {item["scenarioId"]: item for item in self.manifest["scenarioDefinitions"]}
+        by_id[self.manifest["bootstrapScenario"]["scenarioId"]] = self.manifest[
+            "bootstrapScenario"
+        ]
+        for item in self.manifest["refutationScenarios"]:
+            by_id[item["scenarioId"]] = item
+        return by_id
+
+    def test_scenario_ids_are_one_for_one(self):
+        self.assertEqual(
+            set(self.scenarios.scenario_ids()),
+            set(self._manifest_by_id()),
+            "runtime registry ids diverged from the approved manifest",
+        )
+
+    def test_scenario_fields_are_one_for_one(self):
+        for scenario_id, expected in self._manifest_by_id().items():
+            with self.subTest(scenario=scenario_id):
+                actual = dict(self.scenarios.get(scenario_id))
+                actual.pop("scenarioClass")
+                self.assertEqual(actual, expected)
+
+    def test_runtime_registry_digest_is_bindable(self):
+        digest = self.scenarios.registry_digest()
+        self.assertRegex(
+            digest,
+            r"^[0-9a-f]{64}$",
+            "scenarioRegistryDigest must be a lowercase SHA-256 an identity can bind",
+        )
+
+    def test_every_capability_scenario_resolves_through_the_runtime_registry(self):
+        for capability in self.manifest["capabilities"]:
+            owned = {
+                item["scenarioId"]
+                for item in self.scenarios.capability_scenarios(capability["id"])
+            }
+            self.assertEqual(
+                owned,
+                set(capability["scenarioIds"]),
+                f"{capability['id']} scenario ownership diverged in the runtime registry",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
