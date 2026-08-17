@@ -41,6 +41,7 @@ ENV_VARS = (
     "SITESIFT_DAILY_SEND_CAP=20:"
     "SITESIFT_GLOBAL_DAILY_SEND_CAP=20:"
     "SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:"
+    "SITESIFT_NATIVE_IMAGE_INGESTION=false:"
     "SITESIFT_OUTBOUND_MODE=live"
 )
 SECRETS = (
@@ -349,6 +350,30 @@ class TaglessStagingContractTests(unittest.TestCase):
 
     def test_candidate_functional_annotation_drift_is_rejected(self):
         self._assert_revision_refused("candidate_annotation_drift")
+
+    def test_candidate_missing_native_gate_is_rejected(self):
+        self._assert_revision_refused("candidate_missing_native_gate")
+
+    def test_candidate_true_native_gate_is_rejected(self):
+        self._assert_revision_refused("candidate_true_native_gate")
+
+    def test_candidate_case_variant_native_gate_is_rejected(self):
+        self._assert_revision_refused("candidate_case_native_gate")
+
+    def test_candidate_padded_native_gate_is_rejected(self):
+        self._assert_revision_refused("candidate_padded_native_gate")
+
+    def test_candidate_duplicate_native_gate_is_rejected(self):
+        self._assert_revision_refused("candidate_duplicate_native_gate")
+
+    def test_candidate_secret_bound_native_gate_is_rejected(self):
+        self._assert_revision_refused("candidate_secret_native_gate")
+
+    def test_candidate_extra_keyed_native_gate_is_rejected(self):
+        self._assert_revision_refused("candidate_extra_key_native_gate")
+
+    def test_baseline_native_gate_is_rejected(self):
+        self._assert_revision_refused("baseline_native_gate")
 
     def test_cloud_sdk_auth_environment_overrides_stop_before_gcloud(self):
         for name in (
@@ -756,6 +781,18 @@ class TaglessStagingContractTests(unittest.TestCase):
                     "SITESIFT_OUTBOUND_MODE": "live",
                     "SITESIFT_SOURCE_COORDINATOR_MODE": "locked",
                 }
+                if is_baseline and scenario == "baseline_native_gate":
+                    values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "false"
+                if not is_baseline:
+                    values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "false"
+                    if scenario == "candidate_missing_native_gate":
+                        values.pop("SITESIFT_NATIVE_IMAGE_INGESTION")
+                    elif scenario == "candidate_true_native_gate":
+                        values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "true"
+                    elif scenario == "candidate_case_native_gate":
+                        values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "False"
+                    elif scenario == "candidate_padded_native_gate":
+                        values["SITESIFT_NATIVE_IMAGE_INGESTION"] = " false "
                 if not is_baseline and scenario == "candidate_extra_env":
                     values["UNEXPECTED_EXTRA_MODE"] = "1"
                 elif not is_baseline and scenario == "candidate_changed_extra_env":
@@ -779,6 +816,30 @@ class TaglessStagingContractTests(unittest.TestCase):
                     }
                     for name in secret_names
                 )
+                if not is_baseline and scenario == "candidate_duplicate_native_gate":
+                    env.append({
+                        "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+                        "value": "false",
+                    })
+                if not is_baseline and scenario in {
+                    "candidate_secret_native_gate",
+                    "candidate_extra_key_native_gate",
+                }:
+                    gate = next(
+                        entry
+                        for entry in env
+                        if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+                    )
+                    if scenario == "candidate_secret_native_gate":
+                        gate.pop("value")
+                        gate["valueFrom"] = {
+                            "secretKeyRef": {
+                                "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+                                "key": "latest",
+                            }
+                        }
+                    else:
+                        gate["unexpected"] = "rejected"
                 document = {
                     "metadata": {
                         "name": old if is_baseline else candidate,

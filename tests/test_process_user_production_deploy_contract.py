@@ -57,6 +57,7 @@ ENV_VARS = (
     "SITESIFT_DAILY_SEND_CAP=20:"
     "SITESIFT_GLOBAL_DAILY_SEND_CAP=20:"
     "SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:"
+    "SITESIFT_NATIVE_IMAGE_INGESTION=false:"
     "SITESIFT_OUTBOUND_MODE=live"
 )
 SECRETS = (
@@ -509,6 +510,8 @@ class DeployScriptContractTests(unittest.TestCase):
             "SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2",
             env_vars,
         )
+        self.assertIn("SITESIFT_NATIVE_IMAGE_INGESTION=false", env_vars)
+        self.assertNotIn("SITESIFT_NATIVE_IMAGE_INGESTION=true", env_vars)
 
     def test_every_gcloud_call_binds_explicit_account_and_project(self):
         result = self._run("--apply")
