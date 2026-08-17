@@ -617,42 +617,108 @@ paths.
               )
   ```
 
-- [ ] **Step 3: Add an injectable after-tag-removal drift seam to the fake.**
+- [ ] **Step 3: Add a helper-specific post-tag-removal failure seam.**
 
-  Add `self.post_tag_removal_fault = None` and
-  `self.reject_service_access = False` in `FakeOps.__init__()`. Extend the two
-  affected fake methods exactly as follows; this changes test state only:
+  Add these fields in `FakeOps.__init__()`:
 
   ```python
+          self.post_tag_removal_fault = None
+          self.tag_removed = False
+          self.post_tag_service_calls = 0
+  ```
+
+  Add this predicate and replace the affected fake methods with the exact
+  versions below. Every fault is dormant until `remove_cert_tag()` succeeds.
+  The topology fault is returned only by the *second* service read after tag
+  removal: the first is the immediate tag-removal readback, and the second is
+  the helper's authorization read.
+
+  ```python
+      def _post_tag_fault(self, name):
+          return self.tag_removed and self.post_tag_removal_fault == name
+
+      def verify_rules_ui_switches(self):
+          self.prerequisite_calls += 1
+          self.events.append("prerequisites")
+          if self._post_tag_fault("switches") or self.fail_prerequisites or (
+              self.fail_prerequisites_after is not None
+              and self.prerequisite_calls > self.fail_prerequisites_after
+          ):
+              raise phase1_rollout.RolloutError("prerequisite failed")
+
       def verify_service_access(self, topology):
           self.events.append("service-access")
-          if self.reject_service_access or topology.service_url != SERVICE_URL:
+          if self._post_tag_fault("iam") or topology.service_url != SERVICE_URL:
               raise phase1_rollout.RolloutError("service access rejected")
+
+      def artifact_image(self):
+          self.events.append("artifact")
+          if self._post_tag_fault("candidate_artifact"):
+              raise phase1_rollout.RolloutError("artifact read failed")
+          return CANDIDATE_IMAGE
+
+      def get_service(self):
+          self.events.append("service")
+          if self.tag_removed:
+              self.post_tag_service_calls += 1
+              if (
+                  self.post_tag_removal_fault == "topology"
+                  and self.post_tag_service_calls == 2
+              ):
+                  return service(CANDIDATE, OLD_REVISION)
+          return json.loads(json.dumps(self.service))
+
+      def get_revision(self, name):
+          self.events.append(f"revision:{name}")
+          if self._post_tag_fault("candidate_revision") and name == CANDIDATE:
+              raise phase1_rollout.RolloutError("candidate revision read failed")
+          if self._post_tag_fault("rollback_revision") and name == OLD_REVISION:
+              raise phase1_rollout.RolloutError("rollback revision read failed")
+          source = self.candidate_revision if name == CANDIDATE else self.old_revision
+          return json.loads(json.dumps(source))
+
+      def get_queue(self):
+          self.events.append("queue")
+          value = json.loads(json.dumps(self.queue))
+          if self._post_tag_fault("queue"):
+              value["state"] = "RUNNING"
+          return value
+
+      def list_tasks(self):
+          self.events.append("tasks")
+          if self._post_tag_fault("task_read"):
+              raise phase1_rollout.RolloutError("task read failed")
+          if not self.task_snapshots:
+              return []
+          return self.task_snapshots.pop(0)
 
       def remove_cert_tag(self, tag):
           self.events.append("tag:remove")
           if self.fail_remove:
               raise phase1_rollout.RolloutError("remove failed")
           self.service = service()
-          if self.post_tag_removal_fault == "candidate":
+          self.tag_removed = True
+          self.post_tag_service_calls = 0
+          fault = self.post_tag_removal_fault
+          if fault == "candidate_digest":
+              wrong = CANDIDATE_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
+              self.candidate_revision["spec"]["containers"][0]["image"] = wrong
+              self.candidate_revision["status"]["imageDigest"] = wrong
+          elif fault == "candidate_gate":
               gate = next(
                   entry
                   for entry in self.candidate_revision["spec"]["containers"][0]["env"]
                   if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
               )
               gate["value"] = "true"
-          elif self.post_tag_removal_fault == "rollback":
+          elif fault == "rollback_digest":
               wrong = OLD_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
               self.old_revision["spec"]["containers"][0]["image"] = wrong
               self.old_revision["status"]["imageDigest"] = wrong
-          elif self.post_tag_removal_fault == "switches":
-              self.fail_prerequisites = True
-          elif self.post_tag_removal_fault == "topology":
-              self.service = service(CANDIDATE, OLD_REVISION)
-          elif self.post_tag_removal_fault == "iam":
-              self.reject_service_access = True
-          elif self.post_tag_removal_fault == "queue":
-              self.queue["state"] = "RUNNING"
+          elif fault == "lock_before":
+              self.lose_lock_on_assert = self.lock_assertions + 2
+          elif fault == "lock_after":
+              self.lose_lock_on_assert = self.lock_assertions + 3
   ```
 
 - [ ] **Step 4: Pin the exact locked, paused pre-promotion read sequence.**
@@ -672,8 +738,8 @@ paths.
                   "service",
                   "lock:assert",
                   "artifact",
-                  f"revision:{OLD_REVISION}",
                   f"revision:{CANDIDATE}",
+                  f"revision:{OLD_REVISION}",
                   "prerequisites",
                   "service",
                   "service-access",
@@ -692,14 +758,22 @@ paths.
 
   ```python
       def test_every_post_tag_pre_promotion_revalidation_failure_stops_traffic(self):
-          for fault in (
-              "candidate",
-              "rollback",
-              "switches",
-              "topology",
-              "iam",
-              "queue",
-          ):
+          expected_events = {
+              "candidate_artifact": "artifact",
+              "candidate_revision": f"revision:{CANDIDATE}",
+              "candidate_digest": f"revision:{CANDIDATE}",
+              "candidate_gate": f"revision:{CANDIDATE}",
+              "rollback_revision": f"revision:{OLD_REVISION}",
+              "rollback_digest": f"revision:{OLD_REVISION}",
+              "switches": "prerequisites",
+              "topology": "service",
+              "iam": "service-access",
+              "queue": "queue",
+              "task_read": "tasks",
+              "lock_before": "lock:assert",
+              "lock_after": "lock:assert",
+          }
+          for fault, expected_event in expected_events.items():
               with self.subTest(fault=fault):
                   ops = FakeOps()
                   ops.post_tag_removal_fault = fault
@@ -708,10 +782,56 @@ paths.
                       rollout.apply()
                   self.assertIn("tag:remove", ops.events)
                   self.assertNotIn("promote", ops.events)
+                  remove_index = ops.events.index("tag:remove")
+                  after_remove = ops.events[remove_index:]
+                  cleanup_index = (
+                      after_remove.index("pause")
+                      if "pause" in after_remove
+                      else len(after_remove)
+                  )
+                  authorization_events = after_remove[:cleanup_index]
+                  self.assertIn(expected_event, authorization_events)
+
+                  if fault.startswith("candidate_"):
+                      self.assertNotIn(
+                          f"revision:{OLD_REVISION}",
+                          authorization_events,
+                      )
+                  elif fault.startswith("rollback_"):
+                      self.assertLess(
+                          authorization_events.index(f"revision:{CANDIDATE}"),
+                          authorization_events.index(f"revision:{OLD_REVISION}"),
+                      )
+
+                  if fault == "topology":
+                      self.assertEqual(
+                          [
+                              "tag:remove",
+                              "lock:assert",
+                              "service",
+                              "lock:assert",
+                              "artifact",
+                              f"revision:{CANDIDATE}",
+                              f"revision:{OLD_REVISION}",
+                              "prerequisites",
+                              "service",
+                          ],
+                          ops.events[remove_index:remove_index + 9],
+                      )
+                  elif fault == "lock_before":
+                      self.assertNotIn("artifact", after_remove)
+                      self.assertEqual("lock:assert", after_remove[-1])
+                  elif fault == "lock_after":
+                      self.assertIn("tasks", after_remove)
+                      self.assertEqual("lock:assert", after_remove[-1])
   ```
 
-  Keep the existing task-appearance and lock-loss tests; together they prove
-  that the empty-inventory and enclosing-lock assertions also fail closed.
+  This matrix independently targets the candidate artifact lookup; candidate
+  revision read, digest, and gate; rollback revision read and digest; switches;
+  the helper-only topology read; IAM; paused queue; task-inventory read; and the
+  helper's opening and closing lock assertions. Existing drain-time task and
+  generic lock-loss tests remain useful but are not counted as proof for this
+  matrix.
 
 - [ ] **Step 5: Run only the controller contract and prove RED.**
 
@@ -800,19 +920,92 @@ paths.
       return result
   ```
 
-  Replace the candidate comparison with:
+  Extract the candidate-only identity/digest/readiness/gate checks so the
+  pre-promotion helper can authorize the candidate before it reads rollback.
+  Add this function immediately before `validate_candidate()`:
 
   ```python
-  if _canonical_revision_spec(
-      spec,
-      require_native_image_gate=True,
-  ) != _canonical_revision_spec(
-      baseline_spec,
-      require_native_image_gate=False,
-  ):
-      raise RolloutError(
-          "candidate config differs from baseline beyond image and dark gate"
+  def validate_candidate_dark_identity(
+      candidate: Any,
+      expected_name: str,
+      expected_image: str,
+  ) -> tuple[dict[str, Any], dict[str, Any]]:
+      candidate = _object(candidate, "candidate revision")
+      metadata = _object(candidate.get("metadata"), "candidate metadata")
+      if metadata.get("name") != expected_name:
+          raise RolloutError("candidate revision identity is wrong")
+      annotations = metadata.get("annotations", {})
+      if not isinstance(annotations, dict) or annotations.get(
+          "autoscaling.knative.dev/maxScale"
+      ) != "10" or annotations.get("autoscaling.knative.dev/minScale") not in (
+          None,
+          "0",
+      ):
+          raise RolloutError("candidate scaling contract drifted")
+      spec = _object(candidate.get("spec"), "candidate spec")
+      containers = spec.get("containers")
+      if not isinstance(containers, list) or len(containers) != 1:
+          raise RolloutError("candidate container contract is invalid")
+      container = _object(containers[0], "candidate container")
+      if container.get("image") != expected_image:
+          raise RolloutError("candidate image does not match immutable digest")
+      status = _object(candidate.get("status"), "candidate status")
+      if status.get("imageDigest") != expected_image:
+          raise RolloutError("candidate status image digest is wrong")
+      ready = [
+          row
+          for row in status.get("conditions", [])
+          if isinstance(row, dict) and row.get("type") == "Ready"
+      ]
+      if len(ready) != 1 or str(ready[0].get("status")).lower() != "true":
+          raise RolloutError("candidate is not exactly Ready")
+      _canonical_revision_spec(
+          spec,
+          require_native_image_gate=True,
       )
+      return metadata, spec
+  ```
+
+  Add the pure parity helper, then replace `validate_candidate()` with the
+  compatibility wrapper below so existing callers and tests retain their
+  signature:
+
+  ```python
+  def _validate_candidate_parity(
+      metadata: dict[str, Any],
+      spec: dict[str, Any],
+      baseline: Any,
+  ) -> None:
+      baseline = _object(baseline, "baseline revision")
+      baseline_spec = _object(baseline.get("spec"), "baseline spec")
+      if _canonical_revision_spec(
+          spec,
+          require_native_image_gate=True,
+      ) != _canonical_revision_spec(
+          baseline_spec,
+          require_native_image_gate=False,
+      ):
+          raise RolloutError(
+              "candidate config differs from baseline beyond image and dark gate"
+          )
+      if _canonical_revision_metadata(metadata) != _canonical_revision_metadata(
+          _object(baseline.get("metadata"), "baseline metadata")
+      ):
+          raise RolloutError("candidate functional metadata differs from baseline")
+
+
+  def validate_candidate(
+      candidate: Any,
+      baseline: Any,
+      expected_name: str,
+      expected_image: str,
+  ) -> None:
+      metadata, spec = validate_candidate_dark_identity(
+          candidate,
+          expected_name,
+          expected_image,
+      )
+      _validate_candidate_parity(metadata, spec, baseline)
   ```
 
 - [ ] **Step 3: Add the locked, paused, post-tag pre-promotion gate.**
@@ -823,10 +1016,15 @@ paths.
       def _validate_locked_pre_promotion(self, lock: RolloutLock) -> None:
           self.ops.assert_lock(lock)
           image = self.ops.artifact_image()
+          candidate = self.ops.get_revision(self.candidate)
+          candidate_metadata, candidate_spec = validate_candidate_dark_identity(
+              candidate,
+              self.candidate,
+              image,
+          )
           old = self.ops.get_revision(OLD_REVISION)
           validate_old_revision(old)
-          candidate = self.ops.get_revision(self.candidate)
-          validate_candidate(candidate, old, self.candidate, image)
+          _validate_candidate_parity(candidate_metadata, candidate_spec, old)
           self.ops.verify_rules_ui_switches()
           topology = validate_topology(
               self.ops.get_service(),
@@ -855,10 +1053,11 @@ paths.
   ```
 
   The queue was paused and drained before the temporary tag was added. The new
-  helper re-proves `PAUSED` after every other authorization read, while its
-  opening/closing lock assertions fence the exact candidate digest/dark gate,
-  rollback pair, switches, unpromoted topology, IAM, queue, and task inventory.
-  No controller-cached object authorizes promotion.
+  helper re-proves `PAUSED` after every other authorization read. Between its
+  opening/closing lock assertions, it authorizes in the approved order: candidate
+  artifact, candidate revision/digest/gate, rollback revision/digest plus exact
+  config parity, switches, unpromoted topology, IAM, queue, and task inventory.
+  No rollback read or controller-cached object authorizes the candidate first.
 
 - [ ] **Step 4: Prove the stale branch is replaced and the controller is GREEN.**
 
@@ -1466,14 +1665,18 @@ paths.
   - candidate-only plain false gate as the sole config delta, with explicit
     secret-bound/`valueFrom` and extra-keyed rejection;
   - immutable untagged 0% staging;
-  - exact after-tag-removal, under-lock, paused-queue revalidation order and a
-    no-promotion failure test for each authorization read;
+  - exact after-tag-removal, under-lock, paused-queue order with candidate
+    artifact/revision/digest/gate authorized before rollback revision/digest;
+  - a distinct no-promotion failure case for candidate artifact, candidate
+    revision/digest/gate, rollback revision/digest, switches, helper-only
+    topology, IAM, queue, task read, and opening/closing lock assertions;
   - closed lock/queue/tag/promotion/rollback ordering;
   - independent pre-promotion config/rollback-digest proof and direct
     post-promotion switches/IAM/authenticated-health rereads;
   - self-contained shell blocks with no inherited release variable;
   - no POST/provider/mailbox canary path;
-  - exact rollback-proof restoration semantics; and
+  - exact rollback-proof restoration semantics and an asserted post-live
+    rollback identity/digest/Ready readback; and
   - honest post-live evidence labels.
 
   Expected verdict: zero P0/P1/P2 findings. Fix and re-review every finding.
@@ -2004,7 +2207,7 @@ paths.
 
   Expected: the single sanitized success line.
 
-- [ ] **Step 3: Re-prove the rollback image without printing configuration.**
+- [ ] **Step 3: Fail closed on the exact rollback revision, digest, and state.**
 
   ```bash
   set -euo pipefail
@@ -2016,15 +2219,36 @@ paths.
     CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
     CLOUDSDK_CORE_ACCOUNT \
     CLOUDSDK_CORE_PROJECT
-  gcloud run revisions describe process-user-stage-9491133f15d5 \
+  ROLLBACK_REVISION="process-user-stage-9491133f15d5"
+  ROLLBACK_IMAGE="us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
+  gcloud run revisions describe "$ROLLBACK_REVISION" \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
     --project "$PROCESS_USER_PROJECT" \
     --region us-central1 \
-    '--format=value(spec.containers[0].image,status.imageDigest)'
+    --format=json | \
+    EXPECTED_REVISION="$ROLLBACK_REVISION" \
+    EXPECTED_IMAGE="$ROLLBACK_IMAGE" \
+    python3 -c '
+  import json, os, sys
+  revision = json.load(sys.stdin)
+  assert revision.get("metadata", {}).get("name") == os.environ["EXPECTED_REVISION"]
+  containers = revision.get("spec", {}).get("containers", [])
+  assert len(containers) == 1
+  assert containers[0].get("image") == os.environ["EXPECTED_IMAGE"]
+  status = revision.get("status", {})
+  assert status.get("imageDigest") == os.environ["EXPECTED_IMAGE"]
+  ready = [
+      row for row in status.get("conditions", [])
+      if row.get("type") == "Ready"
+  ]
+  assert len(ready) == 1 and str(ready[0].get("status")).lower() == "true"
+  print("rollback revision: identity, digest, and Ready state exact")
+  '
   ```
 
-  Expected: both fields equal
-  `us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968`.
+  Expected: the single sanitized success line. A wrong revision name, container
+  count, spec image, status digest, missing/duplicate Ready condition, or
+  non-true Ready state exits nonzero before the report can claim rollback proof.
 
 - [ ] **Step 4: Prove queue state and empty task inventory.**
 

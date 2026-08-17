@@ -149,9 +149,9 @@ untagged, Ready, and at 0% until the controller:
 5. removes that tag and proves its removal while the durable lock is still held
    and the queue is still paused;
 6. inside a pair of fresh lock assertions, re-reads and revalidates, in exact
-   order, the candidate artifact/digest and false gate, the rollback
-   revision/digest, switches, unpromoted topology, IAM, paused queue, and empty
-   task inventory;
+   order, the candidate artifact and candidate revision/digest/false gate, the
+   rollback revision/digest, switches, unpromoted topology, IAM, paused queue,
+   and empty task inventory;
 7. promotes the candidate to sole 100% traffic plus `release-a`; and
 8. resumes the queue only after post-promotion readbacks pass.
 
@@ -244,7 +244,9 @@ commit:
 - disabled mixed and image-only assembly fails before the file-handling gate;
 - controller tests fail until the existing stale branch assertion, rollback
   pair, exact false candidate delta, and under-lock pre-promotion readbacks are
-  pinned;
+  pinned; their helper-specific matrix separately injects candidate artifact,
+  candidate revision/digest/gate, rollback revision/digest, switch, topology,
+  IAM, queue, task-read, and opening/closing lock failures after tag removal;
 - tagless/production deployment tests fail until the deploy command and
   candidate readback require false; and
 - rollback runbook tests fail until the exact live rollback pair replaces the
@@ -274,7 +276,9 @@ the exact branch and prove local/upstream/remote parity.
 8. Re-read the service, candidate, rollback, queue, tasks, switches, IAM, health,
    and sanitized error/request metadata. Switch, IAM, and authenticated-health
    evidence is gathered directly after promotion rather than copied from the
-   controller's success line.
+   controller's success line. The rollback reread executable asserts its exact
+   revision identity, spec image, status digest, and single Ready=true state;
+   displaying those values without assertions is not evidence.
 9. Publish the evidence-classified standing report and the examination list.
 
 ## What this release may establish
