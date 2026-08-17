@@ -42,8 +42,10 @@ DIGEST = "sha256:" + "a" * 64
 IMAGE = f"{TAG}@{DIGEST}"
 CANONICAL_IMAGE = f"{TAG.rsplit(':', 1)[0]}@{DIGEST}"
 SERVICE_ACCOUNT = "248289505828-compute@developer.gserviceaccount.com"
-ROLLBACK_REVISION = "process-user-lock-0837727b"
-ROLLBACK_DIGEST = "sha256:" + "c" * 64
+ROLLBACK_REVISION = "process-user-stage-9491133f15d5"
+ROLLBACK_DIGEST = (
+    "sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
+)
 ROLLBACK_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     f"cloud-run-source-deploy/process-user@{ROLLBACK_DIGEST}"
@@ -697,7 +699,6 @@ class RollbackRunbookContractTests(unittest.TestCase):
         self,
         scenario: str = "ok",
         account: str | None = ACCOUNT,
-        replace_rollback_placeholders: bool = True,
     ):
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -715,14 +716,6 @@ class RollbackRunbookContractTests(unittest.TestCase):
         else:
             env["GCLOUD_ACCOUNT"] = account
         runbook = self._extract_runbook()
-        if replace_rollback_placeholders:
-            runbook = runbook.replace(
-                'ROLLBACK_REVISION="REPLACE_ME_ROLLBACK_REVISION"',
-                f'ROLLBACK_REVISION="{ROLLBACK_REVISION}"',
-            ).replace(
-                'EXPECTED_ROLLBACK_IMAGE="REPLACE_ME_ROLLBACK_IMAGE@sha256:REPLACE_ME_ROLLBACK_DIGEST"',
-                f'EXPECTED_ROLLBACK_IMAGE="{ROLLBACK_IMAGE}"',
-            )
         return subprocess.run(
             ["bash", "-c", runbook],
             cwd=REPO_ROOT,
@@ -769,11 +762,19 @@ class RollbackRunbookContractTests(unittest.TestCase):
         self.assertNotIn("gcloud auth list", runbook)
         self.assertNotIn("gcloud projects describe", runbook)
 
-    def test_unedited_rollback_placeholders_fail_before_gcloud(self):
-        result = self._run(replace_rollback_placeholders=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("REPLACE_ME", result.stderr)
-        self.assertEqual(self._calls(), [])
+    def test_runbook_pins_exact_live_rollback_pair(self):
+        runbook = self._extract_runbook()
+        self.assertIn(f'ROLLBACK_REVISION="{ROLLBACK_REVISION}"', runbook)
+        self.assertIn(
+            f'EXPECTED_ROLLBACK_IMAGE="{ROLLBACK_IMAGE}"',
+            runbook,
+        )
+
+    def test_readme_pins_dark_native_evidence_boundary(self):
+        readme = DEPLOY_README.read_text(encoding="utf-8")
+        self.assertIn("SITESIFT_NATIVE_IMAGE_INGESTION=false", readme)
+        self.assertIn("Dormant and unproved live", readme)
+        self.assertIn("provider-canary=not-run", readme)
 
     def test_missing_rollback_revision_fails_before_traffic_mutation(self):
         result = self._run(scenario="rollback_revision_missing")
