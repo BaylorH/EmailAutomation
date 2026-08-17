@@ -17,6 +17,7 @@ os.environ.setdefault("FIRESTORE_EMULATOR_HOST", "127.0.0.1:1")
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "email-automation-cache")
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
+from email_automation import app_config
 from email_automation import file_handling
 from email_automation import ai_processing
 from email_automation import property_images
@@ -194,6 +195,24 @@ def _attachment(
         content_bytes = base64.b64encode(content or b"").decode("ascii")
     attachment["contentBytes"] = content_bytes
     return attachment
+
+
+class NativeImageReleaseGateTests(unittest.TestCase):
+    def test_native_image_gate_enables_only_exact_lowercase_true(self):
+        for value in (None, "", "false", "False", "TRUE", " true", "true ", "1"):
+            with self.subTest(value=value):
+                env = {}
+                if value is not None:
+                    env["SITESIFT_NATIVE_IMAGE_INGESTION"] = value
+                with mock.patch.dict(os.environ, env, clear=True):
+                    self.assertFalse(app_config.native_image_ingestion_enabled())
+
+        with mock.patch.dict(
+            os.environ,
+            {"SITESIFT_NATIVE_IMAGE_INGESTION": "true"},
+            clear=True,
+        ):
+            self.assertTrue(app_config.native_image_ingestion_enabled())
 
 
 class NativeImageValidationTests(unittest.TestCase):
