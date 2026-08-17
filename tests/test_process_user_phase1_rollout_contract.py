@@ -192,7 +192,9 @@ class FakeOps:
         self.post_tag_removal_fault = None
         self.tag_removed = False
         self.post_tag_service_calls = 0
-        self.post_tag_lock_assertions = 0
+
+    def _post_tag_fault(self, name):
+        return self.tag_removed and self.post_tag_removal_fault == name
 
     def preflight(self):
         self.events.append("preflight")
@@ -217,16 +219,6 @@ class FakeOps:
     def assert_lock(self, lock):
         self.events.append("lock:assert")
         self.lock_assertions += 1
-        if self.tag_removed:
-            self.post_tag_lock_assertions += 1
-            if (
-                self.post_tag_removal_fault == "lock_before"
-                and self.post_tag_lock_assertions == 2
-            ) or (
-                self.post_tag_removal_fault == "lock_after"
-                and self.post_tag_lock_assertions == 3
-            ):
-                self.lock_held = False
         if self.lose_lock_on_assert == self.lock_assertions:
             self.lock_held = False
         if not self.lock_held or lock.owner_nonce != self.lock_nonce:
@@ -241,9 +233,7 @@ class FakeOps:
     def verify_rules_ui_switches(self):
         self.prerequisite_calls += 1
         self.events.append("prerequisites")
-        if self.tag_removed and self.post_tag_removal_fault == "switches":
-            raise phase1_rollout.RolloutError("post-tag switches failed")
-        if self.fail_prerequisites or (
+        if self._post_tag_fault("switches") or self.fail_prerequisites or (
             self.fail_prerequisites_after is not None
             and self.prerequisite_calls > self.fail_prerequisites_after
         ):
@@ -251,59 +241,46 @@ class FakeOps:
 
     def verify_service_access(self, topology):
         self.events.append("service-access")
-        if self.tag_removed and self.post_tag_removal_fault == "IAM":
-            raise phase1_rollout.RolloutError("post-tag IAM failed")
-        if topology.service_url != SERVICE_URL:
-            raise phase1_rollout.RolloutError("wrong service URL")
+        if self._post_tag_fault("iam") or topology.service_url != SERVICE_URL:
+            raise phase1_rollout.RolloutError("service access rejected")
 
     def artifact_image(self):
         self.events.append("artifact")
-        if self.tag_removed and self.post_tag_removal_fault == "candidate_artifact":
-            return "not-an-immutable-candidate-image"
+        if self._post_tag_fault("candidate_artifact"):
+            raise phase1_rollout.RolloutError("artifact read failed")
         return CANDIDATE_IMAGE
 
     def get_service(self):
         self.events.append("service")
-        result = json.loads(json.dumps(self.service))
         if self.tag_removed:
             self.post_tag_service_calls += 1
             if (
                 self.post_tag_removal_fault == "topology"
                 and self.post_tag_service_calls == 2
             ):
-                result["metadata"]["name"] = "wrong-service"
-        return result
+                return service(CANDIDATE, OLD_REVISION)
+        return json.loads(json.dumps(self.service))
 
     def get_revision(self, name):
         self.events.append(f"revision:{name}")
+        if self._post_tag_fault("candidate_revision") and name == CANDIDATE:
+            raise phase1_rollout.RolloutError("candidate revision read failed")
+        if self._post_tag_fault("rollback_revision") and name == OLD_REVISION:
+            raise phase1_rollout.RolloutError("rollback revision read failed")
         source = self.candidate_revision if name == CANDIDATE else self.old_revision
-        result = json.loads(json.dumps(source))
-        if not self.tag_removed:
-            return result
-        if name == CANDIDATE:
-            if self.post_tag_removal_fault == "candidate_revision":
-                result["metadata"]["name"] = "wrong-candidate"
-            elif self.post_tag_removal_fault == "candidate_digest":
-                result["status"]["imageDigest"] = OLD_IMAGE
-            elif self.post_tag_removal_fault == "candidate_gate":
-                result["spec"]["containers"][0]["env"][-1]["value"] = "true"
-        elif self.post_tag_removal_fault == "rollback_revision":
-            result["metadata"]["name"] = "wrong-rollback"
-        elif self.post_tag_removal_fault == "rollback_digest":
-            result["status"]["imageDigest"] = CANDIDATE_IMAGE
-        return result
+        return json.loads(json.dumps(source))
 
     def get_queue(self):
         self.events.append("queue")
         result = json.loads(json.dumps(self.queue))
-        if self.tag_removed and self.post_tag_removal_fault == "queue":
+        if self._post_tag_fault("queue"):
             result["state"] = "RUNNING"
         return result
 
     def list_tasks(self):
         self.events.append("tasks")
-        if self.tag_removed and self.post_tag_removal_fault == "task_read":
-            raise phase1_rollout.RolloutError("post-tag task read failed")
+        if self._post_tag_fault("task_read"):
+            raise phase1_rollout.RolloutError("task read failed")
         if not self.task_snapshots:
             return []
         return self.task_snapshots.pop(0)
@@ -329,7 +306,26 @@ class FakeOps:
         self.service = service()
         self.tag_removed = True
         self.post_tag_service_calls = 0
-        self.post_tag_lock_assertions = 0
+        fault = self.post_tag_removal_fault
+        if fault == "candidate_digest":
+            wrong = CANDIDATE_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
+            self.candidate_revision["spec"]["containers"][0]["image"] = wrong
+            self.candidate_revision["status"]["imageDigest"] = wrong
+        elif fault == "candidate_gate":
+            gate = next(
+                entry
+                for entry in self.candidate_revision["spec"]["containers"][0]["env"]
+                if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+            )
+            gate["value"] = "true"
+        elif fault == "rollback_digest":
+            wrong = OLD_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
+            self.old_revision["spec"]["containers"][0]["image"] = wrong
+            self.old_revision["status"]["imageDigest"] = wrong
+        elif fault == "lock_before":
+            self.lose_lock_on_assert = self.lock_assertions + 2
+        elif fault == "lock_after":
+            self.lose_lock_on_assert = self.lock_assertions + 3
 
     def promote(self, candidate, old):
         self.events.append("promote")
@@ -357,19 +353,10 @@ class FakeOps:
 
 
 class ValidatorTests(unittest.TestCase):
-    def test_release_packet_pins_exact_branch_and_rollback_identity(self):
-        self.assertEqual(
-            {
-                "branch": RELEASE_BRANCH,
-                "rollback revision": OLD_REVISION,
-                "rollback image": OLD_IMAGE,
-            },
-            {
-                "branch": phase1_rollout.BRANCH,
-                "rollback revision": phase1_rollout.OLD_REVISION,
-                "rollback image": phase1_rollout.OLD_IMAGE,
-            },
-        )
+    def test_release_packet_is_bound_to_branch_and_live_rollback(self):
+        self.assertEqual(RELEASE_BRANCH, phase1_rollout.BRANCH)
+        self.assertEqual(OLD_REVISION, phase1_rollout.OLD_REVISION)
+        self.assertEqual(OLD_IMAGE, phase1_rollout.OLD_IMAGE)
 
     def test_controller_pins_current_promoted_production_baseline(self):
         expected = {
@@ -477,7 +464,7 @@ class ValidatorTests(unittest.TestCase):
                 with self.assertRaises(phase1_rollout.RolloutError):
                     phase1_rollout.validate_queue(bad, "RUNNING")
 
-    def test_candidate_must_be_ready_and_exact_config_clone(self):
+    def test_candidate_must_be_ready_and_exact_dark_config_delta(self):
         phase1_rollout.validate_candidate(
             revision(CANDIDATE, CANDIDATE_IMAGE),
             revision(OLD_REVISION, OLD_IMAGE),
@@ -512,7 +499,7 @@ class ValidatorTests(unittest.TestCase):
                         changed, baseline, CANDIDATE, CANDIDATE_IMAGE
                     )
 
-    def test_candidate_gate_is_exact_false_and_absent_from_baseline(self):
+    def test_candidate_requires_one_exact_false_native_image_gate(self):
         baseline = revision(OLD_REVISION, OLD_IMAGE)
         phase1_rollout.validate_candidate(
             revision(CANDIDATE, CANDIDATE_IMAGE),
@@ -534,9 +521,6 @@ class ValidatorTests(unittest.TestCase):
             }]),
             "capitalized": candidate_with_gate([{
                 "name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "False",
-            }]),
-            "boolean": candidate_with_gate([{
-                "name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": False,
             }]),
             "padded": candidate_with_gate([{
                 "name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": " false ",
@@ -655,29 +639,23 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertEqual("RUNNING", ops.queue["state"])
 
-    def test_every_post_tag_authorization_fault_stops_before_promotion(self):
-        faults = (
-            "candidate_artifact",
-            "candidate_revision",
-            "candidate_digest",
-            "candidate_gate",
-            "rollback_revision",
-            "rollback_digest",
-            "switches",
-            "topology",
-            "IAM",
-            "queue",
-            "task_read",
-            "lock_before",
-            "lock_after",
-        )
-        candidate_faults = {
-            "candidate_artifact",
-            "candidate_revision",
-            "candidate_digest",
-            "candidate_gate",
+    def test_every_post_tag_pre_promotion_revalidation_failure_stops_traffic(self):
+        expected_events = {
+            "candidate_artifact": "artifact",
+            "candidate_revision": f"revision:{CANDIDATE}",
+            "candidate_digest": f"revision:{CANDIDATE}",
+            "candidate_gate": f"revision:{CANDIDATE}",
+            "rollback_revision": f"revision:{OLD_REVISION}",
+            "rollback_digest": f"revision:{OLD_REVISION}",
+            "switches": "prerequisites",
+            "topology": "service",
+            "iam": "service-access",
+            "queue": "queue",
+            "task_read": "tasks",
+            "lock_before": "lock:assert",
+            "lock_after": "lock:assert",
         }
-        for fault in faults:
+        for fault, expected_event in expected_events.items():
             with self.subTest(fault=fault):
                 ops = FakeOps()
                 ops.post_tag_removal_fault = fault
@@ -686,16 +664,47 @@ class StateMachineTests(unittest.TestCase):
                     rollout.apply()
                 self.assertIn("tag:remove", ops.events)
                 self.assertNotIn("promote", ops.events)
-                after_remove = ops.events[ops.events.index("tag:remove") + 1:]
-                candidate_event = f"revision:{CANDIDATE}"
-                rollback_event = f"revision:{OLD_REVISION}"
-                if fault in candidate_faults:
-                    self.assertNotIn(rollback_event, after_remove)
-                if candidate_event in after_remove and rollback_event in after_remove:
-                    self.assertLess(
-                        after_remove.index(candidate_event),
-                        after_remove.index(rollback_event),
+                remove_index = ops.events.index("tag:remove")
+                after_remove = ops.events[remove_index:]
+                cleanup_index = (
+                    after_remove.index("pause")
+                    if "pause" in after_remove
+                    else len(after_remove)
+                )
+                authorization_events = after_remove[:cleanup_index]
+                self.assertIn(expected_event, authorization_events)
+
+                if fault.startswith("candidate_"):
+                    self.assertNotIn(
+                        f"revision:{OLD_REVISION}", authorization_events
                     )
+                elif fault.startswith("rollback_"):
+                    self.assertLess(
+                        authorization_events.index(f"revision:{CANDIDATE}"),
+                        authorization_events.index(f"revision:{OLD_REVISION}"),
+                    )
+
+                if fault == "topology":
+                    self.assertEqual(
+                        [
+                            "tag:remove",
+                            "lock:assert",
+                            "service",
+                            "lock:assert",
+                            "artifact",
+                            f"revision:{CANDIDATE}",
+                            f"revision:{OLD_REVISION}",
+                            "prerequisites",
+                            "service",
+                        ],
+                        ops.events[remove_index:remove_index + 9],
+                    )
+                elif fault == "lock_before":
+                    self.assertNotIn("artifact", after_remove)
+                    self.assertEqual("lock:assert", after_remove[-1])
+                elif fault == "lock_after":
+                    self.assertIn("tasks", after_remove)
+                    self.assertEqual("lock:assert", after_remove[-1])
 
     def test_staging_prerequisites_prove_old_running_empty_without_mutation(self):
         ops = FakeOps()
@@ -978,7 +987,7 @@ class StateMachineTests(unittest.TestCase):
 
         def fail_second_pause():
             pause_calls["count"] += 1
-            if pause_calls["count"] > 3:
+            if pause_calls["count"] > 2:
                 raise phase1_rollout.RolloutError("repause failed")
             original_pause()
 

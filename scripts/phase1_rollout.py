@@ -33,16 +33,18 @@ PROJECT_NUMBER = "248289505828"
 REGION = "us-central1"
 SERVICE = "process-user"
 QUEUE = "graph-process-user"
-BRANCH = "fix/scanned-pdf-production-candidate-20260816"
+BRANCH = "feat/native-image-attachment-ingestion-20260816"
 IMAGE_REPOSITORY = (
     "us-central1-docker.pkg.dev/email-automation-cache/"
     "cloud-run-source-deploy/process-user"
 )
-OLD_REVISION = "process-user-stage-f6f716e71845"
+OLD_REVISION = "process-user-stage-9491133f15d5"
 OLD_IMAGE = (
     IMAGE_REPOSITORY
-    + "@sha256:9876351289fc63c148dea949924552977341e9389c3c8e76c4e320fdd60740cd"
+    + "@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
 )
+NATIVE_IMAGE_GATE_NAME = "SITESIFT_NATIVE_IMAGE_INGESTION"
+NATIVE_IMAGE_GATE_VALUE = "false"
 RULES_HASH = "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
 HOSTING_VERSION = "a3758fb175d427f5"
 INDEX_HASH = "33a041852c11a578b5d4836c64e76b7208afbbf20ccac2208d1b2fc10e0182c0"
@@ -424,13 +426,37 @@ def validate_project_iam(value: Any) -> None:
         raise RolloutError("project invoker policy is not the exact private contract")
 
 
-def _canonical_revision_spec(value: Any) -> dict[str, Any]:
+def _canonical_revision_spec(
+    value: Any, *, require_native_image_gate: bool
+) -> dict[str, Any]:
     result = copy.deepcopy(_object(value, "revision spec"))
     containers = result.get("containers")
     if not isinstance(containers, list) or len(containers) != 1:
         raise RolloutError("revision must have exactly one container")
-    containers[0] = _object(containers[0], "revision container")
-    containers[0].pop("image", None)
+    container = _object(containers[0], "revision container")
+    containers[0] = container
+    environment = container.get("env")
+    if not isinstance(environment, list):
+        raise RolloutError("revision environment is not a list")
+    gate_entries = []
+    retained_environment = []
+    for raw_entry in environment:
+        entry = _object(raw_entry, "revision environment entry")
+        if not isinstance(entry.get("name"), str) or not entry.get("name"):
+            raise RolloutError("revision environment entry name is invalid")
+        if entry.get("name") == NATIVE_IMAGE_GATE_NAME:
+            gate_entries.append(entry)
+        else:
+            retained_environment.append(entry)
+    expected_gate_entries = (
+        [{"name": NATIVE_IMAGE_GATE_NAME, "value": NATIVE_IMAGE_GATE_VALUE}]
+        if require_native_image_gate
+        else []
+    )
+    if gate_entries != expected_gate_entries:
+        raise RolloutError("native image gate is not the exact dark contract")
+    container["env"] = retained_environment
+    container.pop("image", None)
     return result
 
 
@@ -453,14 +479,12 @@ def _canonical_revision_metadata(value: Any) -> dict[str, dict[str, str]]:
     return result
 
 
-def validate_candidate(
+def validate_candidate_dark_identity(
     candidate: Any,
-    baseline: Any,
     expected_name: str,
     expected_image: str,
-) -> None:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = _object(candidate, "candidate revision")
-    baseline = _object(baseline, "baseline revision")
     metadata = _object(candidate.get("metadata"), "candidate metadata")
     if metadata.get("name") != expected_name:
         raise RolloutError("candidate revision identity is wrong")
@@ -473,7 +497,6 @@ def validate_candidate(
     ):
         raise RolloutError("candidate scaling contract drifted")
     spec = _object(candidate.get("spec"), "candidate spec")
-    baseline_spec = _object(baseline.get("spec"), "baseline spec")
     containers = spec.get("containers")
     if not isinstance(containers, list) or len(containers) != 1:
         raise RolloutError("candidate container contract is invalid")
@@ -483,19 +506,49 @@ def validate_candidate(
     status = _object(candidate.get("status"), "candidate status")
     if status.get("imageDigest") != expected_image:
         raise RolloutError("candidate status image digest is wrong")
+    conditions = status.get("conditions")
+    if not isinstance(conditions, list):
+        raise RolloutError("candidate conditions are not a list")
     ready = [
         row
-        for row in status.get("conditions", [])
+        for row in conditions
         if isinstance(row, dict) and row.get("type") == "Ready"
     ]
-    if len(ready) != 1 or str(ready[0].get("status")).lower() != "true":
+    if len(ready) != 1 or ready[0].get("status") != "True":
         raise RolloutError("candidate is not exactly Ready")
-    if _canonical_revision_spec(spec) != _canonical_revision_spec(baseline_spec):
+    _canonical_revision_spec(spec, require_native_image_gate=True)
+    return metadata, spec
+
+
+def _validate_candidate_parity(
+    metadata: Any,
+    spec: Any,
+    baseline: Any,
+) -> None:
+    baseline = _object(baseline, "baseline revision")
+    baseline_spec = _object(baseline.get("spec"), "baseline spec")
+    if _canonical_revision_spec(
+        spec, require_native_image_gate=True
+    ) != _canonical_revision_spec(
+        baseline_spec, require_native_image_gate=False
+    ):
         raise RolloutError("candidate config differs from baseline beyond image")
     if _canonical_revision_metadata(metadata) != _canonical_revision_metadata(
         _object(baseline.get("metadata"), "baseline metadata")
     ):
         raise RolloutError("candidate functional metadata differs from baseline")
+
+
+def validate_candidate(
+    candidate: Any,
+    baseline: Any,
+    expected_name: str,
+    expected_image: str,
+) -> None:
+    metadata, spec = validate_candidate_dark_identity(
+        candidate, expected_name, expected_image
+    )
+    _validate_candidate_parity(metadata, spec, baseline)
 
 
 def validate_old_revision(value: Any) -> None:
@@ -625,6 +678,31 @@ class Phase1Rollout:
     ) -> None:
         self.ops.assert_lock(lock)
         operation()
+        self.ops.assert_lock(lock)
+
+    def _validate_locked_pre_promotion(self, lock: RolloutLock) -> None:
+        self.ops.assert_lock(lock)
+        image = self.ops.artifact_image()
+        if not isinstance(image, str) or not image.startswith(IMAGE_REPOSITORY + "@"):
+            raise RolloutError("artifact image is invalid")
+        candidate = self.ops.get_revision(self.candidate)
+        metadata, spec = validate_candidate_dark_identity(
+            candidate, self.candidate, image
+        )
+        rollback = self.ops.get_revision(OLD_REVISION)
+        validate_old_revision(rollback)
+        _validate_candidate_parity(metadata, spec, rollback)
+        self.ops.verify_rules_ui_switches()
+        topology = validate_topology(
+            self.ops.get_service(),
+            expected_positive=OLD_REVISION,
+            expected_release=OLD_REVISION,
+            expected_aux=AUX_TAGS,
+        )
+        self.ops.verify_service_access(topology)
+        validate_queue(self.ops.get_queue(), "PAUSED")
+        if not self._tasks_are_empty():
+            raise RolloutError("task appeared before promotion")
         self.ops.assert_lock(lock)
 
     def _cleanup_failure(
@@ -781,13 +859,7 @@ class Phase1Rollout:
                 expected_aux=AUX_TAGS,
             )
             tag_attempted = False
-            if not self._tasks_are_empty():
-                raise RolloutError("task appeared before promotion")
-            self.ops.verify_rules_ui_switches()
-            self._locked_mutation(lock, self.ops.pause_queue)
-            validate_queue(self.ops.get_queue(), "PAUSED")
-            if not self._tasks_are_empty():
-                raise RolloutError("task appeared immediately before promotion")
+            self._validate_locked_pre_promotion(lock)
             traffic_attempted = True
             self._locked_mutation(
                 lock, lambda: self.ops.promote(self.candidate, OLD_REVISION)
