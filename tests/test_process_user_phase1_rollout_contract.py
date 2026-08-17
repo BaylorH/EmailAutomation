@@ -706,6 +706,30 @@ class StateMachineTests(unittest.TestCase):
                     self.assertIn("tasks", after_remove)
                     self.assertEqual("lock:assert", after_remove[-1])
 
+    def test_nonempty_final_task_inventory_stops_before_promotion(self):
+        ops = FakeOps()
+        ops.task_snapshots = [
+            [],
+            [],
+            [],
+            [],
+            [{"name": "opaque"}],
+        ]
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaisesRegex(phase1_rollout.RolloutError, "MANUAL_RECOVERY"):
+            rollout.apply()
+
+        remove_index = ops.events.index("tag:remove")
+        helper_task_index = ops.events.index("tasks", remove_index)
+        self.assertLess(
+            ops.events.index(f"revision:{OLD_REVISION}", remove_index),
+            helper_task_index,
+        )
+        self.assertNotIn("promote", ops.events)
+        self.assertTrue(rollout.task_observed)
+        self.assertEqual("PAUSED", ops.queue["state"])
+        self.assertTrue(ops.lock_held)
+
     def test_staging_prerequisites_prove_old_running_empty_without_mutation(self):
         ops = FakeOps()
         rollout, _ = self.make_rollout(ops)
