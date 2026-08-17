@@ -214,6 +214,160 @@ class NativeImageReleaseGateTests(unittest.TestCase):
         ):
             self.assertTrue(app_config.native_image_ingestion_enabled())
 
+    def test_disabled_mixed_snapshot_retains_processed_pdf_without_native_effects(self):
+        native_attachment = _attachment(
+            "property.jpg",
+            "image/jpeg",
+            _jpeg_bytes(),
+        )
+        raw_pdf_attachment = _attachment(
+            "property-details.pdf",
+            "application/pdf",
+            b"%PDF-1.7 property details",
+        )
+        pdf_projection = file_handling._PdfAttachmentList(
+            [{
+                "name": "property-details.pdf",
+                "bytes": b"%PDF-1.7 property details",
+                "_snapshot_index": 1,
+            }],
+            [native_attachment, raw_pdf_attachment],
+        )
+        processed_pdf = {
+            "name": "property-details.pdf",
+            "text": "property details",
+            "method": "local_extraction",
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"SITESIFT_NATIVE_IMAGE_INGESTION": "false"},
+        ), mock.patch.object(
+            file_handling,
+            "fetch_pdf_attachments",
+            return_value=pdf_projection,
+        ), mock.patch.object(
+            file_handling,
+            "_process_pdf_attachment_batch",
+            return_value=[(1, processed_pdf)],
+        ) as process_pdf_batch, mock.patch.object(
+            file_handling,
+            "validate_and_normalize_native_image_attachments",
+            return_value={"status": "accepted", "assets": [{}]},
+        ) as validator, mock.patch.object(
+            file_handling,
+            "build_native_image_manifest_entry",
+            return_value={"name": GENERIC_IMAGE_NAME},
+        ) as success_builder, mock.patch.object(
+            file_handling,
+            "build_native_image_failure_manifest_entry",
+        ) as failure_builder:
+            manifest = file_handling.fetch_and_process_pdfs(
+                {"Authorization": "Bearer fake"},
+                "mixed-native-pdf-message",
+                target_property_hint="123 Main Street, Phoenix, AZ 85001",
+            )
+
+        validator.assert_not_called()
+        success_builder.assert_not_called()
+        failure_builder.assert_not_called()
+        process_pdf_batch.assert_called_once_with(pdf_projection)
+        self.assertEqual([processed_pdf], manifest)
+
+    def test_disabled_native_only_snapshot_returns_no_manifest(self):
+        native_attachment = _attachment(
+            "property.png",
+            "image/png",
+            _png_bytes(),
+        )
+        pdf_projection = file_handling._PdfAttachmentList(
+            [],
+            [native_attachment],
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"SITESIFT_NATIVE_IMAGE_INGESTION": "false"},
+        ), mock.patch.object(
+            file_handling,
+            "fetch_pdf_attachments",
+            return_value=pdf_projection,
+        ), mock.patch.object(
+            file_handling,
+            "_process_pdf_attachment_batch",
+            return_value=[],
+        ) as process_pdf_batch, mock.patch.object(
+            file_handling,
+            "validate_and_normalize_native_image_attachments",
+            return_value={"status": "accepted", "assets": [{}]},
+        ) as validator, mock.patch.object(
+            file_handling,
+            "build_native_image_manifest_entry",
+            return_value={"name": GENERIC_IMAGE_NAME},
+        ) as success_builder, mock.patch.object(
+            file_handling,
+            "build_native_image_failure_manifest_entry",
+        ) as failure_builder:
+            manifest = file_handling.fetch_and_process_pdfs(
+                {"Authorization": "Bearer fake"},
+                "native-only-message",
+                target_property_hint="123 Main Street, Phoenix, AZ 85001",
+            )
+
+        validator.assert_not_called()
+        success_builder.assert_not_called()
+        failure_builder.assert_not_called()
+        process_pdf_batch.assert_called_once_with(pdf_projection)
+        self.assertEqual([], manifest)
+
+    def test_disabled_native_type_mismatch_is_not_processed_as_pdf(self):
+        native_png_claim_with_pdf_type = _attachment(
+            "property.jpg",
+            "application/pdf",
+            _png_bytes(),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"SITESIFT_NATIVE_IMAGE_INGESTION": "false"},
+        ), mock.patch.object(
+            file_handling,
+            "fetch_message_attachment_snapshot",
+            return_value=[native_png_claim_with_pdf_type],
+        ), mock.patch.object(
+            file_handling,
+            "process_pdf_for_ai",
+        ) as process_pdf, mock.patch.object(
+            file_handling,
+            "validate_and_normalize_native_image_attachments",
+            return_value={
+                "status": "quarantined",
+                "assets": [],
+                "failure": {
+                    "name": GENERIC_IMAGE_NAME,
+                    "code": "image_attachment_type_mismatch",
+                },
+            },
+        ) as validator, mock.patch.object(
+            file_handling,
+            "build_native_image_manifest_entry",
+        ) as success_builder, mock.patch.object(
+            file_handling,
+            "build_native_image_failure_manifest_entry",
+            return_value={"name": GENERIC_IMAGE_NAME},
+        ) as failure_builder:
+            manifest = file_handling.fetch_and_process_pdfs(
+                {"Authorization": "Bearer fake"},
+                "native-type-mismatch-message",
+                target_property_hint="123 Main Street, Phoenix, AZ 85001",
+            )
+
+        process_pdf.assert_not_called()
+        validator.assert_not_called()
+        success_builder.assert_not_called()
+        failure_builder.assert_not_called()
+        self.assertEqual([], manifest)
+
 
 class NativeImageValidationTests(unittest.TestCase):
     def _validator(self):
@@ -5571,6 +5725,16 @@ class NativeImageAIPrivacyTests(unittest.TestCase):
 class NativeImageProcessingIntegrationTests(unittest.TestCase):
     TARGET = "123 North Sample Road, Example City, AZ 85001"
     MATCHING_FILENAME = "123 N Sample Rd Example City AZ 85001"
+
+    def setUp(self):
+        super().setUp()
+        gate_patcher = mock.patch.object(
+            file_handling,
+            "native_image_ingestion_enabled",
+            return_value=True,
+        )
+        gate_patcher.start()
+        self.addCleanup(gate_patcher.stop)
 
     @staticmethod
     def _column_config():
