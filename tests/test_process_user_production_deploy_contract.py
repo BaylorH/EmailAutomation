@@ -973,7 +973,7 @@ class RollbackRunbookContractTests(unittest.TestCase):
                         "metadata": {{"name": "{ROLLBACK_REVISION}"}},
                         "spec": {{"containers": [{{"image": rollback_image}}]}},
                         "status": {{
-                            "imageDigest": "{ROLLBACK_DIGEST}",
+                            "imageDigest": "{ROLLBACK_IMAGE}",
                             "conditions": [{{"type": "Ready", "status": "True"}}],
                         }},
                     }}
@@ -982,7 +982,9 @@ class RollbackRunbookContractTests(unittest.TestCase):
                     elif scenario == "missing_rollback_revision_name":
                         rollback_revision["metadata"].pop("name")
                     elif scenario == "wrong_rollback_image_digest":
-                        rollback_revision["status"]["imageDigest"] = "sha256:" + "d" * 64
+                        rollback_revision["status"]["imageDigest"] = (
+                            "{ROLLBACK_IMAGE.rsplit('@', 1)[0]}@sha256:" + "d" * 64
+                        )
                     elif scenario == "missing_rollback_image_digest":
                         rollback_revision["status"].pop("imageDigest")
                     elif scenario == "malformed_rollback_conditions":
