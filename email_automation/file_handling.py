@@ -14,6 +14,7 @@ from urllib.parse import unquote, urljoin, urlparse
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
+from .app_config import native_image_ingestion_enabled
 from .clients import _helper_google_creds, client
 
 
@@ -2662,6 +2663,12 @@ def fetch_and_process_pdfs(
         (position, 1, entry)
         for position, entry in _process_pdf_attachment_batch(pdf_attachments)
     ]
+    if not native_image_ingestion_enabled():
+        positioned_entries.sort(key=lambda item: (item[0], item[1]))
+        return [
+            entry
+            for _position, _priority, entry in positioned_entries
+        ]
 
     native_positions = [
         position
