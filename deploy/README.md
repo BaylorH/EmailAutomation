@@ -539,15 +539,54 @@ rollback_revision_json="$(
     --region "$REGION" \
     --format=json
 )"
-REVISION_JSON="$rollback_revision_json" EXPECTED_IMAGE="$EXPECTED_ROLLBACK_IMAGE" python3 - <<'PY'
+REVISION_JSON="$rollback_revision_json" \
+  EXPECTED_REVISION="$ROLLBACK_REVISION" \
+  EXPECTED_IMAGE="$EXPECTED_ROLLBACK_IMAGE" \
+  python3 - <<'PY'
 import json
 import os
 
 revision = json.loads(os.environ["REVISION_JSON"])
-containers = revision.get("spec", {}).get("containers", [])
-image = containers[0].get("image", "") if len(containers) == 1 else ""
+if type(revision) is not dict:
+    raise SystemExit("rollback revision readback is not a plain object")
+
+metadata = revision.get("metadata")
+if type(metadata) is not dict:
+    raise SystemExit("rollback revision metadata is not a plain object")
+if metadata.get("name") != os.environ["EXPECTED_REVISION"]:
+    raise SystemExit("rollback revision metadata.name does not match the expected revision")
+
+spec = revision.get("spec")
+if type(spec) is not dict:
+    raise SystemExit("rollback revision spec is not a plain object")
+containers = spec.get("containers")
+if type(containers) is not list or len(containers) != 1:
+    raise SystemExit("rollback revision must have exactly one container")
+container = containers[0]
+if type(container) is not dict:
+    raise SystemExit("rollback revision container is not a plain object")
+image = container.get("image", "")
 if image != os.environ["EXPECTED_IMAGE"]:
     raise SystemExit(f"rollback revision image does not match the expected digest: {image!r}")
+
+status = revision.get("status")
+if type(status) is not dict:
+    raise SystemExit("rollback revision status is not a plain object")
+expected_digest = os.environ["EXPECTED_IMAGE"].rsplit("@", 1)[1]
+if status.get("imageDigest") != expected_digest:
+    raise SystemExit("rollback revision status.imageDigest does not match the expected digest")
+conditions = status.get("conditions")
+if type(conditions) is not list:
+    raise SystemExit("rollback revision status.conditions is not a list")
+if any(type(condition) is not dict for condition in conditions):
+    raise SystemExit("rollback revision condition is not a plain object")
+ready_conditions = [
+    condition for condition in conditions if condition.get("type") == "Ready"
+]
+if len(ready_conditions) != 1:
+    raise SystemExit("rollback revision must have exactly one Ready condition")
+if ready_conditions[0].get("status") != "True":
+    raise SystemExit("rollback revision Ready status is not exact string True")
 PY
 
 traffic_revision_at_100() {
