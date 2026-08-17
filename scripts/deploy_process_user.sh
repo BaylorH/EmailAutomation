@@ -59,7 +59,7 @@ service_describe_command=(
   --format=json
 )
 
-env_vars="^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_DAILY_SEND_CAP=20:SITESIFT_GLOBAL_DAILY_SEND_CAP=20:SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_OUTBOUND_MODE=live"
+env_vars="^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_DAILY_SEND_CAP=20:SITESIFT_GLOBAL_DAILY_SEND_CAP=20:SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_NATIVE_IMAGE_INGESTION=false:SITESIFT_OUTBOUND_MODE=live"
 secrets="AZURE_API_APP_ID=AZURE_API_APP_ID:latest,AZURE_API_CLIENT_SECRET=AZURE_API_CLIENT_SECRET:latest,FIREBASE_API_KEY=FIREBASE_API_KEY:latest,OPENAI_API_KEY=OPENAI_API_KEY:latest,GOOGLE_OAUTH_CLIENT_ID=GOOGLE_OAUTH_CLIENT_ID:latest,GOOGLE_OAUTH_CLIENT_SECRET=GOOGLE_OAUTH_CLIENT_SECRET:latest,GOOGLE_REFRESH_TOKEN=GOOGLE_REFRESH_TOKEN:latest"
 
 print_command() {
@@ -586,6 +586,7 @@ expected_values = {
     "SITESIFT_DAILY_SEND_CAP": "20",
     "SITESIFT_GLOBAL_DAILY_SEND_CAP": "20",
     "SITESIFT_TOUR_ACTION_ALLOWLIST": "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+    "SITESIFT_NATIVE_IMAGE_INGESTION": "false",
     "SITESIFT_OUTBOUND_MODE": "live",
 }
 for name, value in expected_values.items():
@@ -605,16 +606,53 @@ for name in (
     if secret_ref.get("name") != name or secret_ref.get("key") != "latest":
         refuse(f"candidate secret reference does not match for {name}")
 
-def canonical_spec(value):
+def canonical_spec(value, *, require_native_image_gate):
     value = json.loads(json.dumps(value))
     containers = value.get("containers")
-    if isinstance(containers, list) and len(containers) == 1:
-        containers[0].pop("image", None)
+    if not isinstance(containers, list) or len(containers) != 1:
+        refuse("revision must contain exactly one container")
+    container = containers[0]
+    environment = container.get("env")
+    if not isinstance(environment, list) or not all(
+        isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        for entry in environment
+    ):
+        refuse("revision environment shape is invalid")
+    gate_entries = [
+        entry
+        for entry in environment
+        if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+    ]
+    expected_gate_entries = (
+        [{
+            "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+            "value": "false",
+        }]
+        if require_native_image_gate
+        else []
+    )
+    if gate_entries != expected_gate_entries:
+        refuse("native image release gate is not exact")
+    container["env"] = [
+        entry
+        for entry in environment
+        if entry.get("name") != "SITESIFT_NATIVE_IMAGE_INGESTION"
+    ]
+    container.pop("image", None)
     return value
 
 
-if canonical_spec(spec) != canonical_spec(baseline_spec):
-    refuse("candidate config differs from the baseline revision beyond immutable image")
+if canonical_spec(
+    spec,
+    require_native_image_gate=True,
+) != canonical_spec(
+    baseline_spec,
+    require_native_image_gate=False,
+):
+    refuse(
+        "candidate config differs from baseline beyond immutable image "
+        "and the exact dark native gate"
+    )
 
 ready_conditions = [
     condition
