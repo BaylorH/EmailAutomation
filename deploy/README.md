@@ -572,9 +572,8 @@ if image != os.environ["EXPECTED_IMAGE"]:
 status = revision.get("status")
 if type(status) is not dict:
     raise SystemExit("rollback revision status is not a plain object")
-expected_digest = os.environ["EXPECTED_IMAGE"].rsplit("@", 1)[1]
-if status.get("imageDigest") != expected_digest:
-    raise SystemExit("rollback revision status.imageDigest does not match the expected digest")
+if status.get("imageDigest") != os.environ["EXPECTED_IMAGE"]:
+    raise SystemExit("rollback revision status.imageDigest does not match the expected image")
 conditions = status.get("conditions")
 if type(conditions) is not list:
     raise SystemExit("rollback revision status.conditions is not a list")
