@@ -239,7 +239,7 @@ The implementation follows RED/GREEN commits:
 - rollback runbook tests fail until the exact live rollback pair replaces the
   former unbound values.
 
-After GREEN, run focused gate tests, the four release contract modules, retained
+After GREEN, run focused gate tests, the three release-control modules, retained
 native/PDF/predecessor tests, broad broker-language and Jill/AI regressions,
 dual-Python compilation where available, shell syntax, `git diff --check`,
 scope checks, two independent reviews, and a fresh final matrix. Only then push
