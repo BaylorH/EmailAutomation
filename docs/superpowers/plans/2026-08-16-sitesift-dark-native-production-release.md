@@ -13,7 +13,10 @@ Cloud Run revision with an explicit lowercase-false binding; both the tagless
 stager and the closed promotion controller must prove that exact gate as the
 only candidate-versus-rollback config delta. Promote only through the existing
 locked queue/traffic controller, whose rollback target is pinned to the current
-live revision and digest.
+live revision and digest. After removing its temporary health tag, the
+controller re-reads the candidate, rollback, switches, topology, IAM, paused
+queue, and empty tasks between fresh lock assertions; independent stage and
+post-live readbacks keep release evidence separate from controller output.
 
 **Tech Stack:** Python 3, `unittest`, `unittest.mock`, Bash, Git, Google Cloud
 CLI, Cloud Build, Artifact Registry, Cloud Run, Cloud Tasks, Firestore REST,
@@ -53,8 +56,8 @@ The implementation delta after this plan commit is limited to these nine paths:
 1. `email_automation/app_config.py` — exact `true`-only feature predicate.
 2. `email_automation/file_handling.py` — PDF-preserving early return before the
    native validation/manifest boundary.
-3. `scripts/phase1_rollout.py` — release branch, rollback pair, and exact
-   candidate dark-gate validation during prerequisite, promotion, and cleanup.
+3. `scripts/phase1_rollout.py` — release branch, rollback pair, exact candidate
+   dark-gate validation, and locked paused post-tag promotion authorization.
 4. `scripts/deploy_process_user.sh` — explicit false deploy binding and exact
    staged-revision readback.
 5. `deploy/README.md` — current release packet, dark-state contract, evidence
@@ -62,7 +65,7 @@ The implementation delta after this plan commit is limited to these nine paths:
 6. `tests/test_image_attachment_ingestion.py` — config semantics, disabled
    mixed/image-only behavior, and explicit enablement for existing native tests.
 7. `tests/test_process_user_phase1_rollout_contract.py` — controller release
-   packet and exact candidate config-delta tests.
+   packet, exact candidate config-delta, and post-tag call-order/failure tests.
 8. `tests/test_process_user_tagless_staging_contract.py` — deploy command,
    candidate readback, and malformed-gate rejection tests.
 9. `tests/test_process_user_production_deploy_contract.py` — production env and
@@ -448,16 +451,19 @@ paths.
   git commit -m "feat: keep native image effects dark by default"
   ```
 
-### Task 6: Pin the release packet and dark readbacks with a RED commit
+### Task 6: Pin the closed controller contract with a RED commit
 
 **Files:**
 
 - Modify: `tests/test_process_user_phase1_rollout_contract.py`
-- Modify: `tests/test_process_user_tagless_staging_contract.py`
-- Modify: `tests/test_process_user_production_deploy_contract.py`
-- Test: the same three files.
+- Test: `tests/test_process_user_phase1_rollout_contract.py`
 
-- [ ] **Step 1: Rebind the Phase 1 test packet.**
+- [ ] **Step 1: Replace the existing stale controller packet assertion.**
+
+  In `tests/test_process_user_phase1_rollout_contract.py`, replace the existing
+  constants at lines 21–26 and replace—not parallel-add—the stale literal in
+  `ValidatorTests.test_controller_pins_current_promoted_production_baseline`
+  (currently line 305):
 
   Replace its rollback constants with:
 
@@ -467,7 +473,20 @@ paths.
       "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
       "process-user@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
   )
+  RELEASE_BRANCH = "feat/native-image-attachment-ingestion-20260816"
   ```
+
+  In the existing `expected` dictionary, replace only its branch entry with:
+
+  ```python
+  "branch": RELEASE_BRANCH,
+  ```
+
+  Keep its existing `"old revision": OLD_REVISION`, `"old image": OLD_IMAGE`,
+  rules/UI/hash, and auxiliary-tag entries unchanged.
+
+  Do not leave `fix/scanned-pdf-production-candidate-20260816` anywhere in this
+  test module. Task 7 proves its removal before controller GREEN.
 
   Build the revision environment in a local list and append the candidate-only
   gate:
@@ -552,6 +571,29 @@ paths.
           )
           invalid_candidates.append(duplicated)
 
+          secret_bound = revision(CANDIDATE, CANDIDATE_IMAGE)
+          secret_gate = next(
+              entry
+              for entry in secret_bound["spec"]["containers"][0]["env"]
+              if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+          )
+          secret_gate.pop("value")
+          secret_gate["valueFrom"] = {
+              "secretKeyRef": {
+                  "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+                  "key": "latest",
+              }
+          }
+          invalid_candidates.append(secret_bound)
+
+          extra_keyed = revision(CANDIDATE, CANDIDATE_IMAGE)
+          next(
+              entry
+              for entry in extra_keyed["spec"]["containers"][0]["env"]
+              if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+          )["unexpected"] = "rejected"
+          invalid_candidates.append(extra_keyed)
+
           for candidate in invalid_candidates:
               with self.subTest(candidate=candidate):
                   with self.assertRaises(phase1_rollout.RolloutError):
@@ -575,134 +617,122 @@ paths.
               )
   ```
 
-- [ ] **Step 3: Pin the tagless deploy argument and candidate fake.**
+- [ ] **Step 3: Add an injectable after-tag-removal drift seam to the fake.**
 
-  Add this exact field to `ENV_VARS` immediately before outbound mode:
+  Add `self.post_tag_removal_fault = None` and
+  `self.reject_service_access = False` in `FakeOps.__init__()`. Extend the two
+  affected fake methods exactly as follows; this changes test state only:
 
   ```python
-  "SITESIFT_NATIVE_IMAGE_INGESTION=false:"
+      def verify_service_access(self, topology):
+          self.events.append("service-access")
+          if self.reject_service_access or topology.service_url != SERVICE_URL:
+              raise phase1_rollout.RolloutError("service access rejected")
+
+      def remove_cert_tag(self, tag):
+          self.events.append("tag:remove")
+          if self.fail_remove:
+              raise phase1_rollout.RolloutError("remove failed")
+          self.service = service()
+          if self.post_tag_removal_fault == "candidate":
+              gate = next(
+                  entry
+                  for entry in self.candidate_revision["spec"]["containers"][0]["env"]
+                  if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+              )
+              gate["value"] = "true"
+          elif self.post_tag_removal_fault == "rollback":
+              wrong = OLD_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
+              self.old_revision["spec"]["containers"][0]["image"] = wrong
+              self.old_revision["status"]["imageDigest"] = wrong
+          elif self.post_tag_removal_fault == "switches":
+              self.fail_prerequisites = True
+          elif self.post_tag_removal_fault == "topology":
+              self.service = service(CANDIDATE, OLD_REVISION)
+          elif self.post_tag_removal_fault == "iam":
+              self.reject_service_access = True
+          elif self.post_tag_removal_fault == "queue":
+              self.queue["state"] = "RUNNING"
   ```
 
-  In the fake revision document, add the gate only for the candidate and expose
-  candidate and baseline failure scenarios:
+- [ ] **Step 4: Pin the exact locked, paused pre-promotion read sequence.**
+
+  Replace the loose tag/remove/promote ordering assertion in the happy-path
+  state-machine test with this exact slice assertion. It proves every
+  authorization read occurs after temporary-tag removal and before promotion:
 
   ```python
-  if is_baseline and scenario == "baseline_native_gate":
-      values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "false"
-  if not is_baseline:
-      values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "false"
-      if scenario == "candidate_missing_native_gate":
-          values.pop("SITESIFT_NATIVE_IMAGE_INGESTION")
-      elif scenario == "candidate_true_native_gate":
-          values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "true"
-      elif scenario == "candidate_padded_native_gate":
-          values["SITESIFT_NATIVE_IMAGE_INGESTION"] = " false "
-  ```
-
-  Add these tests beside the other candidate environment rejection tests:
-
-  ```python
-      def test_candidate_missing_native_gate_is_rejected(self):
-          self._assert_revision_refused("candidate_missing_native_gate")
-
-      def test_candidate_true_native_gate_is_rejected(self):
-          self._assert_revision_refused("candidate_true_native_gate")
-
-      def test_candidate_padded_native_gate_is_rejected(self):
-          self._assert_revision_refused("candidate_padded_native_gate")
-
-      def test_baseline_native_gate_is_rejected(self):
-          self._assert_revision_refused("baseline_native_gate")
-  ```
-
-- [ ] **Step 4: Update the production deploy and rollback constants.**
-
-  In `tests/test_process_user_production_deploy_contract.py`, add the same false
-  field to `ENV_VARS`, and replace the rollback constants with:
-
-  ```python
-  ROLLBACK_REVISION = "process-user-stage-9491133f15d5"
-  ROLLBACK_DIGEST = (
-      "sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
-  )
-  ```
-
-- [ ] **Step 5: Assert that production deploy stays exactly dark.**
-
-  Add this assertion to
-  `test_deploy_explicitly_arms_only_the_internal_release_lane`:
-
-  ```python
-  self.assertIn("SITESIFT_NATIVE_IMAGE_INGESTION=false", env_vars)
-  self.assertNotIn("SITESIFT_NATIVE_IMAGE_INGESTION=true", env_vars)
-  ```
-
-- [ ] **Step 6: Remove runtime rewriting from the rollback-proof test harness.**
-
-  Change the `_run()` signature to:
-
-  ```python
-      def _run(
-          self,
-          scenario: str = "ok",
-          account: str | None = ACCOUNT,
-      ):
-  ```
-
-  Keep its existing environment/fake setup, replace the conditional rewrite
-  block with this exact assignment, and keep the existing `subprocess.run`
-  call:
-
-  ```python
-          runbook = self._extract_runbook()
-  ```
-
-- [ ] **Step 7: Replace the obsolete unbound-value test with an exact-pair
-  assertion.**
-
-  Add:
-
-  ```python
-      def test_runbook_pins_exact_live_rollback_pair(self):
-          runbook = self._extract_runbook()
-          self.assertIn(
-              f'ROLLBACK_REVISION="{ROLLBACK_REVISION}"',
-              runbook,
+          remove_index = ops.events.index("tag:remove")
+          promote_index = ops.events.index("promote")
+          self.assertEqual(
+              [
+                  "lock:assert",
+                  "tag:remove",
+                  "lock:assert",
+                  "service",
+                  "lock:assert",
+                  "artifact",
+                  f"revision:{OLD_REVISION}",
+                  f"revision:{CANDIDATE}",
+                  "prerequisites",
+                  "service",
+                  "service-access",
+                  "queue",
+                  "tasks",
+                  "lock:assert",
+                  "lock:assert",
+                  "promote",
+                  "lock:assert",
+              ],
+              ops.events[remove_index - 1:promote_index + 2],
           )
-          self.assertIn(
-              f'EXPECTED_ROLLBACK_IMAGE="{ROLLBACK_IMAGE}"',
-              runbook,
-          )
-
-      def test_readme_pins_dark_native_evidence_boundary(self):
-          readme = DEPLOY_README.read_text(encoding="utf-8")
-          self.assertIn("SITESIFT_NATIVE_IMAGE_INGESTION=false", readme)
-          self.assertIn("Dormant and unproved live", readme)
-          self.assertIn("provider-canary=not-run", readme)
   ```
 
-- [ ] **Step 8: Run the release modules and prove RED.**
+  Add the fail-closed matrix:
+
+  ```python
+      def test_every_post_tag_pre_promotion_revalidation_failure_stops_traffic(self):
+          for fault in (
+              "candidate",
+              "rollback",
+              "switches",
+              "topology",
+              "iam",
+              "queue",
+          ):
+              with self.subTest(fault=fault):
+                  ops = FakeOps()
+                  ops.post_tag_removal_fault = fault
+                  rollout, _ = self.make_rollout(ops)
+                  with self.assertRaises(phase1_rollout.RolloutError):
+                      rollout.apply()
+                  self.assertIn("tag:remove", ops.events)
+                  self.assertNotIn("promote", ops.events)
+  ```
+
+  Keep the existing task-appearance and lock-loss tests; together they prove
+  that the empty-inventory and enclosing-lock assertions also fail closed.
+
+- [ ] **Step 5: Run only the controller contract and prove RED.**
 
   ```bash
   PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
-    tests.test_process_user_phase1_rollout_contract \
-    tests.test_process_user_tagless_staging_contract \
-    tests.test_process_user_production_deploy_contract
+    tests.test_process_user_phase1_rollout_contract
   ```
 
-  Expected: failures identify the old branch/rollback constants, missing deploy
-  env field, missing exact candidate gate handling, and unbound rollback block.
-  There must be no real `gcloud` call; these modules use injected/fake commands.
+  Expected: failures identify the old branch/rollback constants, missing exact
+  gate handling, and missing post-tag revalidation. No real `gcloud` call occurs;
+  this module uses injected fakes.
 
-- [ ] **Step 9: Commit the RED release contract.**
+- [ ] **Step 6: Commit only the controller RED contract.**
 
   ```bash
-  git add \
-    tests/test_process_user_phase1_rollout_contract.py \
-    tests/test_process_user_tagless_staging_contract.py \
-    tests/test_process_user_production_deploy_contract.py
-  git commit -m "test: pin dark native production release packet"
+  git add tests/test_process_user_phase1_rollout_contract.py
+  git commit -m "test: pin closed dark native promotion contract"
   ```
+
+  Expected: one known RED component and no unrelated test or documentation
+  change. Task 7 is next and must make this exact module GREEN before Task 8.
 
 ### Task 7: Rebind and close the Phase 1 controller
 
@@ -785,17 +815,67 @@ paths.
       )
   ```
 
-- [ ] **Step 3: Run the controller contract.**
+- [ ] **Step 3: Add the locked, paused, post-tag pre-promotion gate.**
+
+  Add immediately after `_locked_mutation()`:
+
+  ```python
+      def _validate_locked_pre_promotion(self, lock: RolloutLock) -> None:
+          self.ops.assert_lock(lock)
+          image = self.ops.artifact_image()
+          old = self.ops.get_revision(OLD_REVISION)
+          validate_old_revision(old)
+          candidate = self.ops.get_revision(self.candidate)
+          validate_candidate(candidate, old, self.candidate, image)
+          self.ops.verify_rules_ui_switches()
+          topology = validate_topology(
+              self.ops.get_service(),
+              expected_positive=OLD_REVISION,
+              expected_release=OLD_REVISION,
+              expected_aux=AUX_TAGS,
+          )
+          self.ops.verify_service_access(topology)
+          validate_queue(self.ops.get_queue(), "PAUSED")
+          if not self._tasks_are_empty():
+              raise RolloutError("task appeared immediately before promotion")
+          self.ops.assert_lock(lock)
+  ```
+
+  In `apply()`, keep the fenced tag removal and its direct topology readback.
+  Immediately after that readback, replace the loose task/switch/second-pause
+  block with:
+
+  ```python
+              tag_attempted = False
+              self._validate_locked_pre_promotion(lock)
+              traffic_attempted = True
+              self._locked_mutation(
+                  lock, lambda: self.ops.promote(self.candidate, OLD_REVISION)
+              )
+  ```
+
+  The queue was paused and drained before the temporary tag was added. The new
+  helper re-proves `PAUSED` after every other authorization read, while its
+  opening/closing lock assertions fence the exact candidate digest/dark gate,
+  rollback pair, switches, unpromoted topology, IAM, queue, and task inventory.
+  No controller-cached object authorizes promotion.
+
+- [ ] **Step 4: Prove the stale branch is replaced and the controller is GREEN.**
 
   ```bash
+  ! rg -n 'fix/scanned-pdf-production-candidate-20260816' \
+    scripts/phase1_rollout.py \
+    tests/test_process_user_phase1_rollout_contract.py
   PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
     tests.test_process_user_phase1_rollout_contract
   ```
 
   Expected: `OK`; happy-path promotion and every rollback/lock failure path
-  remain green, exact false passes, and missing/true/padded/duplicate gates fail.
+  remain green; the exact post-tag call slice matches; exact false passes; and
+  missing, true, padded, duplicate, secret-bound/`valueFrom`, and extra-keyed
+  gates fail. The `rg` command prints nothing and exits 0 through `!`.
 
-- [ ] **Step 4: Commit the controller change.**
+- [ ] **Step 5: Commit the controller GREEN immediately after its RED.**
 
   ```bash
   git add scripts/phase1_rollout.py \
@@ -803,7 +883,124 @@ paths.
   git commit -m "release: bind dark native promotion controller"
   ```
 
-### Task 8: Stage an exact false gate and prove it by readback
+  Expected: the immediately preceding controller RED is fully GREEN. Do not
+  begin staging tests while this module has any known failure.
+
+### Task 8: Pin exact-false tagless staging with a RED commit
+
+**Files:**
+
+- Modify: `tests/test_process_user_tagless_staging_contract.py`
+- Modify: `tests/test_process_user_production_deploy_contract.py`
+- Test: the same two files.
+
+- [ ] **Step 1: Pin the deploy argument in both contract constants.**
+
+  Add this exact field to each module's `ENV_VARS` immediately before outbound
+  mode:
+
+  ```python
+  "SITESIFT_NATIVE_IMAGE_INGESTION=false:"
+  ```
+
+  Add these assertions to
+  `test_deploy_explicitly_arms_only_the_internal_release_lane`:
+
+  ```python
+  self.assertIn("SITESIFT_NATIVE_IMAGE_INGESTION=false", env_vars)
+  self.assertNotIn("SITESIFT_NATIVE_IMAGE_INGESTION=true", env_vars)
+  ```
+
+- [ ] **Step 2: Make the tagless fake expose every exact-gate hostile case.**
+
+  In `revision_document()`, add the gate only for the candidate before `env` is
+  constructed:
+
+  ```python
+  if is_baseline and scenario == "baseline_native_gate":
+      values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "false"
+  if not is_baseline:
+      values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "false"
+      if scenario == "candidate_missing_native_gate":
+          values.pop("SITESIFT_NATIVE_IMAGE_INGESTION")
+      elif scenario == "candidate_true_native_gate":
+          values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "true"
+      elif scenario == "candidate_padded_native_gate":
+          values["SITESIFT_NATIVE_IMAGE_INGESTION"] = " false "
+  ```
+
+  Immediately after `env.extend(...)`, add the structural hostile cases:
+
+  ```python
+  if not is_baseline and scenario in {
+      "candidate_secret_native_gate",
+      "candidate_extra_key_native_gate",
+  }:
+      gate = next(
+          entry
+          for entry in env
+          if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+      )
+      if scenario == "candidate_secret_native_gate":
+          gate.pop("value")
+          gate["valueFrom"] = {
+              "secretKeyRef": {
+                  "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
+                  "key": "latest",
+              }
+          }
+      else:
+          gate["unexpected"] = "rejected"
+  ```
+
+- [ ] **Step 3: Add the exact tagless rejection matrix.**
+
+  Add beside the existing candidate-environment rejection tests:
+
+  ```python
+      def test_candidate_missing_native_gate_is_rejected(self):
+          self._assert_revision_refused("candidate_missing_native_gate")
+
+      def test_candidate_true_native_gate_is_rejected(self):
+          self._assert_revision_refused("candidate_true_native_gate")
+
+      def test_candidate_padded_native_gate_is_rejected(self):
+          self._assert_revision_refused("candidate_padded_native_gate")
+
+      def test_candidate_secret_bound_native_gate_is_rejected(self):
+          self._assert_revision_refused("candidate_secret_native_gate")
+
+      def test_candidate_extra_keyed_native_gate_is_rejected(self):
+          self._assert_revision_refused("candidate_extra_key_native_gate")
+
+      def test_baseline_native_gate_is_rejected(self):
+          self._assert_revision_refused("baseline_native_gate")
+  ```
+
+- [ ] **Step 4: Run only the staging/deploy components and prove RED.**
+
+  ```bash
+  PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
+    tests.test_process_user_tagless_staging_contract \
+    tests.test_process_user_production_deploy_contract
+  ```
+
+  Expected: failures identify the missing deploy argument/readback and exact
+  candidate-delta behavior. Fake `gcloud` commands only; no cloud call occurs.
+
+- [ ] **Step 5: Commit only this component's RED tests.**
+
+  ```bash
+  git add \
+    tests/test_process_user_tagless_staging_contract.py \
+    tests/test_process_user_production_deploy_contract.py
+  git commit -m "test: pin exact dark tagless staging contract"
+  ```
+
+  Expected: one known RED staging/deploy component. Task 9 immediately makes
+  these exact modules GREEN before documentation tests begin.
+
+### Task 9: Stage an exact false gate and prove it by readback
 
 **Files:**
 
@@ -888,7 +1085,7 @@ paths.
       )
   ```
 
-- [ ] **Step 4: Run both staging/deploy contract modules.**
+- [ ] **Step 4: Run both staging/deploy contract modules to GREEN.**
 
   ```bash
   PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
@@ -896,20 +1093,101 @@ paths.
     tests.test_process_user_production_deploy_contract
   ```
 
-  Expected: only the documentation-bound rollback/evidence tests remain RED;
-  deploy ordering, immutable digest, no-traffic/no-tag behavior, exact false
-  gate, and all malformed-gate cases are green.
+  Expected: `OK`; deploy ordering, immutable digest, no-traffic/no-tag behavior,
+  exact false gate, and every malformed gate—including secret-bound/`valueFrom`
+  and extra-keyed entries—are green. No documentation RED exists yet.
 
 - [ ] **Step 5: Commit the staged dark-state contract.**
 
   ```bash
-  git add scripts/deploy_process_user.sh \
-    tests/test_process_user_tagless_staging_contract.py \
-    tests/test_process_user_production_deploy_contract.py
+  git add scripts/deploy_process_user.sh
   git commit -m "release: stage native ingestion disabled"
   ```
 
-### Task 9: Document the current release and pin rollback proof
+  Expected: the immediately preceding staging/deploy RED is fully GREEN. Do not
+  begin README contract changes while either module has a known failure.
+
+### Task 10: Pin release documentation with a RED commit
+
+**Files:**
+
+- Modify: `tests/test_process_user_production_deploy_contract.py`
+- Test: `tests/test_process_user_production_deploy_contract.py`
+
+- [ ] **Step 1: Replace the rollback test constants with the live pair.**
+
+  Use exactly:
+
+  ```python
+  ROLLBACK_REVISION = "process-user-stage-9491133f15d5"
+  ROLLBACK_DIGEST = (
+      "sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
+  )
+  ```
+
+- [ ] **Step 2: Stop rewriting placeholders in the test harness.**
+
+  Change `_run()` to remove `replace_rollback_placeholders`, retain the existing
+  fake setup, and execute the extracted block directly:
+
+  ```python
+      def _run(
+          self,
+          scenario: str = "ok",
+          account: str | None = ACCOUNT,
+      ):
+          # Keep the existing environment and fake-state setup.
+          runbook = self._extract_runbook()
+          return subprocess.run(
+              ["bash", "-c", runbook],
+              cwd=REPO_ROOT,
+              env=env,
+              text=True,
+              capture_output=True,
+              check=False,
+          )
+  ```
+
+  Delete `test_unedited_rollback_placeholders_fail_before_gcloud`; it describes
+  the intentionally retired placeholder contract.
+
+- [ ] **Step 3: Add exact pair and evidence-boundary assertions.**
+
+  ```python
+      def test_runbook_pins_exact_live_rollback_pair(self):
+          runbook = self._extract_runbook()
+          self.assertIn(f'ROLLBACK_REVISION="{ROLLBACK_REVISION}"', runbook)
+          self.assertIn(
+              f'EXPECTED_ROLLBACK_IMAGE="{ROLLBACK_IMAGE}"',
+              runbook,
+          )
+
+      def test_readme_pins_dark_native_evidence_boundary(self):
+          readme = DEPLOY_README.read_text(encoding="utf-8")
+          self.assertIn("SITESIFT_NATIVE_IMAGE_INGESTION=false", readme)
+          self.assertIn("Dormant and unproved live", readme)
+          self.assertIn("provider-canary=not-run", readme)
+  ```
+
+- [ ] **Step 4: Prove only the README-bound component is RED.**
+
+  ```bash
+  PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
+    tests.test_process_user_production_deploy_contract
+  ```
+
+  Expected: failures are limited to the still-placeholder rollback block and
+  missing evidence language; the already GREEN deploy-script assertions stay
+  green.
+
+- [ ] **Step 5: Commit only the README RED contract.**
+
+  ```bash
+  git add tests/test_process_user_production_deploy_contract.py
+  git commit -m "test: pin current dark release documentation"
+  ```
+
+### Task 11: Document the current release and pin rollback proof
 
 **Files:**
 
@@ -994,27 +1272,27 @@ paths.
   or reply canary.
   ```
 
-- [ ] **Step 6: Run the production contract and commit.**
+- [ ] **Step 6: Make the README contract GREEN and commit immediately.**
 
   ```bash
   PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
     tests.test_process_user_production_deploy_contract
   git diff --check
-  git add deploy/README.md \
-    tests/test_process_user_production_deploy_contract.py
+  git add deploy/README.md
   git commit -m "docs: pin dark native release and rollback proof"
   ```
 
   Expected: `OK`, whitespace check exits 0, and the commit contains only the
-  README plus its contract test.
+  README. No known RED is carried into the offline verification task.
 
-### Task 10: Run the full offline gate
+### Task 12: Run the full offline gate
 
 **Files:** verification only across all nine implementation paths.
 
 - [ ] **Step 1: Run native, PDF, predecessor, and retryability coverage.**
 
   ```bash
+  set -euo pipefail
   env -u GOOGLE_APPLICATION_CREDENTIALS \
     PYTHONDONTWRITEBYTECODE=1 E2E_TEST_MODE=true \
     FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
@@ -1034,6 +1312,7 @@ paths.
 - [ ] **Step 2: Run all release-control contracts together.**
 
   ```bash
+  set -euo pipefail
   PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
     tests.test_process_user_phase1_rollout_contract \
     tests.test_process_user_tagless_staging_contract \
@@ -1045,6 +1324,7 @@ paths.
 - [ ] **Step 3: Run broad broker-language, Jill, AI, and processing regressions.**
 
   ```bash
+  set -euo pipefail
   env -u GOOGLE_APPLICATION_CREDENTIALS \
     PYTHONDONTWRITEBYTECODE=1 E2E_TEST_MODE=true \
     FIRESTORE_EMULATOR_HOST=127.0.0.1:9 \
@@ -1082,6 +1362,7 @@ paths.
 - [ ] **Step 4: Compile, parse, and check whitespace.**
 
   ```bash
+  set -euo pipefail
   python3 -m py_compile \
     email_automation/app_config.py \
     email_automation/file_handling.py \
@@ -1099,6 +1380,7 @@ paths.
 - [ ] **Step 5: Run a second Python compiler when available.**
 
   ```bash
+  set -euo pipefail
   for python_bin in /usr/bin/python3 /opt/homebrew/bin/python3; do
     if [[ -x "$python_bin" ]]; then
       "$python_bin" -m py_compile \
@@ -1113,9 +1395,10 @@ paths.
 
 - [ ] **Step 6: Prove the implementation delta is exactly nine paths.**
 
-  Run from the same shell where `PLANNING_COMMIT` was set:
+  Run in a fresh shell; the block resolves its own planning boundary:
 
   ```bash
+  set -euo pipefail
   PLANNING_COMMIT="$(git log -1 --format=%H -- \
     docs/superpowers/plans/2026-08-16-sitesift-dark-native-production-release.md)"
   PLANNING_COMMIT="$PLANNING_COMMIT" python3 - <<'PY'
@@ -1156,7 +1439,7 @@ paths.
 
   Expected: `implementation scope: exact nine paths` and a clean worktree.
 
-### Task 11: Obtain two independent reviews and rerun fresh verification
+### Task 13: Obtain two independent reviews and rerun fresh verification
 
 **Files:** review only; fixes remain limited to the exact nine paths.
 
@@ -1180,26 +1463,33 @@ paths.
   Ask a different fresh reviewer to verify:
 
   - exact branch and rollback pair;
-  - candidate-only plain false gate as the sole config delta;
+  - candidate-only plain false gate as the sole config delta, with explicit
+    secret-bound/`valueFrom` and extra-keyed rejection;
   - immutable untagged 0% staging;
+  - exact after-tag-removal, under-lock, paused-queue revalidation order and a
+    no-promotion failure test for each authorization read;
   - closed lock/queue/tag/promotion/rollback ordering;
+  - independent pre-promotion config/rollback-digest proof and direct
+    post-promotion switches/IAM/authenticated-health rereads;
+  - self-contained shell blocks with no inherited release variable;
   - no POST/provider/mailbox canary path;
   - exact rollback-proof restoration semantics; and
   - honest post-live evidence labels.
 
   Expected verdict: zero P0/P1/P2 findings. Fix and re-review every finding.
 
-- [ ] **Step 3: Rerun Task 10 from the reviewed exact HEAD.**
+- [ ] **Step 3: Rerun Task 12 from the reviewed exact HEAD.**
 
   Expected: all commands pass fresh; do not reuse earlier output.
 
-### Task 12: Push the exact candidate and prove three-way parity
+### Task 14: Push the exact candidate and prove three-way parity
 
 **Files:** no new edits.
 
 - [ ] **Step 1: Record the final candidate identity.**
 
   ```bash
+  set -euo pipefail
   BRANCH="feat/native-image-attachment-ingestion-20260816"
   HEAD_SHA="$(git rev-parse HEAD)"
   SHORT_SHA="$(git rev-parse --short=12 HEAD)"
@@ -1214,6 +1504,8 @@ paths.
 - [ ] **Step 2: Push without force and without creating a PR.**
 
   ```bash
+  set -euo pipefail
+  BRANCH="feat/native-image-attachment-ingestion-20260816"
   git push origin "HEAD:refs/heads/${BRANCH}"
   ```
 
@@ -1222,6 +1514,8 @@ paths.
 - [ ] **Step 3: Prove local, upstream, and remote equality.**
 
   ```bash
+  set -euo pipefail
+  BRANCH="feat/native-image-attachment-ingestion-20260816"
   LOCAL_SHA="$(git rev-parse HEAD)"
   UPSTREAM_SHA="$(git rev-parse '@{upstream}')"
   REMOTE_SHA="$(git ls-remote origin "refs/heads/${BRANCH}" | awk '{print $1}')"
@@ -1232,13 +1526,14 @@ paths.
 
   Expected: all equality checks exit 0 and status is clean/ahead-by-zero.
 
-### Task 13: Refresh gcloud credentials and run mutation-free release gates
+### Task 15: Refresh gcloud credentials and run mutation-free release gates
 
 **Files:** no edits.
 
 - [ ] **Step 1: Establish the exact approved identity environment.**
 
   ```bash
+  set -euo pipefail
   source scripts/process_user_gcloud_preflight.sh
   export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
   unset CLOUDSDK_AUTH_ACCESS_TOKEN \
@@ -1254,6 +1549,15 @@ paths.
 - [ ] **Step 2: Refresh/read the access credential without exposing it.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
   gcloud auth print-access-token \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
     --project "$PROCESS_USER_PROJECT" >/dev/null
@@ -1261,11 +1565,20 @@ paths.
 
   Expected: exit 0 and no stdout. If it fails, stop; the operator completes
   interactive reauthentication outside this release transcript, then restarts
-  at Task 13 Step 1.
+  at Task 15 Step 1.
 
 - [ ] **Step 3: Run both dry-runs.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
   scripts/deploy_process_user.sh --dry-run
   GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT" \
     scripts/rollout_process_user_phase1.sh --dry-run
@@ -1276,17 +1589,38 @@ paths.
 
 - [ ] **Step 4: Re-prove source parity immediately before the first build.**
 
-  Re-run Task 12 Step 3.
+  Run in a fresh shell:
+
+  ```bash
+  set -euo pipefail
+  BRANCH="feat/native-image-attachment-ingestion-20260816"
+  LOCAL_SHA="$(git rev-parse HEAD)"
+  UPSTREAM_SHA="$(git rev-parse '@{upstream}')"
+  REMOTE_SHA="$(git ls-remote origin "refs/heads/${BRANCH}" | awk '{print $1}')"
+  test "$(git branch --show-current)" = "$BRANCH"
+  test -z "$(git status --porcelain=v1)"
+  test "$LOCAL_SHA" = "$UPSTREAM_SHA"
+  test "$LOCAL_SHA" = "$REMOTE_SHA"
+  ```
 
   Expected: exact equality and clean status.
 
-### Task 14: Stage the immutable candidate at 0% and stop for independent readback
+### Task 16: Stage the immutable candidate at 0% and stop for independent readback
 
 **Files:** cloud state only through the reviewed tagless staging script.
 
 - [ ] **Step 1: Execute tagless staging.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
   scripts/deploy_process_user.sh --apply
   ```
 
@@ -1298,6 +1632,15 @@ paths.
 - [ ] **Step 2: Resolve the immutable candidate identity.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
   HEAD_SHA="$(git rev-parse HEAD)"
   SHORT_SHA="$(git rev-parse --short=12 HEAD)"
   CANDIDATE_REVISION="process-user-stage-${SHORT_SHA}"
@@ -1320,6 +1663,26 @@ paths.
   gate without printing the rest of its environment.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+  CANDIDATE_REVISION="process-user-stage-${SHORT_SHA}"
+  CANDIDATE_DIGEST="$(
+    gcloud artifacts docker images describe \
+      "us-central1-docker.pkg.dev/${PROCESS_USER_PROJECT}/cloud-run-source-deploy/process-user:${SHORT_SHA}" \
+      --account "$PROCESS_USER_APPROVED_ACCOUNT" \
+      --project "$PROCESS_USER_PROJECT" \
+      '--format=value(image_summary.digest)'
+  )"
+  [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+  CANDIDATE_IMAGE="us-central1-docker.pkg.dev/${PROCESS_USER_PROJECT}/cloud-run-source-deploy/process-user@${CANDIDATE_DIGEST}"
   gcloud run revisions describe "$CANDIDATE_REVISION" \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
     --project "$PROCESS_USER_PROJECT" \
@@ -1354,6 +1717,17 @@ paths.
 - [ ] **Step 4: Independently prove 0% and no candidate tag.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+  CANDIDATE_REVISION="process-user-stage-${SHORT_SHA}"
   gcloud run services describe process-user \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
     --project "$PROCESS_USER_PROJECT" \
@@ -1377,19 +1751,142 @@ paths.
 
   Expected: the single sanitized routing line.
 
-- [ ] **Step 5: Have a fresh release reviewer inspect Steps 1–4.**
+- [ ] **Step 5: Independently prove rollback digest and sanitized config
+  parity.**
+
+  This is deliberately separate from both the stager and controller. It prints
+  no environment value, secret reference, or revision document:
+
+  ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+  CANDIDATE_REVISION="process-user-stage-${SHORT_SHA}"
+  CANDIDATE_DIGEST="$(
+    gcloud artifacts docker images describe \
+      "us-central1-docker.pkg.dev/${PROCESS_USER_PROJECT}/cloud-run-source-deploy/process-user:${SHORT_SHA}" \
+      --account "$PROCESS_USER_APPROVED_ACCOUNT" \
+      --project "$PROCESS_USER_PROJECT" \
+      '--format=value(image_summary.digest)'
+  )"
+  [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+  CANDIDATE_IMAGE="us-central1-docker.pkg.dev/${PROCESS_USER_PROJECT}/cloud-run-source-deploy/process-user@${CANDIDATE_DIGEST}"
+  ROLLBACK_REVISION="process-user-stage-9491133f15d5"
+  ROLLBACK_IMAGE="us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:3415d3775696932dbaba4911560f3bacb544e4e6123b162d012e485e9d123968"
+  RELEASE_EVIDENCE_DIR="$(mktemp -d)"
+  trap 'rm -rf -- "$RELEASE_EVIDENCE_DIR"' EXIT
+  gcloud run revisions describe "$CANDIDATE_REVISION" \
+    --account "$PROCESS_USER_APPROVED_ACCOUNT" \
+    --project "$PROCESS_USER_PROJECT" \
+    --region us-central1 \
+    --format=json >"$RELEASE_EVIDENCE_DIR/candidate.json"
+  gcloud run revisions describe "$ROLLBACK_REVISION" \
+    --account "$PROCESS_USER_APPROVED_ACCOUNT" \
+    --project "$PROCESS_USER_PROJECT" \
+    --region us-central1 \
+    --format=json >"$RELEASE_EVIDENCE_DIR/rollback.json"
+  EXPECTED_CANDIDATE="$CANDIDATE_REVISION" \
+  EXPECTED_CANDIDATE_IMAGE="$CANDIDATE_IMAGE" \
+  EXPECTED_ROLLBACK="$ROLLBACK_REVISION" \
+  EXPECTED_ROLLBACK_IMAGE="$ROLLBACK_IMAGE" \
+    python3 - "$RELEASE_EVIDENCE_DIR/candidate.json" \
+      "$RELEASE_EVIDENCE_DIR/rollback.json" <<'PY'
+  import copy
+  import json
+  import os
+  import sys
+
+  with open(sys.argv[1], encoding="utf-8") as stream:
+      candidate = json.load(stream)
+  with open(sys.argv[2], encoding="utf-8") as stream:
+      rollback = json.load(stream)
+
+  gate_name = "SITESIFT_NATIVE_IMAGE_INGESTION"
+
+  def canonical_spec(revision, expected_gate):
+      spec = copy.deepcopy(revision["spec"])
+      containers = spec.get("containers")
+      assert isinstance(containers, list) and len(containers) == 1
+      container = containers[0]
+      environment = container.get("env")
+      assert isinstance(environment, list)
+      assert all(
+          isinstance(entry, dict) and isinstance(entry.get("name"), str)
+          for entry in environment
+      )
+      gates = [entry for entry in environment if entry.get("name") == gate_name]
+      assert gates == expected_gate
+      container["env"] = [
+          entry for entry in environment if entry.get("name") != gate_name
+      ]
+      container.pop("image", None)
+      return spec
+
+  def canonical_metadata(revision):
+      metadata = revision["metadata"]
+      annotations = dict(metadata.get("annotations", {}))
+      labels = dict(metadata.get("labels", {}))
+      annotations.pop("run.googleapis.com/operation-id", None)
+      labels.pop("serving.knative.dev/configurationGeneration", None)
+      labels.pop("serving.knative.dev/route", None)
+      return {"annotations": annotations, "labels": labels}
+
+  assert candidate["metadata"]["name"] == os.environ["EXPECTED_CANDIDATE"]
+  assert rollback["metadata"]["name"] == os.environ["EXPECTED_ROLLBACK"]
+  assert candidate["spec"]["containers"][0]["image"] == os.environ[
+      "EXPECTED_CANDIDATE_IMAGE"
+  ]
+  assert candidate["status"]["imageDigest"] == os.environ[
+      "EXPECTED_CANDIDATE_IMAGE"
+  ]
+  assert rollback["spec"]["containers"][0]["image"] == os.environ[
+      "EXPECTED_ROLLBACK_IMAGE"
+  ]
+  assert rollback["status"]["imageDigest"] == os.environ[
+      "EXPECTED_ROLLBACK_IMAGE"
+  ]
+  assert canonical_spec(
+      candidate,
+      [{"name": gate_name, "value": "false"}],
+  ) == canonical_spec(rollback, [])
+  assert canonical_metadata(candidate) == canonical_metadata(rollback)
+  print("staging parity: exact rollback digest and sole dark-gate delta")
+  PY
+  ```
+
+  Expected: the single sanitized parity line. Any missing, duplicate,
+  `valueFrom`/secret-bound, extra-keyed, nonexact, or baseline gate fails; any
+  rollback digest or other functional config drift also fails.
+
+- [ ] **Step 6: Have a fresh release reviewer inspect Steps 1–5.**
 
   Expected verdict: stage is promotable with zero P0/P1/P2 findings. The reviewer
   must state that native behavior is dormant and not live-proven. Any ambiguity
   stops before promotion.
 
-### Task 15: Promote only through the closed controller
+### Task 17: Promote only through the closed controller
 
 **Files:** cloud state only through the reviewed promotion controller.
 
 - [ ] **Step 1: Run the exact controller.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
   GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT" \
     scripts/rollout_process_user_phase1.sh --apply
   ```
@@ -1397,24 +1894,37 @@ paths.
   Expected final line includes the exact candidate revision,
   `queue=RUNNING`, `switches=false,false`, and `provider-canary=not-run`.
   Internally, the controller must prove the lock, pause/drain snapshots,
-  temporary authenticated health tag, tag removal, exact false gate, promotion,
-  post-promotion health, empty tasks, and queue resume.
+  temporary authenticated health tag and its removal, then—under the same lock
+  while the queue remains paused—fresh candidate digest/dark-gate, rollback,
+  switches, topology, IAM, queue, and empty-task reads before promotion. It then
+  proves post-promotion health and empty tasks before queue resume.
 
 - [ ] **Step 2: Apply the failure rule without improvisation.**
 
   If the command exits nonzero, preserve its sanitized error and inspect only
   the controller’s final queue/traffic/readback state. Expected safe outcomes
   are either exact rollback at 100% plus RUNNING queue, or an explicit
-  `MANUAL_RECOVERY` state with the queue kept paused. Do not run Task 16 and do
+  `MANUAL_RECOVERY` state with the queue kept paused. Do not run Task 18 and do
   not issue a direct traffic command.
 
-### Task 16: Read back production and classify the evidence
+### Task 18: Read back production and classify the evidence
 
 **Files:** no repository edits; report results in the task response.
 
 - [ ] **Step 1: Prove final routing.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+  CANDIDATE_REVISION="process-user-stage-${SHORT_SHA}"
   gcloud run services describe process-user \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
     --project "$PROCESS_USER_PROJECT" \
@@ -1438,13 +1948,74 @@ paths.
 
   Expected: the single sanitized success line.
 
-- [ ] **Step 2: Re-run the candidate dark-gate readback from Task 14 Step 3.**
+- [ ] **Step 2: Directly re-read the candidate dark gate and immutable image.**
 
-  Expected: exact immutable image, Ready, and one plain lowercase-false gate.
+  Run this independently of the controller output:
+
+  ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+  CANDIDATE_REVISION="process-user-stage-${SHORT_SHA}"
+  CANDIDATE_DIGEST="$(
+    gcloud artifacts docker images describe \
+      "us-central1-docker.pkg.dev/${PROCESS_USER_PROJECT}/cloud-run-source-deploy/process-user:${SHORT_SHA}" \
+      --account "$PROCESS_USER_APPROVED_ACCOUNT" \
+      --project "$PROCESS_USER_PROJECT" \
+      '--format=value(image_summary.digest)'
+  )"
+  [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+  CANDIDATE_IMAGE="us-central1-docker.pkg.dev/${PROCESS_USER_PROJECT}/cloud-run-source-deploy/process-user@${CANDIDATE_DIGEST}"
+  gcloud run revisions describe "$CANDIDATE_REVISION" \
+    --account "$PROCESS_USER_APPROVED_ACCOUNT" \
+    --project "$PROCESS_USER_PROJECT" \
+    --region us-central1 \
+    --format=json | \
+    EXPECTED_REVISION="$CANDIDATE_REVISION" \
+    EXPECTED_IMAGE="$CANDIDATE_IMAGE" \
+    python3 -c '
+  import json, os, sys
+  revision = json.load(sys.stdin)
+  assert revision.get("metadata", {}).get("name") == os.environ["EXPECTED_REVISION"]
+  containers = revision.get("spec", {}).get("containers", [])
+  assert len(containers) == 1
+  assert containers[0].get("image") == os.environ["EXPECTED_IMAGE"]
+  assert revision.get("status", {}).get("imageDigest") == os.environ["EXPECTED_IMAGE"]
+  gates = [
+      entry for entry in containers[0].get("env", [])
+      if entry.get("name") == "SITESIFT_NATIVE_IMAGE_INGESTION"
+  ]
+  assert gates == [{"name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "false"}]
+  ready = [
+      row for row in revision.get("status", {}).get("conditions", [])
+      if row.get("type") == "Ready"
+  ]
+  assert len(ready) == 1 and str(ready[0].get("status")).lower() == "true"
+  print("production candidate: image, readiness, and dark gate exact")
+  '
+  ```
+
+  Expected: the single sanitized success line.
 
 - [ ] **Step 3: Re-prove the rollback image without printing configuration.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
   gcloud run revisions describe process-user-stage-9491133f15d5 \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
     --project "$PROCESS_USER_PROJECT" \
@@ -1458,6 +2029,15 @@ paths.
 - [ ] **Step 4: Prove queue state and empty task inventory.**
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
   gcloud tasks queues describe graph-process-user \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
     --project "$PROCESS_USER_PROJECT" \
@@ -1474,9 +2054,80 @@ paths.
 
   Expected: first command prints `RUNNING`; second prints nothing.
 
-- [ ] **Step 5: Read sanitized candidate error and request metadata.**
+- [ ] **Step 5: Directly re-read switches, IAM, and authenticated health.**
+
+  This imports the reviewed read adapter but does not run the promotion state
+  machine. It directly calls the underlying control-plane/HTTPS reads after
+  promotion, so the evidence does not depend on the controller's success line:
 
   ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  python3 -B <<'PY'
+  import importlib.util
+  from pathlib import Path
+  import sys
+
+  root = Path.cwd()
+  module_path = root / "scripts" / "phase1_rollout.py"
+  spec = importlib.util.spec_from_file_location(
+      "phase1_rollout_post_live_readback",
+      module_path,
+  )
+  module = importlib.util.module_from_spec(spec)
+  assert spec.loader is not None
+  sys.modules[spec.name] = module
+  spec.loader.exec_module(module)
+
+  head = module._current_head(root)
+  ops = module.SubprocessOps(root, head)
+  ops.preflight()
+  ops.verify_rules_ui_switches()
+  topology = module.validate_topology(
+      ops.get_service(),
+      expected_positive=ops.candidate,
+      expected_release=ops.candidate,
+      expected_aux=module.AUX_TAGS,
+  )
+  ops.verify_service_access(topology)
+  module._validate_legacy_health(
+      ops.legacy_health_get(topology.service_url, topology.service_url)
+  )
+  module._validate_legacy_health(
+      ops.legacy_health_get(
+          topology.tag_urls["release-a"],
+          topology.service_url,
+      )
+  )
+  print("direct post-live readback: switches false; IAM private; health exact")
+  PY
+  ```
+
+  Expected: the single sanitized success line. This is authenticated
+  `GET /health` only; it is not a worker POST, mailbox/provider canary, attachment
+  test, or downstream effect proof.
+
+- [ ] **Step 6: Read sanitized candidate error and request metadata.**
+
+  ```bash
+  set -euo pipefail
+  source scripts/process_user_gcloud_preflight.sh
+  export GCLOUD_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+  unset CLOUDSDK_AUTH_ACCESS_TOKEN \
+    CLOUDSDK_AUTH_ACCESS_TOKEN_FILE \
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT \
+    CLOUDSDK_CORE_ACCOUNT \
+    CLOUDSDK_CORE_PROJECT
+  SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+  CANDIDATE_REVISION="process-user-stage-${SHORT_SHA}"
   gcloud logging read \
     'resource.type="cloud_run_revision" AND resource.labels.service_name="process-user" AND resource.labels.revision_name="'"$CANDIDATE_REVISION"'" AND severity>=ERROR' \
     --account "$PROCESS_USER_APPROVED_ACCOUNT" \
@@ -1498,7 +2149,7 @@ paths.
   request rows contain only status/latency/revision metadata. Do not expand log
   payloads to investigate content in this release task.
 
-- [ ] **Step 6: Deliver the standing report with five explicit sections.**
+- [ ] **Step 7: Deliver the standing report with five explicit sections.**
 
   The report must state:
 
@@ -1506,8 +2157,9 @@ paths.
      independent 0/0/0 reviews.
   2. **Proved live by control plane:** final SHA, branch parity, artifact digest,
      active revision, 100%/`release-a`, exact false gate, rollback pair,
-     readiness, queue, switches/IAM/health evidence from the controller, and
-     sanitized logs.
+     readiness and queue, plus the independent direct switches/IAM/authenticated-
+     health reread and sanitized logs. Controller output is supporting evidence,
+     not a substitute for these direct rereads.
   3. **Observed in routine live operation:** only previously recorded or newly
      observed sanitized production facts; if none occurred in the window, say
      “no routine behavioral event observed” rather than manufacturing a canary.

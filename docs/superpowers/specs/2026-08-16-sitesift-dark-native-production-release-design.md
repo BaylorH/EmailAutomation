@@ -146,11 +146,18 @@ untagged, Ready, and at 0% until the controller:
 2. acquires and repeatedly reasserts the durable rollout lock;
 3. pauses and drains the queue;
 4. temporarily tags only the candidate for one authenticated `GET /health`;
-5. removes that tag and proves its removal;
-6. revalidates candidate image, exact false gate, rollback pair, switches,
-   topology, IAM, and queue state;
+5. removes that tag and proves its removal while the durable lock is still held
+   and the queue is still paused;
+6. inside a pair of fresh lock assertions, re-reads and revalidates, in exact
+   order, the candidate artifact/digest and false gate, the rollback
+   revision/digest, switches, unpromoted topology, IAM, paused queue, and empty
+   task inventory;
 7. promotes the candidate to sole 100% traffic plus `release-a`; and
 8. resumes the queue only after post-promotion readbacks pass.
+
+Every item in step 6 is gathered after temporary-tag removal; no pre-lock,
+pre-pause, or controller-cached observation can authorize promotion. Any read
+or comparison failure occurs before the traffic mutation and fails closed.
 
 The health request is a container/control-plane proof only. It is not a
 provider, mailbox, image-ingestion, PDF-extraction, sheet-write, or reply
@@ -216,8 +223,8 @@ The post-release report uses five evidence classes:
   does not fall open.
 - PDF failures preserve their existing retryable/fail-closed semantics.
 - A malformed Graph page still fails before partial PDF/native processing.
-- Missing, duplicated, or nonexact candidate gate readback aborts staging or
-  promotion.
+- Missing, duplicated, secret-bound/`valueFrom`, extra-keyed, or nonexact
+  candidate gate readback aborts staging or promotion.
 - Any branch, upstream, remote, digest, rollback, routing, IAM, queue, task,
   switch, health, or lock mismatch stops at the existing closed boundary.
 - Any failure after a possible traffic change invokes rollback; unprovable
@@ -228,12 +235,16 @@ The post-release report uses five evidence classes:
 
 ## Verification strategy
 
-The implementation follows RED/GREEN commits:
+The implementation follows component-local RED/GREEN commit pairs. A RED commit
+is immediately followed by the GREEN commit for that same component; the plan
+never carries a known failure into an unrelated implementation or documentation
+commit:
 
 - exact configuration parsing fails before the predicate exists;
 - disabled mixed and image-only assembly fails before the file-handling gate;
-- controller tests fail until the branch, rollback pair, and exact false
-  candidate delta are pinned;
+- controller tests fail until the existing stale branch assertion, rollback
+  pair, exact false candidate delta, and under-lock pre-promotion readbacks are
+  pinned;
 - tagless/production deployment tests fail until the deploy command and
   candidate readback require false; and
 - rollback runbook tests fail until the exact live rollback pair replaces the
@@ -253,12 +264,17 @@ the exact branch and prove local/upstream/remote parity.
    read. Failure is a hard stop.
 4. Run both dry-runs and verify they perform no cloud mutation.
 5. Stage the immutable candidate untagged at 0%.
-6. Independently inspect candidate/rollback/config/traffic readbacks. The false
-   gate is mandatory and native remains unproved.
+6. Independently inspect candidate/rollback/config/traffic readbacks. This
+   includes a direct rollback-digest assertion and a sanitized candidate-versus-
+   rollback config comparison that strips only immutable image identity and the
+   exact candidate-only false gate. The false gate is mandatory and native
+   remains unproved.
 7. Run the closed promotion controller. Do not call either POST route or any
    provider/mailbox harness.
 8. Re-read the service, candidate, rollback, queue, tasks, switches, IAM, health,
-   and sanitized error/request metadata.
+   and sanitized error/request metadata. Switch, IAM, and authenticated-health
+   evidence is gathered directly after promotion rather than copied from the
+   controller's success line.
 9. Publish the evidence-classified standing report and the examination list.
 
 ## What this release may establish
@@ -309,6 +325,8 @@ Stop, roll back if traffic changed, and redesign if any of the following occurs:
   cannot be proved equal to the release packet;
 - the rollback revision/digest differs from the pinned pair;
 - staging assigns a tag or positive traffic to the candidate;
+- any post-tag-removal candidate, rollback, switch, topology, IAM, paused-queue,
+  empty-task, or enclosing-lock revalidation is missing, stale, or fails;
 - promotion observes queue tasks, enabled campaign switches, public/changed
   IAM, an unexpected health result, lock ambiguity, or routing drift; or
 - the final report labels native behavior or a provider/mailbox effect as
