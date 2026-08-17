@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Static capability ranking policy for the production automation certification program. This file is TRACKED POLICY ONLY. It must never record dynamic production state - no stamps, no active capability, no current identity, no revision, and no verdicts. Durable current state lives in the private certification ledger and the sanitized Brain checkpoint, so that recording a stamp can never change the source SHA that stamp certifies.",
+  "approvedManifestPath": "docs/superpowers/plans/2026-08-17-production-automation-certification-scenarios.json",
+  "capabilityOrder": [
+    "spreadsheet-admission",
+    "authoritative-field-contract",
+    "initial-outreach-quality",
+    "thread-property-binding",
+    "text-extraction-sheet-integrity",
+    "property-decision",
+    "natural-reply-closure",
+    "pdf-and-link-understanding",
+    "operator-actions",
+    "followup-and-stop-controls",
+    "retry-reorder-recovery",
+    "whole-scrub"
+  ],
+  "dependencies": {
+    "spreadsheet-admission": [],
+    "authoritative-field-contract": [],
+    "initial-outreach-quality": [
+      "authoritative-field-contract"
+    ],
+    "thread-property-binding": [],
+    "text-extraction-sheet-integrity": [
+      "thread-property-binding"
+    ],
+    "property-decision": [
+      "text-extraction-sheet-integrity"
+    ],
+    "natural-reply-closure": [
+      "authoritative-field-contract",
+      "property-decision"
+    ],
+    "pdf-and-link-understanding": [
+      "text-extraction-sheet-integrity"
+    ],
+    "operator-actions": [
+      "property-decision"
+    ],
+    "followup-and-stop-controls": [
+      "initial-outreach-quality"
+    ],
+    "retry-reorder-recovery": [
+      "thread-property-binding"
+    ],
+    "whole-scrub": [
+      "spreadsheet-admission",
+      "authoritative-field-contract",
+      "initial-outreach-quality",
+      "thread-property-binding",
+      "text-extraction-sheet-integrity",
+      "property-decision",
+      "natural-reply-closure",
+      "pdf-and-link-understanding",
+      "operator-actions",
+      "followup-and-stop-controls",
+      "retry-reorder-recovery"
+    ]
+  },
+  "dependencyRule": "Every dependency must appear earlier in capabilityOrder than its dependent, so the ranking is a total order over a directed acyclic graph and can never cycle.",
+  "priorityClasses": [
+    "wrong-external-effect-or-customer-data-safety",
+    "inability-to-finish-the-core-job",
+    "incorrect-extraction-binding-state-or-message-behavior",
+    "hidden-failure-duplicate-or-recovery-weakness",
+    "communication-quality-and-efficiency",
+    "performance-and-cost",
+    "adjacent-features-infrastructure-and-convenience"
+  ],
+  "selectionRule": "Exactly one capability is active. At most one independently proved instrumentation or authority blocker may accompany it. A recorded safety failure preempts core completion. A capability activates only when every declared dependency already holds a valid stamp. The general backlog is durable memory and never influences selection.",
+  "blockingPrerequisites": {
+    "spreadsheet-admission": {
+      "manifestField": "frontendCertificationSourceAnchor",
+      "requiredState": "non-null",
+      "verdictWhenUnmet": "INSTRUMENT_BLOCKED",
+      "reason": "frontend-certification-anchor-absent",
+      "detail": "The coordinated frontend adapter must be committed from the clean baseline and its source anchor recorded through a reviewed successor before spreadsheet admission can run."
+    }
+  },
+  "identityInvalidationFields": [
+    "fullGitSha",
+    "imageDigest",
+    "configDigest",
+    "scenarioRegistryDigest",
+    "promptDigest",
+    "requestedModel",
+    "resolvedModel",
+    "modelFingerprint",
+    "dependencyDigest",
+    "fixtureConfigSecretVersion",
+    "crossRepoAnchors"
+  ],
+  "invalidationRule": "Any change to an identity field invalidates every stamp, because the stamp certified a bound identity that no longer exists. A changed production path invalidates only the stamps that declared it. An unknown or absent identity field fails closed and never silently preserves a stamp.",
+  "requiredEffectKeyPrefixes": [
+    "observed_projection:"
+  ],
+  "requiredEffectKeyLiterals": [
+    "captured_outreach",
+    "fixture_audit",
+    "fixture_followup",
+    "fixture_thread_index",
+    "intentional_oracle_mismatch"
+  ],
+  "requiredEffectRule": "A required effect must name an observed store, capture, or adapter projection. A scenario may never emit its own pass token."
+}

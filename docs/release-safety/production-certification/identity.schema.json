@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sitesift.internal/schemas/production-certification-identity.json",
+  "title": "Production certification bound identity",
+  "description": "The complete identity a certification stamp is bound to. Every field is required and no additional field is tolerated: an unknown field means the deployed thing changed in a way this program cannot reason about, which must fail closed rather than silently preserve a stamp. This schema describes PRIVATE or LOCAL identity exports only; no populated identity document is ever committed to the product branch.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fullGitSha",
+    "imageDigest",
+    "configDigest",
+    "scenarioRegistryDigest",
+    "promptDigest",
+    "requestedModel",
+    "resolvedModel",
+    "modelFingerprint",
+    "dependencyDigest",
+    "fixtureConfigSecretVersion",
+    "crossRepoAnchors"
+  ],
+  "properties": {
+    "fullGitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full backend source SHA. An abbreviated SHA is not an identity."
+    },
+    "imageDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Immutable container image digest shared by the production candidate and the certification twin."
+    },
+    "configDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Digest of the strict normalized service configuration comparison."
+    },
+    "scenarioRegistryDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase SHA-256 of the canonical in-image scenario_registry.json bytes."
+    },
+    "promptDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Digest of the exact prompt text submitted for model-dependent scenarios."
+    },
+    "requestedModel": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model identifier requested by the worker."
+    },
+    "resolvedModel": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-returned response.model. A mutable alias that resolves differently invalidates the stamp."
+    },
+    "modelFingerprint": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable provider fingerprint bound to each run and stamp."
+    },
+    "dependencyDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Digest of the hash-locked dependency graph baked into the image."
+    },
+    "fixtureConfigSecretVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Immutable numeric fixture-config secret version. Concrete client, recipient, Sheet, Drive, thread, and event identities come only from this bound secret, never from the registry or the request."
+    },
+    "crossRepoAnchors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "frontend"
+      ],
+      "description": "Exact source anchors for both repositories. A frontend adapter change invalidates backend stamps that depended on it.",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "frontend": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    }
+  }
+}
