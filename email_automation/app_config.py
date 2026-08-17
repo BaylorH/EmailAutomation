@@ -4,6 +4,11 @@ import os
 E2E_TEST_MODE = os.getenv("E2E_TEST_MODE") == "true"
 
 
+def native_image_ingestion_enabled():
+    """Enable native image effects only for the exact reviewed value."""
+    return os.getenv("SITESIFT_NATIVE_IMAGE_INGESTION") == "true"
+
+
 def _clean_env(name):
     """Read an env var and strip surrounding whitespace.
 
