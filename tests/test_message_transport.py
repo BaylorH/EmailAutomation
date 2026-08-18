@@ -307,21 +307,238 @@ class ImportTimeProviderConstructionTests(unittest.TestCase):
             "lazy, invert this test and unblock credential-free collection",
         )
 
-    def test_this_module_imports_no_email_automation_package(self):
-        source = Path(__file__).read_text(encoding="utf-8")
-        tree = ast.parse(source)
+    def test_this_module_imports_nothing_that_builds_providers_at_import(self):
+        """Collection of this module must never require credentials.
+
+        The property that matters is not "imports no email_automation" - it is
+        "imports nothing whose import constructs a provider client". Any module
+        reaching email_automation/clients.py pulls in `_fs = firestore.Client()` and
+        `openai.OpenAI(...)` at module scope. A pure boundary module such as
+        message_transport, which holds only dataclasses, protocols, and sources over
+        an INJECTED request function, imports none of that and is therefore safe to
+        import here.
+
+        Narrowed from a blanket ban when Task 3 added CanonicalInboundMessageTests.
+        Deliberately still a ban, not a warning: widening it to the credential-
+        constructing modules is what would make collection need a secret again.
+        """
+        credential_constructing = {
+            "email_automation.clients",
+            "email_automation.processing",
+            "email_automation.email",
+            "email_automation.followup",
+            "email_automation.ai_processing",
+        }
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         imported = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                imported.update(alias.name.split(".")[0] for alias in node.names)
+                imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.split(".")[0])
-        self.assertNotIn(
-            "email_automation",
-            imported,
-            "this characterization must stay credential-free; importing the package "
-            "constructs production Firestore and OpenAI clients at import time",
+                imported.add(node.module)
+        self.assertEqual(
+            imported & credential_constructing,
+            set(),
+            "importing one of these constructs a production Firestore and OpenAI "
+            "client at module scope, so collection would need a real credential",
         )
+
+    def test_message_transport_module_builds_no_provider_at_import(self):
+        """The new boundary module must stay pure, or the above ban is worthless."""
+        tree = ast.parse(_module_source("email_automation/message_transport.py"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                self.assertNotIn(
+                    "clients",
+                    node.module,
+                    "message_transport must not import clients; that would drag "
+                    "firestore.Client() and openai.OpenAI() into every importer",
+                )
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                func = node.value.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                self.assertNotIn(
+                    name,
+                    ("Client", "OpenAI"),
+                    "message_transport constructs a provider at module scope",
+                )
+
+
+class CanonicalInboundMessageTests(unittest.TestCase):
+    """Task 3. A Graph-backed source and an approved fixture source must produce
+    BYTE-EQUAL canonical inbound state for the same logical message.
+
+    This is the whole premise of the certification program: certification runs the
+    same deployed business logic and differs ONLY in acquisition. If the two sources
+    can disagree on any field - body text, quoted content, envelope, headers,
+    attachment flag, message ids, timestamps, reply target, prior messages, or Sent
+    Items receipts - then a capability stamp earned through the fixture lane says
+    nothing about the Graph lane, and the whole instrument is void.
+
+    The fixture lane runs with the ENTIRE Graph request layer patched to raise, so a
+    hidden read, createReplyAll, send, or Sent Items call fails loudly rather than
+    silently succeeding.
+    """
+
+    GRAPH_MESSAGE = {
+        "id": "AAMkAGI2-graph-id",
+        "internetMessageId": "<abc123@contoso.example>",
+        "conversationId": "conv-777",
+        "subject": "RE: 100 Example Rd availability",
+        "receivedDateTime": "2026-08-17T14:05:00Z",
+        "hasAttachments": True,
+        "from": {"emailAddress": {"address": "broker@example.test", "name": "A Broker"}},
+        "replyTo": [{"emailAddress": {"address": "broker.reply@example.test"}}],
+        "toRecipients": [{"emailAddress": {"address": "operator@example.test"}}],
+        "ccRecipients": [{"emailAddress": {"address": "assistant@example.test"}}],
+        "body": {
+            "contentType": "HTML",
+            "content": "<html><body><p>Rent is $14 NNN.</p>"
+            "<blockquote>On Mon you wrote: what is the rent?</blockquote>"
+            "</body></html>",
+        },
+        "internetMessageHeaders": [
+            {"name": "In-Reply-To", "value": "<prior@contoso.example>"},
+            {"name": "References", "value": "<root@contoso.example> <prior@contoso.example>"},
+        ],
+    }
+
+    ATTACHMENTS = (
+        {"id": "att-1", "name": "flyer.pdf", "contentType": "application/pdf", "size": 1024},
+    )
+
+    def _sources(self):
+        from email_automation import message_transport as mt
+
+        def exploding_request(*args, **kwargs):
+            raise AssertionError(
+                "the fixture lane made a Graph request; acquisition must be the ONLY "
+                "difference between the two lanes"
+            )
+
+        graph = mt.GraphInboundMessageSource(
+            request=lambda *a, **k: {
+                **self.GRAPH_MESSAGE,
+                "attachments": list(self.ATTACHMENTS),
+            },
+            headers={"Authorization": "Bearer fake"},
+        )
+        fixture = mt.FixtureInboundMessageSource(
+            snapshot={
+                **self.GRAPH_MESSAGE,
+                "attachments": list(self.ATTACHMENTS),
+            },
+            request=exploding_request,
+        )
+        return mt, graph, fixture
+
+    def test_module_exposes_every_locked_interface_name(self):
+        from email_automation import message_transport as mt
+
+        for name in (
+            "DeliveryKind",
+            "HydratedInboundMessage",
+            "InboundMessageSource",
+            "CanonicalConversationState",
+            "ConversationStateSource",
+            "OutboundDraft",
+            "DeliveryReceipt",
+            "OutboundDraftTransport",
+        ):
+            self.assertTrue(hasattr(mt, name), f"locked interface {name} is missing")
+        self.assertEqual(mt.DeliveryKind.NEW.value, "new")
+        self.assertEqual(mt.DeliveryKind.REPLY.value, "reply")
+        self.assertEqual(mt.DeliveryKind.REPLY_ALL.value, "reply_all")
+
+    def test_graph_and_fixture_sources_hydrate_equal_canonical_messages(self):
+        _mt, graph, fixture = self._sources()
+        summary = {"id": self.GRAPH_MESSAGE["id"]}
+        self.assertEqual(graph.hydrate(summary), fixture.hydrate(summary))
+
+    def test_every_canonical_field_matches_field_by_field(self):
+        _mt, graph, fixture = self._sources()
+        summary = {"id": self.GRAPH_MESSAGE["id"]}
+        left, right = graph.hydrate(summary), fixture.hydrate(summary)
+        for field in (
+            "summary",
+            "full_text",
+            "text_for_ai",
+            "source_envelope",
+            "internet_headers",
+            "attachment_snapshot",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(getattr(left, field), getattr(right, field))
+
+    def test_quoted_history_is_excluded_from_text_for_ai_but_kept_in_full_text(self):
+        _mt, graph, _fixture = self._sources()
+        hydrated = graph.hydrate({"id": self.GRAPH_MESSAGE["id"]})
+        self.assertIn("Rent is $14 NNN.", hydrated.text_for_ai)
+        self.assertNotIn("what is the rent?", hydrated.text_for_ai)
+        self.assertIn("what is the rent?", hydrated.full_text)
+
+    def test_envelope_carries_identity_and_recipients(self):
+        _mt, graph, _fixture = self._sources()
+        envelope = graph.hydrate({"id": self.GRAPH_MESSAGE["id"]}).source_envelope
+        self.assertEqual(envelope["graphMessageId"], self.GRAPH_MESSAGE["id"])
+        self.assertEqual(envelope["internetMessageId"], self.GRAPH_MESSAGE["internetMessageId"])
+        self.assertEqual(envelope["conversationId"], self.GRAPH_MESSAGE["conversationId"])
+        self.assertEqual(envelope["fromEmail"], "broker@example.test")
+        self.assertEqual(envelope["replyTo"], ("broker.reply@example.test",))
+        self.assertEqual(envelope["to"], ("operator@example.test",))
+        self.assertEqual(envelope["cc"], ("assistant@example.test",))
+        self.assertEqual(envelope["receivedDateTime"], self.GRAPH_MESSAGE["receivedDateTime"])
+        self.assertTrue(envelope["hasAttachments"])
+
+    def test_reply_targets_are_normalized_from_internet_headers(self):
+        _mt, graph, _fixture = self._sources()
+        envelope = graph.hydrate({"id": self.GRAPH_MESSAGE["id"]}).source_envelope
+        self.assertEqual(envelope["inReplyTo"], "<prior@contoso.example>")
+        self.assertEqual(
+            envelope["references"],
+            ("<root@contoso.example>", "<prior@contoso.example>"),
+        )
+
+    def test_hydrated_message_is_immutable(self):
+        _mt, graph, _fixture = self._sources()
+        hydrated = graph.hydrate({"id": self.GRAPH_MESSAGE["id"]})
+        with self.assertRaises(Exception):
+            hydrated.full_text = "tampered"  # type: ignore[misc]
+        self.assertIsInstance(hydrated.internet_headers, tuple)
+        self.assertIsInstance(hydrated.attachment_snapshot, tuple)
+
+    def test_fixture_lane_makes_zero_graph_requests(self):
+        _mt, _graph, fixture = self._sources()
+        hydrated = fixture.hydrate({"id": self.GRAPH_MESSAGE["id"]})
+        self.assertTrue(hydrated.full_text)
+
+    def test_conversation_state_parity_including_sent_receipts(self):
+        mt, _graph, _fixture = self._sources()
+        prior = {**self.GRAPH_MESSAGE, "id": "prior-id", "hasAttachments": False}
+        receipts = ({"internetMessageId": "<sent-1@contoso.example>", "status": "sent"},)
+
+        graph_state = mt.GraphConversationStateSource(
+            request=lambda *a, **k: {
+                "reply_target": {**self.GRAPH_MESSAGE, "attachments": list(self.ATTACHMENTS)},
+                "prior_messages": [prior],
+                "sent_receipts": list(receipts),
+            },
+            headers={"Authorization": "Bearer fake"},
+        ).load("conv-777")
+
+        fixture_state = mt.FixtureConversationStateSource(
+            snapshot={
+                "reply_target": {**self.GRAPH_MESSAGE, "attachments": list(self.ATTACHMENTS)},
+                "prior_messages": [prior],
+                "sent_receipts": list(receipts),
+            },
+        ).load("conv-777")
+
+        self.assertEqual(graph_state, fixture_state)
+        self.assertEqual(len(graph_state.prior_messages), 1)
+        self.assertEqual(graph_state.sent_receipts[0]["status"], "sent")
+        self.assertIsInstance(graph_state.prior_messages, tuple)
 
 
 if __name__ == "__main__":
