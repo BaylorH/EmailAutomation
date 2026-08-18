@@ -26,6 +26,52 @@ class _ThreadSnapshot:
         return deepcopy(self._data)
 
 
+class _UnmodeledFirestoreAccess(AssertionError):
+    """Raised when a test path reaches Firestore in a way this double does not model.
+
+    Deliberately loud. A bare ``patch.object(processing, "_fs")`` MagicMock absorbs
+    every access and returns a truthy mock, so an unmodeled read silently falls
+    through instead of failing - which is how a real regression in the projection
+    recovery guard could pass unnoticed.
+    """
+
+
+class _NoProjectionRecoveryFirestore:
+    """Models exactly one read: the reply-review projection recovery guard.
+
+    ``_has_pending_reply_review_projection_recovery`` (email_automation/processing.py:973)
+    issues ``_fs.collection("users").document(uid).collection("processingFailures")
+    .document(doc_id).get()`` with NO deadline. Against a real client that call blocks
+    forever inside the gRPC stream rather than raising, so neither the guard's own
+    ``except Exception`` nor the Phase 1 wrapper can absorb it - a hang, not an error.
+
+    Returning a snapshot whose ``exists`` is False drives the guard through its real
+    ``if not getattr(snapshot, "exists", False): return False`` branch
+    (email_automation/processing.py:1001-1002), which is the honest "no pending
+    recovery, proceed" outcome. That is a modeled value, not MagicMock truthiness.
+    """
+
+    def __init__(self):
+        self.reads = []
+
+    def collection(self, name):
+        if name not in ("users", "processingFailures"):
+            raise _UnmodeledFirestoreAccess(f"unmodeled collection({name!r})")
+        return self
+
+    def document(self, doc_id):
+        self.reads.append(doc_id)
+        return self
+
+    def get(self, *args, **kwargs):
+        return _ThreadSnapshot({}, exists=False)
+
+    def __getattr__(self, attribute):
+        raise _UnmodeledFirestoreAccess(
+            f"unmodeled Firestore access: _fs.{attribute}"
+        )
+
+
 class _TransactionConflict(RuntimeError):
     pass
 
@@ -413,6 +459,8 @@ class BatchedInboundAuthorityTests(unittest.TestCase):
         ), patch.object(
             processing,
             "set_last_scan_iso",
+        ), patch.object(
+            processing, "_fs", _NoProjectionRecoveryFirestore()
         ), patch.object(processing.time, "sleep"):
             result = processing.scan_inbox_against_index(
                 "uid-1",
@@ -470,6 +518,8 @@ class BatchedInboundAuthorityTests(unittest.TestCase):
             processing,
             "mark_processed",
         ) as mark_processed, patch.object(
+            processing, "_fs", _NoProjectionRecoveryFirestore()
+        ), patch.object(
             processing,
             "set_last_scan_iso",
         ) as set_last_scan:
