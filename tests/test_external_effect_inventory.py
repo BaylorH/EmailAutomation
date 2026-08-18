@@ -45,14 +45,26 @@ SKIP_PARTS = {".git", "tests", "__pycache__", "node_modules", ".venv", "venv"}
 # ownership by enclosing function is the stable fact, and a line number would
 # make this file churn on every unrelated edit.
 
+# Step 2 of Task 7F routed the three sites reachable from the automation lane.
+# What remains is deliberately NOT routed:
+#   * service_providers.py IS the raw provider adapter - routing it would mean
+#     routing a provider through itself. It is unreachable from the automation
+#     lane (production imports only get_drive_service) and is held to the same
+#     enumerated-bypass rule as its send helpers.
+#   * scheduler_runner.py is a top-level script, imported by nothing.
 UNROUTED_AI_SITES = {
-    ("email_automation/ai_processing.py", "propose_sheet_updates"),
-    ("email_automation/column_config.py", "_ai_match_columns"),
-    ("email_automation/file_handling.py", "upload_pdf_user_data"),
     ("email_automation/service_providers.py", "chat_completion"),
     ("email_automation/service_providers.py", "upload_file"),
     ("scheduler_runner.py", "propose_sheet_updates"),
     ("scheduler_runner.py", "upload_pdf_user_data"),
+}
+
+# Routed in Task 7F step 2. Each reaches the provider only through the runtime's
+# AI transport, so a certification runtime refuses before a request is built.
+ROUTED_AI_SITES = {
+    ("email_automation/ai_processing.py", "propose_sheet_updates"),
+    ("email_automation/column_config.py", "_ai_match_columns"),
+    ("email_automation/file_handling.py", "upload_pdf_user_data"),
 }
 
 # The plan predicted five public-Drive permission sites across four files. Unlike
@@ -169,6 +181,60 @@ class ProviderEffectInventoryTests(unittest.TestCase):
             "update UNROUTED_AI_SITES in the same commit - and if a NEW direct "
             "call appeared, that is the alarm",
         )
+
+    def test_routed_ai_sites_no_longer_reach_a_provider_directly(self):
+        """The lanes Task 7F step 2 converged."""
+        actual = _sites(lambda kind: kind.startswith("ai_"))
+        for site in ROUTED_AI_SITES:
+            with self.subTest(site=site):
+                self.assertNotIn(site, actual)
+
+    def test_every_routed_ai_site_resolves_through_the_runtime_transport(self):
+        """Structural: the call goes through ai_for, not a module-level client."""
+        for module, function_name in ROUTED_AI_SITES:
+            with self.subTest(module=module, function=function_name):
+                source = _source(module)
+                tree = ast.parse(source)
+                owner = _enclosing_functions(tree)
+                uses_resolver = any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "ai_for"
+                    and owner.get(node) == function_name
+                    for node in ast.walk(tree)
+                )
+                self.assertTrue(
+                    uses_resolver,
+                    f"{module}:{function_name} no longer resolves its AI transport "
+                    "through ai_for",
+                )
+
+    def test_the_unrouted_remainder_is_unreachable_rather_than_merely_listed(self):
+        """service_providers is the raw adapter; scheduler_runner is a script.
+
+        Neither is reachable from the automation lane, which is what makes
+        leaving them unrouted defensible rather than an omission.
+        """
+        remaining_modules = {module for module, _fn in UNROUTED_AI_SITES}
+        self.assertEqual(
+            remaining_modules,
+            {"email_automation/service_providers.py", "scheduler_runner.py"},
+        )
+        for relative in _deployable_files():
+            if relative in remaining_modules or relative.startswith(SCRIPT_PREFIX):
+                continue
+            try:
+                tree = ast.parse(_source(relative))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name.rsplit(".", 1)[-1] for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module.rsplit(".", 1)[-1]]
+                if "scheduler_runner" in names:
+                    self.fail(f"{relative} imports the scheduler script")
 
     def test_public_drive_permission_sites_are_exactly_the_known_set(self):
         actual = _sites(lambda kind: kind == "drive_permission")

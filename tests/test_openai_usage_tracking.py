@@ -147,7 +147,11 @@ class OpenAIUsageTrackingTests(unittest.TestCase):
 
     def test_sheet_update_extraction_records_openai_usage_after_model_call(self):
         source = Path("email_automation/ai_processing.py").read_text()
-        model_call = source.index("response = client.responses.create")
+        # Anchored on the request-scoped transport rather than a raw client, which
+        # is what the extraction call became in Task 7F. The property under test
+        # is unchanged and is an ORDERING one: usage is recorded after the model
+        # call, never before it, so a refused or failed call records nothing.
+        model_call = source.index("ai_for(runtime, client).create_response")
         usage_call = source.find("track_openai_usage_safely", model_call)
 
         self.assertNotEqual(usage_call, -1, "OpenAI extraction usage is not tracked after the model call")

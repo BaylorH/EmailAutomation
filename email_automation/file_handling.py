@@ -16,6 +16,7 @@ from googleapiclient.http import MediaIoBaseUpload
 import io
 from .app_config import native_image_ingestion_enabled
 from .clients import _helper_google_creds, client
+from .automation_runtime import ai_for
 
 
 _PDF_PAGE_MARKER_LINE_RE = re.compile(r"^--- Page [1-9][0-9]* ---$", re.MULTILINE)
@@ -2533,7 +2534,7 @@ def fetch_and_process_linked_assets(
     return processed
 
 
-def upload_pdf_user_data(filename: str, content: bytes) -> str:
+def upload_pdf_user_data(filename: str, content: bytes, runtime=None) -> str:
     """Upload PDF to OpenAI with purpose='user_data' and return file_id."""
     tmp_path = None
     try:
@@ -2543,10 +2544,7 @@ def upload_pdf_user_data(filename: str, content: bytes) -> str:
             tmp_file.flush()
 
             with open(tmp_path, "rb") as f:
-                file_response = client.files.create(
-                    file=f,
-                    purpose="user_data"
-                )
+                file_response = ai_for(runtime, client).upload_file(f, "user_data")
 
             file_id = file_response.id
             print(f"📤 Uploaded to OpenAI: {filename} -> {file_id}")

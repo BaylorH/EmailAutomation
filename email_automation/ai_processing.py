@@ -14,6 +14,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import unquote, urlsplit, urlunsplit
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
+from .automation_runtime import ai_for
 from .messaging import build_conversation_payload
 from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execute_with_retry
 from .column_config import (
@@ -7044,7 +7045,7 @@ def propose_sheet_updates(uid: str,
                           column_config: dict = None,        # Optional: dynamic column configuration
                           extraction_fields: List[str] = None,  # Optional: list of canonical field keys user wants extracted
                           dry_run: bool = False,
-                          authenticated_mailbox_email: str = None) -> Optional[Dict]:
+                          authenticated_mailbox_email: str = None, runtime=None) -> Optional[Dict]:
     """
     Uses OpenAI Responses API to propose sheet updates.
     - Grounds on the current row's (address, city) as TARGET PROPERTY.
@@ -7722,11 +7723,11 @@ OUTPUT ONLY valid JSON in this exact format:
         input_content.append({"type": "input_text", "text": prompt})
 
         # ---- Call OpenAI (low temperature for determinism) --------------------
-        response = client.responses.create(
-            model="gpt-5.2",  # GPT-5.2 Thinking for complex extraction
-            input=[{"role": "user", "content": input_content}],
-            temperature=0.1
-        )
+        response = ai_for(runtime, client).create_response({
+            "model": "gpt-5.2",  # GPT-5.2 Thinking for complex extraction
+            "input": [{"role": "user", "content": input_content}],
+            "temperature": 0.1,
+        })
         if not dry_run:
             track_openai_usage_safely(
                 db=_fs,

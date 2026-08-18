@@ -878,6 +878,41 @@ def sheets_for(runtime: Optional["AutomationRuntime"], ambient_factory: Callable
     return ambient_factory()
 
 
+class AmbientAITransport:
+    """Ordinary production, over the CALLER'S OWN client object.
+
+    ``ProviderBackedAITransport`` resolves ``clients.client`` itself, which is
+    right for a runtime built from nothing. It is wrong as an ambient fallback:
+    modules import ``client`` by value and their tests patch that per-module
+    binding, so reaching for one canonical global here would silently ignore the
+    patch - the same trap ``firestore_for`` and ``clock_for`` exist to avoid.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def create_response(self, request: Mapping[str, Any]) -> Any:
+        return self._client.responses.create(**dict(request))
+
+    def create_chat_completion(self, request: Mapping[str, Any]) -> Any:
+        return self._client.chat.completions.create(**dict(request))
+
+    def upload_file(self, file_obj: Any, purpose: str) -> Any:
+        return self._client.files.create(file=file_obj, purpose=purpose)
+
+
+def ai_for(runtime: Optional["AutomationRuntime"], ambient: Any) -> AIProviderTransport:
+    """Return the request's AI transport, or ordinary production over ``ambient``.
+
+    A certification runtime yields ``DenyingAITransport``, which refuses BEFORE a
+    request is built - so an agent-safe lane cannot spend a token or leak a
+    fixture body into a prompt.
+    """
+    if runtime is not None and getattr(runtime, "ai_provider", None) is not None:
+        return runtime.ai_provider
+    return AmbientAITransport(ambient)
+
+
 def clock_for(
     runtime: Optional["AutomationRuntime"],
     ambient: Callable[[], datetime],

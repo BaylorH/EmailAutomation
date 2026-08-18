@@ -1977,13 +1977,14 @@ def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, 
     }
 
 
-def _ai_match_columns(headers: List[str], canonicals: List[str]) -> Dict[str, tuple]:
+def _ai_match_columns(headers: List[str], canonicals: List[str], runtime=None) -> Dict[str, tuple]:
     """
     Use AI to semantically match remaining headers to canonical fields.
     Returns: {"canonical": ("header", confidence), ...}
     """
     try:
         from .clients import client  # OpenAI client
+        from .automation_runtime import ai_for
 
         # Build context about canonical fields
         field_descriptions = []
@@ -2005,11 +2006,11 @@ Return JSON: {{"canonical_name": {{"header": "matched_header", "confidence": 0.8
 Only include matches you're confident about (>0.7). Skip fields with no good match.
 """
 
-        response = client.responses.create(
-            model="gpt-4o-mini",  # Fast model for simple matching
-            input=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
+        response = ai_for(runtime, client).create_response({
+            "model": "gpt-4o-mini",  # Fast model for simple matching
+            "input": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+        })
 
         raw = response.output_text.strip()
         if raw.startswith("```"):
