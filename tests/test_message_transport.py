@@ -395,7 +395,8 @@ class CanonicalInboundMessageTests(unittest.TestCase):
         "body": {
             "contentType": "HTML",
             "content": "<html><body><p>Rent is $14 NNN.</p>"
-            "<blockquote>On Mon you wrote: what is the rent?</blockquote>"
+            "<p>On Mon 16 Aug 2026 at 09:00, An Operator wrote:</p>"
+            "<p>what is the rent?</p>"
             "</body></html>",
         },
         "internetMessageHeaders": [
@@ -477,6 +478,56 @@ class CanonicalInboundMessageTests(unittest.TestCase):
         self.assertIn("Rent is $14 NNN.", hydrated.text_for_ai)
         self.assertNotIn("what is the rent?", hydrated.text_for_ai)
         self.assertIn("what is the rent?", hydrated.full_text)
+
+    def test_canonical_text_matches_productions_own_pipeline_exactly(self):
+        """The two lanes must not merely both look right - they must be identical.
+
+        Recomputes production's exact inline sequence (normalize body, then
+        strip_email_quotes) and requires byte equality. An earlier draft of the
+        canonicalizer stripped <blockquote> with BeautifulSoup and produced
+        DIFFERENT text_for_ai than production for the same message; certification
+        would then have been measuring a quote stripper that ships nowhere.
+        """
+        from email_automation.utils import strip_email_quotes, strip_html_tags
+
+        _mt, graph, _fixture = self._sources()
+        hydrated = graph.hydrate({"id": self.GRAPH_MESSAGE["id"]})
+
+        body = self.GRAPH_MESSAGE["body"]
+        raw_content = body.get("content", "") or ""
+        content_type = (body.get("contentType") or "Text").upper()
+        production_full = (
+            strip_html_tags(raw_content) if content_type == "HTML" else raw_content
+        )
+        self.assertEqual(hydrated.full_text, production_full)
+        self.assertEqual(hydrated.text_for_ai, strip_email_quotes(production_full))
+
+    def test_inline_quote_without_a_canonical_marker_survives_into_text_for_ai(self):
+        """PRODUCT OBSERVATION, pinned so it is not mistaken for instrument error.
+
+        production's strip_email_quotes is line-marker based: it breaks on a line
+        matching "On ... wrote:", a From:/Sent: header pair, or a divider line. A
+        quote folded onto the SAME line as surrounding prose matches nothing and
+        survives into the text handed to the model.
+
+        That is a real product weakness on the re-asking axis (FDR-004 guarantee #6),
+        because the model then sees the operator's own earlier question as though it
+        were part of the broker's reply. It is recorded here rather than repaired,
+        because certification must reproduce production faithfully; fixing it is a
+        separate product decision with its own evidence.
+        """
+        from email_automation.message_transport import canonicalize_inbound_message
+
+        hydrated = canonicalize_inbound_message(
+            {
+                "id": "inline-quote",
+                "body": {
+                    "contentType": "HTML",
+                    "content": "<p>Rent is $14 NNN. On Mon you wrote: what is the rent?</p>",
+                },
+            }
+        )
+        self.assertIn("what is the rent?", hydrated.text_for_ai)
 
     def test_envelope_carries_identity_and_recipients(self):
         _mt, graph, _fixture = self._sources()

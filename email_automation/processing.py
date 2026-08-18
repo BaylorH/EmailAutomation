@@ -83,6 +83,7 @@ from .email import (
     _kill_switch_suppressed,
     resolve_outbound_mode,
 )
+from .message_transport import merge_readback, normalize_graph_body
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff,
@@ -6443,9 +6444,7 @@ def process_inbox_message(
         ).json() or {}
         full_body_resp = full_msg.get("body", {}) or {}
         has_attachments = bool(has_attachments or full_msg.get("hasAttachments"))
-        _raw_content = full_body_resp.get("content", "") or ""
-        _ctype = (full_body_resp.get("contentType") or "Text").upper()
-        _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
+        _full_text = normalize_graph_body(full_body_resp)
     except Exception as e:
         print(f"⚠️ Could not fetch full body for {msg_id}: {e}")
         _full_text = body_preview or ""
@@ -6454,7 +6453,7 @@ def process_inbox_message(
     # This prevents the AI from misinterpreting quoted content as the broker's message
     _text_for_ai = strip_email_quotes(_full_text)
 
-    merged_msg = {**msg, **{k: v for k, v in full_msg.items() if k not in msg or not msg.get(k)}}
+    merged_msg = merge_readback(msg, full_msg)
     to_recipients = _recipient_email_addresses(merged_msg.get("toRecipients"))
     cc_recipients = _recipient_email_addresses(merged_msg.get("ccRecipients"))
     reply_to_recipients = _recipient_email_addresses(merged_msg.get("replyTo"))
@@ -9097,16 +9096,14 @@ def _save_message_to_thread(
                 timeout=30
             )
         ).json() or {}
-        merged_msg = {**msg, **{k: v for k, v in full_msg.items() if k not in msg or not msg.get(k)}}
+        merged_msg = merge_readback(msg, full_msg)
         cc_recipients = _recipient_email_addresses(merged_msg.get("ccRecipients"))
         reply_to_recipients = _recipient_email_addresses(merged_msg.get("replyTo"))
         sender_addr = _recipient_email_address(merged_msg.get("sender"))
         source_envelope = _source_message_envelope(merged_msg)
         full_body_resp = full_msg.get("body", {}) or {}
         has_attachments = bool(has_attachments or full_msg.get("hasAttachments"))
-        _raw_content = full_body_resp.get("content", "") or ""
-        _ctype = (full_body_resp.get("contentType") or "Text").upper()
-        _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
+        _full_text = normalize_graph_body(full_body_resp)
     except Exception as e:
         raise RetryableProcessingError(
             "Batched message full readback failed; leaving the thread retryable"

@@ -29,14 +29,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional, Protocol, Tuple
 
-from bs4 import BeautifulSoup
-
-from .utils import strip_html_tags
-
-# Elements that carry quoted history rather than what the broker just wrote.
-QUOTE_ELEMENTS = ("blockquote",)
-QUOTE_CLASS_MARKERS = ("gmail_quote", "moz-cite-prefix", "OutlookMessageHeader")
-
+from .utils import strip_email_quotes, strip_html_tags
 
 class DeliveryKind(str, Enum):
     NEW = "new"
@@ -144,37 +137,51 @@ def _header_value(headers: Tuple[Mapping[str, str], ...], wanted: str) -> str:
     return ""
 
 
+def normalize_graph_body(body: Mapping[str, Any]) -> str:
+    """Byte-identical to the inline normalization at processing.py:6446-6448 and
+    processing.py:9107-9109, which were exact duplicates of each other.
+
+    Extracted rather than rewritten. The three lines are reproduced exactly -
+    including the "Text" default and the unstripped ``.upper()`` - because the point
+    is to have ONE implementation, not a better one. Improving it here would be a
+    behavior change smuggled into a refactor.
+    """
+    raw_content = body.get("content", "") or ""
+    content_type = (body.get("contentType") or "Text").upper()
+    return strip_html_tags(raw_content) if content_type == "HTML" else raw_content
+
+
+def merge_readback(summary: Mapping[str, Any], readback: Mapping[str, Any]) -> dict:
+    """Byte-identical to the inline merge at processing.py:6457 and :9100.
+
+    Readback values fill only keys the scan-time summary lacks or left falsy, so a
+    populated summary field always wins.
+    """
+    return {
+        **summary,
+        **{k: v for k, v in readback.items() if k not in summary or not summary.get(k)},
+    }
+
+
 def _body_text(raw: Mapping[str, Any]) -> Tuple[str, str]:
-    """Return (full_text, text_for_ai).
+    """Return (full_text, text_for_ai) using PRODUCTION's exact pipeline.
 
     ``full_text`` keeps quoted history because thread reconstruction and audit need
     it. ``text_for_ai`` drops it, because a model shown the operator's own earlier
     question will happily "extract" it back as though the broker had answered - the
-    exact mechanism behind SiteSift re-asking questions that were already answered.
+    mechanism behind SiteSift re-asking questions already answered.
+
+    This deliberately calls production's ``strip_email_quotes`` rather than a
+    smarter HTML-aware stripper. An earlier draft removed <blockquote> elements with
+    BeautifulSoup and produced DIFFERENT text_for_ai than production for the same
+    message - certification would then have been measuring a quote stripper that
+    ships nowhere. Certification must reproduce production faithfully, weaknesses
+    included; production's line-marker stripper only fires on a canonical marker
+    such as a line matching "On ... wrote:", and that limitation is a PRODUCT
+    observation to record, never something the instrument silently repairs.
     """
-    body = raw.get("body") or {}
-    content = str(body.get("content") or "")
-    content_type = str(body.get("contentType") or "Text").strip().upper()
-
-    if content_type != "HTML":
-        full = content.strip()
-        return full, full
-
-    full = strip_html_tags(content).strip()
-
-    soup = BeautifulSoup(content, "html.parser")
-    for element_name in QUOTE_ELEMENTS:
-        for element in soup.find_all(element_name):
-            element.decompose()
-    for marker in QUOTE_CLASS_MARKERS:
-        for element in soup.find_all(attrs={"class": marker}):
-            element.decompose()
-    # Outlook marks the quoted original with this id on the wrapping div.
-    for element in soup.find_all(attrs={"id": "divRplyFwdMsg"}):
-        element.decompose()
-
-    without_quotes = strip_html_tags(str(soup)).strip()
-    return full, without_quotes
+    full = normalize_graph_body(raw.get("body") or {})
+    return full, strip_email_quotes(full)
 
 
 def _attachments(raw: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
