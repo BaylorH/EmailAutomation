@@ -26,6 +26,8 @@ no credential. That is the same defect backlog #84 exists to remove from
 
 from __future__ import annotations
 
+import hashlib
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -965,6 +967,49 @@ def clock_for(
     if runtime is not None and getattr(runtime, "now", None) is not None:
         return runtime.now
     return ambient
+
+
+def log_identity(runtime: Optional["AutomationRuntime"], value: Optional[str]) -> str:
+    """Return an identity safe to write to a DURABLE log for this request.
+
+    Ordinary production is returned UNCHANGED. Operators debug real campaigns by
+    grepping for a real address, and quietly redacting that would trade a
+    certification property for an operational regression - which the plan
+    explicitly forbids ("ordinary operational meaning must remain available").
+
+    A certification run gets a stable digest instead. Application logs are
+    durable and centrally aggregated, so a fixture identity written there
+    outlives the run, the cleanup, and the fixture itself. The digest still
+    correlates every line of one run to the same subject, which is all an
+    operator needs from a log they are not entitled to read identities from.
+    """
+    text = (value or "").strip()
+    if not text:
+        return "unknown"
+    if not is_certification(runtime):
+        return text
+    digest = hashlib.sha256(
+        f"{runtime.certification_run_id}\x1f{text.lower()}".encode("utf-8")
+    ).hexdigest()[:12]
+    return f"subject-{digest}"
+
+
+_LOG_ADDRESS_RE = re.compile(r"[A-Z0-9._%+\-']+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+
+def log_reason(runtime: Optional["AutomationRuntime"], text: Optional[str]) -> str:
+    """Scrub identities out of a free-text reason before it reaches a durable log.
+
+    Guard reasons are assembled from real values on purpose - an operator
+    reviewing a dead-lettered item needs to know WHICH recipient mismatched - so
+    the reason stored in Firestore keeps them. It is only the LOG copy that is
+    sanitized, because logs are centrally aggregated and outlive the fixture.
+    Ordinary production is returned unchanged.
+    """
+    body = text or ""
+    if not is_certification(runtime) or not body:
+        return body
+    return _LOG_ADDRESS_RE.sub(lambda m: log_identity(runtime, m.group(0)), body)
 
 
 def is_certification(runtime: Optional["AutomationRuntime"]) -> bool:

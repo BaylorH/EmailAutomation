@@ -281,7 +281,9 @@ if __name__ == "__main__":
 
 import os
 import re
-from contextlib import ExitStack
+import io
+import logging
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -851,3 +853,159 @@ class FirstSliceClientIsolationTests(unittest.TestCase):
         self.assertIsNot(first["store"], second["store"])
         self.assertIsNot(first["runtime"].counters, second["runtime"].counters)
         self.assertIsNot(first["runtime"].effect_scope, second["runtime"].effect_scope)
+
+
+# ---------------------------------------------------------------------------
+# Task 7G - no fixture value reaches a durable log
+# ---------------------------------------------------------------------------
+
+
+class CertificationLogCanaryTests(unittest.TestCase):
+    """Drive the real slice with canaries and read what the logs actually said.
+
+    A static scan for "risky" interpolations flagged 75 sites here, most of them
+    harmless and none of them proof. Driving the lane and reading the captured
+    output found FIVE real leaks, all of the same value - the recipient identity
+    - and three of the five were only reachable on FAILURE paths. The happy path
+    alone would have reported clean, which is why the probe covers guard
+    rejections and dead-lettering too.
+    """
+
+    CANARIES = {
+        "body": "CANARYBODYaaa111",
+        "name": "CANARYNAMEccc333",
+    }
+
+    def _capture(self, mutate=None):
+        """Run the certification slice and return everything it logged."""
+        original_seed = FirstSliceClientIsolationTests._seed
+
+        def seeded(inner_self):
+            store = original_seed(inner_self)
+            item = store.data[f"{FIXTURE_PREFIX}/outbox/outbox-1"]
+            item["script"] = (
+                f"Hi {self.CANARIES['name']}, could you share the asking rent "
+                f"for {self.CANARIES['body']}?"
+            )
+            item["contactName"] = self.CANARIES["name"]
+            if mutate:
+                mutate(store)
+            return store
+
+        FirstSliceClientIsolationTests._seed = seeded
+        try:
+            case = FirstSliceClientIsolationTests(
+                "test_the_slice_completes_without_touching_any_ambient_client"
+            )
+            stream = io.StringIO()
+            log_stream = io.StringIO()
+            handler = logging.StreamHandler(log_stream)
+            logging.getLogger().addHandler(handler)
+            try:
+                with redirect_stdout(stream), redirect_stderr(stream):
+                    try:
+                        case._drive_run()
+                    except Exception:  # a guard path may abort; its LOGS still count
+                        pass
+            finally:
+                logging.getLogger().removeHandler(handler)
+            return stream.getvalue() + log_stream.getvalue()
+        finally:
+            FirstSliceClientIsolationTests._seed = original_seed
+
+    # the paths that actually reach a log statement
+    def _row_mismatch(self, store):
+        store.data[f"{FIXTURE_PREFIX}/outbox/outbox-1"]["rowNumber"] = 999
+
+    def _unresolved_placeholder(self, store):
+        item = store.data[f"{FIXTURE_PREFIX}/outbox/outbox-1"]
+        item["script"] = f"Hi [NAME], about {self.CANARIES['body']}?"
+        item.pop("contactName", None)
+
+    def _unsafe_body(self, store):
+        store.data[f"{FIXTURE_PREFIX}/outbox/outbox-1"]["script"] = (
+            f"Hi {self.CANARIES['name']}, I guarantee {self.CANARIES['body']} "
+            "and will sign the lease myself."
+        )
+
+    def _paths(self):
+        return {
+            "happy": None,
+            "row mismatch": self._row_mismatch,
+            "unresolved placeholder": self._unresolved_placeholder,
+            "unsafe body": self._unsafe_body,
+        }
+
+    def test_no_recipient_identity_reaches_a_durable_log(self):
+        """Logs are aggregated and outlive the run, the cleanup, and the fixture."""
+        for label, mutate in self._paths().items():
+            with self.subTest(path=label):
+                captured = self._capture(mutate)
+                self.assertNotIn(
+                    FIXTURE_RECIPIENT,
+                    captured,
+                    f"the recipient identity reached the log on the {label} path",
+                )
+
+    def test_no_message_body_or_contact_name_reaches_a_durable_log(self):
+        for label, mutate in self._paths().items():
+            for canary, token in self.CANARIES.items():
+                with self.subTest(path=label, canary=canary):
+                    self.assertNotIn(token, self._capture(mutate))
+
+    def test_no_fixture_resource_identity_reaches_a_durable_log(self):
+        captured = self._capture()
+        for label, token in (("sheet", FIXTURE_SHEET), ("user", FIXTURE_UID)):
+            with self.subTest(resource=label):
+                self.assertNotIn(token, captured)
+
+    def test_the_run_still_says_something_useful(self):
+        """Sanitizing must not silence the lane - operational meaning survives."""
+        captured = self._capture()
+        self.assertIn("Created draft", captured)
+        self.assertIn("Sent and indexed email", captured)
+        self.assertIn("subject-", captured, "no stable subject digest was emitted")
+
+    def test_the_same_subject_correlates_across_lines_within_one_run(self):
+        """A digest that did not correlate would be useless to an operator."""
+        captured = self._capture()
+        digests = set(re.findall(r"subject-[0-9a-f]{12}", captured))
+        self.assertEqual(
+            len(digests), 1, f"one subject should yield one digest, got {digests}"
+        )
+
+    def test_production_logging_is_deliberately_unchanged(self):
+        """The seam must not have quietly redacted real operations.
+
+        Redacting production logs would trade a certification property for an
+        operational regression: operators debug live campaigns by grepping for a
+        real address.
+        """
+        self.assertEqual(ar.log_identity(None, "broker@example.com"), "broker@example.com")
+        self.assertEqual(
+            ar.log_identity(ar.production_runtime(), "broker@example.com"),
+            "broker@example.com",
+        )
+        self.assertEqual(
+            ar.log_reason(None, "queued=broker@example.com mismatched"),
+            "queued=broker@example.com mismatched",
+        )
+
+    def test_a_certification_runtime_digests_rather_than_drops(self):
+        runtime = ar.certification_runtime(run_id="cert-log", scope="logs")
+        masked = ar.log_identity(runtime, "broker@example.com")
+        self.assertTrue(masked.startswith("subject-"))
+        self.assertNotIn("broker", masked)
+        self.assertEqual(masked, ar.log_identity(runtime, "BROKER@example.com"))
+
+        other = ar.certification_runtime(run_id="cert-log-2", scope="logs")
+        self.assertNotEqual(masked, ar.log_identity(other, "broker@example.com"))
+
+    def test_reason_scrubbing_keeps_the_operational_sentence(self):
+        runtime = ar.certification_runtime(run_id="cert-log", scope="logs")
+        scrubbed = ar.log_reason(
+            runtime, "Queued recipient does not match sheet row 7; queued=broker@example.com"
+        )
+        self.assertIn("does not match sheet row 7", scrubbed)
+        self.assertNotIn("broker@example.com", scrubbed)
+        self.assertIn("subject-", scrubbed)

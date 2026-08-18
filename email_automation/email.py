@@ -31,7 +31,13 @@ from .sheets import (
     is_retryable_sheets_error,
 )
 from .notifications import delete_notification_and_decrement_counters
-from .automation_runtime import sheets_for, is_certification, CounterReservation
+from .automation_runtime import (
+    sheets_for,
+    is_certification,
+    log_identity,
+    log_reason,
+    CounterReservation,
+)
 from .message_transport import (
     DeliveryKind,
     GraphDraftDeliveryTransport,
@@ -3597,7 +3603,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             transport = _delivery_transport_for(runtime, headers, base)
             prepared = transport.prepare(outbound_draft)
             draft_id = prepared.provider_message_id
-            print(f"📝 Created draft {draft_id} for {addr}")
+            print(f"📝 Created draft {draft_id} for {log_identity(runtime, addr)}")
 
             internet_message_id = prepared.internet_message_id
             conversation_id = prepared.conversation_id
@@ -3753,7 +3759,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                     print(f"⚠️ Failed to index conversation ID (fallback) - primary index succeeded")
 
             results["sent"].append(addr)
-            print(f"✅ Sent and indexed email to {addr} (threadId: {root_id})")
+            print(f"✅ Sent and indexed email to {log_identity(runtime, addr)} (threadId: {root_id})")
 
             # Schedule follow-up if configured
             if followup_config and followup_config.get("enabled", False):
@@ -3811,7 +3817,7 @@ def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str, runtime
         "updatedAt": SERVER_TIMESTAMP,
     }, runtime=runtime)
     doc_ref.delete()
-    print(f"☠️ Moved item {doc_ref.id} to dead-letter queue: {reason}")
+    print(f"☠️ Moved item {doc_ref.id} to dead-letter queue: {log_reason(runtime, reason)}")
 
 
 def _record_outbox_reconciliation(
@@ -5480,7 +5486,7 @@ def _send_single_outbox_item(
                     email_scripts[0] if email_scripts else "",
                     recipient_contact_name,
                 )
-                print(f"  → Using exact outbox script for {recipient_email}")
+                print(f"  → Using exact outbox script for {log_identity(runtime, recipient_email)}")
             else:
                 selected_script = _select_script_for_recipient(
                     user_id, recipient_email, email_scripts, contact_name=recipient_contact_name,
@@ -5495,7 +5501,7 @@ def _send_single_outbox_item(
                 recipient_contact_name_failure_reason,
                 runtime=runtime,
             ):
-                print(f"   🛑 Blocked unresolved contact name for {recipient_email}; manual review required")
+                print(f"   🛑 Blocked unresolved contact name for {log_identity(runtime, recipient_email)}; manual review required")
                 return
 
             if _dead_letter_invalid_initial_outreach_column_contract_if_needed(
