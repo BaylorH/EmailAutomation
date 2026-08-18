@@ -27,6 +27,7 @@ SUPPORT_MODULES = {
     "email_automation/logging.py": "logging infrastructure, not a feature",
     "email_automation/email_operations.py": "LEGACY disabled send path; kept dead and guarded by tests/test_legacy_email_operations_disabled.py",
     "email_automation/operator_replay.py": "local, Baylor/BP21-only operator recovery utility; not deployed or normal-user callable",
+    "email_automation/automation_runtime.py": "pure request-scoped runtime bundle: immutable dependency set plus counter store, effect scope, and provider transports. Owns no product feature - it is the isolation seam that keeps a certification run and an ordinary production run from sharing a capture, clock, counter, source, transport, run id, or scope. Resolves provider clients lazily so building one needs no credential.",
     "email_automation/message_transport.py": "pure acquisition boundary: canonical inbound/conversation projection plus source and transport protocols. Owns no product feature - it is the seam that lets the Graph lane and the certification fixture lane produce byte-equal state. Deliberately imports no provider client so certification tests collect without credentials.",
 }
 
