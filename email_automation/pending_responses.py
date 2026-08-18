@@ -276,7 +276,7 @@ def _get_local_campaign_suppression(getter=None):
     return getter()
 
 
-def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+def process_pending_responses(user_id: str, headers: Dict[str, str], runtime=None) -> List[Dict[str, Any]]:
     """
     Retry sending all pending responses.
 
@@ -452,7 +452,8 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
                 body=response_body,
                 current_msg_id=msg_id,
                 recipient=recipient,
-                thread_id=thread_id
+                thread_id=thread_id,
+                runtime=runtime,
             )
 
             if sent:

@@ -14,6 +14,7 @@ os.environ.setdefault(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
+from email_automation import automation_runtime as ar
 from email_automation import pending_responses, processing
 from email_automation import reply_reviews
 from email_automation.campaign_safety import CampaignAutomationDecision
@@ -850,6 +851,148 @@ class PendingResponsesTests(unittest.TestCase):
         dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
         self.assertEqual(dead_letter["source"], "pendingResponses")
         self.assertIn("Sent Items retry guard could not verify prior send", dead_letter["failureReason"])
+
+
+class PendingResponseDeliveryRoutingTests(unittest.TestCase):
+    """Task 7B: pending-response retries reach the shared delivery boundary.
+
+    This lane never held a Graph send call of its own - it delegates to the
+    automatic-reply lane, which Task 7A converged. So the property to prove is
+    not "the send moved" but that the runtime REACHES the send: a retry driven
+    with a certification runtime must capture, and it must do so while every
+    direct Graph verb is unreachable.
+    """
+
+    _mock_clients_module = PendingResponsesTests._mock_clients_module
+
+    def _allow(self):
+        return patch.object(
+            pending_responses,
+            "get_client_automation_decision",
+            return_value=CampaignAutomationDecision(
+                # A persisted columnConfig is required: an ALLOW decision without
+                # one fails the column contract and dead-letters before delivery.
+                state="allow", reason="",
+                client_data={"status": "live", "columnConfig": get_default_column_config()},
+                metadata={"terminal": False, "stopKind": "none"},
+            ),
+        )
+
+    def _pending_doc(self):
+        return FakeDoc("thread-retry", {
+            "threadId": "thread-retry",
+            "msgId": "message-retry-1",
+            "recipient": "broker@fixture.example.com",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
+            "clientId": "client-1",
+            "attempts": 0,
+        })
+
+    def _runtime(self):
+        return ar.certification_runtime(
+            run_id="cert-run-7b",
+            scope="pending-response-retry",
+            conversation_snapshot={
+                "reply_target": {
+                    "id": "message-retry-1",
+                    "from": {"emailAddress": {"address": "broker@fixture.example.com"}},
+                    "toRecipients": [
+                        {"emailAddress": {"address": "sender@fixture.example.com"}}
+                    ],
+                    "ccRecipients": [],
+                    "body": {"contentType": "Text", "content": "Original enquiry"},
+                },
+                "prior_messages": [],
+                "sent_receipts": [],
+            },
+        )
+
+    def test_the_runtime_reaches_the_reply_lane(self):
+        """Without this, a certification retry would silently use production."""
+        seen = {}
+
+        def fake_send_reply_in_thread(**kwargs):
+            seen.update(kwargs)
+            return True
+
+        doc = self._pending_doc()
+        runtime = self._runtime()
+        with self._mock_clients_module(FakeFirestore([doc])), patch.object(
+            processing, "send_reply_in_thread", new=fake_send_reply_in_thread
+        ), patch.object(
+            pending_responses, "find_matching_sent_message_for_retry", return_value=None
+        ), patch.object(
+            # A successful retry recomputes client completion against the real
+            # store; the fixture store here is not shaped for that walk.
+            processing, "_maybe_mark_client_completed"
+        ), self._allow():
+            pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}, runtime=runtime
+            )
+
+        self.assertIs(seen.get("runtime"), runtime)
+
+    def test_an_ordinary_retry_still_passes_no_runtime(self):
+        """Production must be untouched: omitting a runtime means today's behavior."""
+        seen = {}
+
+        def fake_send_reply_in_thread(**kwargs):
+            seen.update(kwargs)
+            return True
+
+        doc = self._pending_doc()
+        with self._mock_clients_module(FakeFirestore([doc])), patch.object(
+            processing, "send_reply_in_thread", new=fake_send_reply_in_thread
+        ), patch.object(
+            pending_responses, "find_matching_sent_message_for_retry", return_value=None
+        ), patch.object(
+            # A successful retry recomputes client completion against the real
+            # store; the fixture store here is not shaped for that walk.
+            processing, "_maybe_mark_client_completed"
+        ), self._allow():
+            pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertIsNone(seen.get("runtime"))
+
+    def test_retry_and_terminalization_semantics_survive_a_failed_capture(self):
+        """A refused delivery must retry exactly as it does in production."""
+        doc = self._pending_doc()
+
+        def fake_send_reply_in_thread(**_kwargs):
+            return False
+
+        with self._mock_clients_module(FakeFirestore([doc])), patch.object(
+            processing, "send_reply_in_thread", new=fake_send_reply_in_thread
+        ), patch.object(
+            pending_responses, "find_matching_sent_message_for_retry", return_value=None
+        ), self._allow():
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}, runtime=self._runtime()
+            )
+
+        self.assertFalse(doc.reference.deleted)
+        self.assertEqual(1, doc.reference.update_calls[-1]["attempts"])
+        self.assertEqual("send_reply_in_thread returned False", states[0]["error"])
+
+    def test_a_successful_capture_terminalizes_the_pending_item(self):
+        doc = self._pending_doc()
+
+        def fake_send_reply_in_thread(**_kwargs):
+            return True
+
+        with self._mock_clients_module(FakeFirestore([doc])), patch.object(
+            processing, "send_reply_in_thread", new=fake_send_reply_in_thread
+        ), patch.object(
+            pending_responses, "find_matching_sent_message_for_retry", return_value=None
+        ), patch.object(processing, "_maybe_mark_client_completed"), self._allow():
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}, runtime=self._runtime()
+            )
+
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual("healthy", states[0]["status"])
 
 
 if __name__ == "__main__":
