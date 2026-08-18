@@ -8,6 +8,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import openai
 from .app_config import FIREBASE_API_KEY, OPENAI_API_KEY, OPENAI_ASSISTANT_MODEL
+from .automation_runtime import firestore_for
 
 # Initialize clients
 _fs = firestore.Client()
@@ -40,9 +41,11 @@ def _sheets_client():
     sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
     return sheets
 
-def _get_sheet_id_or_fail(uid: str, client_id: str) -> str:
+def _get_sheet_id_or_fail(uid: str, client_id: str, runtime=None) -> str:
+    fs = firestore_for(runtime, _fs)
+
     # Try active clients
-    doc_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
+    doc_ref = fs.collection("users").document(uid).collection("clients").document(client_id)
     doc_snapshot = doc_ref.get()
     if doc_snapshot.exists:
         doc_data = doc_snapshot.to_dict() or {}
@@ -51,7 +54,7 @@ def _get_sheet_id_or_fail(uid: str, client_id: str) -> str:
             return sid
 
     # Try archived clients (emails might keep flowing after archive)
-    archived_doc_ref = _fs.collection("users").document(uid).collection("archivedClients").document(client_id)
+    archived_doc_ref = fs.collection("users").document(uid).collection("archivedClients").document(client_id)
     archived_doc_snapshot = archived_doc_ref.get()
     if archived_doc_snapshot.exists:
         archived_doc_data = archived_doc_snapshot.to_dict() or {}

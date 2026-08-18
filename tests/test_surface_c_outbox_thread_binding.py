@@ -338,7 +338,7 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
         send_outbox_as_reply.assert_called_once()
         self.assertTrue(doc.reference.deleted)
         self.assertEqual([], _dead_letter_reasons(fake_fs))
-        highlight_row.assert_called_once_with("sheet-1", 42)
+        highlight_row.assert_called_once_with("sheet-1", 42, runtime=None)
         resumed = [p for p in _thread_status_sets(fake_fs) if p.get("status") == "active"]
         self.assertEqual(1, len(resumed))
         self.assertEqual("waiting", resumed[0].get("followUpStatus"))

@@ -366,9 +366,9 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
             {"doc": doc, "data": data},
         )
 
-        _get_thread_row_number.assert_called_once_with("uid-1", "thread-1")
+        _get_thread_row_number.assert_called_once_with("uid-1", "thread-1", runtime=None)
         _find_row_by_email.assert_not_called()
-        highlight_row.assert_called_once_with("sheet-1", 9)
+        highlight_row.assert_called_once_with("sheet-1", 9, runtime=None)
         send_and_index_email.assert_not_called()
 
 

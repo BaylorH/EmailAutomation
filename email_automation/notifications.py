@@ -4,6 +4,7 @@ import re
 from typing import Optional, List, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs
+from .automation_runtime import firestore_for
 from google.cloud import firestore
 
 logger = logging.getLogger(__name__)
@@ -32,9 +33,10 @@ def _decrement_notification_rollups(client_data: Dict[str, Any], kind: Optional[
     }
 
 
-def delete_notification_and_decrement_counters(uid: str, client_id: str, notification_id: str) -> bool:
+def delete_notification_and_decrement_counters(uid: str, client_id: str, notification_id: str, runtime=None) -> bool:
     """Delete a notification and keep the parent client rollup counters in sync."""
-    client_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
+    fs = firestore_for(runtime, _fs)
+    client_ref = fs.collection("users").document(uid).collection("clients").document(client_id)
     notif_ref = client_ref.collection("notifications").document(notification_id)
 
     @firestore.transactional
@@ -52,7 +54,7 @@ def delete_notification_and_decrement_counters(uid: str, client_id: str, notific
         transaction.set(client_ref, _decrement_notification_rollups(client_data, kind), merge=True)
         return True
 
-    transaction = _fs.transaction()
+    transaction = fs.transaction()
     return bool(delete_with_counters(transaction))
 
 

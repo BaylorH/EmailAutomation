@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from google.cloud.firestore_v1.field_path import FieldPath
+from .automation_runtime import AutomationRuntime, firestore_for
 from .clients import _fs
 from .utils import b64url_id, clean_email_content, normalize_message_id, strip_email_quotes
 
@@ -103,12 +104,14 @@ def _outbound_history_match(real_payload: Dict[str, Any], synthetic_payload: Dic
     return True
 
 
-def _delete_synthetic_outbound_duplicates(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any]) -> None:
+def _delete_synthetic_outbound_duplicates(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any],
+                                          runtime: Optional[AutomationRuntime] = None) -> None:
     if not _is_real_graph_outbound(message_id, payload):
         return
 
     try:
-        messages_ref = (_fs.collection("users").document(user_id)
+        fs = firestore_for(runtime, _fs)
+        messages_ref = (fs.collection("users").document(user_id)
                         .collection("threads").document(thread_id)
                         .collection("messages"))
         for doc in messages_ref.stream():
@@ -174,10 +177,12 @@ def get_thread_status(user_id: str, thread_id: str) -> Optional[str]:
         print(f"❌ Failed to get thread status: {e}")
         return None
 
-def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any]) -> bool:
+def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any],
+                     runtime: Optional[AutomationRuntime] = None) -> bool:
     """Save or update thread root document. Returns True on success, False on failure."""
     try:
-        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(root_id)
+        fs = firestore_for(runtime, _fs)
+        thread_ref = fs.collection("users").document(user_id).collection("threads").document(root_id)
         meta["updatedAt"] = SERVER_TIMESTAMP
         if "createdAt" not in meta:
             meta["createdAt"] = SERVER_TIMESTAMP
@@ -189,13 +194,15 @@ def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any]) -> bool:
         print(f"❌ Failed to save thread root {root_id}: {e}")
         return False
 
-def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any]) -> bool:
+def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any],
+                 runtime: Optional[AutomationRuntime] = None) -> bool:
     """Save message to thread. Returns True on success, False on failure."""
     try:
-        msg_ref = (_fs.collection("users").document(user_id)
+        fs = firestore_for(runtime, _fs)
+        msg_ref = (fs.collection("users").document(user_id)
                    .collection("threads").document(thread_id)
                    .collection("messages").document(message_id))
-        _delete_synthetic_outbound_duplicates(user_id, thread_id, message_id, payload)
+        _delete_synthetic_outbound_duplicates(user_id, thread_id, message_id, payload, runtime=runtime)
         payload["createdAt"] = SERVER_TIMESTAMP
         msg_ref.set(payload, merge=True)
         print(f"💾 Saved message {message_id} to thread {thread_id}")
@@ -216,16 +223,18 @@ def _message_index_candidates(message_id: str) -> List[str]:
     return lookup_candidates
 
 
-def index_message_id(user_id: str, message_id: str, thread_id: str) -> bool:
+def index_message_id(user_id: str, message_id: str, thread_id: str,
+                     runtime: Optional[AutomationRuntime] = None) -> bool:
     """Index message ID for O(1) lookup. Returns True on success, False on failure."""
     try:
+        fs = firestore_for(runtime, _fs)
         lookup_candidates = _message_index_candidates(message_id)
         if not lookup_candidates:
             print("⚠️ Empty message_id provided, skipping msgIndex write")
             return False
         canonical_message_id = lookup_candidates[0]
         encoded_id = b64url_id(canonical_message_id)
-        index_ref = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id)
+        index_ref = fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id)
         index_ref.set({"threadId": thread_id}, merge=True)
         print(f"🔍 Indexed message ID: {canonical_message_id[:50]}... -> {thread_id}")
         return True
@@ -233,13 +242,15 @@ def index_message_id(user_id: str, message_id: str, thread_id: str) -> bool:
         print(f"❌ Failed to index message {message_id}: {e}")
         return False
 
-def lookup_thread_by_message_id(user_id: str, message_id: str) -> Optional[str]:
+def lookup_thread_by_message_id(user_id: str, message_id: str,
+                                runtime: Optional[AutomationRuntime] = None) -> Optional[str]:
     """Look up thread ID by message ID."""
     try:
+        fs = firestore_for(runtime, _fs)
         lookup_candidates = _message_index_candidates(message_id)
         for candidate in lookup_candidates:
             encoded_id = b64url_id(candidate)
-            doc = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id).get()
+            doc = fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id).get()
             if doc.exists:
                 return doc.to_dict().get("threadId")
         return None
@@ -247,13 +258,15 @@ def lookup_thread_by_message_id(user_id: str, message_id: str) -> Optional[str]:
         print(f"❌ Failed to lookup message {message_id}: {e}")
         return None
 
-def index_conversation_id(user_id: str, conversation_id: str, thread_id: str) -> bool:
+def index_conversation_id(user_id: str, conversation_id: str, thread_id: str,
+                          runtime: Optional[AutomationRuntime] = None) -> bool:
     """Index conversation ID for fallback lookup. Returns True on success, False on failure."""
     if not conversation_id:
         print(f"⚠️ Empty conversation_id provided, skipping index")
         return False  # Don't pretend success when nothing was indexed
     try:
-        conv_ref = _fs.collection("users").document(user_id).collection("convIndex").document(conversation_id)
+        fs = firestore_for(runtime, _fs)
+        conv_ref = fs.collection("users").document(user_id).collection("convIndex").document(conversation_id)
         conv_ref.set({"threadId": thread_id}, merge=True)
         print(f"🔍 Indexed conversation ID: {conversation_id} -> {thread_id}")
         return True

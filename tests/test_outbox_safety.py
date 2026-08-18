@@ -1522,7 +1522,9 @@ class OutboxSafetyTests(unittest.TestCase):
             )
 
         self.assertTrue(outbox_ref.deleted)
-        delete_notification.assert_called_once_with("uid-1", "client-1", "notification-1")
+        delete_notification.assert_called_once_with(
+            "uid-1", "client-1", "notification-1", runtime=None
+        )
         thread_set = fake_fs.set_calls[0]
         self.assertEqual(
             thread_set[0],
@@ -1614,7 +1616,9 @@ class OutboxSafetyTests(unittest.TestCase):
 
         send_outbox_as_reply.assert_called_once()
         save_outbox_reply_message.assert_called_once()
-        delete_notification.assert_called_once_with("uid-1", "client-1", "notification-1")
+        delete_notification.assert_called_once_with(
+            "uid-1", "client-1", "notification-1", runtime=None
+        )
         self.assertTrue(doc.reference.deleted)
         audit_payload = _action_audit_payload(fake_fs, "uid-1", "audit-dashboard-reply")
         self.assertEqual("sent", audit_payload["status"])

@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .clients import _fs
+from .automation_runtime import clock_for, firestore_for
 from .utils import (
     exponential_backoff_request,
     format_email_body_with_footer,
@@ -3987,7 +3988,8 @@ def _mark_followup_complete(user_id: str, thread_id: str, reason: str):
 def schedule_followup_for_thread(
     user_id: str,
     thread_id: str,
-    followup_config: Dict
+    followup_config: Dict,
+    runtime=None
 ):
     """
     Schedule follow-ups for a newly sent thread.
@@ -3999,6 +4001,7 @@ def schedule_followup_for_thread(
         followup_config: Configuration from outbox containing:
             - enabled: bool
             - followUps: [{waitTime, waitUnit, message}, ...]
+        runtime: Request runtime; None means ordinary production
     """
     if not followup_config or not followup_config.get("enabled", False):
         return
@@ -4006,6 +4009,9 @@ def schedule_followup_for_thread(
     followups = followup_config.get("followUps", [])
     if not followups:
         return
+
+    fs = firestore_for(runtime, _fs)
+    now = clock_for(runtime, lambda: datetime.now(timezone.utc))
 
     # Client-written config is untrusted: reject out-of-range waits or an
     # oversized sequence fail-closed (disabled + flagged for review) so the
@@ -4016,7 +4022,7 @@ def schedule_followup_for_thread(
             f"   🛑 Rejecting follow-up config for thread {thread_id[:20]}...: "
             f"{invalid_reason}"
         )
-        _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
+        fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
             "followUpConfig": {
                 "enabled": False,
                 "invalidReason": invalid_reason,
@@ -4034,7 +4040,7 @@ def schedule_followup_for_thread(
     delta, wait_time, wait_unit = _followup_wait_delta(first_followup, default_wait=5)
 
     next_followup_at = _next_business_followup_time(
-        datetime.now(timezone.utc) + delta,
+        now() + delta,
         followup_config,
     )
 
@@ -4049,7 +4055,7 @@ def schedule_followup_for_thread(
         "lastFollowUpSentAt": None
     }
 
-    _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
+    fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
         "followUpConfig": thread_followup_config,
         "followUpStatus": "waiting",
         "hasInboundReply": False,

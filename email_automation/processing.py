@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
+from .automation_runtime import firestore_for
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
 from .sheets import AssetLinkWriteError, format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
@@ -5373,7 +5374,7 @@ def _store_contact_optout(user_id: str, email: str, reason: str, thread_id: str)
         return False
 
 
-def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
+def is_contact_opted_out(user_id: str, email: str, runtime=None) -> Optional[Dict]:
     """
     Check if a contact has opted out of communications.
     Returns the opt-out record if found, None otherwise.
@@ -5400,8 +5401,9 @@ def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
 
+        fs = firestore_for(runtime, _fs)
         optout_collection = (
-            _fs.collection("users").document(user_id).collection("optedOutContacts")
+            fs.collection("users").document(user_id).collection("optedOutContacts")
         )
         for candidate in candidates:
             email_hash = hashlib.sha256(candidate.encode('utf-8')).hexdigest()[:16]

@@ -31,6 +31,7 @@ from .sheets import (
     is_retryable_sheets_error,
 )
 from .notifications import delete_notification_and_decrement_counters
+from .automation_runtime import sheets_for, is_certification, CounterReservation
 from .utils import normalize_message_id
 from .sent_mail_guard import (
     SentMailGuardLookupError,
@@ -272,6 +273,80 @@ def _increment_global_send_count(fs, day_key: str, amount: int) -> None:
     )
 
 
+def _fs_for(runtime):
+    """Resolve the Firestore client for this request.
+
+    ``clients`` builds ``firestore.Client()`` at IMPORT time, so importing it is
+    itself an effect. Ordinary production keeps the existing lazy import; a
+    request carrying its own scoped client never reaches for ``clients`` at all.
+    """
+    if runtime is not None and runtime.firestore is not None:
+        return runtime.firestore
+    from .clients import _fs
+    return _fs
+
+
+def _send_counter_scope_key(user_id: str, day_key: str, scope: str) -> str:
+    return f"{user_id}:{day_key}" if scope == "user" else day_key
+
+
+def _read_send_count(fs, runtime, user_id: str, day_key: str, *, scope: str) -> int:
+    """Read the send count for ``scope`` from whichever store this request owns.
+
+    Certification must never read production's ``sendCounters``. Two reasons, and
+    either alone would be sufficient: a fixture run must not be able to observe -
+    let alone consume - a real user's daily allowance, and production's counters
+    live at a root collection outside any fixture prefix, so a scoped client would
+    refuse them and stall the drain fail-closed. The runtime's isolated
+    CounterStore is the equivalent that belongs to this run alone.
+    """
+    if is_certification(runtime):
+        return runtime.counters.used(scope, _send_counter_scope_key(user_id, day_key, scope))
+    if scope == "user":
+        return _read_daily_send_count(fs, user_id, day_key)
+    return _read_global_send_count(fs, day_key)
+
+
+def _increment_send_count(
+    fs,
+    runtime,
+    user_id: str,
+    day_key: str,
+    amount: int,
+    *,
+    scope: str,
+    cap: Optional[int],
+    reservation_key: str,
+) -> None:
+    """Record ``amount`` sends against ``scope``, atomically under certification.
+
+    The reservation is keyed by recipient, so a re-driven drain reserves once
+    rather than twice - the same idempotence production leans on its transaction
+    for. Exhaustion raises so the caller's existing fail-closed handler fires,
+    rather than the drain quietly continuing past a ceiling.
+    """
+    if is_certification(runtime):
+        key = _send_counter_scope_key(user_id, day_key, scope)
+        token = runtime.counters.reserve_many(
+            (
+                CounterReservation(
+                    scope=scope,
+                    key=key,
+                    amount=amount,
+                    limit=cap if cap is not None else amount,
+                ),
+            ),
+            idempotency_key=f"{runtime.certification_run_id}:{scope}:{reservation_key}",
+        )
+        if token is None:
+            raise RuntimeError(f"certification {scope} send cap exhausted for {key}")
+        return
+    if scope == "user":
+        _increment_daily_send_count(fs, user_id, day_key, amount)
+    else:
+        _increment_global_send_count(fs, day_key, amount)
+
+
 def _record_send_cap_health(
     fs,
     user_id: str,
@@ -393,13 +468,13 @@ def _fresh_graph_headers(
     return headers
 
 
-def _update_action_audit(user_id: str, action_audit_id: Optional[str], payload: Dict[str, Any]) -> None:
+def _update_action_audit(user_id: str, action_audit_id: Optional[str], payload: Dict[str, Any], runtime=None) -> None:
     if not action_audit_id:
         return
     try:
-        from .clients import _fs
+        fs = _fs_for(runtime)
         (
-            _fs.collection("users").document(user_id)
+            fs.collection("users").document(user_id)
             .collection("actionAudit").document(action_audit_id)
             .set(payload, merge=True)
         )
@@ -413,6 +488,7 @@ def _terminalize_outbox_action_audit(
     data: Dict[str, Any],
     status: str,
     extra: Optional[Dict[str, Any]] = None,
+    runtime=None,
 ) -> None:
     """Write the final dashboard action-audit state for a no-send/send outcome."""
     if not user_id:
@@ -428,7 +504,7 @@ def _terminalize_outbox_action_audit(
     }
     if extra:
         payload.update({k: v for k, v in extra.items() if v is not None})
-    _update_action_audit(user_id, data.get("actionAuditId"), payload)
+    _update_action_audit(user_id, data.get("actionAuditId"), payload, runtime=runtime)
 
 
 def _mark_outbox_action_audit_retrying(
@@ -527,17 +603,17 @@ def _should_pause_results_outbox_for_user(user_id: Optional[str], data: Optional
     return should_pause_results_outbox_for_user(user_id, data)
 
 
-def _pause_results_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bool:
+def _pause_results_outbox_item_if_needed(user_id: str, doc_ref, data: dict, runtime=None) -> bool:
     if not _should_pause_results_outbox_for_user(user_id, data):
         return False
-    _move_to_dead_letter(user_id, doc_ref, data, RESULTS_FEATURE_PAUSED_REASON)
+    _move_to_dead_letter(user_id, doc_ref, data, RESULTS_FEATURE_PAUSED_REASON, runtime=runtime)
     return True
 
 
-def _read_client_automation_decision(user_id: str, client_id: Optional[str]):
+def _read_client_automation_decision(user_id: str, client_id: Optional[str], runtime=None):
     """Use the tri-state reader while preserving legacy test/extension patches."""
     if get_client_automation_pause is _ORIGINAL_GET_CLIENT_AUTOMATION_PAUSE:
-        return get_client_automation_decision(user_id, client_id)
+        return get_client_automation_decision(user_id, client_id, runtime=runtime)
 
     paused, reason, client_data = get_client_automation_pause(user_id, client_id)
     if not paused:
@@ -561,9 +637,9 @@ def _read_client_automation_decision(user_id: str, client_id: Optional[str]):
     )
 
 
-def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bool:
+def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict, runtime=None) -> bool:
     client_id = (data.get("clientId") or "").strip()
-    decision = _read_client_automation_decision(user_id, client_id)
+    decision = _read_client_automation_decision(user_id, client_id, runtime=runtime)
     if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
         return False
 
@@ -573,10 +649,11 @@ def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bo
             doc_ref,
             data,
             f"Client campaign is stopped; send canceled: {decision.reason}",
+            runtime=runtime,
         )
         return True
 
-    _preserve_retryable_outbox_suppression(user_id, doc_ref, data, decision)
+    _preserve_retryable_outbox_suppression(user_id, doc_ref, data, decision, runtime=runtime)
     return True
 
 
@@ -587,6 +664,7 @@ def _preserve_retryable_outbox_suppression(
     decision,
     *,
     extra: Optional[Dict[str, Any]] = None,
+    runtime=None,
 ) -> None:
     """Release a claim without consuming an attempt or destroying queued work."""
     suppression_payload = {
@@ -610,6 +688,7 @@ def _preserve_retryable_outbox_suppression(
             "automationSuppressedReason": decision.reason,
             "automationSuppressedAt": SERVER_TIMESTAMP,
         },
+        runtime=runtime,
     )
 
 
@@ -740,6 +819,7 @@ def _dead_letter_invalid_initial_outreach_column_contract_if_needed(
     doc_ref,
     data: dict,
     body: str,
+    runtime=None,
 ) -> bool:
     """Fail closed when first-touch copy violates the persisted column contract."""
     if not _is_initial_outreach_outbox(data):
@@ -750,7 +830,7 @@ def _dead_letter_invalid_initial_outreach_column_contract_if_needed(
         reason = "Initial outreach has no clientId for persisted columnConfig validation"
     else:
         try:
-            decision = _read_client_automation_decision(user_id, client_id)
+            decision = _read_client_automation_decision(user_id, client_id, runtime=runtime)
             client_data = decision.client_data if decision else {}
             column_config = (client_data or {}).get("columnConfig")
             config_error = get_column_config_error(column_config)
@@ -768,6 +848,7 @@ def _dead_letter_invalid_initial_outreach_column_contract_if_needed(
         doc_ref,
         data,
         f"{reason}; manual review required before sending",
+        runtime=runtime,
     )
     return True
 
@@ -859,9 +940,10 @@ def _campaign_sheet_header_and_row(
     *,
     operation_name: str,
     sheet_metadata_cache: Optional[Dict[str, Any]] = None,
+    runtime=None,
 ) -> tuple[List[str], List[str]]:
-    sheet_id = _get_sheet_id_or_fail(user_id, client_id)
-    sheets = _sheets_client()
+    sheet_id = _get_sheet_id_or_fail(user_id, client_id, runtime=runtime)
+    sheets = sheets_for(runtime, _sheets_client)
     cache = sheet_metadata_cache if sheet_metadata_cache is not None else {}
     metadata = cache.get(sheet_id)
     if metadata:
@@ -895,6 +977,7 @@ def _resolve_campaign_launch_contact_name_result_from_sheet(
     *,
     row_number_override: Optional[object] = None,
     sheet_metadata_cache: Optional[Dict[str, Any]] = None,
+    runtime=None,
 ) -> Dict[str, Optional[str]]:
     if not _is_campaign_launch_outbox(data):
         return {"contact_name": None, "failure_reason": None}
@@ -917,6 +1000,7 @@ def _resolve_campaign_launch_contact_name_result_from_sheet(
         row_number,
         operation_name="outbox_contact_name_row_guard",
         sheet_metadata_cache=sheet_metadata_cache,
+        runtime=runtime,
     )
     return _contact_name_resolution_from_campaign_row(header, row_values)
 
@@ -943,6 +1027,7 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
     recipient_email: str,
     row_number_override: Optional[object] = None,
     sheet_metadata_cache: Optional[Dict[str, Any]] = None,
+    runtime=None,
 ) -> bool:
     if not _is_campaign_launch_outbox(data):
         return False
@@ -964,6 +1049,7 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
             data,
             "Campaign launch outbox is missing required campaign launch metadata "
             f"({', '.join(missing)}); manual review required before sending.",
+            runtime=runtime,
         )
         return True
 
@@ -975,6 +1061,7 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
             doc_ref,
             data,
             f"Campaign launch outbox has invalid rowNumber ({raw_row_number!r}); manual review required before sending.",
+            runtime=runtime,
         )
         return True
 
@@ -984,6 +1071,7 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
             doc_ref,
             data,
             f"Campaign launch outbox has invalid rowNumber ({row_number}); manual review required before sending.",
+            runtime=runtime,
         )
         return True
 
@@ -994,6 +1082,7 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
             row_number,
             operation_name="outbox_recipient_row_guard",
             sheet_metadata_cache=sheet_metadata_cache,
+            runtime=runtime,
         )
         row_emails = _email_values_from_row(header, row_values)
     except Exception as exc:
@@ -1026,6 +1115,7 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
             doc_ref,
             data,
             f"Could not verify queued recipient against sheet row {row_number}; manual review required before sending: {exc}",
+            runtime=runtime,
         )
         return True
 
@@ -1039,6 +1129,7 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
                 f"Queued recipient does not match sheet row {row_number}; "
                 f"queued={recipient}, row={expected}. Manual review required before sending."
             ),
+            runtime=runtime,
         )
         return True
 
@@ -1052,6 +1143,7 @@ def _dead_letter_unsafe_outbound_body_if_needed(
     body: str,
     *,
     allow_scheduling_language: bool = False,
+    runtime=None,
 ) -> bool:
     validation = validate_outbound_body(
         body,
@@ -1066,6 +1158,7 @@ def _dead_letter_unsafe_outbound_body_if_needed(
         doc_ref,
         data,
         f"{validation.reason}; manual review required before sending",
+        runtime=runtime,
     )
     return True
 
@@ -1076,6 +1169,7 @@ def _dead_letter_unresolved_name_placeholder_if_needed(
     data: dict,
     body: str,
     failure_reason: Optional[str],
+    runtime=None,
 ) -> bool:
     if not failure_reason or not NAME_PLACEHOLDER_RE.search(body or ""):
         return False
@@ -1084,6 +1178,7 @@ def _dead_letter_unresolved_name_placeholder_if_needed(
         doc_ref,
         data,
         f"{failure_reason}; manual review required before sending",
+        runtime=runtime,
     )
     return True
 
@@ -1116,7 +1211,7 @@ TERMINAL_TOUR_STATUSES = {
 }
 
 
-def _validate_outbox_thread_reply_target(user_id: str, data: dict) -> Dict[str, Any]:
+def _validate_outbox_thread_reply_target(user_id: str, data: dict, runtime=None) -> Dict[str, Any]:
     """Re-validate the client-supplied thread binding on a dashboard thread reply.
 
     The outbox document is written entirely client-side (InlineReplyComposer),
@@ -1132,7 +1227,7 @@ def _validate_outbox_thread_reply_target(user_id: str, data: dict) -> Dict[str, 
     Fail-closed: lookup failures return ok=False so the item is dead-lettered
     for manual review instead of sending with unverified context.
     """
-    from .clients import _fs
+    fs = _fs_for(runtime)
 
     thread_id = str(data.get("threadId") or "").strip()
     reply_to_msg_id = str(data.get("replyToMessageId") or "").strip()
@@ -1143,7 +1238,7 @@ def _validate_outbox_thread_reply_target(user_id: str, data: dict) -> Dict[str, 
 
     try:
         thread_ref = (
-            _fs.collection("users").document(user_id)
+            fs.collection("users").document(user_id)
             .collection("threads").document(thread_id)
         )
         snapshot = thread_ref.get()
@@ -1595,6 +1690,7 @@ def _mark_tour_invite_thread_sent(
     data: Dict[str, Any],
     outbox_id: Optional[str] = None,
     send_result: Optional[Dict[str, Any]] = None,
+    runtime=None,
 ) -> None:
     """Persist the post-send lifecycle state for reviewed tour invites."""
     thread_id = (data.get("threadId") or "").strip()
@@ -1616,9 +1712,9 @@ def _mark_tour_invite_thread_sent(
     }
 
     try:
-        from .clients import _fs
+        fs = _fs_for(runtime)
         (
-            _fs.collection("users").document(user_id)
+            fs.collection("users").document(user_id)
             .collection("threads").document(thread_id)
             .set({key: value for key, value in payload.items() if value is not None}, merge=True)
         )
@@ -1717,6 +1813,7 @@ def _has_existing_thread_for_property(
     property_address: str,
     *,
     client_id: Optional[str] = None,
+    runtime=None,
 ) -> bool:
     """
     Check if we've already sent an email to this recipient about this property.
@@ -1729,7 +1826,7 @@ def _has_existing_thread_for_property(
 
     Returns True if a matching thread already exists, False otherwise.
     """
-    from .clients import _fs
+    fs = _fs_for(runtime)
 
     if not recipient_email or not property_address:
         return False
@@ -1743,7 +1840,7 @@ def _has_existing_thread_for_property(
         property_normalized = property_normalized.split(',')[0].strip()
 
     try:
-        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        threads_ref = fs.collection("users").document(user_id).collection("threads")
 
         # Query threads where this email was a recipient
         query = threads_ref.where("email", "array_contains", recipient_lower)
@@ -1768,14 +1865,14 @@ def _has_existing_thread_for_property(
         return False
 
 
-def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None) -> bool:
+def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None, runtime=None) -> bool:
     """
     Attempt to claim an outbox item for processing using a transaction.
     Prevents duplicate sends when multiple processes run concurrently.
 
     Returns True if successfully claimed, False if already being processed.
     """
-    from .clients import _fs
+    fs = _fs_for(runtime)
     from google.cloud.firestore import transactional
 
     cancelled_seen = {}
@@ -1825,7 +1922,7 @@ def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None) -> bo
         return True
 
     try:
-        transaction = _fs.transaction()
+        transaction = fs.transaction()
         claimed = claim_transaction(transaction, doc_ref)
         if not claimed and cancelled_seen:
             _terminalize_outbox_action_audit(
@@ -1834,6 +1931,7 @@ def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None) -> bo
                 cancelled_seen.get("data") or data,
                 "cancelled",
                 {"cancelledAt": SERVER_TIMESTAMP},
+                runtime=runtime,
             )
         return claimed
     except Exception as e:
@@ -2170,15 +2268,15 @@ def _delete_graph_reply_draft(
     return False
 
 
-def _get_thread_row_number(user_id: str, thread_id: str) -> Optional[int]:
+def _get_thread_row_number(user_id: str, thread_id: str, runtime=None) -> Optional[int]:
     """Return the stored Sheet row number for a known thread, if present."""
     if not thread_id:
         return None
 
     try:
-        from .clients import _fs
+        fs = _fs_for(runtime)
         thread_doc = (
-            _fs.collection("users").document(user_id)
+            fs.collection("users").document(user_id)
             .collection("threads").document(thread_id).get()
         )
         if not thread_doc.exists:
@@ -2446,14 +2544,14 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         return {"sent": False, "error": error_msg}
 
 
-def get_contact_email_count(user_id: str, recipient_email: str) -> int:
+def get_contact_email_count(user_id: str, recipient_email: str, runtime=None) -> int:
     """
     Count how many outbound emails have been sent to this contact.
     Used to determine whether to use primary or secondary script.
     """
-    from .clients import _fs
+    fs = _fs_for(runtime)
 
-    threads_ref = _fs.collection("users").document(user_id).collection("threads")
+    threads_ref = fs.collection("users").document(user_id).collection("threads")
 
     # Query threads where this email was a recipient
     # The 'email' field is an array of recipient emails
@@ -2551,7 +2649,7 @@ def _personalize_name_placeholders(script: Optional[str], contact_name: Optional
 
 
 def _select_script_for_recipient(user_id: str, recipient_email: str,
-                                  scripts: List[str], contact_name: str = None) -> str:
+                                  scripts: List[str], contact_name: str = None, runtime=None) -> str:
     """
     Select appropriate script based on contact history.
 
@@ -2567,7 +2665,7 @@ def _select_script_for_recipient(user_id: str, recipient_email: str,
     if not scripts or len(scripts) == 0:
         return ""
 
-    email_count = get_contact_email_count(user_id, recipient_email)
+    email_count = get_contact_email_count(user_id, recipient_email, runtime=runtime)
     print(f"📊 Contact history for {recipient_email}: {email_count} previous email(s)")
 
     # Primary script for first contact
@@ -2736,6 +2834,7 @@ def _delete_cancelled_outbox_item_if_needed(
     doc_ref,
     data: Dict[str, Any],
     user_id: Optional[str] = None,
+    runtime=None,
 ) -> bool:
     if not _is_cancelled_outbox_item(data):
         return False
@@ -2748,6 +2847,7 @@ def _delete_cancelled_outbox_item_if_needed(
             data,
             "cancelled",
             {"cancelledAt": SERVER_TIMESTAMP},
+            runtime=runtime,
         )
         print(f"   🗑️ Deleted canceled outbox item {doc_id}")
     except Exception as e:
@@ -2958,9 +3058,10 @@ def _finalize_successful_outbox_item(
     client_id: Optional[str] = None,
     send_result: Optional[Dict[str, Any]] = None,
     dashboard_tour_resolution: Optional[Dict[str, Any]] = None,
+    runtime=None,
 ):
     """Delete sent outbox and apply post-send dashboard state only after send success."""
-    from .clients import _fs
+    fs = _fs_for(runtime)
 
     client_id = client_id or (data.get("clientId") or "").strip()
 
@@ -2973,8 +3074,8 @@ def _finalize_successful_outbox_item(
         )
         if row_number and client_id:
             try:
-                sheet_id = _get_sheet_id_or_fail(user_id, client_id)
-                highlight_row(sheet_id, row_number)
+                sheet_id = _get_sheet_id_or_fail(user_id, client_id, runtime=runtime)
+                highlight_row(sheet_id, row_number, runtime=runtime)
             except Exception as e:
                 print(f"  ⚠️ Could not highlight row {row_number}: {e}")
         print(
@@ -3005,13 +3106,13 @@ def _finalize_successful_outbox_item(
     if data.get("partialSend") or data.get("remainingRecipients"):
         audit_payload["partialSend"] = False
         audit_payload["remainingRecipients"] = []
-    _update_action_audit(user_id, data.get("actionAuditId"), audit_payload)
+    _update_action_audit(user_id, data.get("actionAuditId"), audit_payload, runtime=runtime)
 
     source_dead_letter_id = str(data.get("sourceDeadLetterId") or "").strip()
     if source_dead_letter_id:
         try:
             source_ref = (
-                _fs.collection("users").document(user_id)
+                fs.collection("users").document(user_id)
                 .collection("deadLetterQueue").document(source_dead_letter_id)
             )
             @firestore.transactional
@@ -3050,7 +3151,7 @@ def _finalize_successful_outbox_item(
                 }, merge=True)
                 return True
 
-            if not reconcile_reviewed_reply(_fs.transaction()):
+            if not reconcile_reviewed_reply(fs.transaction()):
                 raise ValueError("source dead-letter does not match this unresolved reply review")
             print(f"   ✅ Resolved reviewed reply draft {source_dead_letter_id} after send")
         except Exception as e:
@@ -3063,12 +3164,13 @@ def _finalize_successful_outbox_item(
         data,
         outbox_id=getattr(doc_ref, "id", None),
         send_result=send_result,
+        runtime=runtime,
     )
 
     if row_number and client_id:
         try:
-            sheet_id = _get_sheet_id_or_fail(user_id, client_id)
-            highlight_row(sheet_id, row_number)
+            sheet_id = _get_sheet_id_or_fail(user_id, client_id, runtime=runtime)
+            highlight_row(sheet_id, row_number, runtime=runtime)
         except Exception as e:
             print(f"  ⚠️ Could not highlight row {row_number}: {e}")
 
@@ -3076,7 +3178,7 @@ def _finalize_successful_outbox_item(
     notification_client_id = data.get("notificationClientId") or client_id
     if data.get("deleteNotificationOnSend") and notification_id and notification_client_id:
         try:
-            delete_notification_and_decrement_counters(user_id, notification_client_id, notification_id)
+            delete_notification_and_decrement_counters(user_id, notification_client_id, notification_id, runtime=runtime)
             print(f"   🗑️ Deleted action notification {notification_id} after send")
         except Exception as e:
             print(f"   ⚠️ Could not delete action notification {notification_id}: {e}")
@@ -3088,7 +3190,7 @@ def _finalize_successful_outbox_item(
         # recipient. The source conversation must remain terminal after send.
         try:
             thread_ref = (
-                _fs.collection("users").document(user_id)
+                fs.collection("users").document(user_id)
                 .collection("threads").document(thread_id)
             )
             snapshot = thread_ref.get()
@@ -3151,7 +3253,7 @@ def _finalize_successful_outbox_item(
         # thread that belongs to a different client. Fail closed on any doubt.
         try:
             thread_ref = (
-                _fs.collection("users").document(user_id)
+                fs.collection("users").document(user_id)
                 .collection("threads").document(thread_id)
             )
             resume_block_reason = None
@@ -3242,7 +3344,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                         subject_override: str = None, signature_mode: str = None, followup_config: Dict = None,
                         contact_name: str = None, user_email: str = None,
                         thread_context: Optional[Dict[str, Any]] = None,
-                        allow_scheduling_language: bool = False):
+                        allow_scheduling_language: bool = False, runtime=None):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -3301,7 +3403,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     active_recipients = []
 
     for recipient in recipients:
-        optout_record = is_contact_opted_out(user_id, recipient)
+        optout_record = is_contact_opted_out(user_id, recipient, runtime=runtime)
         if optout_record:
             opted_out_recipients.append({
                 "email": recipient,
@@ -3490,7 +3592,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
             # 3. Send draft. This is the irreversible boundary, so campaign
             # eligibility must be read again after draft preparation.
-            decision = _read_client_automation_decision(user_id, client_id_or_none)
+            decision = _read_client_automation_decision(user_id, client_id_or_none, runtime=runtime)
             if decision.denies_autonomous_work:
                 _delete_graph_reply_draft(headers, draft_id, base=base)
                 reason = f"Campaign send suppressed before Graph send: {decision.reason}"
@@ -3570,7 +3672,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # Save thread root with retry
             thread_saved = False
             for attempt in range(MAX_INDEX_RETRIES):
-                if save_thread_root(user_id, root_id, thread_meta):
+                if save_thread_root(user_id, root_id, thread_meta, runtime=runtime):
                     thread_saved = True
                     break
                 print(f"⚠️ Thread save attempt {attempt + 1}/{MAX_INDEX_RETRIES} failed, retrying...")
@@ -3602,7 +3704,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # Save message with retry
             message_saved = False
             for attempt in range(MAX_INDEX_RETRIES):
-                if save_message(user_id, root_id, root_id, message_record):
+                if save_message(user_id, root_id, root_id, message_record, runtime=runtime):
                     message_saved = True
                     break
                 print(f"⚠️ Message save attempt {attempt + 1}/{MAX_INDEX_RETRIES} failed, retrying...")
@@ -3614,10 +3716,10 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # Index message ID with retry and verification (CRITICAL for reply matching)
             msg_indexed = False
             for attempt in range(MAX_INDEX_RETRIES):
-                if index_message_id(user_id, internet_message_id, root_id):
+                if index_message_id(user_id, internet_message_id, root_id, runtime=runtime):
                     # Verify the index was actually written
                     time.sleep(0.2)  # Brief delay for consistency
-                    if lookup_thread_by_message_id(user_id, internet_message_id) == root_id:
+                    if lookup_thread_by_message_id(user_id, internet_message_id, runtime=runtime) == root_id:
                         msg_indexed = True
                         break
                     print(f"⚠️ Index verification failed on attempt {attempt + 1}")
@@ -3631,7 +3733,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             if conversation_id:
                 conv_indexed = False
                 for attempt in range(MAX_INDEX_RETRIES):
-                    if index_conversation_id(user_id, conversation_id, root_id):
+                    if index_conversation_id(user_id, conversation_id, root_id, runtime=runtime):
                         conv_indexed = True
                         break
                     print(f"⚠️ Conversation index attempt {attempt + 1}/{MAX_INDEX_RETRIES} failed, retrying...")
@@ -3647,13 +3749,13 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # Schedule follow-up if configured
             if followup_config and followup_config.get("enabled", False):
                 from .followup import schedule_followup_for_thread
-                from .clients import _fs
+                fs = _fs_for(runtime)
                 # Store contact name on thread for follow-up personalization
                 if contact_name:
-                    _fs.collection("users").document(user_id).collection("threads").document(root_id).update({
+                    fs.collection("users").document(user_id).collection("threads").document(root_id).update({
                         "contactName": contact_name
                     })
-                schedule_followup_for_thread(user_id, root_id, followup_config)
+                schedule_followup_for_thread(user_id, root_id, followup_config, runtime=runtime)
 
         except Exception as e:
             msg = str(e)
@@ -3662,12 +3764,12 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
     return results
 
-def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
+def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str, runtime=None):
     """Move a failed outbox item to the dead-letter queue for manual review."""
-    from .clients import _fs
+    fs = _fs_for(runtime)
     from google.cloud.firestore import SERVER_TIMESTAMP
 
-    dead_letter_ref = _fs.collection("users").document(user_id).collection("deadLetterQueue")
+    dead_letter_ref = fs.collection("users").document(user_id).collection("deadLetterQueue")
     attempts = max(int(data.get("attempts") or 0), MAX_OUTBOX_ATTEMPTS)
 
     # Copy data to dead-letter queue with failure info
@@ -3698,7 +3800,7 @@ def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
         "deadLetteredAt": SERVER_TIMESTAMP,
         "failedAt": SERVER_TIMESTAMP,
         "updatedAt": SERVER_TIMESTAMP,
-    })
+    }, runtime=runtime)
     doc_ref.delete()
     print(f"☠️ Moved item {doc_ref.id} to dead-letter queue: {reason}")
 
@@ -3712,13 +3814,14 @@ def _record_outbox_reconciliation(
     recipients: List[str],
     *,
     delete_original: bool = False,
+    runtime=None,
 ) -> None:
     """Expose a Graph-accepted send that could not be fully indexed.
 
     Graph has already accepted the message, so retrying the same outbox item could
     duplicate-send. Operators need a visible reconciliation item instead.
     """
-    from .clients import _fs
+    fs = _fs_for(runtime)
 
     recipients = _ordered_unique([email for email in recipients if isinstance(email, str)])
     identity_payload = _send_identity_payload({**(send_result or {}), "sent": recipients}, recipients)
@@ -3737,7 +3840,7 @@ def _record_outbox_reconciliation(
         "updatedAt": SERVER_TIMESTAMP,
         **identity_payload,
     }
-    _fs.collection("users").document(user_id).collection("deadLetterQueue").add(dead_letter_payload)
+    fs.collection("users").document(user_id).collection("deadLetterQueue").add(dead_letter_payload)
 
     if delete_original:
         _update_action_audit(user_id, data.get("actionAuditId"), {
@@ -3751,7 +3854,7 @@ def _record_outbox_reconciliation(
             "deadLetteredAt": SERVER_TIMESTAMP,
             "updatedAt": SERVER_TIMESTAMP,
             **identity_payload,
-        })
+        }, runtime=runtime)
         doc_ref.delete()
 
 
@@ -3840,6 +3943,7 @@ def send_outboxes(
     user_id: str,
     headers: Dict[str, str],
     headers_provider: Optional[Callable[[], Dict[str, str]]] = None,
+    runtime=None,
 ) -> List[Dict[str, Any]]:
     """
     Process outbox items: read script content (generated by frontend LLM), append footer, and send.
@@ -3857,13 +3961,13 @@ def send_outboxes(
     reached a send outcome, so a swallowed per-item Graph send failure now
     escalates the health rail via ``main._combine_graph_operation_states``.
     """
-    from .clients import _fs
+    fs = _fs_for(runtime)
     from collections import defaultdict
 
     operation_states: List[Dict[str, Any]] = []
 
     # Fetch user's email signature settings
-    user_doc = _fs.collection("users").document(user_id).get()
+    user_doc = fs.collection("users").document(user_id).get()
     user_signature = None
     signature_mode = None
     user_email = None
@@ -3875,7 +3979,7 @@ def send_outboxes(
         elif user_signature:
             print(f"📝 Using custom email signature for user")
 
-    outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
+    outbox_ref = fs.collection("users").document(user_id).collection("outbox")
     # Order by createdAt to send emails in the order they were queued (oldest first)
     docs = _order_outbox_docs(list(outbox_ref.order_by("createdAt").stream()))
 
@@ -3899,9 +4003,10 @@ def send_outboxes(
                 user_email,
                 headers_provider=headers_provider,
                 operation_states=operation_states,
+                runtime=runtime,
             )
             continue
-        if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
+        if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id, runtime=runtime):
             continue
         emails = data.get("assignedEmails") or []
 
@@ -3947,7 +4052,8 @@ def send_outboxes(
             if attempts >= MAX_OUTBOX_ATTEMPTS:
                 _move_to_dead_letter(
                     user_id, item['doc'].reference, data,
-                    f"Exceeded max attempts ({MAX_OUTBOX_ATTEMPTS}): {data.get('lastError', 'unknown error')}"
+                    f"Exceeded max attempts ({MAX_OUTBOX_ATTEMPTS}): {data.get('lastError', 'unknown error')}",
+                    runtime=runtime,
                 )
             else:
                 valid_items.append(item)
@@ -3964,14 +4070,14 @@ def send_outboxes(
         send_count = send_plan["send_count"]
         if daily_cap is not None:
             try:
-                current = _read_daily_send_count(_fs, user_id, cap_day_key)
+                current = _read_send_count(fs, runtime, user_id, cap_day_key, scope="user")
             except Exception as exc:  # noqa: BLE001 - fail closed on read error
                 print(
                     f"🛑 Daily send-cap counter unavailable for {user_id} — "
                     f"retaining outbox (fail-closed): {exc}"
                 )
                 _record_send_cap_health(
-                    _fs, user_id, status="error",
+                    fs, user_id, status="error",
                     reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
                     cap=daily_cap, count=None, day_key=cap_day_key,
                 )
@@ -3983,7 +4089,7 @@ def send_outboxes(
                     "retaining outbox for next cycle."
                 )
                 _record_send_cap_health(
-                    _fs, user_id, status="warning",
+                    fs, user_id, status="warning",
                     reason=DAILY_CAP_REACHED_REASON,
                     cap=daily_cap, count=current, day_key=cap_day_key,
                 )
@@ -3991,14 +4097,14 @@ def send_outboxes(
 
         if global_cap is not None:
             try:
-                current_global = _read_global_send_count(_fs, cap_day_key)
+                current_global = _read_send_count(fs, runtime, user_id, cap_day_key, scope="global")
             except Exception as exc:  # noqa: BLE001 - fail closed on read error
                 print(
                     "🛑 Global send-cap counter unavailable — "
                     f"retaining outbox (fail-closed): {exc}"
                 )
                 _record_send_cap_health(
-                    _fs, user_id, status="error",
+                    fs, user_id, status="error",
                     reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
                     cap=global_cap, count=None, day_key=cap_day_key, scope="global",
                 )
@@ -4010,7 +4116,7 @@ def send_outboxes(
                     "retaining outbox for next cycle."
                 )
                 _record_send_cap_health(
-                    _fs, user_id, status="warning",
+                    fs, user_id, status="warning",
                     reason=DAILY_CAP_REACHED_REASON,
                     cap=global_cap, count=current_global, day_key=cap_day_key,
                     scope="global",
@@ -4062,6 +4168,7 @@ def send_outboxes(
                 user_email,
                 headers_provider=headers_provider,
                 operation_states=operation_states,
+                runtime=runtime,
             )
 
         # --- Rail 2: record the sends we just made -------------------------
@@ -4070,16 +4177,22 @@ def send_outboxes(
         if daily_cap is not None or global_cap is not None:
             try:
                 if daily_cap is not None:
-                    _increment_daily_send_count(_fs, user_id, cap_day_key, send_count)
+                    _increment_send_count(
+                        fs, runtime, user_id, cap_day_key, send_count,
+                        scope="user", cap=daily_cap, reservation_key=recipient_email,
+                    )
                 if global_cap is not None:
-                    _increment_global_send_count(_fs, cap_day_key, send_count)
+                    _increment_send_count(
+                        fs, runtime, user_id, cap_day_key, send_count,
+                        scope="global", cap=global_cap, reservation_key=recipient_email,
+                    )
             except Exception as exc:  # noqa: BLE001 - fail closed on write error
                 print(
                     f"🛑 Could not record daily send count for {user_id} — "
                     f"halting further drains (fail-closed): {exc}"
                 )
                 _record_send_cap_health(
-                    _fs, user_id, status="error",
+                    fs, user_id, status="error",
                     reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
                     cap=daily_cap if daily_cap is not None else global_cap,
                     count=None, day_key=cap_day_key,
@@ -4794,6 +4907,7 @@ def _send_single_outbox_item(
     user_email: str = None,
     headers_provider: Optional[Callable[[], Dict[str, str]]] = None,
     operation_states: Optional[list] = None,
+    runtime=None,
 ):
     """
     Send a single outbox item with smart script selection based on contact history.
@@ -4811,7 +4925,7 @@ def _send_single_outbox_item(
     # Graph already accepted this tour-action reply.  This state is finalize-
     # only: claims, retries, and scheduler re-entry must never call Graph again.
     if _is_dashboard_tour_pending_finalization(data):
-        if not _claim_outbox_item(d.reference, data, user_id=user_id):
+        if not _claim_outbox_item(d.reference, data, user_id=user_id, runtime=runtime):
             print(f"   ⏭️ Skipping {d.id} - already being finalized by another worker")
             return
         fresh_data = _get_current_outbox_data(d.reference)
@@ -4829,6 +4943,7 @@ def _send_single_outbox_item(
                 client_id=(data.get("clientId") or "").strip(),
                 send_result=pending_send_result,
                 dashboard_tour_resolution=data.get("tourActionResolution") or {},
+                runtime=runtime,
             )
             _record_operation_state(
                 operation_states,
@@ -4860,11 +4975,11 @@ def _send_single_outbox_item(
         )
         return
 
-    if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
+    if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id, runtime=runtime):
         return
 
     # CRITICAL: Claim the item before processing to prevent duplicate sends
-    if not _claim_outbox_item(d.reference, data, user_id=user_id):
+    if not _claim_outbox_item(d.reference, data, user_id=user_id, runtime=runtime):
         print(f"   ⏭️ Skipping {d.id} - already being processed by another worker")
         return
 
@@ -4874,16 +4989,16 @@ def _send_single_outbox_item(
     if fresh_data:
         data = fresh_data
 
-    if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
+    if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id, runtime=runtime):
         return
 
-    if _pause_results_outbox_item_if_needed(user_id, d.reference, data):
+    if _pause_results_outbox_item_if_needed(user_id, d.reference, data, runtime=runtime):
         print(f"   ⏸️ Paused Results/Tour outbox item {d.id} for non-admin user {user_id}")
         return
 
     emails = data.get("assignedEmails") or []
     clientId = (data.get("clientId") or "").strip()
-    if _pause_client_outbox_item_if_needed(user_id, d.reference, data):
+    if _pause_client_outbox_item_if_needed(user_id, d.reference, data, runtime=runtime):
         print(f"   ⏸️ Moved outbox item {d.id} for paused/stopped client {clientId or 'n/a'} to dead letter")
         return
 
@@ -4895,14 +5010,14 @@ def _send_single_outbox_item(
     # If row_number is missing (e.g., user reply from UI), prefer the known thread anchor.
     # Broker email can appear on several rows in a campaign; email fallback is only safe for new outreach.
     if not row_number and thread_id:
-        row_number = _get_thread_row_number(user_id, thread_id)
+        row_number = _get_thread_row_number(user_id, thread_id, runtime=runtime)
         if row_number:
             print(f"   📍 Resolved row number from thread {thread_id[:20]}...: {row_number}")
 
     if not row_number and emails and clientId:
         try:
-            sheet_id = _get_sheet_id_or_fail(user_id, clientId)
-            sheets = _sheets_client()
+            sheet_id = _get_sheet_id_or_fail(user_id, clientId, runtime=runtime)
+            sheets = sheets_for(runtime, _sheets_client)
             tab_title = _get_first_tab_title(sheets, sheet_id)
             sheet_headers = _read_header_row2(sheets, sheet_id, tab_title)
             row_number, _row_values = _find_row_by_email(sheets, sheet_id, tab_title, sheet_headers, emails[0])
@@ -4923,7 +5038,7 @@ def _send_single_outbox_item(
     # to dead-letter so a stale or crafted outbox item can neither reply into
     # a stopped/foreign thread nor silently convert into a new indexed send.
     if is_thread_reply:
-        thread_reply_target = _validate_outbox_thread_reply_target(user_id, data)
+        thread_reply_target = _validate_outbox_thread_reply_target(user_id, data, runtime=runtime)
         if not thread_reply_target.get("ok"):
             reason = thread_reply_target.get("reason") or "thread_reply_validation_failed"
             _move_to_dead_letter(
@@ -4932,6 +5047,7 @@ def _send_single_outbox_item(
                 data,
                 f"Thread reply failed pre-send validation: {reason}; "
                 "manual review required before sending",
+                runtime=runtime,
             )
             print(f"   🛑 Blocked thread reply outbox item {d.id}: {reason}")
             return
@@ -4963,7 +5079,7 @@ def _send_single_outbox_item(
         # DUPLICATE CHECK: For new outreach (not replies), check if thread already exists
         # Only check if we have a subject (property address)
         if subject_override and len(emails) == 1:
-            if _has_existing_thread_for_property(user_id, emails[0], subject_override, client_id=clientId):
+            if _has_existing_thread_for_property(user_id, emails[0], subject_override, client_id=clientId, runtime=runtime):
                 print(f"   🚫 DUPLICATE DETECTED: Already sent to {emails[0]} about '{subject_override}'")
                 print(f"   🗑️ Deleting duplicate outbox entry")
                 _terminalize_outbox_action_audit(
@@ -4972,6 +5088,7 @@ def _send_single_outbox_item(
                     data,
                     "duplicate_skipped",
                     {"skippedAt": SERVER_TIMESTAMP, "skipReason": "existing_thread_for_property"},
+                    runtime=runtime,
                 )
                 d.reference.delete()
                 return
@@ -4993,8 +5110,8 @@ def _send_single_outbox_item(
     # Fallback: fetch followUpConfig from client if not on outbox item
     if not followup_config and clientId:
         try:
-            from .clients import _fs
-            client_doc = _fs.collection("users").document(user_id).collection("clients").document(clientId).get()
+            fs = _fs_for(runtime)
+            client_doc = fs.collection("users").document(user_id).collection("clients").document(clientId).get()
             if client_doc.exists:
                 client_data = client_doc.to_dict()
                 followup_config = client_data.get("followUpConfig")
@@ -5033,6 +5150,7 @@ def _send_single_outbox_item(
             d.reference,
             data,
             script_content,
+            runtime=runtime,
         ):
             print(f"   🛑 Blocked unsafe dashboard reply body in outbox item {d.id}; manual review required")
             return
@@ -5050,6 +5168,7 @@ def _send_single_outbox_item(
                 d.reference,
                 resolution_result.get("data") or data,
                 user_id=user_id,
+                runtime=runtime,
             )
             return
         if resolution_status == "claim_lost":
@@ -5063,6 +5182,7 @@ def _send_single_outbox_item(
                 data,
                 f"Dashboard action failed server validation: {reason}; "
                 "manual review required before sending",
+                runtime=runtime,
             )
             print(f"   🛑 Blocked dashboard action reply {d.id}: {reason}")
             return
@@ -5077,6 +5197,7 @@ def _send_single_outbox_item(
                     "skipReason": resolution_result.get("reason")
                     or "notification_already_resolved",
                 },
+                runtime=runtime,
             )
             d.reference.delete()
             print(
@@ -5097,6 +5218,7 @@ def _send_single_outbox_item(
             data,
             script_content,
             allow_scheduling_language=bool(dashboard_tour_resolution),
+            runtime=runtime,
         ):
             print(f"   🛑 Blocked unsafe dashboard reply body in outbox item {d.id}; manual review required")
             return
@@ -5131,6 +5253,7 @@ def _send_single_outbox_item(
                     d.reference,
                     data,
                     _manual_continuation_retry_reason(prior_send),
+                    runtime=runtime,
                 )
                 return
             elif prior_send.get("guardLookupError"):
@@ -5139,6 +5262,7 @@ def _send_single_outbox_item(
                     d.reference,
                     data,
                     f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                    runtime=runtime,
                 )
                 return
             elif dashboard_tour_resolution and dashboard_tour_resolution.get("recovery"):
@@ -5148,6 +5272,7 @@ def _send_single_outbox_item(
                     data,
                     "A prior dashboard tour send attempt could not be matched in "
                     "Sent Items; manual review required before any resend",
+                    runtime=runtime,
                 )
                 return
             else:
@@ -5258,6 +5383,7 @@ def _send_single_outbox_item(
                             d.reference,
                             data,
                             _manual_continuation_retry_reason(prior_send),
+                            runtime=runtime,
                         )
                         return
                     if prior_send.get("guardLookupError"):
@@ -5266,6 +5392,7 @@ def _send_single_outbox_item(
                             d.reference,
                             data,
                             f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                            runtime=runtime,
                         )
                         return
                     if dashboard_tour_resolution and dashboard_tour_resolution.get("recovery"):
@@ -5275,6 +5402,7 @@ def _send_single_outbox_item(
                             data,
                             "A prior dashboard tour send attempt could not be matched "
                             "in Sent Items; manual review required before any resend",
+                            runtime=runtime,
                         )
                         return
                     res = send_and_index_email(
@@ -5285,6 +5413,7 @@ def _send_single_outbox_item(
                         contact_name=contact_name, user_email=user_email,
                         thread_context=_thread_context_from_outbox(data),
                         allow_scheduling_language=_is_tour_invite_outbox(data),
+                        runtime=runtime,
                     )
                     if _handle_suppressed_outbox_send_result(
                         user_id,
@@ -5316,6 +5445,7 @@ def _send_single_outbox_item(
                 recipient_email,
                 row_number_override=row_number,
                 sheet_metadata_cache=recipient_guard_sheet_cache,
+                runtime=runtime,
             ):
                 print(f"   🛑 Blocked row-recipient mismatch for outbox item {d.id}")
                 return
@@ -5327,6 +5457,7 @@ def _send_single_outbox_item(
                         data,
                         row_number_override=row_number,
                         sheet_metadata_cache=recipient_guard_sheet_cache,
+                        runtime=runtime,
                     )
                     recipient_contact_name = name_resolution.get("contact_name")
                     recipient_contact_name_failure_reason = name_resolution.get("failure_reason")
@@ -5342,7 +5473,8 @@ def _send_single_outbox_item(
                 print(f"  → Using exact outbox script for {recipient_email}")
             else:
                 selected_script = _select_script_for_recipient(
-                    user_id, recipient_email, email_scripts, contact_name=recipient_contact_name
+                    user_id, recipient_email, email_scripts, contact_name=recipient_contact_name,
+                    runtime=runtime,
                 )
 
             if _dead_letter_unresolved_name_placeholder_if_needed(
@@ -5351,6 +5483,7 @@ def _send_single_outbox_item(
                 data,
                 selected_script,
                 recipient_contact_name_failure_reason,
+                runtime=runtime,
             ):
                 print(f"   🛑 Blocked unresolved contact name for {recipient_email}; manual review required")
                 return
@@ -5360,11 +5493,12 @@ def _send_single_outbox_item(
                 d.reference,
                 data,
                 selected_script,
+                runtime=runtime,
             ):
                 print(f"   🛑 Blocked column-contract violation for {recipient_email}; manual review required")
                 return
 
-            if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, selected_script):
+            if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, selected_script, runtime=runtime):
                 print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
                 return
 
@@ -5390,6 +5524,7 @@ def _send_single_outbox_item(
                         d.reference,
                         data,
                         _manual_continuation_retry_reason(prior_send),
+                        runtime=runtime,
                     )
                     return
                 if prior_send.get("guardLookupError"):
@@ -5398,6 +5533,7 @@ def _send_single_outbox_item(
                         d.reference,
                         data,
                         f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                        runtime=runtime,
                     )
                     return
                 res = send_and_index_email(user_id, current_headers, selected_script, [recipient_email],
@@ -5406,7 +5542,7 @@ def _send_single_outbox_item(
                                            signature_mode=signature_mode, followup_config=followup_config,
                                            contact_name=recipient_contact_name, user_email=user_email,
                                            thread_context=_thread_context_from_outbox(data),
-                                           allow_scheduling_language=_is_tour_invite_outbox(data))
+                                           allow_scheduling_language=_is_tour_invite_outbox(data), runtime=runtime)
 
                 if _handle_suppressed_outbox_send_result(
                     user_id,
@@ -5442,6 +5578,7 @@ def _send_single_outbox_item(
                 row_number=row_number, client_id=clientId,
                 send_result=final_send_result,
                 dashboard_tour_resolution=dashboard_tour_resolution,
+                runtime=runtime,
             )
         except Exception as exc:
             if not dashboard_tour_resolution:
@@ -5469,6 +5606,7 @@ def _send_single_outbox_item(
             data,
             "opt_out_skipped",
             {"skippedAt": SERVER_TIMESTAMP, "skipReason": "contact_opted_out"},
+            runtime=runtime,
         )
         d.reference.delete()
         print(f"🚫 Deleted outbox item {d.id}; all recipients opted out")
@@ -5499,6 +5637,7 @@ def _send_single_outbox_item(
                 error_msg,
                 {**send_identity, "sent": sent_but_unindexed_recipients},
                 sent_but_unindexed_recipients,
+                runtime=runtime,
             )
 
         if accepted_set and not remaining_recipients:
@@ -5510,6 +5649,7 @@ def _send_single_outbox_item(
                 {**send_identity, "sent": sent_recipients},
                 sent_recipients,
                 delete_original=True,
+                runtime=runtime,
             )
             print(f"⚠️ Moved outbox item {d.id} to reconciliation; Graph accepted send but indexing failed")
             # Graph accepted the send (indexing pending) -> not a send failure.
@@ -5535,7 +5675,7 @@ def _send_single_outbox_item(
 
         if new_attempts >= MAX_OUTBOX_ATTEMPTS:
             dead_letter_data = {**data, **retry_extra} if retry_extra else data
-            _move_to_dead_letter(user_id, d.reference, dead_letter_data, f"Send errors after {new_attempts} attempts: {error_msg}")
+            _move_to_dead_letter(user_id, d.reference, dead_letter_data, f"Send errors after {new_attempts} attempts: {error_msg}", runtime=runtime)
         else:
             # Release claim and update attempts so it can be retried
             d.reference.set(

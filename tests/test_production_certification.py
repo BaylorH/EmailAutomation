@@ -273,3 +273,511 @@ class SealedInputTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Task 5A - first vertical slice through scoped data clients
+# ---------------------------------------------------------------------------
+
+import os
+import re
+from contextlib import ExitStack
+from unittest.mock import patch
+
+os.environ.setdefault("E2E_TEST_MODE", "true")
+
+from email_automation import automation_runtime as ar  # noqa: E402
+from email_automation.column_config import get_default_column_config  # noqa: E402
+from email_automation import campaign_safety as campaign_safety_module  # noqa: E402
+from email_automation import clients as clients_module  # noqa: E402
+from email_automation import email as email_module  # noqa: E402
+from email_automation import followup as followup_module  # noqa: E402
+from email_automation import messaging as messaging_module  # noqa: E402
+from email_automation import notifications as notifications_module  # noqa: E402
+from email_automation import processing as processing_module  # noqa: E402
+from email_automation import sheets as sheets_module  # noqa: E402
+
+
+FIXTURE_UID = "cert-uid-0001"
+FIXTURE_CLIENT = "cert-client-0001"
+FIXTURE_SHEET = "cert-sheet-0001"
+FIXTURE_PREFIX = f"users/{FIXTURE_UID}"
+FIXTURE_RECIPIENT = "broker@fixture.example.com"
+FIXTURE_ROW = 7
+
+
+class AmbientReached(AssertionError):
+    """The ambient production client was touched during a scoped run."""
+
+
+class ExplodingClient:
+    """Stands in for every ambient production client.
+
+    ANY attribute access is a failure. That is the whole experiment: if the slice
+    still reaches a module-level ``_fs``, a freshly constructed provider client,
+    or an OAuth-backed Sheets service, this object turns the silent fallback into
+    a loud one.
+    """
+
+    def __init__(self, label):
+        self._label = label
+
+    def __getattr__(self, name):
+        raise AmbientReached(f"ambient {self._label} was reached: .{name}")
+
+    def __call__(self, *args, **kwargs):
+        raise AmbientReached(f"ambient {self._label} was constructed")
+
+
+# --- the fixture store -----------------------------------------------------
+#
+# Path-keyed rather than shape-specific, because the slice walks arbitrary
+# chains and the point of the exercise is that the fence - not the double -
+# is what constrains where a write may land.
+
+
+class FixtureSnapshot:
+    def __init__(self, store, path, data, exists=True):
+        self._store = store
+        self._path = path
+        self.id = path.rsplit("/", 1)[-1]
+        self._data = dict(data)
+        self.exists = exists
+
+    def to_dict(self):
+        return dict(self._data)
+
+    @property
+    def reference(self):
+        return FixtureDocument(self._store, self._path)
+
+
+class FixtureDocument:
+    def __init__(self, store, path):
+        self._store = store
+        self._path = path
+
+    @property
+    def id(self):
+        return self._path.rsplit("/", 1)[-1]
+
+    def collection(self, name):
+        return FixtureCollection(self._store, f"{self._path}/{name}")
+
+    def get(self, transaction=None):
+        exists = self._path in self._store.data
+        self._store.reads.append(self._path)
+        return FixtureSnapshot(
+            self._store, self._path, self._store.data.get(self._path, {}), exists=exists
+        )
+
+    def set(self, data, merge=False):
+        self._store.writes.append(("set", self._path, dict(data), merge))
+        current = dict(self._store.data.get(self._path, {})) if merge else {}
+        current.update(data)
+        self._store.data[self._path] = current
+
+    def update(self, data):
+        self._store.writes.append(("update", self._path, dict(data), None))
+        current = dict(self._store.data.get(self._path, {}))
+        current.update(data)
+        self._store.data[self._path] = current
+
+    def create(self, data):
+        self._store.writes.append(("create", self._path, dict(data), None))
+        self._store.data[self._path] = dict(data)
+
+    def delete(self):
+        self._store.writes.append(("delete", self._path, None, None))
+        self._store.data.pop(self._path, None)
+
+
+class FixtureCollection:
+    def __init__(self, store, path, filters=()):
+        self._store = store
+        self._path = path
+        self._filters = tuple(filters)
+
+    def document(self, name):
+        return FixtureDocument(self._store, f"{self._path}/{name}")
+
+    def where(self, field=None, op=None, value=None, **kwargs):
+        return FixtureCollection(self._store, self._path, self._filters + ((field, op, value),))
+
+    def order_by(self, *args, **kwargs):
+        return self
+
+    def limit(self, *args, **kwargs):
+        return self
+
+    def add(self, data):
+        index = self._store.generated
+        self._store.generated += 1
+        path = f"{self._path}/generated-{index}"
+        self._store.writes.append(("add", path, dict(data), None))
+        self._store.data[path] = dict(data)
+        return FixtureDocument(self._store, path)
+
+    def _matches(self, data):
+        for field, op, value in self._filters:
+            actual = data.get(field)
+            if op == "array_contains":
+                if not isinstance(actual, (list, tuple)) or value not in actual:
+                    return False
+            elif actual != value:
+                return False
+        return True
+
+    def stream(self):
+        self._store.reads.append(self._path)
+        depth = self._path.count("/") + 1
+        for path, data in sorted(self._store.data.items()):
+            if path.startswith(self._path + "/") and path.count("/") == depth:
+                if self._matches(data):
+                    yield FixtureSnapshot(self._store, path, data)
+
+    def get(self):
+        return list(self.stream())
+
+
+class FixtureTransaction:
+    """Applies immediately. Atomicity is not what this slice is proving."""
+
+    def __init__(self, store):
+        self._store = store
+        self._max_attempts = 1
+        self._read_only = False
+        self._id = b"fixture"
+
+    def _clean_up(self):
+        return None
+
+    def _begin(self, retry_id=None):
+        return None
+
+    def _commit(self):
+        return []
+
+    def _rollback(self):
+        return None
+
+    def set(self, ref, data, merge=False):
+        ref.set(data, merge=merge)
+
+    def update(self, ref, data):
+        ref.update(data)
+
+    def create(self, ref, data):
+        ref.create(data)
+
+    def delete(self, ref):
+        ref.delete()
+
+
+class FixtureBatch(FixtureTransaction):
+    def commit(self):
+        return []
+
+
+class FixtureFirestore:
+    def __init__(self):
+        self.data = {}
+        self.writes = []
+        self.reads = []
+        self.generated = 0
+
+    def collection(self, name):
+        return FixtureCollection(self, name)
+
+    def transaction(self, **kwargs):
+        return FixtureTransaction(self)
+
+    def batch(self):
+        return FixtureBatch(self)
+
+
+class FixtureSheetRequest:
+    def __init__(self, provider, label, kwargs, payload):
+        self._provider = provider
+        self._label = label
+        self._kwargs = kwargs
+        self._payload = payload
+
+    def execute(self):
+        self._provider.calls.append((self._label, self._kwargs))
+        return self._payload
+
+
+class FixtureSheetValues:
+    def __init__(self, provider):
+        self._provider = provider
+
+    def get(self, **kwargs):
+        range_name = kwargs.get("range") or ""
+        return FixtureSheetRequest(
+            self._provider, "values.get", kwargs,
+            {"values": [self._provider.row_for(range_name)]},
+        )
+
+    def update(self, **kwargs):
+        return FixtureSheetRequest(self._provider, "values.update", kwargs, {})
+
+    def batchUpdate(self, **kwargs):  # noqa: N802 - Google API name
+        return FixtureSheetRequest(self._provider, "values.batchUpdate", kwargs, {})
+
+
+class FixtureSpreadsheets:
+    def __init__(self, provider):
+        self._provider = provider
+
+    def values(self):
+        return FixtureSheetValues(self._provider)
+
+    def get(self, **kwargs):
+        return FixtureSheetRequest(
+            self._provider, "spreadsheets.get", kwargs,
+            {"sheets": [{"properties": {"title": "Sheet1", "sheetId": 0}}]},
+        )
+
+    def batchUpdate(self, **kwargs):  # noqa: N802 - Google API name
+        return FixtureSheetRequest(self._provider, "spreadsheets.batchUpdate", kwargs, {})
+
+
+class FixtureSheets:
+    def __init__(self, header, row):
+        self.calls = []
+        self._header = header
+        self._row = row
+
+    def row_for(self, range_name):
+        return self._row if range_name.endswith(f"{FIXTURE_ROW}:{FIXTURE_ROW}") else self._header
+
+    def spreadsheets(self):
+        return FixtureSpreadsheets(self)
+
+
+class FirstSliceClientIsolationTests(unittest.TestCase):
+    """One-property outreach, driven end to end through scoped clients only.
+
+    Every ambient production client is booby-trapped, so a single unthreaded call
+    site anywhere in the reached graph fails the run rather than quietly writing
+    to production. The Graph boundary itself is NOT extracted here - that is Task
+    6 - so it is patched with the established deterministic fake and asserted on;
+    nothing in this test makes a network request.
+    """
+
+    HEADER = ["Property Address", "Email", "Name"]
+
+    def _row(self):
+        return ["100 Fixture Way", FIXTURE_RECIPIENT, "Pat Fixture"]
+
+    def _seed(self):
+        store = FixtureFirestore()
+        store.data[FIXTURE_PREFIX] = {
+            "email": "sender@fixture.invalid",
+            "signatureMode": "none",
+        }
+        store.data["systemConfig/campaignAccess"] = {
+            "automationEnabled": True,
+            "allowedUids": [FIXTURE_UID],
+        }
+        store.data[f"{FIXTURE_PREFIX}/clients/{FIXTURE_CLIENT}"] = {
+            "sheetId": FIXTURE_SHEET,
+            "status": "live",
+            "columnConfig": get_default_column_config(),
+        }
+        store.data[
+            f"{FIXTURE_PREFIX}/clients/{FIXTURE_CLIENT}/notifications/notif-1"
+        ] = {"kind": "sheet_update"}
+        store.data[f"{FIXTURE_PREFIX}/outbox/outbox-1"] = {
+            "assignedEmails": [FIXTURE_RECIPIENT],
+            "script": "Hi Pat, could you share the asking rent for 100 Fixture Way?",
+            "scriptSelectionMode": "exact",
+            "clientId": FIXTURE_CLIENT,
+            "subject": "100 Fixture Way",
+            "rowNumber": FIXTURE_ROW,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_launch",
+            "contactName": "Pat",
+            "actionAuditId": "audit-1",
+            "notificationId": "notif-1",
+            "notificationClientId": FIXTURE_CLIENT,
+            "deleteNotificationOnSend": True,
+            "followUpConfig": {
+                "enabled": True,
+                "followUps": [
+                    {"waitTime": 3, "waitUnit": "days",
+                     "message": "Following up on 100 Fixture Way."}
+                ],
+            },
+            "createdAt": "2026-08-17T00:00:00Z",
+        }
+        return store
+
+    def _runtime(self, store, sheets):
+        return ar.certification_runtime(
+            run_id="cert-run-5a",
+            scope="campaign-one-property",
+            firestore=store,
+            sheets=sheets,
+            firestore_prefix=FIXTURE_PREFIX,
+            sheet_ids=(FIXTURE_SHEET,),
+            # campaign authority is a genuinely global decision; readable, never writable
+            readable_paths=("systemConfig/campaignAccess",),
+        )
+
+    def _drive_run(self):
+        """Drive the slice with every ambient client booby-trapped."""
+        from tests.test_full_campaign_e2e import FakeGraph
+
+        store = self._seed()
+        sheets = FixtureSheets(self.HEADER, self._row())
+        runtime = self._runtime(store, sheets)
+        graph = FakeGraph()
+
+        exploding_modules = (
+            (clients_module, "_fs"),
+            (messaging_module, "_fs"),
+            (processing_module, "_fs"),
+            (followup_module, "_fs"),
+            (notifications_module, "_fs"),
+        )
+        with ExitStack() as stack:
+            for module, attribute in exploding_modules:
+                stack.enter_context(
+                    patch.object(module, attribute, ExplodingClient(f"{module.__name__}.{attribute}"))
+                )
+            # a fresh provider client is just as much an escape as the global one
+            stack.enter_context(
+                patch("google.cloud.firestore.Client", ExplodingClient("firestore.Client"))
+            )
+            for module in (clients_module, sheets_module):
+                stack.enter_context(
+                    patch.object(module, "_sheets_client", ExplodingClient("_sheets_client"))
+                )
+            stack.enter_context(patch.object(email_module, "requests", graph))
+            stack.enter_context(patch.object(email_module.time, "sleep", return_value=None))
+            states = email_module.send_outboxes(
+                FIXTURE_UID,
+                {"Authorization": "Bearer fixture"},
+                runtime=runtime,
+            )
+        return {
+            "store": store,
+            "sheets": sheets,
+            "runtime": runtime,
+            "graph": graph,
+            "states": states,
+        }
+
+    # -- the run itself ---------------------------------------------------
+
+    def test_the_slice_completes_without_touching_any_ambient_client(self):
+        result = self._drive_run()
+        self.assertEqual(result["graph"].sent_recipients(), [FIXTURE_RECIPIENT])
+        self.assertEqual(len(result["graph"].sent_draft_ids), 1)
+
+    def test_no_effect_escaped_the_fixture_scope(self):
+        result = self._drive_run()
+        self.assertEqual(result["runtime"].effect_scope.violations, [])
+        for _kind, path, _payload, _merge in result["store"].writes:
+            self.assertTrue(
+                path.startswith(FIXTURE_PREFIX),
+                f"write escaped the fixture prefix: {path}",
+            )
+
+    def test_ordinary_thread_message_and_index_writes_all_landed(self):
+        writes = {path for _kind, path, _payload, _merge in self._drive_run()["store"].writes}
+        self.assertTrue(any(p.startswith(f"{FIXTURE_PREFIX}/threads/") for p in writes))
+        self.assertTrue(any("/messages/" in p for p in writes))
+        self.assertTrue(any(f"{FIXTURE_PREFIX}/msgIndex/" in p for p in writes))
+        self.assertTrue(any(f"{FIXTURE_PREFIX}/convIndex/" in p for p in writes))
+
+    def test_action_audit_and_outbox_terminalization_landed(self):
+        writes = self._drive_run()["store"].writes
+        audit = [w for w in writes if w[1] == f"{FIXTURE_PREFIX}/actionAudit/audit-1"]
+        self.assertTrue(audit, "no action-audit write")
+        self.assertEqual(audit[-1][2].get("status"), "sent")
+        self.assertIn(
+            ("delete", f"{FIXTURE_PREFIX}/outbox/outbox-1", None, None), writes
+        )
+
+    def test_campaign_authority_and_optout_reads_went_through_the_fence(self):
+        """Both gates ran, and both ran against the fixture store.
+
+        These two reads are the ones a certification run most needs to be real:
+        skipping authority would let a stopped client send, and skipping the
+        opt-out check would mail someone who asked not to be mailed. Proving the
+        run reached them - rather than fail-closing before them - is the point.
+        """
+        reads = self._drive_run()["store"].reads
+        self.assertIn(f"{FIXTURE_PREFIX}/clients/{FIXTURE_CLIENT}", reads)
+        self.assertIn(f"{FIXTURE_PREFIX}/archivedClients/{FIXTURE_CLIENT}", reads)
+        self.assertIn("systemConfig/campaignAccess", reads)
+        self.assertTrue(
+            any(r.startswith(f"{FIXTURE_PREFIX}/optedOutContacts/") for r in reads),
+            f"the opt-out gate never read the fixture store: {reads}",
+        )
+
+    def test_the_global_policy_document_is_read_but_never_written(self):
+        """The one path outside the fixture subtree the run may touch at all."""
+        result = self._drive_run()
+        self.assertIn("systemConfig/campaignAccess", result["store"].reads)
+        self.assertEqual(
+            [w for w in result["store"].writes if not w[1].startswith(FIXTURE_PREFIX)],
+            [],
+        )
+
+    def test_row_highlight_reached_the_fixture_sheet_only(self):
+        sheets = self._drive_run()["sheets"]
+        highlights = [
+            kwargs for label, kwargs in sheets.calls if label == "spreadsheets.batchUpdate"
+        ]
+        self.assertTrue(highlights, "row highlight never happened")
+        for kwargs in highlights:
+            self.assertEqual(kwargs.get("spreadsheetId"), FIXTURE_SHEET)
+
+    def test_followup_was_scheduled_through_the_scoped_client(self):
+        writes = self._drive_run()["store"].writes
+        self.assertTrue(
+            any("followUp" in str(payload) or "followup" in path.lower()
+                for _kind, path, payload, _merge in writes if payload),
+            "no follow-up scheduling write",
+        )
+
+    def test_notification_deletion_did_not_fall_back_to_the_ambient_client(self):
+        writes = self._drive_run()["store"].writes
+        self.assertIn(
+            ("delete",
+             f"{FIXTURE_PREFIX}/clients/{FIXTURE_CLIENT}/notifications/notif-1",
+             None, None),
+            writes,
+        )
+
+    def test_the_slice_makes_zero_drive_calls(self):
+        result = self._drive_run()
+        self.assertIsInstance(result["runtime"].drive, ar.DenyingDriveClient)
+        self.assertEqual(result["runtime"].drive_publication.real_permission_calls, 0)
+        self.assertEqual(result["runtime"].drive_publication.captured, [])
+
+    def test_certification_never_touches_production_send_counters(self):
+        """Production's ``sendCounters`` live outside any fixture prefix.
+
+        Reading them would leak a real user's allowance into a fixture run and
+        writing them would consume it, so the isolated CounterStore is the only
+        legitimate store here - and the fixture store must show no counter path.
+        """
+        result = self._drive_run()
+        touched = [
+            path for path in
+            [w[1] for w in result["store"].writes] + result["store"].reads
+            if "sendCounter" in path
+        ]
+        self.assertEqual(touched, [])
+
+    def test_two_concurrent_runtimes_share_no_store(self):
+        first = self._drive_run()
+        second = self._drive_run()
+        self.assertIsNot(first["store"], second["store"])
+        self.assertIsNot(first["runtime"].counters, second["runtime"].counters)
+        self.assertIsNot(first["runtime"].effect_scope, second["runtime"].effect_scope)

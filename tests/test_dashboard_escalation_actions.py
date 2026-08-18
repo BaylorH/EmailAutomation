@@ -647,7 +647,7 @@ class DismissEscalationNotificationTests(unittest.TestCase):
         # Escalation actually clears out of 'paused'.
         self.assertEqual(store.data_at(DIS_THREAD_PATH)["status"], "active")
         # Notification cleared through the counter-safe backend helper.
-        del_notif.assert_called_once_with(DIS_UID, DIS_CLIENT, DIS_NOTIF)
+        del_notif.assert_called_once_with(DIS_UID, DIS_CLIENT, DIS_NOTIF, runtime=None)
 
     def _dismiss_via_endpoint(self, store, action_audit_id=None):
         """Drive the REAL /api/dismiss-notification handler with a faked Firestore.

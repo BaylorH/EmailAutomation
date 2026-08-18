@@ -9,6 +9,7 @@ import httplib2
 from google.auth.exceptions import TransportError
 from googleapiclient.errors import HttpError
 from requests import exceptions as requests_exceptions
+from .automation_runtime import sheets_for
 from .clients import _sheets_client
 from .column_config import (
     CANONICAL_FIELDS,
@@ -741,7 +742,7 @@ ROW_HIGHLIGHT_BLUE = {"red": 0.7, "green": 0.85, "blue": 1.0}    # Paused - awai
 ROW_HIGHLIGHT_COLOR = ROW_HIGHLIGHT_YELLOW  # Default for backwards compatibility
 
 
-def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
+def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None, runtime=None) -> bool:
     """
     Apply background color highlight to an entire row.
 
@@ -749,6 +750,7 @@ def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
         spreadsheet_id: Google Sheets ID
         rownum: 1-based row number to highlight
         color: RGB dict with values 0-1 (defaults to light yellow)
+        runtime: request-scoped runtime, or None for ambient production
 
     Returns:
         True on success, False on failure
@@ -757,7 +759,7 @@ def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
         color = ROW_HIGHLIGHT_COLOR
 
     try:
-        sheets = _sheets_client()
+        sheets = sheets_for(runtime, _sheets_client)
         meta = _execute_with_retry(
             sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
             "highlight_row_get_meta"

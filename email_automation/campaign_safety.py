@@ -3,6 +3,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from google.cloud.firestore import SERVER_TIMESTAMP
 
+from .automation_runtime import firestore_for
+
 
 CAMPAIGN_AUTOMATION_ALLOW = "allow"
 CAMPAIGN_AUTOMATION_BLOCKED = "blocked"
@@ -308,6 +310,7 @@ def get_client_automation_decision(
     client_id: Optional[str],
     *,
     firestore_client=None,
+    runtime=None,
 ) -> CampaignAutomationDecision:
     """Read active then archived client state and fail closed when it is uncertain."""
     if not isinstance(user_id, str) or not user_id.strip() or not isinstance(client_id, str) or not client_id.strip():
@@ -317,6 +320,11 @@ def get_client_automation_decision(
     try:
         fs = firestore_client
         if fs is None:
+            fs = firestore_for(runtime, None)
+        if fs is None:
+            # Only ambient production reaches the import: clients builds a live
+            # Firestore client at import time (backlog #84), which a fenced run
+            # must never trigger.
             from .clients import _fs
 
             fs = _fs
