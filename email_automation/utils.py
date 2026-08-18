@@ -385,7 +385,7 @@ def _subject_to_address_city(subject: str) -> tuple[str, str]:
 # Cache for uploaded image URLs - populated on first use, persists for process lifetime
 _CACHED_IMAGE_URLS = {}
 
-def _upload_logo_to_drive(image_filename: str = "mohr-partners-logo.png") -> str:
+def _upload_logo_to_drive(image_filename: str = "mohr-partners-logo.png", runtime=None) -> str:
     """
     Get or upload image to Google Drive and return public direct image URL.
 
@@ -474,13 +474,9 @@ def _upload_logo_to_drive(image_filename: str = "mohr-partners-logo.png") -> str
         ).execute()
 
         # Make link-shareable
-        drive.permissions().create(
-            fileId=file.get("id"),
-            body={
-                "role": "reader",
-                "type": "anyone"
-            }
-        ).execute()
+        drive_publication_for(runtime, drive).publish(
+            file.get("id"), {"role": "reader", "type": "anyone"}
+        )
 
         web_link = file.get("webViewLink")
 

@@ -913,6 +913,43 @@ def ai_for(runtime: Optional["AutomationRuntime"], ambient: Any) -> AIProviderTr
     return AmbientAITransport(ambient)
 
 
+class AmbientDrivePublication:
+    """Ordinary production, over the CALLER'S OWN Drive service.
+
+    Same contract as ``AmbientAITransport``: the caller already holds a built
+    service, and its tests patch that. Reaching for a fresh one here would both
+    ignore the patch and pay for an extra OAuth refresh.
+    """
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+
+    def publish(self, file_id: str, permission: Mapping[str, Any]) -> Mapping[str, Any]:
+        return (
+            self._service.permissions()
+            .create(fileId=file_id, body=dict(permission))
+            .execute()
+        )
+
+
+def drive_publication_for(
+    runtime: Optional["AutomationRuntime"],
+    ambient: Any,
+) -> DrivePublicationTransport:
+    """Return the request's Drive publication transport, else ordinary production.
+
+    A public Drive permission is the least reversible effect in this system: once
+    a link is world-readable it may be crawled, cached, or reshared, and deleting
+    the permission afterwards does not undo that. So certification captures the
+    would-publish request and calls ``permissions().create`` never - which is why
+    public-link publication stays NOT_TESTED by contract rather than being
+    exercised against a fixture.
+    """
+    if runtime is not None and getattr(runtime, "drive_publication", None) is not None:
+        return runtime.drive_publication
+    return AmbientDrivePublication(ambient)
+
+
 def clock_for(
     runtime: Optional["AutomationRuntime"],
     ambient: Callable[[], datetime],

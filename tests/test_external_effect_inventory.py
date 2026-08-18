@@ -71,11 +71,18 @@ ROUTED_AI_SITES = {
 # Task 6's premise, this one is CORRECT, and pinning it here is what makes that
 # checkable rather than remembered.
 UNROUTED_DRIVE_SITES = {
+    ("email_automation/service_providers.py", "set_public_permission"),
+    ("scheduler_runner.py", "upload_pdf_to_drive"),
+}
+
+# Routed in Task 7F step 4. A public Drive permission is the least reversible
+# effect here - once a link is world-readable it may be crawled, cached or
+# reshared, and removing the permission afterwards does not undo that - so
+# certification captures the would-publish request and calls the provider never.
+ROUTED_DRIVE_SITES = {
     ("email_automation/file_handling.py", "upload_pdf_to_drive"),
     ("email_automation/file_handling.py", "upload_property_image_to_drive"),
-    ("email_automation/service_providers.py", "set_public_permission"),
     ("email_automation/utils.py", "_upload_logo_to_drive"),
-    ("scheduler_runner.py", "upload_pdf_to_drive"),
 }
 
 OPERATOR_SCRIPT_SITES = {
@@ -251,10 +258,47 @@ class ProviderEffectInventoryTests(unittest.TestCase):
 
         The plan states five permission call sites across four files. Task 6's
         plan text was confidently wrong about the delivery boundary, so a stated
-        premise is not evidence until it is checked.
+        premise is not evidence until it is checked. Counted across the routed
+        and unrouted sets together, since step 4 moved three of the five.
         """
-        self.assertEqual(len(UNROUTED_DRIVE_SITES), 5)
-        self.assertEqual(len({module for module, _fn in UNROUTED_DRIVE_SITES}), 4)
+        every_site = UNROUTED_DRIVE_SITES | ROUTED_DRIVE_SITES
+        self.assertEqual(len(every_site), 5)
+        self.assertEqual(len({module for module, _fn in every_site}), 4)
+
+    def test_routed_drive_sites_no_longer_reach_the_provider_directly(self):
+        actual = _sites(lambda kind: kind == "drive_permission")
+        for site in ROUTED_DRIVE_SITES:
+            with self.subTest(site=site):
+                self.assertNotIn(site, actual)
+
+    def test_every_routed_drive_site_resolves_through_the_runtime_transport(self):
+        for module, function_name in ROUTED_DRIVE_SITES:
+            with self.subTest(module=module, function=function_name):
+                tree = ast.parse(_source(module))
+                owner = _enclosing_functions(tree)
+                self.assertTrue(
+                    any(
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "drive_publication_for"
+                        and owner.get(node) == function_name
+                        for node in ast.walk(tree)
+                    ),
+                    f"{module}:{function_name} no longer resolves its Drive "
+                    "publication through drive_publication_for",
+                )
+
+    def test_the_unrouted_drive_remainder_has_no_production_caller(self):
+        """set_public_permission is provider-interface only; the other is a script."""
+        source = _source("email_automation/service_providers.py")
+        self.assertIn("def set_public_permission", source)
+        callers = []
+        for relative in _deployable_files():
+            if relative == "email_automation/service_providers.py":
+                continue
+            if "set_public_permission(" in _source(relative):
+                callers.append(relative)
+        self.assertEqual(callers, [])
 
     def test_the_adapters_exist_and_are_the_only_sanctioned_reach(self):
         adapters = _sites(lambda kind: True)

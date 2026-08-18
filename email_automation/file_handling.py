@@ -16,7 +16,7 @@ from googleapiclient.http import MediaIoBaseUpload
 import io
 from .app_config import native_image_ingestion_enabled
 from .clients import _helper_google_creds, client
-from .automation_runtime import ai_for
+from .automation_runtime import ai_for, drive_publication_for
 
 
 _PDF_PAGE_MARKER_LINE_RE = re.compile(r"^--- Page [1-9][0-9]* ---$", re.MULTILINE)
@@ -1793,7 +1793,7 @@ def ensure_drive_folder(*, redact_failure_detail: bool = False):
             print(f"❌ Failed to ensure Drive folder: {e}")
         return None
 
-def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> Optional[str]:
+def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None, runtime=None) -> Optional[str]:
     """Upload PDF to Drive and return webViewLink."""
     try:
         creds = _helper_google_creds()
@@ -1820,13 +1820,9 @@ def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> Opt
         ).execute()
         
         # Make link-shareable
-        drive.permissions().create(
-            fileId=file.get("id"),
-            body={
-                "role": "reader",
-                "type": "anyone"
-            }
-        ).execute()
+        drive_publication_for(runtime, drive).publish(
+            file.get("id"), {"role": "reader", "type": "anyone"}
+        )
         
         web_link = file.get("webViewLink")
         print(f"📁 Uploaded to Drive: {name} -> {web_link}")
@@ -2046,6 +2042,7 @@ def upload_property_image_to_drive(
     folder_id: str = None,
     *,
     redact_failure_detail: bool = False,
+    runtime=None,
 ) -> Optional[Dict[str, Any]]:
     """Upload a generated property preview image and return safe hosted metadata."""
     if not content:
@@ -2079,10 +2076,9 @@ def upload_property_image_to_drive(
             fields="id,webViewLink",
         ).execute()
 
-        drive.permissions().create(
-            fileId=file.get("id"),
-            body={"role": "reader", "type": "anyone"},
-        ).execute()
+        drive_publication_for(runtime, drive).publish(
+            file.get("id"), {"role": "reader", "type": "anyone"}
+        )
 
         file_id = file.get("id")
         if not file_id:
