@@ -12,6 +12,33 @@ import os
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
+def _record_delete(sink):
+    """Record a Graph draft deletion instead of performing one.
+
+    These lanes used to delete an abandoned draft through a helper the tests
+    mocked by name. Once the call moved behind the delivery transport that mock
+    stopped intercepting anything, and the real verb underneath would have
+    reached a live mailbox. Asserting the DELETE itself is both stronger and
+    safe.
+    """
+
+    class _Deleted:
+        status_code = 204
+
+        def json(self):
+            return {}
+
+        def raise_for_status(self):
+            return None
+
+    def _delete(url, **_kwargs):
+        sink.append(url)
+        return _Deleted()
+
+    return _delete
+
+
+
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -610,6 +637,7 @@ class DirectFollowupKillSwitchTests(unittest.TestCase):
                     "sentRecipients": ["broker@example.com"],
                 }
 
+                deleted_urls = []
                 with patch.object(followup, "_fs", _direct_send_firestore()), \
                      patch.object(
                          followup,
@@ -646,7 +674,7 @@ class DirectFollowupKillSwitchTests(unittest.TestCase):
                          "email_automation.email._filter_reply_all_draft_recipients",
                          return_value=recipient_result,
                      ), \
-                     patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+                     patch("requests.delete", side_effect=_record_delete(deleted_urls)):
                     sent = followup._send_followup_email(
                         user_id="user-1",
                         headers={"Authorization": "Bearer token"},
@@ -662,7 +690,7 @@ class DirectFollowupKillSwitchTests(unittest.TestCase):
                     ["https://graph.microsoft.com/v1.0/me/messages/graph-root/createReplyAll"],
                 )
                 self.assertFalse(any(url.endswith("/send") for url in post_urls))
-                delete_draft.assert_called_once()
+                self.assertEqual(len(deleted_urls), 1, f"draft not deleted: {deleted_urls}")
                 self.assertIn(
                     "suppressed_by_kill_switch",
                     followup._send_followup_email.last_error,

@@ -55,12 +55,11 @@ GUARDED_MODULES = (
 SHARED_DELIVERY_MODULE = "email_automation/message_transport.py"
 SHARED_DELIVERY_OWNER = "send_prepared_draft"
 
-# The delivery sites that have NOT yet converged. This set SHRINKS as Tasks
-# 7A-7D land; each of those tasks is expected to fail this constant and update
-# it in the same commit, exactly as Task 6 did.
-EXPECTED_GUARDED_SEND_SITES = {
-    ("email_automation/followup.py", "_send_followup_email"),
-}
+# EMPTY, as of Task 7D. Every guarded delivery lane now routes through the
+# shared boundary, so no policy-owning module holds a send call of its own.
+# A NEW entry appearing here is the alarm: it means a lane was added that
+# bypasses the boundary rather than converging on it.
+EXPECTED_GUARDED_SEND_SITES = set()
 
 # Unguarded or partially guarded surfaces that reach Graph send/reply directly.
 # Enumerated so a NEW one fails this test rather than arriving unnoticed.
@@ -219,19 +218,27 @@ class GuardedDeliveryBoundaryTests(unittest.TestCase):
             [(m, f) for m in GUARDED_MODULES for f, _u, _l in find_graph_send_calls(m)]
         }
         for converged in (
-            "send_and_index_email", "send_reply_in_thread", "_send_outbox_as_reply",
+            "send_and_index_email", "send_reply_in_thread",
+            "_send_outbox_as_reply", "_send_followup_email",
         ):
             with self.subTest(lane=converged):
                 self.assertNotIn(converged, owners)
 
-    def test_one_lane_remains_unconverged_for_task_7d(self):
-        """A live count, not a comment: it must fall as each lane is routed."""
-        owners = {owner for _module, owner in EXPECTED_GUARDED_SEND_SITES}
-        self.assertEqual(
-            len(owners), 1,
-            "the remaining unconverged delivery lanes changed; update this count in "
-            "the same commit that converges one",
-        )
+    def test_every_guarded_lane_has_converged(self):
+        """The end state Tasks 6 and 7A-7D existed to reach.
+
+        Phase A began with four independent send sites across three modules.
+        There are now none: every guarded lane reaches the provider through one
+        boundary. This is the invariant Task 7E's bypass proof rests on, so it
+        is asserted rather than described.
+        """
+        self.assertEqual(EXPECTED_GUARDED_SEND_SITES, set())
+        actual = {
+            (module, owner)
+            for module in GUARDED_MODULES
+            for owner, _url, _lineno in find_graph_send_calls(module)
+        }
+        self.assertEqual(actual, set())
 
     def test_every_guarded_delivery_call_targets_a_draft_send_endpoint(self):
         for module in GUARDED_MODULES:

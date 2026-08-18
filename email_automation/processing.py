@@ -5711,7 +5711,6 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         from .clients import _fs
         from .email import (
             _check_single_provider_send_cap,
-            _delete_graph_reply_draft,
             _filter_reply_all_draft_recipients,
             _hydrate_reply_all_draft_recipients,
             _refund_single_provider_send,

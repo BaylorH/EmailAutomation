@@ -8,6 +8,33 @@ from unittest.mock import Mock, patch
 import requests
 from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 
+def _record_delete(sink):
+    """Record a Graph draft deletion instead of performing one.
+
+    These lanes used to delete an abandoned draft through a helper the tests
+    mocked by name. Once the call moved behind the delivery transport that mock
+    stopped intercepting anything, and the real verb underneath would have
+    reached a live mailbox. Asserting the DELETE itself is both stronger and
+    safe.
+    """
+
+    class _Deleted:
+        status_code = 204
+
+        def json(self):
+            return {}
+
+        def raise_for_status(self):
+            return None
+
+    def _delete(url, **_kwargs):
+        sink.append(url)
+        return _Deleted()
+
+    return _delete
+
+
+
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -1679,8 +1706,12 @@ class FollowupTerminalStateTests(unittest.TestCase):
             followup, "_save_followup_message", return_value=True
         ), patch(
             "google.cloud.firestore.transactional", lambda fn: fn
-        ), patch(
-            "email_automation.email._delete_graph_reply_draft"
+        ), patch.object(
+            # Patch the verb, not the old helper name: the lane deletes through
+            # the transport now, and a name-level mock stopped intercepting it.
+            requests,
+            "delete",
+            return_value=FakeResponse(204),
         ):
             result = followup._send_followup_email(
                 "uid-1",
@@ -1811,8 +1842,12 @@ class FollowupTerminalStateTests(unittest.TestCase):
             return_value=sheets,
         ), patch(
             "google.cloud.firestore.transactional", lambda fn: fn
-        ), patch(
-            "email_automation.email._delete_graph_reply_draft"
+        ), patch.object(
+            # Patch the verb, not the old helper name: the lane deletes through
+            # the transport now, and a name-level mock stopped intercepting it.
+            requests,
+            "delete",
+            return_value=FakeResponse(204),
         ):
             result = followup._send_followup_email(
                 "uid-1",
@@ -1880,6 +1915,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
                 return FakeResponse(202, {})
             raise AssertionError(f"Unexpected POST: {url}")
 
+        deleted_urls = []
         with patch.object(followup, "_fs", fake_fs), patch.object(
             followup, "exponential_backoff_request", side_effect=run_request
         ), patch.object(requests, "get", side_effect=fake_get), patch.object(
@@ -1890,7 +1926,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "email_automation.processing.is_contact_opted_out", return_value=None
         ), patch(
             "email_automation.email._delete_graph_reply_draft"
-        ) as delete_draft:
+        ), patch("requests.delete", side_effect=_record_delete(deleted_urls)):
             result = followup._send_followup_email(
                 "uid-1",
                 {"Authorization": "Bearer token"},
@@ -1902,7 +1938,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertFalse(any(url.endswith("/send") for url in post_urls))
-        delete_draft.assert_called_once()
+        self.assertEqual(len(deleted_urls), 1, f"draft not deleted: {deleted_urls}")
         self.assertIn("claim owner", followup._send_followup_email.last_error)
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
 
@@ -4792,13 +4828,14 @@ class FollowupTerminalStateTests(unittest.TestCase):
             ),
         ]
 
+        deleted_urls = []
         with patch.object(followup, "_fs", fake_fs), \
              patch.object(followup, "exponential_backoff_request", side_effect=run_request), \
              patch.object(requests, "get", side_effect=fake_get), \
              patch.object(requests, "post", side_effect=fake_post), \
              patch.object(requests, "patch", return_value=FakeResponse(200)), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
-             patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+             patch("requests.delete", side_effect=_record_delete(deleted_urls)):
             result = followup._send_followup_email(
                 "uid-1",
                 {"Authorization": "Bearer token"},
@@ -4810,7 +4847,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertFalse(any(url.endswith("/send") for url in posts))
-        delete_draft.assert_called_once()
+        self.assertEqual(len(deleted_urls), 1, f"draft not deleted: {deleted_urls}")
         self.assertEqual("terminal", followup._send_followup_email.campaign_suppression_kind)
         self.assertIn("client_stopped_by_user", followup._send_followup_email.last_error)
 
@@ -4873,6 +4910,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
                 return FakeResponse(202, {})
             return FakeResponse(201, {})
 
+        deleted_urls = []
         with patch.object(followup, "_fs", fake_fs), patch.object(
             followup, "exponential_backoff_request", side_effect=run_request
         ), patch.object(requests, "get", side_effect=fake_get), patch.object(
@@ -4899,7 +4937,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
             },
         ), patch.object(
             followup, "_save_followup_message", return_value=True
-        ), patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+        ), patch("requests.delete", side_effect=_record_delete(deleted_urls)):
             result = followup._send_followup_email(
                 "uid-1",
                 {"Authorization": "Bearer token"},
@@ -4911,7 +4949,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertFalse(any(url.endswith("/send") for url in posts))
-        delete_draft.assert_called_once()
+        self.assertEqual(len(deleted_urls), 1, f"draft not deleted: {deleted_urls}")
         self.assertIn("requirements_mismatch", followup._send_followup_email.last_error)
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
 
@@ -5192,8 +5230,13 @@ class FollowupTerminalStateTests(unittest.TestCase):
                     followup,
                     "_persist_followup_send_intent",
                     return_value=(None, "test stop"),
-                ) as persist_intent, patch(
-                    "email_automation.email._delete_graph_reply_draft"
+                ) as persist_intent, patch.object(
+                    # The lane deletes an abandoned draft through the transport
+                    # now, so the verb has to be patched - mocking the old helper
+                    # name let the real DELETE reach a live mailbox.
+                    requests,
+                    "delete",
+                    return_value=FakeResponse(204),
                 ):
                     result = followup._send_followup_email(
                         "uid-1",
@@ -5314,8 +5357,13 @@ class FollowupTerminalStateTests(unittest.TestCase):
                     followup,
                     "_persist_followup_send_intent",
                     return_value=(None, "test stop"),
-                ) as persist_intent, patch(
-                    "email_automation.email._delete_graph_reply_draft"
+                ) as persist_intent, patch.object(
+                    # The lane deletes an abandoned draft through the transport
+                    # now, so the verb has to be patched - mocking the old helper
+                    # name let the real DELETE reach a live mailbox.
+                    requests,
+                    "delete",
+                    return_value=FakeResponse(204),
                 ):
                     result = followup._send_followup_email(
                         "uid-1",
@@ -5439,8 +5487,12 @@ class FollowupTerminalStateTests(unittest.TestCase):
         ), patch(
             "google.cloud.firestore.transactional",
             lambda fn: fn,
-        ), patch(
-            "email_automation.email._delete_graph_reply_draft"
+        ), patch.object(
+            # Patch the verb, not the old helper name: the lane deletes through
+            # the transport now, and a name-level mock stopped intercepting it.
+            requests,
+            "delete",
+            return_value=FakeResponse(204),
         ):
             result = followup._send_followup_email(
                 "uid-1",

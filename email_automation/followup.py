@@ -29,6 +29,11 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .clients import _fs
 from .automation_runtime import clock_for, firestore_for
+from .message_transport import (
+    DeliveryKind,
+    GraphDraftDeliveryTransport,
+    OutboundDraft,
+)
 from .utils import (
     exponential_backoff_request,
     format_email_body_with_footer,
@@ -2885,6 +2890,35 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
     return operation_states
 
 
+def _recipient_addresses(entries) -> list:
+    """Flatten a Graph recipient list back to plain addresses."""
+    addresses = []
+    for entry in entries or []:
+        address = ((entry or {}).get("emailAddress") or {}).get("address")
+        if address:
+            addresses.append(address)
+    return addresses
+
+
+def _followup_delivery_transport_for(runtime, headers, base):
+    """Resolve the delivery boundary for the follow-up lane.
+
+    ``requests`` is imported locally inside ``_send_followup_email``, so it is
+    imported here too rather than assumed at module scope.
+    """
+    if runtime is not None and getattr(runtime, "outbound", None) is not None:
+        return runtime.outbound
+    import requests
+
+    return GraphDraftDeliveryTransport(
+        headers=headers,
+        base=base,
+        request=requests,
+        retry=exponential_backoff_request,
+        send_max_retries=1,
+    )
+
+
 def _send_followup_email(
     user_id: str,
     headers: Dict[str, str],
@@ -2893,6 +2927,7 @@ def _send_followup_email(
     followup_config: Dict,
     followup_index: int,
     claim_owner: Optional[str] = None,
+    runtime=None,
 ) -> bool:
     """Send a follow-up email for a specific thread."""
     import requests
@@ -3315,7 +3350,7 @@ def _send_followup_email(
                 return False
 
         # Send as a filtered reply-all draft so broker CCs are preserved safely.
-        send_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        send_attempt_at = clock_for(runtime, lambda: datetime.now(timezone.utc))() - timedelta(seconds=5)
         _set_followup_send_outcome(attempt_at=send_attempt_at)
 
         try:
@@ -3345,29 +3380,26 @@ def _send_followup_email(
             return False
 
         from .email import (
-            _delete_graph_reply_draft,
             _filter_reply_all_draft_recipients,
             _hydrate_reply_all_draft_recipients,
             _reviewed_recipient_reply_all_fallback,
             _source_message_reply_all_fallback,
         )
 
-        create_reply_resp = exponential_backoff_request(
-            lambda: requests.post(
-                f"{base}/me/messages/{graph_msg_id}/createReplyAll",
-                headers=headers,
-                timeout=30,
-            )
-        )
-        if not create_reply_resp or create_reply_resp.status_code not in [200, 201, 202]:
+        # The last lane to converge. As with the others, every Graph interaction
+        # goes through the boundary, not just the send: a draft created in a real
+        # mailbox is an effect. Follow-up policy and counters are untouched.
+        transport = _followup_delivery_transport_for(runtime, headers, base)
+        reply_handle = transport.create_reply(graph_msg_id, accepted=(200, 201, 202))
+        if not reply_handle.ok:
             failure_reason = (
-                f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
+                f"createReplyAll failed: {reply_handle.status_code if reply_handle.status_code is not None else 'no response'}"
             )
             _set_followup_send_outcome(error=failure_reason)
             print(f"   ❌ {failure_reason}")
             return False
 
-        reply_draft = create_reply_resp.json() or {}
+        reply_draft = dict(reply_handle.raw)
         reply_draft_id = reply_draft.get("id")
         if not reply_draft_id:
             failure_reason = "createReplyAll returned no draft id"
@@ -3378,7 +3410,9 @@ def _send_followup_email(
         source_message = dict(last_outbound or {})
         source_message["replyToEmails"] = [recipient]
 
-        reply_draft = _hydrate_reply_all_draft_recipients(headers, reply_draft, base=base)
+        reply_draft = _hydrate_reply_all_draft_recipients(
+            headers, reply_draft, base=base, transport=transport
+        )
         reply_draft = _source_message_reply_all_fallback(reply_draft, source_message)
         reply_draft = _reviewed_recipient_reply_all_fallback(
             reply_draft,
@@ -3404,7 +3438,7 @@ def _send_followup_email(
                 "manual review required before sending follow-up"
             )
             _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {failure_reason}")
             return False
 
@@ -3421,7 +3455,7 @@ def _send_followup_email(
                     "manual review required before sending follow-up"
                 )
                 _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-                _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                transport.delete_draft(reply_draft_id)
                 print(f"   🛑 {failure_reason}")
                 return False
             recipient_payload["ccRecipients"] = [
@@ -3438,7 +3472,7 @@ def _send_followup_email(
         if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
             failure_reason = "No safe reply-all recipients remained after filtering"
             _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   ❌ {failure_reason}")
             return False
 
@@ -3449,24 +3483,23 @@ def _send_followup_email(
             recipient_payload["ccRecipients"]
         )
 
-        patch_resp = exponential_backoff_request(
-            lambda: requests.patch(
-                f"{base}/me/messages/{reply_draft_id}",
-                headers=headers,
-                json={
-                    "body": {"contentType": "HTML", "content": html_content},
-                    "toRecipients": recipient_payload["toRecipients"],
-                    "ccRecipients": recipient_payload["ccRecipients"],
-                },
-                timeout=30,
-            )
+        followup_envelope = OutboundDraft(
+            kind=DeliveryKind.REPLY_ALL,
+            subject=str(subject or ""),
+            body=html_content,
+            to=tuple(_recipient_addresses(recipient_payload["toRecipients"])),
+            cc=tuple(_recipient_addresses(recipient_payload["ccRecipients"])),
+            bcc=(),
+            reply_to_message_id=graph_msg_id,
+            idempotency_key=f"{thread_id}:followup:{followup_index}",
         )
+        patch_resp = transport.apply_reply(reply_handle, followup_envelope)
         if not patch_resp or patch_resp.status_code not in [200, 202]:
             failure_reason = (
                 f"Patch reply-all draft failed: {patch_resp.status_code if patch_resp else 'no response'}"
             )
             _set_followup_send_outcome(error=failure_reason)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   ❌ {failure_reason}")
             return False
 
@@ -3474,14 +3507,7 @@ def _send_followup_email(
             signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
             for attachment in signature_attachments:
                 try:
-                    att_resp = exponential_backoff_request(
-                        lambda att=attachment: requests.post(
-                            f"{base}/me/messages/{reply_draft_id}/attachments",
-                            headers=headers,
-                            json=att,
-                            timeout=30
-                        )
-                    )
+                    att_resp = transport.attach(reply_handle, attachment)
                     if att_resp and att_resp.status_code in [200, 201]:
                         print(f"      📎 Attached {attachment['name']}")
                     else:
@@ -3490,7 +3516,7 @@ def _send_followup_email(
                             "manual review required before sending follow-up"
                         )
                         _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-                        _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                        transport.delete_draft(reply_draft_id)
                         print(f"      🛑 {failure_reason}")
                         return False
                 except Exception as e:
@@ -3499,7 +3525,7 @@ def _send_followup_email(
                         "manual review required before sending follow-up"
                     )
                     _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-                    _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                    transport.delete_draft(reply_draft_id)
                     print(f"      🛑 {failure_reason}")
                     return False
 
@@ -3510,7 +3536,7 @@ def _send_followup_email(
         )
         if campaign_decision.denies_autonomous_work:
             _set_followup_campaign_suppression(campaign_decision)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {_get_followup_send_outcome().error}")
             return False
         contract_error = _followup_column_contract_error(
@@ -3520,7 +3546,7 @@ def _send_followup_email(
         if contract_error:
             failure_reason = f"{contract_error}; manual review required before sending follow-up"
             _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {failure_reason}")
             return False
 
@@ -3538,7 +3564,7 @@ def _send_followup_email(
                 "manual review required before sending follow-up"
             )
             _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {failure_reason}")
             return False
 
@@ -3548,7 +3574,7 @@ def _send_followup_email(
                 "manual review required before sending follow-up"
             )
             _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {failure_reason}")
             return False
 
@@ -3563,7 +3589,7 @@ def _send_followup_email(
                 outbound_mode,
                 context=f"_send_followup_email thread {thread_id} at Graph send",
             )
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             return False
 
         if not claim_owner:
@@ -3575,7 +3601,7 @@ def _send_followup_email(
                 error=failure_reason,
                 guard_failed_closed=True,
             )
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {failure_reason}")
             return False
 
@@ -3612,7 +3638,7 @@ def _send_followup_email(
                 error=failure_reason,
                 guard_failed_closed=True,
             )
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {failure_reason}")
             return False
 
@@ -3622,11 +3648,7 @@ def _send_followup_email(
             attempt_marker=send_attempt,
         )
 
-        reply_resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-            max_retries=1,
-            operation="graph_send",
-        )
+        reply_resp = transport.send_prepared_draft(reply_draft_id)
 
         if reply_resp.status_code in [200, 201, 202]:
             print(f"   Sent follow-up #{followup_index + 1} for thread {thread_id[:20]}...")

@@ -112,7 +112,12 @@ class CapturingDeliveryTransport:
     # whole reason certification can exercise recipient filtering at all without
     # a live mailbox to reply into.
 
-    def create_reply(self, source_message_id: str) -> ReplyDraftHandle:
+    def create_reply(
+        self,
+        source_message_id: str,
+        *,
+        accepted: tuple = (200, 201),
+    ) -> ReplyDraftHandle:
         proposed = self._proposed_recipients(source_message_id)
         handle = ReplyDraftHandle(
             provider_message_id=f"captured-reply-{self._digest(source_message_id)}",
@@ -125,7 +130,7 @@ class CapturingDeliveryTransport:
                     {"emailAddress": {"address": a}} for a in proposed["cc"]
                 ],
             },
-            status_code=201,
+            status_code=accepted[0] if accepted else 201,
             ok=True,
         )
         self.reply_drafts.append(handle)

@@ -484,7 +484,18 @@ class GraphDraftDeliveryTransport:
     # set. So the transport hands the raw draft back unedited and takes the
     # caller's final decision on the way through ``apply_reply``.
 
-    def create_reply(self, source_message_id: str) -> "ReplyDraftHandle":
+    def create_reply(
+        self,
+        source_message_id: str,
+        *,
+        accepted: Tuple[int, ...] = (200, 201),
+    ) -> "ReplyDraftHandle":
+        """``accepted`` belongs to the caller.
+
+        The converging lanes do not agree on what counts as a created draft -
+        one accepts 202 where another does not - and quietly unifying them here
+        would change a lane's behavior under the guise of a refactor.
+        """
         http = self._http()
         response = self._call(
             lambda: http.post(
@@ -495,7 +506,7 @@ class GraphDraftDeliveryTransport:
             max_retries=self._max_retries,
         )
         status_code = getattr(response, "status_code", None)
-        ok = isinstance(status_code, int) and status_code in (200, 201)
+        ok = isinstance(status_code, int) and status_code in accepted
         raw: Dict[str, Any] = {}
         if ok:
             try:
