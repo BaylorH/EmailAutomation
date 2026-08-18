@@ -388,21 +388,17 @@ class CapturingDrivePublication:
         return {"status": "captured", "fileId": file_id}
 
 
-class RecordingOutboundTransport:
-    """Certification delivery capture. Produces a receipt without sending."""
+def _capturing_outbound_transport(run_id: str) -> Any:
+    """The certification delivery transport.
 
-    def __init__(self) -> None:
-        self.delivered: list = []
+    Imported lazily and taken from ``certification.capture`` rather than
+    reimplemented here: the certification lane has to drive the SAME
+    prepare/commit/discard boundary production drives, or the thing under test
+    is a parallel code path and proving it correct proves nothing.
+    """
+    from .certification.capture import CapturingDeliveryTransport
 
-    def deliver(self, draft: OutboundDraft) -> DeliveryReceipt:
-        self.delivered.append(draft)
-        index = len(self.delivered)
-        return DeliveryReceipt(
-            status="captured",
-            provider_message_id=f"captured-{index}",
-            internet_message_id=f"<captured-{index}@certification.invalid>",
-            conversation_id="captured-conversation",
-        )
+    return CapturingDeliveryTransport(run_id=run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +505,7 @@ def certification_runtime(
             if conversation_snapshot is not None
             else None
         ),
-        outbound=RecordingOutboundTransport(),
+        outbound=_capturing_outbound_transport(run_id),
         counters=InMemoryCounterStore(limits=limits),
         now=now or _utc_now,
         firestore=ScopedFirestore(firestore, effect_scope) if firestore is not None else None,

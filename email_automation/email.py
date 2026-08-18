@@ -32,6 +32,11 @@ from .sheets import (
 )
 from .notifications import delete_notification_and_decrement_counters
 from .automation_runtime import sheets_for, is_certification, CounterReservation
+from .message_transport import (
+    DeliveryKind,
+    GraphDraftDeliveryTransport,
+    OutboundDraft,
+)
 from .utils import normalize_message_id
 from .sent_mail_guard import (
     SentMailGuardLookupError,
@@ -270,6 +275,28 @@ def _increment_global_send_count(fs, day_key: str, amount: int) -> None:
             {"count": Increment(amount), "day": day_key, "updatedAt": SERVER_TIMESTAMP},
             merge=True,
         )
+    )
+
+
+def _delivery_transport_for(runtime, headers, base):
+    """Resolve the delivery boundary for this request.
+
+    Phase A proved there was no shared boundary to relocate - four independent
+    send sites existed - so this is the convergence point being CREATED. A
+    certification runtime supplies its own capture transport; ordinary
+    production builds the Graph one with the module's existing retry policy, so
+    limits stay exactly what they were rather than being restated inside the
+    transport.
+    """
+    if runtime is not None and getattr(runtime, "outbound", None) is not None:
+        return runtime.outbound
+    return GraphDraftDeliveryTransport(
+        headers=headers,
+        base=base,
+        request=requests,
+        retry=exponential_backoff_request,
+        max_retries=GRAPH_SEND_MAX_RETRIES,
+        send_max_retries=1,
     )
 
 
@@ -3529,83 +3556,48 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 dynamic_subject = _subject_for_recipient(user_id, client_id_or_none, (addr or "").lower())
             subject_to_use = dynamic_subject or "Client Outreach"
 
-        msg = {
-            "subject": subject_to_use,
-            "body": {"contentType": content_type, "content": content},
-            "toRecipients": [{"emailAddress": {"address": addr}}],
-        }
-        
-        # Add headers
         internet_headers = []
         if client_id_or_none:
             internet_headers.append({"name": "x-client-id", "value": client_id_or_none})
         if row_number:
             internet_headers.append({"name": "x-row-anchor", "value": f"rowNumber={row_number}"})
-        
-        if internet_headers:
-            msg["internetMessageHeaders"] = internet_headers
+
+        outbound_draft = OutboundDraft(
+            kind=DeliveryKind.NEW,
+            subject=subject_to_use,
+            body=content,
+            to=(addr,),
+            cc=(),
+            bcc=(),
+            attachments=tuple(signature_attachments or ()),
+            idempotency_key=f"{client_id_or_none or 'no-client'}:{addr}:{row_number or ''}",
+            content_type=content_type,
+            internet_headers=tuple(internet_headers),
+        )
 
         try:
-            # 1. Create draft
-            create_response = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30),
-                max_retries=GRAPH_SEND_MAX_RETRIES,
-            )
-            draft_id = create_response.json()["id"]
+            # 1. Build and identify the message, stopping short of the send.
+            transport = _delivery_transport_for(runtime, headers, base)
+            prepared = transport.prepare(outbound_draft)
+            draft_id = prepared.provider_message_id
             print(f"📝 Created draft {draft_id} for {addr}")
 
-            # 1b. Add signature image attachments (for professional mode)
-            # CID (Content-ID) attachments are the most reliable way to embed images in emails
-            if signature_attachments:
-                for attachment in signature_attachments:
-                    attach_response = exponential_backoff_request(
-                        lambda att=attachment: requests.post(
-                            f"{base}/me/messages/{draft_id}/attachments",
-                            headers=headers,
-                            json=att,
-                            timeout=30
-                        ),
-                        max_retries=GRAPH_SEND_MAX_RETRIES,
-                    )
-                    if attach_response.status_code in [200, 201]:
-                        print(f"   📎 Attached {attachment['name']}")
-                    else:
-                        print(f"   ⚠️ Failed to attach {attachment['name']}: {attach_response.status_code}")
+            internet_message_id = prepared.internet_message_id
+            conversation_id = prepared.conversation_id
+            subject = prepared.subject
 
-            # 2. Get message identifiers
-            get_response = exponential_backoff_request(
-                lambda: requests.get(
-                    f"{base}/me/messages/{draft_id}",
-                    headers=headers,
-                    params={"$select": "internetMessageId,conversationId,subject,toRecipients"},
-                    timeout=30
-                )
-            )
-            message_data = get_response.json()
-
-            internet_message_id = message_data.get("internetMessageId")
-            conversation_id = message_data.get("conversationId")
-            subject = message_data.get("subject", "")
-
-            if not internet_message_id:
-                raise Exception("No internetMessageId returned from Graph")
-
-            # 3. Send draft. This is the irreversible boundary, so campaign
+            # 2. Send. This is the irreversible boundary, so campaign
             # eligibility must be read again after draft preparation.
             decision = _read_client_automation_decision(user_id, client_id_or_none, runtime=runtime)
             if decision.denies_autonomous_work:
-                _delete_graph_reply_draft(headers, draft_id, base=base)
+                transport.discard(prepared)
                 reason = f"Campaign send suppressed before Graph send: {decision.reason}"
                 results["errors"][addr] = reason
                 results.update(_campaign_suppression_result(decision))
                 print(f"🛑 {reason}")
                 return results
 
-            exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
-                max_retries=1,
-                operation="graph_send",
-            )
+            transport.commit(prepared)
 
             # 4. Index in Firestore with retry logic
             # CRITICAL: Email is already sent at this point. We MUST index it successfully

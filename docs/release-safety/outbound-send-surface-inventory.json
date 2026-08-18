@@ -94,6 +94,20 @@
         "not part of GitHub Actions scheduler"
       ],
       "nextGate": "Move to an archived scripts folder or add a runtime guard before any future cleanup broadens scheduler entrypoints."
+    },
+    {
+      "path": "email_automation/message_transport.py",
+      "lane": "shared_delivery_boundary",
+      "policyStatus": "shared_boundary",
+      "trigger": "The single convergence point for outbound delivery, created by Task 6 of the production automation certification plan. Initial-outreach sends route through it today; the remaining guarded lanes converge in Tasks 7A-7D.",
+      "risk": "Every lane routed here shares one send call, so a defect here reaches every lane at once. The compensating property is that a single boundary is auditable, whereas four independent send sites were not.",
+      "currentControls": [
+        "two-phase prepare/commit so the caller keeps the last-moment eligibility decision",
+        "refuses to send a draft with no internetMessageId, which could never be indexed",
+        "discard path deletes an abandoned draft rather than leaving it sendable",
+        "carries no policy of its own by design; rendering and safety stay with the caller"
+      ],
+      "nextGate": "Converge the three remaining guarded lanes (Tasks 7A-7D), then require every bypass surface in this inventory to route here or document why it is legacy-disabled (Task 7E)."
     }
   ]
 }

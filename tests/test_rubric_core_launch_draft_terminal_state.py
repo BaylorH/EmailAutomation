@@ -243,6 +243,11 @@ class CoreLaunchDraftTerminalStateTests(unittest.TestCase):
             metadata={"terminal": True, "stopKind": "terminal_stop"},
         )
         posts = []
+        deletes = []
+
+        def fake_delete(url, **_kwargs):
+            deletes.append(url)
+            return _FakeGraphResponse(204)
 
         def fake_post(url, **_kwargs):
             posts.append(url)
@@ -267,8 +272,8 @@ class CoreLaunchDraftTerminalStateTests(unittest.TestCase):
                 "subject": "123 Main St",
             }),
         ), mock.patch.object(
-            email_mod, "_delete_graph_reply_draft"
-        ) as delete_draft, mock.patch(
+            email_mod.requests, "delete", side_effect=fake_delete
+        ), mock.patch(
             "email_automation.processing.is_contact_opted_out", return_value=None
         ):
             result = email_mod.send_and_index_email(
@@ -283,7 +288,12 @@ class CoreLaunchDraftTerminalStateTests(unittest.TestCase):
         self.assertTrue(result["campaignAutomationSuppressed"])
         self.assertTrue(result["campaignAutomationTerminal"])
         self.assertFalse(any(url.endswith("/send") for url in posts))
-        delete_draft.assert_called_once()
+        # Assert the BEHAVIOR - the abandoned draft is deleted - rather than that a
+        # particular helper was called. Pinning the helper name is what let this
+        # test keep passing while the DELETE it cared about escaped to the real
+        # network: the helper was mocked, the verb underneath it was not.
+        self.assertEqual(len(deletes), 1, f"abandoned draft was not deleted: {deletes}")
+        self.assertTrue(deletes[0].endswith("/me/messages/draft-stop"))
 
     def test_mid_batch_maintenance_suppression_retries_only_unsent_recipients(self):
         data = {

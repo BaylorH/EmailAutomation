@@ -73,6 +73,11 @@ class OutboundDraft:
     reply_to_message_id: Optional[str] = None
     attachments: Tuple[Mapping[str, Any], ...] = ()
     idempotency_key: str = ""
+    # The envelope's own shape. Carried on the draft rather than decided inside
+    # the transport so the four lanes converging here cannot drift into four
+    # slightly different messages.
+    content_type: str = "HTML"
+    internet_headers: Tuple[Mapping[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -297,3 +302,204 @@ class FixtureConversationStateSource:
 
     def load(self, conversation_key: str) -> CanonicalConversationState:
         return canonicalize_conversation_state(self.snapshot)
+
+
+# ---------------------------------------------------------------------------
+# the shared delivery boundary
+# ---------------------------------------------------------------------------
+#
+# Phase A proved there was no common boundary to RELOCATE: four independent
+# ``requests.post(.../me/messages/{id}/send)`` sites existed across three
+# guarded modules. So this boundary is CREATED, and it is deliberately
+# TWO-PHASE rather than one ``deliver()`` call.
+#
+# The reason is the product's own shape. Between building a draft and sending
+# it, the caller re-reads campaign eligibility - the last moment at which a send
+# can still be called off. Collapsing that into a single ``deliver()`` would
+# force the safety decision INSIDE the transport, which is exactly the coupling
+# this refactor exists to remove. ``prepare`` stops short of the irreversible
+# call; the caller keeps the decision; ``commit`` or ``discard`` follows.
+#
+# Rendering and safety logic stay with the caller. This module knows how to talk
+# to Graph and nothing about who may be mailed.
+
+
+class DeliveryPreparationError(RuntimeError):
+    """A draft could not be prepared into a sendable state."""
+
+
+@dataclass(frozen=True)
+class PreparedDelivery:
+    """A built, identified, NOT-yet-sent message.
+
+    Carrying the identifiers before the send is not an optimization: once the
+    send succeeds the message must be indexed, and a send that cannot be matched
+    back to a thread orphans every future reply. Reading them first means a
+    missing identifier fails BEFORE anything irreversible happens.
+    """
+
+    draft: "OutboundDraft"
+    provider_message_id: str
+    internet_message_id: str
+    conversation_id: str
+    subject: str
+
+
+class GraphDraftDeliveryTransport:
+    """Ordinary production delivery: create draft, attach, identify, send.
+
+    ``request`` and ``retry`` are injected so this module stays pure at import
+    and so the caller's existing retry policy is preserved exactly rather than
+    reimplemented here with subtly different limits.
+    """
+
+    def __init__(
+        self,
+        *,
+        headers: Mapping[str, str],
+        base: str = "https://graph.microsoft.com/v1.0",
+        request: Any = None,
+        retry: Optional[Callable[..., Any]] = None,
+        max_retries: int = 3,
+        send_max_retries: int = 1,
+        headers_provider: Optional[Callable[[], Mapping[str, str]]] = None,
+    ) -> None:
+        self._headers = dict(headers)
+        self._base = base.rstrip("/")
+        self._request = request
+        self._retry = retry
+        self._max_retries = max_retries
+        self._send_max_retries = send_max_retries
+        self._headers_provider = headers_provider
+
+    # -- plumbing ---------------------------------------------------------
+
+    def _http(self) -> Any:
+        if self._request is None:
+            import requests  # imported here so building a transport needs no network stack
+
+            self._request = requests
+        return self._request
+
+    def _current_headers(self) -> Dict[str, str]:
+        if self._headers_provider is not None:
+            fresh = self._headers_provider()
+            if fresh:
+                return dict(fresh)
+        return dict(self._headers)
+
+    def _call(self, func: Callable[[], Any], *, max_retries: int, operation: Optional[str] = None) -> Any:
+        if self._retry is None:
+            return func()
+        if operation is None:
+            return self._retry(func, max_retries=max_retries)
+        return self._retry(func, max_retries=max_retries, operation=operation)
+
+    # -- the boundary -----------------------------------------------------
+
+    def prepare(self, draft: "OutboundDraft") -> PreparedDelivery:
+        http = self._http()
+        headers = self._current_headers()
+        message = graph_message_payload(draft)
+
+        create = self._call(
+            lambda: http.post(f"{self._base}/me/messages", headers=headers, json=message, timeout=30),
+            max_retries=self._max_retries,
+        )
+        try:
+            draft_id = create.json()["id"]
+        except Exception as exc:  # noqa: BLE001 - a draft with no id cannot be sent or cleaned up
+            raise DeliveryPreparationError(f"Graph returned no draft id: {exc}") from exc
+
+        for attachment in draft.attachments:
+            self._call(
+                lambda att=attachment: http.post(
+                    f"{self._base}/me/messages/{draft_id}/attachments",
+                    headers=headers,
+                    json=att,
+                    timeout=30,
+                ),
+                max_retries=self._max_retries,
+            )
+
+        identified = self._call(
+            lambda: http.get(
+                f"{self._base}/me/messages/{draft_id}",
+                headers=headers,
+                params={"$select": "internetMessageId,conversationId,subject,toRecipients"},
+                timeout=30,
+            ),
+            max_retries=self._max_retries,
+        )
+        data = identified.json() or {}
+        internet_message_id = data.get("internetMessageId")
+        if not internet_message_id:
+            raise DeliveryPreparationError(
+                "Graph returned no internetMessageId; a message that cannot be "
+                "indexed would orphan every future reply, so it is not sent"
+            )
+
+        return PreparedDelivery(
+            draft=draft,
+            provider_message_id=draft_id,
+            internet_message_id=internet_message_id,
+            conversation_id=data.get("conversationId") or "",
+            subject=data.get("subject") or draft.subject,
+        )
+
+    def commit(self, prepared: PreparedDelivery) -> DeliveryReceipt:
+        http = self._http()
+        self._call(
+            lambda: http.post(
+                f"{self._base}/me/messages/{prepared.provider_message_id}/send",
+                headers=self._current_headers(),
+                timeout=30,
+            ),
+            max_retries=self._send_max_retries,
+            operation="graph_send",
+        )
+        return DeliveryReceipt(
+            status="sent",
+            provider_message_id=prepared.provider_message_id,
+            internet_message_id=prepared.internet_message_id,
+            conversation_id=prepared.conversation_id,
+        )
+
+    def discard(self, prepared: PreparedDelivery) -> bool:
+        """Best-effort cleanup of a draft that lost eligibility before sending."""
+        http = self._http()
+        try:
+            self._call(
+                lambda: http.delete(
+                    f"{self._base}/me/messages/{prepared.provider_message_id}",
+                    headers=self._current_headers(),
+                    timeout=30,
+                ),
+                max_retries=self._max_retries,
+            )
+            return True
+        except Exception:  # noqa: BLE001 - an abandoned draft is untidy, never unsafe
+            return False
+
+    def deliver(self, draft: "OutboundDraft") -> DeliveryReceipt:
+        return self.commit(self.prepare(draft))
+
+
+def graph_message_payload(draft: "OutboundDraft") -> Dict[str, Any]:
+    """Render an OutboundDraft into the Graph message body.
+
+    Kept here rather than at each call site so the four lanes Task 6 and 7A-7D
+    converge cannot drift into four slightly different envelopes.
+    """
+    payload: Dict[str, Any] = {
+        "subject": draft.subject,
+        "body": {"contentType": draft.content_type, "content": draft.body},
+        "toRecipients": [{"emailAddress": {"address": address}} for address in draft.to],
+    }
+    if draft.cc:
+        payload["ccRecipients"] = [{"emailAddress": {"address": a}} for a in draft.cc]
+    if draft.bcc:
+        payload["bccRecipients"] = [{"emailAddress": {"address": a}} for a in draft.bcc]
+    if draft.internet_headers:
+        payload["internetMessageHeaders"] = [dict(h) for h in draft.internet_headers]
+    return payload

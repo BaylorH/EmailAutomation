@@ -282,6 +282,7 @@ if __name__ == "__main__":
 import os
 import re
 from contextlib import ExitStack
+from dataclasses import replace
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -626,13 +627,18 @@ class FirstSliceClientIsolationTests(unittest.TestCase):
             readable_paths=("systemConfig/campaignAccess",),
         )
 
-    def _drive_run(self):
+    def _drive_run(self, lane="capture"):
         """Drive the slice with every ambient client booby-trapped."""
         from tests.test_full_campaign_e2e import FakeGraph
 
         store = self._seed()
         sheets = FixtureSheets(self.HEADER, self._row())
         runtime = self._runtime(store, sheets)
+        if lane == "graph":
+            # Same fenced data clients, but the ORDINARY production delivery
+            # boundary. This is what makes the parity claim meaningful: only the
+            # transport differs between the two lanes.
+            runtime = replace(runtime, outbound=None)
         graph = FakeGraph()
 
         exploding_modules = (
@@ -673,7 +679,16 @@ class FirstSliceClientIsolationTests(unittest.TestCase):
     # -- the run itself ---------------------------------------------------
 
     def test_the_slice_completes_without_touching_any_ambient_client(self):
+        """The certification lane reaches delivery and captures, sending nothing."""
         result = self._drive_run()
+        captured = result["runtime"].outbound.captured
+        self.assertEqual([draft.to for draft in captured], [(FIXTURE_RECIPIENT,)])
+        self.assertEqual(result["graph"].sent_recipients(), [])
+        self.assertEqual(result["graph"].sent_draft_ids, [])
+
+    def test_the_production_lane_of_the_same_fixture_really_sends(self):
+        """Guards against a capture lane that passes because nothing runs."""
+        result = self._drive_run(lane="graph")
         self.assertEqual(result["graph"].sent_recipients(), [FIXTURE_RECIPIENT])
         self.assertEqual(len(result["graph"].sent_draft_ids), 1)
 
@@ -774,6 +789,61 @@ class FirstSliceClientIsolationTests(unittest.TestCase):
             if "sendCounter" in path
         ]
         self.assertEqual(touched, [])
+
+    # -- state parity: a captured receipt must behave like a Graph receipt ----
+
+    @staticmethod
+    def _normalized_writes(store):
+        """Write shapes with message-derived identifiers collapsed.
+
+        The two lanes necessarily produce different message ids - that is the
+        one thing that legitimately differs - so comparing raw paths would
+        always fail and prove nothing. Everything else must match exactly.
+        """
+        shapes = []
+        for kind, path, _payload, _merge in store.writes:
+            segments = []
+            for segment in path.split("/"):
+                if "@" in segment or segment.startswith("captured-") or segment.startswith("conv-"):
+                    segments.append("<id>")
+                elif len(segment) > 24 and segment.isalnum():
+                    segments.append("<id>")
+                else:
+                    segments.append(segment)
+            shapes.append((kind, "/".join(segments)))
+        return shapes
+
+    def test_a_captured_receipt_drives_the_same_writes_as_a_graph_receipt(self):
+        """Task 6's core claim.
+
+        If capture drove even slightly different state, every downstream
+        assertion in a certification run would be describing a code path the
+        product never takes in production.
+        """
+        capture_lane = self._drive_run(lane="capture")
+        graph_lane = self._drive_run(lane="graph")
+        self.assertEqual(
+            self._normalized_writes(capture_lane["store"]),
+            self._normalized_writes(graph_lane["store"]),
+        )
+
+    def test_both_lanes_terminalize_the_outbox_and_audit_identically(self):
+        for lane in ("capture", "graph"):
+            with self.subTest(lane=lane):
+                writes = self._drive_run(lane=lane)["store"].writes
+                audit = [w for w in writes if w[1] == f"{FIXTURE_PREFIX}/actionAudit/audit-1"]
+                self.assertEqual(audit[-1][2].get("status"), "sent")
+                self.assertIn(
+                    ("delete", f"{FIXTURE_PREFIX}/outbox/outbox-1", None, None), writes
+                )
+
+    def test_both_lanes_reach_the_row_highlight(self):
+        for lane in ("capture", "graph"):
+            with self.subTest(lane=lane):
+                sheets = self._drive_run(lane=lane)["sheets"]
+                self.assertTrue(
+                    [k for label, k in sheets.calls if label == "spreadsheets.batchUpdate"]
+                )
 
     def test_two_concurrent_runtimes_share_no_store(self):
         first = self._drive_run()

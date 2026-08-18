@@ -76,7 +76,14 @@ class GraphSendInventoryTests(unittest.TestCase):
 
     def test_inventory_marks_each_surface_policy_status(self):
         inventory = json.loads(INVENTORY_PATH.read_text())
-        allowed_statuses = {"guarded", "provider", "legacy_disabled", "legacy_script"}
+        # "shared_boundary" is the convergence point Task 6 created. It is
+        # deliberately NOT "guarded": it carries no policy of its own, because
+        # rendering and safety stay with the caller. The category exists so that
+        # distinction is recorded rather than mistaken for an unguarded surface -
+        # see test_the_shared_boundary_carries_no_policy_of_its_own below.
+        allowed_statuses = {
+            "guarded", "provider", "legacy_disabled", "legacy_script", "shared_boundary",
+        }
 
         for entry in inventory.get("sendSurfaces", []):
             with self.subTest(path=entry.get("path")):
@@ -96,6 +103,26 @@ class GraphSendInventoryTests(unittest.TestCase):
             "legacy_disabled",
             entries["email_automation/email_operations.py"]["policyStatus"],
         )
+
+    def test_the_shared_boundary_carries_no_policy_of_its_own(self):
+        """Its emptiness is the design, so it has to be asserted, not assumed.
+
+        If someone later moves ``validate_outbound_body`` into the transport, the
+        four converging lanes stop being able to apply their own distinct policy
+        and the boundary silently becomes a policy engine. That is a decision
+        worth failing a test over rather than discovering in production.
+        """
+        inventory = json.loads(INVENTORY_PATH.read_text())
+        boundaries = [
+            entry["path"]
+            for entry in inventory.get("sendSurfaces", [])
+            if entry.get("policyStatus") == "shared_boundary"
+        ]
+        self.assertEqual(boundaries, ["email_automation/message_transport.py"])
+        for path in boundaries:
+            with self.subTest(path=path):
+                text = (REPO_ROOT / path).read_text(errors="ignore")
+                self.assertNotIn("validate_outbound_body", text)
 
     def test_active_send_surfaces_reference_shared_body_policy(self):
         inventory = json.loads(INVENTORY_PATH.read_text())

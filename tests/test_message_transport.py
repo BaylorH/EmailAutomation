@@ -49,9 +49,17 @@ GUARDED_MODULES = (
 # The exact guarded delivery sites, keyed by the function that owns them. Line
 # numbers are informational only - ownership by enclosing function is the stable
 # fact and is what Task 6 will refactor.
+# The shared delivery boundary Task 6 CREATED. Phase A proved there was nothing
+# to relocate - four independent send sites existed - so this is a new
+# convergence point, and initial outreach is the first lane routed through it.
+SHARED_DELIVERY_MODULE = "email_automation/message_transport.py"
+SHARED_DELIVERY_OWNER = "commit"
+
+# The delivery sites that have NOT yet converged. This set SHRINKS as Tasks
+# 7A-7D land; each of those tasks is expected to fail this constant and update
+# it in the same commit, exactly as Task 6 did.
 EXPECTED_GUARDED_SEND_SITES = {
     ("email_automation/email.py", "_send_outbox_as_reply"),
-    ("email_automation/email.py", "send_and_index_email"),
     ("email_automation/processing.py", "send_reply_in_thread"),
     ("email_automation/followup.py", "_send_followup_email"),
 }
@@ -157,7 +165,13 @@ def find_graph_send_calls(relative_path):
             continue
         if func.attr not in ("post", "patch", "put"):
             continue
-        if not (isinstance(func.value, ast.Name) and func.value.id == "requests"):
+        # Deliberately NOT restricted to a receiver literally named ``requests``.
+        # Any receiver counts - an injected HTTP client, a Session, or an alias -
+        # because the property being pinned is "no module reaches a Graph send
+        # endpoint unnoticed", and a one-line ``import requests as r`` would
+        # otherwise walk straight past it. Task 7E depends on this being
+        # unevadable, so the URL shape is the discriminator, not the variable name.
+        if not isinstance(func.value, (ast.Name, ast.Attribute)):
             continue
         if not node.args:
             continue
@@ -176,7 +190,7 @@ def find_graph_send_calls(relative_path):
 class GuardedDeliveryBoundaryTests(unittest.TestCase):
     """Where a guarded message actually leaves the process, today."""
 
-    def test_guarded_send_sites_are_exactly_the_known_four(self):
+    def test_unconverged_send_sites_are_exactly_the_known_remainder(self):
         actual = set()
         for module in GUARDED_MODULES:
             for function_name, _url, _lineno in find_graph_send_calls(module):
@@ -184,20 +198,38 @@ class GuardedDeliveryBoundaryTests(unittest.TestCase):
         self.assertEqual(
             actual,
             EXPECTED_GUARDED_SEND_SITES,
-            "the guarded delivery surface changed; if Task 6 collapsed these into one "
-            "boundary, update EXPECTED_GUARDED_SEND_SITES in the same commit",
+            "the guarded delivery surface changed; if a task routed another lane "
+            "through the shared boundary, update EXPECTED_GUARDED_SEND_SITES in the "
+            "same commit - and if a NEW site appeared, that is the alarm",
         )
 
-    def test_there_is_no_single_shared_delivery_function_yet(self):
-        """Characterization of the CURRENT state, which Task 6 exists to invert."""
-        owners = {owner for _module, owner in EXPECTED_GUARDED_SEND_SITES}
-        self.assertGreater(
-            len(owners),
-            1,
-            "a single shared delivery owner now exists - Task 6 has landed, so this "
-            "characterization must be replaced by the shared-boundary assertion",
+    def test_the_shared_delivery_boundary_exists_and_owns_exactly_one_send(self):
+        """Task 6's substance, asserted structurally rather than by mock."""
+        sites = list(find_graph_send_calls(SHARED_DELIVERY_MODULE))
+        self.assertEqual(
+            len(sites), 1,
+            f"{SHARED_DELIVERY_MODULE} must hold exactly one send call, found {sites}",
         )
-        self.assertEqual(len(owners), 4, "four independent delivery owners are expected")
+        function_name, url, _lineno = sites[0]
+        self.assertEqual(function_name, SHARED_DELIVERY_OWNER)
+        self.assertTrue(url.endswith("/send"))
+
+    def test_initial_outreach_no_longer_holds_its_own_send_call(self):
+        """The lane Task 6 converged. Its send now lives at the shared boundary."""
+        owners = {
+            owner for module, owner in
+            [(m, f) for m in GUARDED_MODULES for f, _u, _l in find_graph_send_calls(m)]
+        }
+        self.assertNotIn("send_and_index_email", owners)
+
+    def test_three_lanes_remain_unconverged_for_tasks_7a_through_7d(self):
+        """A live count, not a comment: it must fall as each lane is routed."""
+        owners = {owner for _module, owner in EXPECTED_GUARDED_SEND_SITES}
+        self.assertEqual(
+            len(owners), 3,
+            "the remaining unconverged delivery lanes changed; update this count in "
+            "the same commit that converges one",
+        )
 
     def test_every_guarded_delivery_call_targets_a_draft_send_endpoint(self):
         for module in GUARDED_MODULES:
@@ -228,7 +260,7 @@ class SendSurfaceInventoryTests(unittest.TestCase):
             yield path.relative_to(REPO_ROOT).as_posix()
 
     def test_no_unknown_module_reaches_a_graph_send_endpoint(self):
-        allowed = set(GUARDED_MODULES) | KNOWN_BYPASS_MODULES
+        allowed = set(GUARDED_MODULES) | KNOWN_BYPASS_MODULES | {SHARED_DELIVERY_MODULE}
         offenders = set()
         for relative_path in self._repo_python_files():
             try:
@@ -590,6 +622,216 @@ class CanonicalInboundMessageTests(unittest.TestCase):
         self.assertEqual(len(graph_state.prior_messages), 1)
         self.assertEqual(graph_state.sent_receipts[0]["status"], "sent")
         self.assertIsInstance(graph_state.prior_messages, tuple)
+
+
+# ---------------------------------------------------------------------------
+# Task 6 - the shared initial-outreach delivery boundary
+# ---------------------------------------------------------------------------
+#
+# These are RUNTIME tests, unlike everything above. They import
+# ``email_automation.message_transport``, which is pure and imports only
+# ``utils`` - no provider client is constructed and no credential is needed. The
+# source-level classes above still import nothing from the package, so the
+# structural invariant they pin remains independent of the business logic.
+
+from email_automation.message_transport import (  # noqa: E402
+    DeliveryKind,
+    GraphDraftDeliveryTransport,
+    OutboundDraft,
+    PreparedDelivery,
+    DeliveryPreparationError,
+)
+from email_automation.certification.capture import (  # noqa: E402
+    CapturingDeliveryTransport,
+)
+
+
+class _Response:
+    def __init__(self, payload=None, status_code=200):
+        self._payload = payload or {}
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+class _GraphSpy:
+    """Records every Graph call the transport makes, in order."""
+
+    def __init__(self, *, identifiers=None, fail_on=None):
+        self.calls = []
+        self._identifiers = identifiers if identifiers is not None else {
+            "internetMessageId": "<outreach-1@example.com>",
+            "conversationId": "conv-1",
+            "subject": "100 Fixture Way",
+        }
+        self._fail_on = fail_on
+
+    def _maybe_fail(self, label):
+        if self._fail_on == label:
+            raise RuntimeError(f"graph failed at {label}")
+
+    def post(self, url, headers=None, json=None, timeout=None, **kwargs):
+        if url.endswith("/me/messages"):
+            self.calls.append(("create", url))
+            self._maybe_fail("create")
+            return _Response({"id": "draft-1"})
+        if url.endswith("/attachments"):
+            self.calls.append(("attach", url))
+            self._maybe_fail("attach")
+            return _Response({"id": "att-1"}, status_code=201)
+        if url.endswith("/send"):
+            self.calls.append(("send", url))
+            self._maybe_fail("send")
+            return _Response({}, status_code=202)
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(self, url, headers=None, params=None, timeout=None, **kwargs):
+        self.calls.append(("identifiers", url))
+        self._maybe_fail("identifiers")
+        return _Response(dict(self._identifiers))
+
+    def delete(self, url, headers=None, timeout=None, **kwargs):
+        self.calls.append(("discard", url))
+        return _Response({}, status_code=204)
+
+    def kinds(self):
+        return [kind for kind, _url in self.calls]
+
+
+def _draft(**overrides):
+    payload = dict(
+        kind=DeliveryKind.NEW,
+        subject="100 Fixture Way",
+        body="Hi Pat, could you share the asking rent?",
+        to=("broker@fixture.example.com",),
+        cc=(),
+        bcc=(),
+        attachments=(),
+        idempotency_key="outbox-1:broker@fixture.example.com",
+    )
+    payload.update(overrides)
+    return OutboundDraft(**payload)
+
+
+class OutboundDeliveryTests(unittest.TestCase):
+    """The convergence point Task 6 creates.
+
+    Phase A proved there was no common boundary to relocate: four independent
+    ``/me/messages/{id}/send`` sites existed. So this boundary is CREATED, and
+    the property that matters is that preparing a message and committing it are
+    separable - because the product re-reads campaign eligibility in between, at
+    the last moment before the irreversible call.
+    """
+
+    def _transport(self, **kwargs):
+        spy = _GraphSpy(**kwargs)
+        transport = GraphDraftDeliveryTransport(
+            headers={"Authorization": "Bearer fixture"},
+            base="https://graph.microsoft.com/v1.0",
+            request=spy,
+        )
+        return transport, spy
+
+    # -- prepare stops short of the irreversible call ---------------------
+
+    def test_prepare_creates_a_draft_and_reads_identifiers_without_sending(self):
+        transport, spy = self._transport()
+        prepared = transport.prepare(_draft())
+        self.assertIsInstance(prepared, PreparedDelivery)
+        self.assertEqual(prepared.provider_message_id, "draft-1")
+        self.assertEqual(prepared.internet_message_id, "<outreach-1@example.com>")
+        self.assertEqual(prepared.conversation_id, "conv-1")
+        self.assertEqual(spy.kinds(), ["create", "identifiers"])
+        self.assertNotIn("send", spy.kinds())
+
+    def test_attachments_are_added_before_identifiers_are_read(self):
+        transport, spy = self._transport()
+        transport.prepare(_draft(attachments=({"name": "sig.png"},)))
+        self.assertEqual(spy.kinds(), ["create", "attach", "identifiers"])
+
+    def test_a_draft_with_no_internet_message_id_is_refused_before_sending(self):
+        """Without it a sent message can never be matched to its thread."""
+        transport, spy = self._transport(identifiers={"conversationId": "conv-1"})
+        with self.assertRaises(DeliveryPreparationError):
+            transport.prepare(_draft())
+        self.assertNotIn("send", spy.kinds())
+
+    # -- commit is the irreversible boundary ------------------------------
+
+    def test_commit_sends_the_prepared_draft_and_returns_a_receipt(self):
+        transport, spy = self._transport()
+        receipt = transport.commit(transport.prepare(_draft()))
+        self.assertEqual(spy.kinds(), ["create", "identifiers", "send"])
+        self.assertEqual(receipt.status, "sent")
+        self.assertEqual(receipt.provider_message_id, "draft-1")
+        self.assertEqual(receipt.internet_message_id, "<outreach-1@example.com>")
+        self.assertEqual(receipt.conversation_id, "conv-1")
+
+    def test_discard_deletes_the_draft_and_never_sends(self):
+        """The suppression path: eligibility was lost after the draft was built."""
+        transport, spy = self._transport()
+        transport.discard(transport.prepare(_draft()))
+        self.assertEqual(spy.kinds(), ["create", "identifiers", "discard"])
+        self.assertNotIn("send", spy.kinds())
+
+    def test_deliver_is_prepare_then_commit(self):
+        transport, spy = self._transport()
+        receipt = transport.deliver(_draft())
+        self.assertEqual(spy.kinds(), ["create", "identifiers", "send"])
+        self.assertEqual(receipt.status, "sent")
+
+    def test_a_failed_send_propagates_rather_than_reporting_success(self):
+        """An ambiguous send must never be reported as a clean no-send."""
+        transport, spy = self._transport(fail_on="send")
+        prepared = transport.prepare(_draft())
+        with self.assertRaises(Exception):
+            transport.commit(prepared)
+        self.assertIn("send", spy.kinds())
+
+    # -- the certification transport is the same shape, minus the network --
+
+    def test_capture_transport_makes_no_provider_call_at_all(self):
+        capture = CapturingDeliveryTransport(run_id="cert-run-6")
+        prepared = capture.prepare(_draft())
+        receipt = capture.commit(prepared)
+        self.assertEqual(receipt.status, "captured")
+        self.assertEqual(len(capture.captured), 1)
+        self.assertEqual(capture.captured[0].to, ("broker@fixture.example.com",))
+
+    def test_capture_receives_the_final_envelope_not_a_template(self):
+        """Whatever capture records is exactly what would have gone on the wire."""
+        capture = CapturingDeliveryTransport(run_id="cert-run-6")
+        draft = _draft(body="Hi Pat, could you share the asking rent?")
+        capture.commit(capture.prepare(draft))
+        self.assertEqual(capture.captured[0].body, draft.body)
+        self.assertEqual(capture.captured[0].subject, draft.subject)
+
+    def test_capture_identifiers_are_deterministic_and_run_scoped(self):
+        """Two runs must not collide, and one run must be reproducible."""
+        first = CapturingDeliveryTransport(run_id="cert-run-a")
+        second = CapturingDeliveryTransport(run_id="cert-run-a")
+        other = CapturingDeliveryTransport(run_id="cert-run-b")
+        a = first.commit(first.prepare(_draft()))
+        b = second.commit(second.prepare(_draft()))
+        c = other.commit(other.prepare(_draft()))
+        self.assertEqual(a.internet_message_id, b.internet_message_id)
+        self.assertNotEqual(a.internet_message_id, c.internet_message_id)
+
+    def test_a_discarded_capture_is_not_recorded_as_delivered(self):
+        capture = CapturingDeliveryTransport(run_id="cert-run-6")
+        capture.discard(capture.prepare(_draft()))
+        self.assertEqual(capture.captured, [])
+        self.assertEqual(len(capture.discarded), 1)
+
+    def test_capture_never_reaches_a_real_recipient_domain(self):
+        """Structural: the synthetic identifiers must be unmistakably non-routable."""
+        capture = CapturingDeliveryTransport(run_id="cert-run-6")
+        receipt = capture.commit(capture.prepare(_draft()))
+        self.assertTrue(receipt.internet_message_id.endswith(".invalid>"))
 
 
 if __name__ == "__main__":
