@@ -118,5 +118,91 @@
       ]
     }
   ],
-  "convergedLanesPurpose": "Lanes that no longer call a Graph send endpoint directly because their delivery was routed to the shared boundary. They are recorded rather than deleted: each still owns its own recipient, opt-out, cancellation, and audit decisions, and losing that record would make the boundary look like the only thing guarding a send."
+  "convergedLanesPurpose": "Lanes that no longer call a Graph send endpoint directly because their delivery was routed to the shared boundary. They are recorded rather than deleted: each still owns its own recipient, opt-out, cancellation, and audit decisions, and losing that record would make the boundary look like the only thing guarding a send.",
+  "mailboxCapableSurfacesPurpose": "Task 7E. sendSurfaces answers 'what can send'. This section answers the wider question the certification program actually needs: what can touch the mailbox AT ALL - read, write, delete, or send. A send-only inventory cannot see a destructive mailbox call or an unrouted mailbox read, and both are effects a zero-effect certification run must not cause. Counts are derived by AST from Graph /me/ URLs; a module whose URL is assembled by concatenation is undercounted here, which is why sendCapableByName exists alongside the counts.",
+  "mailboxCapableSurfaces": [
+    {
+      "path": "email_automation/message_transport.py",
+      "disposition": "shared_boundary",
+      "note": "The convergence point. Every guarded lane's provider I/O lives here."
+    },
+    {
+      "path": "email_automation/email.py",
+      "disposition": "converged_lane",
+      "note": "Retains mailbox reads (sent-item reconciliation, reply-sender lookup) and one orphaned DELETE helper, _delete_graph_reply_draft, which has no production caller left after Task 7D. Reads are NOT yet routed through InboundMessageSource."
+    },
+    {
+      "path": "email_automation/processing.py",
+      "disposition": "converged_lane",
+      "note": "Eleven mailbox reads not yet routed through InboundMessageSource / ConversationStateSource. Delivery is converged; reads are not."
+    },
+    {
+      "path": "email_automation/followup.py",
+      "disposition": "converged_lane",
+      "note": "One mailbox read remaining; delivery converged in Task 7D."
+    },
+    {
+      "path": "email_automation/sent_mail_guard.py",
+      "disposition": "read_only_guard",
+      "note": "Sent Items lookups backing the duplicate-send guard. Read-only; no send."
+    },
+    {
+      "path": "email_automation/messaging.py",
+      "disposition": "read_only",
+      "note": "Conversation payload assembly. Read-only; no send."
+    },
+    {
+      "path": "email_automation/file_handling.py",
+      "disposition": "read_only",
+      "note": "Attachment snapshot fetch. Read-only; no send."
+    },
+    {
+      "path": "email_automation/operator_replay.py",
+      "disposition": "read_only_recovery",
+      "note": "Task 7E target. Reads one exact Graph message to validate identity. Holds NO send call, so operator replay cannot deliver by itself."
+    },
+    {
+      "path": "email_automation/dead_letter_recovery.py",
+      "disposition": "no_graph_access",
+      "note": "Task 7E target. Contains ZERO Graph call sites. Recovery reaches delivery only by writing an outbox item, which drains through the converged boundary - so it is a re-entry, not a bypass."
+    },
+    {
+      "path": "email_automation/service_providers.py",
+      "disposition": "provider_bypass",
+      "note": "Send-capable BY NAME (send_draft / send_new_message / reply_to_message); its URLs are concatenated so the AST URL counts understate it. Not reachable from the automation lane: the only production import is get_drive_service, and a standing guard forbids production code calling its raw send helpers."
+    },
+    {
+      "path": "email_automation/email_operations.py",
+      "disposition": "legacy_disabled_bypass",
+      "note": "Fifteen send call sites. No production module imports it, and every send helper calls _require_legacy_email_operations_enabled at entry, which raises unless an env flag is explicitly set. Unreachable by default."
+    },
+    {
+      "path": "scheduler_runner.py",
+      "disposition": "legacy_script_bypass",
+      "note": "Seven send call sites. A top-level script, imported by nothing, invoked manually."
+    },
+    {
+      "path": "noPopup_signin_emails_to_excel.py",
+      "disposition": "legacy_script_bypass",
+      "note": "Two send call sites. A top-level script, imported by nothing, invoked manually."
+    },
+    {
+      "path": "app.py",
+      "disposition": "operator_surface_gap",
+      "note": "GAP FOUND BY TASK 7E. Three mailbox reads and one mailbox DELETE (api_clear_outlook_emails) behind operator endpoints. It holds no send, so the send-only inventory never saw it - yet deleting a user's mail is a destructive mailbox effect. Recorded here rather than silently omitted."
+    },
+    {
+      "path": "scripts/analyze_overnight_campaign.py",
+      "disposition": "manual_script_read_only",
+      "note": "Analysis script. Mailbox reads only, run by hand."
+    },
+    {
+      "path": "scripts/e2e_tools.py",
+      "disposition": "manual_script_read_only",
+      "note": "End-to-end tooling. Mailbox reads only, run by hand."
+    }
+  ],
+  "sendCapableByName": [
+    "email_automation/service_providers.py"
+  ]
 }
