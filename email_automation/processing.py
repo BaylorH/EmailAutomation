@@ -6403,8 +6403,21 @@ def process_inbox_message(
     allow_outbound_reply: bool = True,
     operator_replay_attempt_id: Optional[str] = None,
     authenticated_mailbox_email: Optional[str] = None,
+    attachment_snapshot: Optional[List[Dict[str, Any]]] = None,
 ):
-    """ENHANCED: Process a single inbox message with full pipeline including events."""
+    """ENHANCED: Process a single inbox message with full pipeline including events.
+
+    ``attachment_snapshot`` lets a caller supply an already-acquired attachment
+    snapshot instead of having one downloaded from Graph. It defaults to None, so
+    every ordinary production caller is unaffected and keeps fetching.
+
+    This is a FORWARD, not an alternate path: the snapshot is handed to
+    ``fetch_and_process_pdfs`` and from there through the same ordering,
+    PDF/native classification, address binding, caps, normalization, privacy
+    projection, and fail-closed raises as a fetched one. Certification supplies
+    approved bytes through this parameter precisely so it exercises the deployed
+    pipeline rather than a copy of it.
+    """
     if not allow_outbound_reply:
         _reset_reply_send_outcome()
     msg_id = msg.get("id")
@@ -6867,6 +6880,7 @@ def process_inbox_message(
             headers,
             msg_id,
             target_property_hint=native_target_property_hint,
+            attachment_snapshot=attachment_snapshot,
         )
 
         if pdf_manifest:

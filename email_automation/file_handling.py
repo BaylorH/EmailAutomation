@@ -2632,14 +2632,32 @@ def fetch_and_process_pdfs(
     graph_msg_id: str,
     *,
     target_property_hint: Optional[str] = None,
+    attachment_snapshot: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Process current-message PDFs and, when targeted, native images.
 
     Legacy direct callers omit ``target_property_hint`` and retain the existing
     PDF-only path. Processing supplies even an incomplete/empty row value so one
     paginated Graph snapshot owns both PDF and native-image routing.
+
+    ``attachment_snapshot`` forwards an ALREADY-ACQUIRED snapshot straight through
+    to ``fetch_pdf_attachments``, which has accepted one since native-image
+    ingestion landed; only this wrapper lacked the parameter, so every caller was
+    forced to hit Graph. Certification supplies approved bytes here instead of
+    downloading them.
+
+    Nothing else changes, deliberately. Ordering, PDF/native classification,
+    address binding, caps, normalization, privacy projection, and every
+    fail-closed raise below run on the supplied snapshot exactly as on a fetched
+    one, because this is a FORWARD and not a second pipeline. A supplied lane with
+    its own validators or manifest builders would let a certification stamp
+    describe code that never runs in production.
     """
-    pdf_attachments = fetch_pdf_attachments(headers, graph_msg_id)
+    pdf_attachments = fetch_pdf_attachments(
+        headers,
+        graph_msg_id,
+        attachment_snapshot=attachment_snapshot,
+    )
     if target_property_hint is None:
         return [
             entry

@@ -6759,3 +6759,151 @@ class NativeImageProcessingIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuppliedAttachmentSnapshotForwardingTests(unittest.TestCase):
+    """Task 4. An approved snapshot must travel the SAME pipeline as a Graph one.
+
+    Certification supplies attachment bytes instead of downloading them. If the
+    supplied path forked into its own validator, parser, classifier, or manifest
+    builder, a stamp earned on fixtures would describe code that never runs in
+    production. So the requirement is not "supplied snapshots work" - it is
+    "supplied snapshots are indistinguishable downstream, and reach Graph zero
+    times".
+    """
+
+    def _snapshot(self):
+        return [
+            _attachment("flyer.pdf", "application/pdf", b"%PDF-1.4 fake"),
+            _attachment("property.png", "image/png", _png_bytes()),
+        ]
+
+    def _exploding_graph(self):
+        def _explode(*args, **kwargs):
+            raise AssertionError(
+                "a supplied attachment snapshot must never trigger a Graph fetch"
+            )
+
+        return _explode
+
+    def test_supplied_snapshot_reaches_graph_zero_times(self):
+        snapshot = self._snapshot()
+        with mock.patch.dict(
+            os.environ, {"SITESIFT_NATIVE_IMAGE_INGESTION": "false"}
+        ), mock.patch.object(
+            file_handling,
+            "fetch_message_attachment_snapshot",
+            side_effect=self._exploding_graph(),
+        ), mock.patch.object(
+            file_handling, "_process_pdf_attachment_batch", return_value=[]
+        ):
+            manifest = file_handling.fetch_and_process_pdfs(
+                {"Authorization": "Bearer fake"},
+                "supplied-snapshot-message",
+                target_property_hint="123 Main Street, Phoenix, AZ 85001",
+                attachment_snapshot=snapshot,
+            )
+        self.assertEqual([], manifest)
+
+    def test_supplied_snapshot_produces_the_same_manifest_as_the_graph_path(self):
+        snapshot = self._snapshot()
+        processed_pdf = {"name": "flyer.pdf", "text": "Rent is $14 NNN."}
+
+        def _run(*, supplied):
+            patches = [
+                mock.patch.dict(os.environ, {"SITESIFT_NATIVE_IMAGE_INGESTION": "false"}),
+                mock.patch.object(
+                    file_handling,
+                    "_process_pdf_attachment_batch",
+                    return_value=[(0, processed_pdf)],
+                ),
+            ]
+            if supplied:
+                patches.append(
+                    mock.patch.object(
+                        file_handling,
+                        "fetch_message_attachment_snapshot",
+                        side_effect=self._exploding_graph(),
+                    )
+                )
+            else:
+                patches.append(
+                    mock.patch.object(
+                        file_handling,
+                        "fetch_message_attachment_snapshot",
+                        return_value=snapshot,
+                    )
+                )
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                kwargs = {"target_property_hint": "123 Main Street, Phoenix, AZ 85001"}
+                if supplied:
+                    kwargs["attachment_snapshot"] = snapshot
+                return file_handling.fetch_and_process_pdfs(
+                    {"Authorization": "Bearer fake"}, "parity-message", **kwargs
+                )
+
+        self.assertEqual(_run(supplied=False), _run(supplied=True))
+
+    def test_supplied_snapshot_preserves_snapshot_ordering_for_native_routing(self):
+        """Native entries must bind to their ORIGINAL snapshot position.
+
+        Position is how a native asset is tied back to the right attachment; a
+        supplied snapshot that renumbered would bind an image to the wrong one.
+        """
+        snapshot = self._snapshot()
+        with mock.patch.dict(
+            os.environ, {"SITESIFT_NATIVE_IMAGE_INGESTION": "true"}
+        ), mock.patch.object(
+            file_handling,
+            "fetch_message_attachment_snapshot",
+            side_effect=self._exploding_graph(),
+        ), mock.patch.object(
+            file_handling, "_process_pdf_attachment_batch", return_value=[(0, {"name": "flyer.pdf"})]
+        ), mock.patch.object(
+            file_handling,
+            "validate_and_normalize_native_image_attachments",
+            return_value={"status": "accepted", "assets": [{}]},
+        ) as validator, mock.patch.object(
+            file_handling,
+            "build_native_image_manifest_entry",
+            return_value={"name": GENERIC_IMAGE_NAME},
+        ):
+            manifest = file_handling.fetch_and_process_pdfs(
+                {"Authorization": "Bearer fake"},
+                "ordered-message",
+                target_property_hint="123 Main Street, Phoenix, AZ 85001",
+                attachment_snapshot=snapshot,
+            )
+
+        # The validator receives the EXACT supplied snapshot, not a rebuilt one.
+        validator.assert_called_once()
+        self.assertEqual(validator.call_args.args[0], snapshot)
+        # PDF at position 0 precedes the native image at position 1.
+        self.assertEqual([entry["name"] for entry in manifest],
+                         ["flyer.pdf", GENERIC_IMAGE_NAME])
+
+    def test_supplied_snapshot_still_fails_closed_on_a_bad_projection(self):
+        """Fail-closed behavior must not be softened for the supplied lane."""
+        snapshot = self._snapshot()
+        with mock.patch.dict(
+            os.environ, {"SITESIFT_NATIVE_IMAGE_INGESTION": "true"}
+        ), mock.patch.object(
+            file_handling,
+            "fetch_message_attachment_snapshot",
+            side_effect=self._exploding_graph(),
+        ), mock.patch.object(
+            file_handling, "_process_pdf_attachment_batch", return_value=[]
+        ), mock.patch.object(
+            file_handling,
+            "validate_and_normalize_native_image_attachments",
+            return_value={"status": "accepted", "assets": []},
+        ):
+            with self.assertRaises(ValueError):
+                file_handling.fetch_and_process_pdfs(
+                    {"Authorization": "Bearer fake"},
+                    "bad-projection-message",
+                    target_property_hint="123 Main Street, Phoenix, AZ 85001",
+                    attachment_snapshot=snapshot,
+                )
