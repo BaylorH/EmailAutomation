@@ -59,7 +59,6 @@ SHARED_DELIVERY_OWNER = "send_prepared_draft"
 # 7A-7D land; each of those tasks is expected to fail this constant and update
 # it in the same commit, exactly as Task 6 did.
 EXPECTED_GUARDED_SEND_SITES = {
-    ("email_automation/email.py", "_send_outbox_as_reply"),
     ("email_automation/followup.py", "_send_followup_email"),
 }
 
@@ -219,15 +218,17 @@ class GuardedDeliveryBoundaryTests(unittest.TestCase):
             owner for module, owner in
             [(m, f) for m in GUARDED_MODULES for f, _u, _l in find_graph_send_calls(m)]
         }
-        for converged in ("send_and_index_email", "send_reply_in_thread"):
+        for converged in (
+            "send_and_index_email", "send_reply_in_thread", "_send_outbox_as_reply",
+        ):
             with self.subTest(lane=converged):
                 self.assertNotIn(converged, owners)
 
-    def test_two_lanes_remain_unconverged_for_tasks_7c_and_7d(self):
+    def test_one_lane_remains_unconverged_for_task_7d(self):
         """A live count, not a comment: it must fall as each lane is routed."""
         owners = {owner for _module, owner in EXPECTED_GUARDED_SEND_SITES}
         self.assertEqual(
-            len(owners), 2,
+            len(owners), 1,
             "the remaining unconverged delivery lanes changed; update this count in "
             "the same commit that converges one",
         )

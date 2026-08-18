@@ -3,21 +3,6 @@
   "purpose": "Machine-readable inventory of every Python file that can directly call Microsoft Graph send/reply endpoints. Update this file whenever a Graph send surface is added, removed, or moved.",
   "sendSurfaces": [
     {
-      "path": "email_automation/email.py",
-      "lane": "core_outbox",
-      "policyStatus": "guarded",
-      "trigger": "Queued Firestore outbox items for campaign launch, dashboard replies, new-property outreach, dead-letter requeue, and reviewed tour invites.",
-      "risk": "This is the primary production send path; a bypass here can send placeholders, wrong recipients, duplicate retries, or paused-client messages.",
-      "currentControls": [
-        "outbound body validation",
-        "paused-client dead-letter guard",
-        "Results/Tour outbox pause gate",
-        "Sent Items retry reconciliation",
-        "actionAudit terminal states"
-      ],
-      "nextGate": "Centralize these controls into a shared outbound policy object and require every other send surface to call it or document why it is legacy-disabled."
-    },
-    {
       "path": "email_automation/followup.py",
       "lane": "followup_scheduler",
       "policyStatus": "guarded",
@@ -111,6 +96,23 @@
         "tour action allowlist gate",
         "reply indexing tests",
         "Graph retry tests"
+      ]
+    },
+    {
+      "path": "email_automation/email.py",
+      "lane": "core_outbox",
+      "policyStatus": "converged",
+      "trigger": "Queued Firestore outbox items for campaign launch, dashboard replies, new-property outreach, dead-letter requeue, and reviewed tour invites.",
+      "risk": "This is the primary production send path; a bypass here can send placeholders, wrong recipients, duplicate retries, or paused-client messages.",
+      "nextGate": "Both of this module's delivery lanes - initial outreach (Task 6) and dashboard/manual replies (Task 7C) - now route through the shared boundary. It keeps every recipient, duplicate, cancellation, cap, and audit decision. Remaining gate: Task 7E must prove no recovery or alternate-send path here bypasses the boundary.",
+      "convergedAt": "email_automation/message_transport.py",
+      "convergedBy": "Tasks 6 and 7C of the production automation certification plan",
+      "retainedControls": [
+        "outbound body validation",
+        "paused-client dead-letter guard",
+        "Results/Tour outbox pause gate",
+        "Sent Items retry reconciliation",
+        "actionAudit terminal states"
       ]
     }
   ],

@@ -278,6 +278,30 @@ def _increment_global_send_count(fs, day_key: str, amount: int) -> None:
     )
 
 
+def _addresses_from_recipients(entries) -> list:
+    """Flatten a Graph recipient list back to plain addresses."""
+    addresses = []
+    for entry in entries or []:
+        address = ((entry or {}).get("emailAddress") or {}).get("address")
+        if address:
+            addresses.append(address)
+    return addresses
+
+
+def _reply_transport_for(runtime, headers, base):
+    """Resolve the delivery boundary for the dashboard/manual reply lane."""
+    if runtime is not None and getattr(runtime, "outbound", None) is not None:
+        return runtime.outbound
+    return GraphDraftDeliveryTransport(
+        headers=headers,
+        base=base,
+        request=requests,
+        retry=exponential_backoff_request,
+        max_retries=GRAPH_SEND_MAX_RETRIES,
+        send_max_retries=1,
+    )
+
+
 def _delivery_transport_for(runtime, headers, base):
     """Resolve the delivery boundary for this request.
 
@@ -2375,7 +2399,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                           signature_mode: str = None, user_email: str = None,
                           fallback_to_emails: Optional[List[str]] = None,
                           fallback_cc_emails: Optional[List[str]] = None,
-                          client_id: Optional[str] = None) -> dict:
+                          client_id: Optional[str] = None, runtime=None) -> dict:
     """
     Send an outbox item as a reply to an existing message in a thread.
 
@@ -2422,21 +2446,19 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
     )
 
     try:
-        create_reply_resp = exponential_backoff_request(
-            lambda: requests.post(
-                f"{base}/me/messages/{reply_to_msg_id}/createReplyAll",
-                headers=headers,
-                timeout=30,
-            ),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
-        )
+        # Same convergence as the automatic-reply lane: every Graph interaction
+        # here goes through the shared boundary, not just the send, because a
+        # draft created in a real mailbox is an effect too. The recipient,
+        # authority, and audit decisions below are untouched.
+        transport = _reply_transport_for(runtime, headers, base)
+        reply_handle = transport.create_reply(reply_to_msg_id)
 
-        if not create_reply_resp or create_reply_resp.status_code not in [200, 201]:
-            error_msg = f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'None'}"
+        if not reply_handle.ok:
+            error_msg = f"createReplyAll failed: {reply_handle.status_code if reply_handle.status_code is not None else 'None'}"
             print(f"   ❌ {error_msg}")
             return {"sent": False, "error": error_msg}
 
-        reply_draft = create_reply_resp.json() or {}
+        reply_draft = dict(reply_handle.raw)
         reply_draft_id = reply_draft.get("id")
         if not reply_draft_id:
             error_msg = "createReplyAll did not return a draft id"
@@ -2447,6 +2469,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
             headers,
             reply_draft,
             base=base,
+            transport=transport,
         )
         reply_draft = _source_message_reply_all_fallback(
             reply_draft,
@@ -2486,27 +2509,24 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
             error_msg = "Reply-all draft has no safe recipients after filtering"
             print(f"   ❌ {error_msg}")
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             return {
                 "sent": False,
                 "error": error_msg,
                 "skippedRecipients": recipient_result.get("skipped"),
             }
 
-        patch_payload = {
-            "body": {"contentType": "HTML", "content": html_body},
-            "toRecipients": recipient_payload["toRecipients"],
-            "ccRecipients": recipient_payload["ccRecipients"],
-        }
-        patch_resp = exponential_backoff_request(
-            lambda: requests.patch(
-                f"{base}/me/messages/{reply_draft_id}",
-                headers=headers,
-                json=patch_payload,
-                timeout=30,
-            ),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
+        reply_envelope = OutboundDraft(
+            kind=DeliveryKind.REPLY_ALL,
+            subject=str(source_metadata.get("subject") or ""),
+            body=html_body,
+            to=tuple(_addresses_from_recipients(recipient_payload["toRecipients"])),
+            cc=tuple(_addresses_from_recipients(recipient_payload["ccRecipients"])),
+            bcc=(),
+            reply_to_message_id=reply_to_msg_id,
+            idempotency_key=f"{thread_id}:{reply_to_msg_id}",
         )
+        patch_resp = transport.apply_reply(reply_handle, reply_envelope)
         if not patch_resp or patch_resp.status_code not in [200, 202, 204]:
             error_msg = f"Patch reply-all draft failed: {patch_resp.status_code if patch_resp else 'None'}"
             print(f"   ❌ {error_msg}")
@@ -2516,15 +2536,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
             signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
             for attachment in signature_attachments:
                 try:
-                    att_resp = exponential_backoff_request(
-                        lambda att=attachment: requests.post(
-                            f"{base}/me/messages/{reply_draft_id}/attachments",
-                            headers=headers,
-                            json=att,
-                            timeout=30,
-                        ),
-                        max_retries=GRAPH_SEND_MAX_RETRIES,
-                    )
+                    att_resp = transport.attach(reply_handle, attachment)
                     if att_resp.status_code in [200, 201]:
                         print(f"   📎 Attached {attachment['name']}")
                 except Exception as e:
@@ -2532,7 +2544,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
 
         decision = _read_client_automation_decision(user_id, client_id)
         if decision.denies_autonomous_work:
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             reason = f"Campaign send suppressed before Graph send: {decision.reason}"
             print(f"   🛑 {reason}")
             return {
@@ -2542,11 +2554,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
             }
 
         sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
-        resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-            max_retries=1,
-            operation="graph_send",
-        )
+        resp = transport.send_prepared_draft(reply_draft_id)
 
         if resp and resp.status_code in [200, 202]:
             print(f"   ✅ Sent reply-all draft to thread {thread_id}")
@@ -5289,6 +5297,7 @@ def _send_single_outbox_item(
                             else data.get("ccEmails") or data.get("ccRecipients") or []
                         ),
                         client_id=clientId,
+                        runtime=runtime,
                     )
 
                     if _handle_suppressed_outbox_send_result(
