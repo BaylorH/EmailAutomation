@@ -218,7 +218,7 @@ class ProcessingReplySafetyTests(unittest.TestCase):
              patch("requests.post", side_effect=fake_post), \
              patch("requests.patch", side_effect=fake_patch), \
              patch("email_automation.utils.time.sleep", return_value=None), \
-             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, base=None: draft), \
+             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, **_kwargs: draft), \
              patch("email_automation.email._source_message_reply_all_fallback", side_effect=lambda draft, _current_meta: draft), \
              patch("email_automation.email._reviewed_recipient_reply_all_fallback", side_effect=lambda draft, to_emails=None: draft), \
              patch("email_automation.email._filter_reply_all_draft_recipients", return_value={
@@ -275,6 +275,12 @@ class ProcessingReplySafetyTests(unittest.TestCase):
             },
         }
 
+        deleted_urls = []
+
+        def fake_delete(url, **_kwargs):
+            deleted_urls.append(url)
+            return FakeResponse(204, {})
+
         with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1"}), \
              patch.object(processing, "get_client_automation_decision", return_value=CampaignAutomationDecision(
                  state="allow", reason="", client_data={"status": "live"},
@@ -286,11 +292,11 @@ class ProcessingReplySafetyTests(unittest.TestCase):
              patch("requests.get", return_value=FakeResponse(200, current_meta)), \
              patch("requests.post", side_effect=fake_post), \
              patch("requests.patch", side_effect=AssertionError("Suppressed reply must not be patched")), \
-             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, base=None: draft), \
+             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, **_kwargs: draft), \
              patch("email_automation.email._source_message_reply_all_fallback", side_effect=lambda draft, _current_meta: draft), \
              patch("email_automation.email._reviewed_recipient_reply_all_fallback", side_effect=lambda draft, to_emails=None: draft), \
              patch("email_automation.email._filter_reply_all_draft_recipients", return_value=recipient_result), \
-             patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+             patch("requests.delete", side_effect=fake_delete):
             sent = processing.send_reply_in_thread(
                 user_id="uid-1",
                 headers={"Authorization": "Bearer token"},
@@ -306,8 +312,9 @@ class ProcessingReplySafetyTests(unittest.TestCase):
             processing.send_reply_in_thread.last_outcome,
         )
         self.assertIn("opted out", processing.send_reply_in_thread.last_error.lower())
-        delete_draft.assert_called_once()
-        self.assertEqual("draft-1", delete_draft.call_args.args[1])
+        # Behavior, not helper name: the abandoned draft is actually deleted.
+        self.assertEqual(len(deleted_urls), 1, f"draft not deleted: {deleted_urls}")
+        self.assertTrue(deleted_urls[0].endswith("/me/messages/draft-1"))
 
     def test_tour_actions_default_allowlist_is_baylor_only(self):
         with patch.dict(os.environ, {}, clear=True):

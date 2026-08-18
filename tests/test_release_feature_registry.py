@@ -395,16 +395,24 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
         registry = _read_json(REGISTRY_PATH)
         features = {feature.get("id"): feature for feature in registry.get("features", [])}
         outbound = _read_json(OUTBOUND_INVENTORY_PATH)
+        # Routing this lane's delivery to the shared boundary moved it out of
+        # sendSurfaces. It must NOT thereby look read-only: it still decides who
+        # is replied to, and the release gate depends on that being visible.
         processing_surface = next(
             (
                 surface
-                for surface in outbound.get("sendSurfaces", [])
+                for surface in (
+                    outbound.get("sendSurfaces", []) + outbound.get("convergedLanes", [])
+                )
                 if surface.get("path") == "email_automation/processing.py"
             ),
             None,
         )
         if processing_surface is None:
-            self.fail("Outbound inventory must include email_automation/processing.py.")
+            self.fail(
+                "Outbound inventory must include email_automation/processing.py, "
+                "either as a send surface or as a converged lane."
+            )
 
         feature = features.get("core.inbox_auto_reply")
         self.assertIsNotNone(feature)
@@ -412,6 +420,26 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
         self.assertIn("email_automation/processing.py", feature.get("ownerModules", {}).get("backend", []))
         self.assertEqual("sends_email_autonomous", feature.get("sendRisk"))
         self.assertTrue(feature.get("productionGate", {}).get("requiredBeforePush"))
+
+    def test_converging_a_lane_does_not_downgrade_its_send_risk(self):
+        """The failure mode this guards is quiet: a lane stops holding a send
+        call, looks inert on inspection, and loses its production gate while
+        still autonomously deciding who gets mailed."""
+        registry = _read_json(REGISTRY_PATH)
+        features = {feature.get("id"): feature for feature in registry.get("features", [])}
+        outbound = _read_json(OUTBOUND_INVENTORY_PATH)
+        for lane in outbound.get("convergedLanes", []):
+            with self.subTest(path=lane.get("path")):
+                owners = [
+                    feature
+                    for feature in features.values()
+                    if lane.get("path") in feature.get("ownerModules", {}).get("backend", [])
+                ]
+                self.assertTrue(owners, f"{lane.get('path')} owns no registered feature")
+                self.assertTrue(
+                    any(f.get("sendRisk") == "sends_email_autonomous" for f in owners),
+                    f"{lane.get('path')} converged and lost its autonomous-send risk",
+                )
 
     def test_policy_review_projection_ownership_and_writes_are_registered(self):
         registry = _read_json(REGISTRY_PATH)

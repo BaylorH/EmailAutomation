@@ -29,19 +29,27 @@ from ..message_transport import (
     DeliveryReceipt,
     OutboundDraft,
     PreparedDelivery,
+    ReplyDraftHandle,
 )
 
 
 class CapturingDeliveryTransport:
     """Records the final envelope. Calls nothing."""
 
-    def __init__(self, *, run_id: str) -> None:
+    def __init__(self, *, run_id: str, conversations: Any = None) -> None:
         if not run_id:
             raise ValueError("capture requires an exact run id")
         self.run_id = run_id
         self.captured: List[OutboundDraft] = []
         self.discarded: List[OutboundDraft] = []
         self.real_send_calls = 0
+        # Canonical conversation state, when the scenario supplies it. The reply
+        # lane needs the provider's proposed recipient list in order to filter it
+        # down to the safe set; on this lane that list comes from the sealed
+        # fixture rather than from a live mailbox.
+        self.conversations = conversations
+        self.reply_drafts: List[ReplyDraftHandle] = []
+        self.applied: List[OutboundDraft] = []
 
     # -- identity ---------------------------------------------------------
 
@@ -95,3 +103,104 @@ class CapturingDeliveryTransport:
 
     def deliver(self, draft: OutboundDraft) -> DeliveryReceipt:
         return self.commit(self.prepare(draft))
+
+    # -- the reply lane ---------------------------------------------------
+    #
+    # Mirrors ``GraphDraftDeliveryTransport``'s reply protocol exactly, so the
+    # automatic-reply path runs the same branches on both lanes. The provider's
+    # "proposed recipients" come from canonical conversation state, which is the
+    # whole reason certification can exercise recipient filtering at all without
+    # a live mailbox to reply into.
+
+    def create_reply(self, source_message_id: str) -> ReplyDraftHandle:
+        proposed = self._proposed_recipients(source_message_id)
+        handle = ReplyDraftHandle(
+            provider_message_id=f"captured-reply-{self._digest(source_message_id)}",
+            raw={
+                "id": f"captured-reply-{self._digest(source_message_id)}",
+                "toRecipients": [
+                    {"emailAddress": {"address": a}} for a in proposed["to"]
+                ],
+                "ccRecipients": [
+                    {"emailAddress": {"address": a}} for a in proposed["cc"]
+                ],
+            },
+            status_code=201,
+            ok=True,
+        )
+        self.reply_drafts.append(handle)
+        return handle
+
+    def _digest(self, value: str) -> str:
+        return hashlib.sha256(f"{self.run_id}\x1f{value}".encode("utf-8")).hexdigest()[:16]
+
+    def _proposed_recipients(self, source_message_id: str) -> Mapping[str, tuple]:
+        """What the provider would have proposed for a reply-all.
+
+        Empty when the scenario supplies no conversation state - which correctly
+        drives the product's "no safe recipients remained" branch rather than
+        inventing an address to reply to.
+        """
+        if self.conversations is None:
+            return {"to": (), "cc": ()}
+        try:
+            state = self.conversations.load(source_message_id)
+        except Exception:  # noqa: BLE001 - an unavailable fixture is not a recipient
+            return {"to": (), "cc": ()}
+        target = getattr(state, "reply_target", None)
+        envelope = getattr(target, "source_envelope", None) or {}
+        if not envelope:
+            return {"to": (), "cc": ()}
+        # Reply-all, as the provider composes it: the original sender in To, the
+        # original To and CC carried into CC. The product then filters this down
+        # to the safe set - that filtering is the behavior under test, so this
+        # must propose the same starting point a real mailbox would.
+        sender = envelope.get("fromEmail") or ""
+        carried = tuple(envelope.get("to") or ()) + tuple(envelope.get("cc") or ())
+        return {
+            "to": (sender,) if sender else (),
+            "cc": tuple(dict.fromkeys(a for a in carried if a and a != sender)),
+        }
+
+    def apply_reply(self, handle: ReplyDraftHandle, draft: OutboundDraft) -> Any:
+        """Record the FINAL envelope - after the caller's recipient filtering."""
+        self.applied.append(draft)
+        return _CapturedResponse(200)
+
+    def attach(self, handle: ReplyDraftHandle, attachment: Mapping[str, Any]) -> Any:
+        return _CapturedResponse(201)
+
+    def send_prepared_draft(self, provider_message_id: str) -> Any:
+        """The captured counterpart of the one real send call."""
+        for draft in self.applied:
+            if draft not in self.captured:
+                self.captured.append(draft)
+        return _CapturedResponse(202)
+
+    def fetch_draft_recipients(self, provider_message_id: str) -> Optional[Mapping[str, Any]]:
+        """Nothing further to fetch: the fixture's audience is authoritative.
+
+        Returning None rather than an empty draft matters. An empty audience is
+        a real product state - "no safe recipients remained" - and certification
+        must be able to reach it, not paper over it with an invented address.
+        """
+        return None
+
+    def delete_draft(self, provider_message_id: str) -> bool:
+        for draft in self.applied:
+            if draft not in self.discarded:
+                self.discarded.append(draft)
+        return True
+
+
+class _CapturedResponse:
+    """A provider response that never came from a provider."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    def json(self) -> dict:
+        return {}
+
+    def raise_for_status(self) -> None:
+        return None

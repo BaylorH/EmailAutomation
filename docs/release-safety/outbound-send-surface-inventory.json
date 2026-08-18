@@ -18,20 +18,6 @@
       "nextGate": "Centralize these controls into a shared outbound policy object and require every other send surface to call it or document why it is legacy-disabled."
     },
     {
-      "path": "email_automation/processing.py",
-      "lane": "inbox_auto_reply",
-      "policyStatus": "guarded",
-      "trigger": "Broker inbox reply processing that may send a same-thread response after AI classification/extraction.",
-      "risk": "This is the path most likely to auto-reply from a broker response; it must never create tour scheduling, placeholders, or wrong reply-all recipients for normal users.",
-      "currentControls": [
-        "reply-all draft path",
-        "tour action allowlist gate",
-        "reply indexing tests",
-        "Graph retry tests"
-      ],
-      "nextGate": "Route every processing reply through the same outbound policy used by outbox sends and keep tour interpretation separate from core event handling."
-    },
-    {
       "path": "email_automation/followup.py",
       "lane": "followup_scheduler",
       "policyStatus": "guarded",
@@ -109,5 +95,24 @@
       ],
       "nextGate": "Converge the three remaining guarded lanes (Tasks 7A-7D), then require every bypass surface in this inventory to route here or document why it is legacy-disabled (Task 7E)."
     }
-  ]
+  ],
+  "convergedLanes": [
+    {
+      "path": "email_automation/processing.py",
+      "lane": "inbox_auto_reply",
+      "policyStatus": "converged",
+      "trigger": "Broker inbox reply processing that may send a same-thread response after AI classification/extraction.",
+      "risk": "This is the path most likely to auto-reply from a broker response; it must never create tour scheduling, placeholders, or wrong reply-all recipients for normal users.",
+      "nextGate": "Pending-response retries (Task 7B) reach delivery through this module's reply path and inherit the shared boundary with it.",
+      "convergedAt": "email_automation/message_transport.py",
+      "convergedBy": "Task 7A of the production automation certification plan",
+      "retainedControls": [
+        "reply-all draft path",
+        "tour action allowlist gate",
+        "reply indexing tests",
+        "Graph retry tests"
+      ]
+    }
+  ],
+  "convergedLanesPurpose": "Lanes that no longer call a Graph send endpoint directly because their delivery was routed to the shared boundary. They are recorded rather than deleted: each still owns its own recipient, opt-out, cancellation, and audit decisions, and losing that record would make the boundary look like the only thing guarding a send."
 }

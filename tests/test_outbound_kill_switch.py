@@ -440,6 +440,12 @@ class DirectAutoReplyKillSwitchTests(unittest.TestCase):
                     os.environ[OUTBOUND_MODE_ENV] = changed_mode
                     return _GraphResponse(204, {})
 
+                deleted_urls = []
+
+                def fake_delete(url, **_kwargs):
+                    deleted_urls.append(url)
+                    return _GraphResponse(204, {})
+
                 current_meta = {
                     "conversationId": "conversation-1",
                     "subject": "RE: 100 Safety Way",
@@ -469,7 +475,7 @@ class DirectAutoReplyKillSwitchTests(unittest.TestCase):
                      patch("requests.patch", side_effect=fake_patch), \
                      patch(
                          "email_automation.email._hydrate_reply_all_draft_recipients",
-                         side_effect=lambda _headers, draft, base=None: draft,
+                         side_effect=lambda _headers, draft, **_kwargs: draft,
                      ), \
                      patch(
                          "email_automation.email._source_message_reply_all_fallback",
@@ -483,7 +489,7 @@ class DirectAutoReplyKillSwitchTests(unittest.TestCase):
                          "email_automation.email._filter_reply_all_draft_recipients",
                          return_value=recipient_result,
                      ), \
-                     patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+                     patch("requests.delete", side_effect=fake_delete):
                     sent = processing.send_reply_in_thread(
                         user_id="user-1",
                         headers={"Authorization": "Bearer token"},
@@ -499,7 +505,8 @@ class DirectAutoReplyKillSwitchTests(unittest.TestCase):
                     ["https://graph.microsoft.com/v1.0/me/messages/message-1/createReplyAll"],
                 )
                 self.assertFalse(any(url.endswith("/send") for url in post_urls))
-                delete_draft.assert_called_once()
+                # Behavior, not helper name: the suppressed draft is deleted.
+                self.assertEqual(len(deleted_urls), 1, f"draft not deleted: {deleted_urls}")
                 self.assertEqual(
                     processing.send_reply_in_thread.last_outcome,
                     "suppressed_by_kill_switch",
@@ -625,7 +632,7 @@ class DirectFollowupKillSwitchTests(unittest.TestCase):
                      patch("requests.patch", side_effect=fake_patch), \
                      patch(
                          "email_automation.email._hydrate_reply_all_draft_recipients",
-                         side_effect=lambda _headers, draft, base=None: draft,
+                         side_effect=lambda _headers, draft, **_kwargs: draft,
                      ), \
                      patch(
                          "email_automation.email._source_message_reply_all_fallback",

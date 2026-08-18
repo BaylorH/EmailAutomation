@@ -53,14 +53,13 @@ GUARDED_MODULES = (
 # to relocate - four independent send sites existed - so this is a new
 # convergence point, and initial outreach is the first lane routed through it.
 SHARED_DELIVERY_MODULE = "email_automation/message_transport.py"
-SHARED_DELIVERY_OWNER = "commit"
+SHARED_DELIVERY_OWNER = "send_prepared_draft"
 
 # The delivery sites that have NOT yet converged. This set SHRINKS as Tasks
 # 7A-7D land; each of those tasks is expected to fail this constant and update
 # it in the same commit, exactly as Task 6 did.
 EXPECTED_GUARDED_SEND_SITES = {
     ("email_automation/email.py", "_send_outbox_as_reply"),
-    ("email_automation/processing.py", "send_reply_in_thread"),
     ("email_automation/followup.py", "_send_followup_email"),
 }
 
@@ -214,19 +213,21 @@ class GuardedDeliveryBoundaryTests(unittest.TestCase):
         self.assertEqual(function_name, SHARED_DELIVERY_OWNER)
         self.assertTrue(url.endswith("/send"))
 
-    def test_initial_outreach_no_longer_holds_its_own_send_call(self):
-        """The lane Task 6 converged. Its send now lives at the shared boundary."""
+    def test_converged_lanes_no_longer_hold_their_own_send_call(self):
+        """Each lane routed to the shared boundary loses its private send."""
         owners = {
             owner for module, owner in
             [(m, f) for m in GUARDED_MODULES for f, _u, _l in find_graph_send_calls(m)]
         }
-        self.assertNotIn("send_and_index_email", owners)
+        for converged in ("send_and_index_email", "send_reply_in_thread"):
+            with self.subTest(lane=converged):
+                self.assertNotIn(converged, owners)
 
-    def test_three_lanes_remain_unconverged_for_tasks_7a_through_7d(self):
+    def test_two_lanes_remain_unconverged_for_tasks_7c_and_7d(self):
         """A live count, not a comment: it must fall as each lane is routed."""
         owners = {owner for _module, owner in EXPECTED_GUARDED_SEND_SITES}
         self.assertEqual(
-            len(owners), 3,
+            len(owners), 2,
             "the remaining unconverged delivery lanes changed; update this count in "
             "the same commit that converges one",
         )
@@ -298,8 +299,19 @@ class SendSurfaceInventoryTests(unittest.TestCase):
         )
 
     def test_inventory_document_covers_every_module_with_a_send_site(self):
+        """A converged lane stays documented; it does not vanish from the record.
+
+        Once a lane routes to the shared boundary it no longer holds a send
+        endpoint, so it leaves ``sendSurfaces``. It must NOT thereby disappear:
+        it still owns its own recipient, opt-out, cancellation, and audit
+        decisions, and a reader who could no longer see that would conclude the
+        boundary is the only thing guarding a send.
+        """
         inventory = json.loads(INVENTORY_PATH.read_text(encoding="utf-8"))
         catalogued = {entry["path"] for entry in inventory["sendSurfaces"]}
+        catalogued |= {
+            entry["path"] for entry in inventory.get("convergedLanes", [])
+        }
         live = set(GUARDED_MODULES) | {
             module for module in KNOWN_BYPASS_MODULES if (REPO_ROOT / module).is_file()
         }
@@ -309,6 +321,16 @@ class SendSurfaceInventoryTests(unittest.TestCase):
             "a module with a real send site is absent from "
             "docs/release-safety/outbound-send-surface-inventory.json",
         )
+
+    def test_every_converged_lane_still_records_the_controls_it_retained(self):
+        inventory = json.loads(INVENTORY_PATH.read_text(encoding="utf-8"))
+        converged = inventory.get("convergedLanes", [])
+        self.assertTrue(converged, "Task 6/7A converged at least one lane")
+        for entry in converged:
+            with self.subTest(path=entry.get("path")):
+                self.assertEqual(entry.get("convergedAt"), SHARED_DELIVERY_MODULE)
+                self.assertTrue(entry.get("retainedControls"))
+                self.assertTrue(entry.get("convergedBy"))
 
 
 class ImportTimeProviderConstructionTests(unittest.TestCase):

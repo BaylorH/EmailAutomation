@@ -2140,6 +2140,7 @@ def _hydrate_reply_all_draft_recipients(
     draft: Dict[str, Any],
     *,
     base: str = "https://graph.microsoft.com/v1.0",
+    transport=None,
 ) -> Dict[str, Any]:
     """
     Microsoft Graph may return only the draft id from createReplyAll even though
@@ -2157,22 +2158,30 @@ def _hydrate_reply_all_draft_recipients(
         return draft
 
     try:
-        fetched_resp = exponential_backoff_request(
-            lambda: requests.get(
-                f"{base}/me/messages/{draft_id}",
-                headers=headers,
-                params={"$select": "id,toRecipients,ccRecipients"},
-                timeout=30,
-            ),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
-        )
-        if not fetched_resp or fetched_resp.status_code != 200:
-            print(
-                "   ⚠️ Could not fetch reply-all draft recipients: "
-                f"{fetched_resp.status_code if fetched_resp else 'None'}"
+        if transport is not None:
+            fetched = transport.fetch_draft_recipients(draft_id)
+            if fetched is None:
+                # The transport's draft is already authoritative. An empty
+                # audience here is a real state the caller must be allowed to
+                # see, not a sparse response to paper over.
+                return draft
+        else:
+            fetched_resp = exponential_backoff_request(
+                lambda: requests.get(
+                    f"{base}/me/messages/{draft_id}",
+                    headers=headers,
+                    params={"$select": "id,toRecipients,ccRecipients"},
+                    timeout=30,
+                ),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
             )
-            return draft
-        fetched = fetched_resp.json() or {}
+            if not fetched_resp or fetched_resp.status_code != 200:
+                print(
+                    "   ⚠️ Could not fetch reply-all draft recipients: "
+                    f"{fetched_resp.status_code if fetched_resp else 'None'}"
+                )
+                return draft
+            fetched = fetched_resp.json() or {}
         hydrated = dict(draft)
         hydrated["toRecipients"] = fetched.get("toRecipients") or []
         hydrated["ccRecipients"] = fetched.get("ccRecipients") or []

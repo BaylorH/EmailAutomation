@@ -447,17 +447,25 @@ class GraphDraftDeliveryTransport:
             subject=data.get("subject") or draft.subject,
         )
 
-    def commit(self, prepared: PreparedDelivery) -> DeliveryReceipt:
+    def send_prepared_draft(self, provider_message_id: str) -> Any:
+        """THE send call. Every lane routed to this boundary passes through here.
+
+        Kept as one named function so the AST send-site sweep has exactly one
+        site to find, and so a future lane cannot converge "almost" here.
+        """
         http = self._http()
-        self._call(
+        return self._call(
             lambda: http.post(
-                f"{self._base}/me/messages/{prepared.provider_message_id}/send",
+                f"{self._base}/me/messages/{provider_message_id}/send",
                 headers=self._current_headers(),
                 timeout=30,
             ),
             max_retries=self._send_max_retries,
             operation="graph_send",
         )
+
+    def commit(self, prepared: PreparedDelivery) -> DeliveryReceipt:
+        self.send_prepared_draft(prepared.provider_message_id)
         return DeliveryReceipt(
             status="sent",
             provider_message_id=prepared.provider_message_id,
@@ -467,11 +475,94 @@ class GraphDraftDeliveryTransport:
 
     def discard(self, prepared: PreparedDelivery) -> bool:
         """Best-effort cleanup of a draft that lost eligibility before sending."""
+        return self.delete_draft(prepared.provider_message_id)
+
+    # -- the reply lane ---------------------------------------------------
+    #
+    # A reply is not a fresh draft: the provider creates it, proposing its own
+    # recipient list, and the caller then filters that list down to the safe
+    # set. So the transport hands the raw draft back unedited and takes the
+    # caller's final decision on the way through ``apply_reply``.
+
+    def create_reply(self, source_message_id: str) -> "ReplyDraftHandle":
+        http = self._http()
+        response = self._call(
+            lambda: http.post(
+                f"{self._base}/me/messages/{source_message_id}/createReplyAll",
+                headers=self._current_headers(),
+                timeout=30,
+            ),
+            max_retries=self._max_retries,
+        )
+        status_code = getattr(response, "status_code", None)
+        ok = isinstance(status_code, int) and status_code in (200, 201)
+        raw: Dict[str, Any] = {}
+        if ok:
+            try:
+                raw = response.json() or {}
+            except Exception:  # noqa: BLE001 - an unparseable draft is a failed draft
+                raw = {}
+        return ReplyDraftHandle(
+            provider_message_id=str(raw.get("id") or ""),
+            raw=raw,
+            status_code=status_code,
+            ok=ok,
+        )
+
+    def apply_reply(self, handle: "ReplyDraftHandle", draft: "OutboundDraft") -> Any:
+        http = self._http()
+        return self._call(
+            lambda: http.patch(
+                f"{self._base}/me/messages/{handle.provider_message_id}",
+                headers=self._current_headers(),
+                json=reply_patch_payload(draft),
+                timeout=30,
+            ),
+            max_retries=self._max_retries,
+        )
+
+    def attach(self, handle: "ReplyDraftHandle", attachment: Mapping[str, Any]) -> Any:
+        http = self._http()
+        return self._call(
+            lambda: http.post(
+                f"{self._base}/me/messages/{handle.provider_message_id}/attachments",
+                headers=self._current_headers(),
+                json=attachment,
+                timeout=30,
+            ),
+            max_retries=self._max_retries,
+        )
+
+    def fetch_draft_recipients(self, provider_message_id: str) -> Optional[Mapping[str, Any]]:
+        """Re-read a sparse reply draft's audience.
+
+        Graph sometimes returns only an id from createReplyAll even though the
+        saved draft has the computed To/CC. Returning ``None`` means "nothing
+        further to fetch" - which is what a transport whose draft is already
+        authoritative should say, rather than inventing an audience.
+        """
+        http = self._http()
+        response = self._call(
+            lambda: http.get(
+                f"{self._base}/me/messages/{provider_message_id}",
+                headers=self._current_headers(),
+                params={"$select": "id,toRecipients,ccRecipients"},
+                timeout=30,
+            ),
+            max_retries=self._max_retries,
+        )
+        if not response or getattr(response, "status_code", None) != 200:
+            return None
+        return response.json() or {}
+
+    def delete_draft(self, provider_message_id: str) -> bool:
+        if not provider_message_id:
+            return False
         http = self._http()
         try:
             self._call(
                 lambda: http.delete(
-                    f"{self._base}/me/messages/{prepared.provider_message_id}",
+                    f"{self._base}/me/messages/{provider_message_id}",
                     headers=self._current_headers(),
                     timeout=30,
                 ),
@@ -503,3 +594,30 @@ def graph_message_payload(draft: "OutboundDraft") -> Dict[str, Any]:
     if draft.internet_headers:
         payload["internetMessageHeaders"] = [dict(h) for h in draft.internet_headers]
     return payload
+
+
+@dataclass(frozen=True)
+class ReplyDraftHandle:
+    """A provider-created reply draft, before the caller has decided anything.
+
+    ``raw`` carries the provider's OWN recipient lists verbatim. That matters:
+    the reply lane derives its final safe recipients by filtering what the
+    provider proposed, and that filtering is the caller's business, not the
+    transport's. Handing the raw draft back unedited is what keeps the decision
+    where it belongs.
+    """
+
+    provider_message_id: str
+    raw: Mapping[str, Any]
+    status_code: Optional[int]
+    ok: bool
+
+
+def reply_patch_payload(draft: "OutboundDraft") -> Dict[str, Any]:
+    """The body/recipient update applied to a provider-created reply draft."""
+    return {
+        "body": {"contentType": draft.content_type, "content": draft.body},
+        "toRecipients": [{"emailAddress": {"address": a}} for a in draft.to],
+        "ccRecipients": [{"emailAddress": {"address": a}} for a in draft.cc],
+    }
+

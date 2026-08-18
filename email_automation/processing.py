@@ -14,6 +14,11 @@ from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .automation_runtime import firestore_for
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
+from .message_transport import (
+    DeliveryKind,
+    GraphDraftDeliveryTransport,
+    OutboundDraft,
+)
 from .sheets import AssetLinkWriteError, format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
@@ -5626,7 +5631,38 @@ def _tour_actions_allowed(user_id: str) -> bool:
     return str(user_id or "").strip() in allowed
 
 
-def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
+def _addresses_of(entries) -> list:
+    """Flatten a Graph recipient list back to plain addresses."""
+    addresses = []
+    for entry in entries or []:
+        address = ((entry or {}).get("emailAddress") or {}).get("address")
+        if address:
+            addresses.append(address)
+    return addresses
+
+
+def _reply_delivery_transport_for(runtime, headers, base, *, retry, max_retries):
+    """Resolve the delivery boundary for the automatic-reply lane.
+
+    ``retry`` and ``max_retries`` are passed in rather than read from module
+    scope because ``send_reply_in_thread`` imports them LOCALLY, and that local
+    import is the seam the surrounding tests patch. Reaching for a module-level
+    copy here would both break at import time and quietly detach the transport
+    from the retry policy the caller actually has.
+    """
+    if runtime is not None and getattr(runtime, "outbound", None) is not None:
+        return runtime.outbound
+    return GraphDraftDeliveryTransport(
+        headers=headers,
+        base=base,
+        request=requests,
+        retry=retry,
+        max_retries=max_retries,
+        send_max_retries=1,
+    )
+
+
+def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str, runtime=None) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     _reset_reply_send_outcome()
     outbound_mode = resolve_outbound_mode()
@@ -5702,6 +5738,17 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             return False
 
         base = "https://graph.microsoft.com/v1.0"
+        # Every Graph interaction on this lane goes through one transport, so a
+        # certification run captures the whole exchange rather than the send
+        # alone - a draft created in a real mailbox is an effect too. Recipient,
+        # cancellation, policy, and audit decisions stay exactly where they are.
+        transport = _reply_delivery_transport_for(
+            runtime,
+            headers,
+            base,
+            retry=exponential_backoff_request,
+            max_retries=GRAPH_SEND_MAX_RETRIES,
+        )
         current_meta = {}
 
         try:
@@ -5751,17 +5798,14 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         reply_sent_successfully = False
         reply_sent_after = None
 
-        create_reply_resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReplyAll", headers=headers, timeout=30),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
-        )
-        if not create_reply_resp or create_reply_resp.status_code not in [200, 201]:
-            failure_reason = f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
+        reply_handle = transport.create_reply(current_msg_id)
+        if not reply_handle.ok:
+            failure_reason = f"createReplyAll failed: {reply_handle.status_code if reply_handle.status_code is not None else 'no response'}"
             _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
             print(f"   ❌ {failure_reason}")
             return False
 
-        reply_draft = create_reply_resp.json() or {}
+        reply_draft = dict(reply_handle.raw)
         reply_draft_id = reply_draft.get("id")
         if not reply_draft_id:
             _set_reply_send_outcome(
@@ -5775,6 +5819,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             headers,
             reply_draft,
             base=base,
+            transport=transport,
         )
         reply_draft = _source_message_reply_all_fallback(
             reply_draft,
@@ -5799,30 +5844,27 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                     outcome="suppressed_recipient_optout",
                 )
                 print("   ⏭️ Reply suppressed because all safe recipients opted out")
-                _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                transport.delete_draft(reply_draft_id)
                 return False
             _set_reply_send_outcome(
                 error="No safe reply-all recipients remained after filtering",
                 outcome="send_failed",
             )
             print("   ❌ No safe reply-all recipients remained after filtering")
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             return False
 
-        patch_payload = {
-            "body": {"contentType": "HTML", "content": html_body},
-            "toRecipients": recipient_payload["toRecipients"],
-            "ccRecipients": recipient_payload["ccRecipients"],
-        }
-        patch_resp = exponential_backoff_request(
-            lambda: requests.patch(
-                f"{base}/me/messages/{reply_draft_id}",
-                headers=headers,
-                json=patch_payload,
-                timeout=30
-            ),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
+        reply_envelope = OutboundDraft(
+            kind=DeliveryKind.REPLY_ALL,
+            subject=str(current_meta.get("subject") or ""),
+            body=html_body,
+            to=tuple(_addresses_of(recipient_payload["toRecipients"])),
+            cc=tuple(_addresses_of(recipient_payload["ccRecipients"])),
+            bcc=(),
+            reply_to_message_id=current_msg_id,
+            idempotency_key=f"{thread_id}:{current_msg_id}",
         )
+        patch_resp = transport.apply_reply(reply_handle, reply_envelope)
         if not patch_resp or patch_resp.status_code not in [200, 202, 204]:
             failure_reason = f"Reply-all draft patch failed: {patch_resp.status_code if patch_resp else 'no response'}"
             _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
@@ -5835,15 +5877,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
         for attachment in signature_attachments:
             try:
-                att_resp = exponential_backoff_request(
-                    lambda att=attachment: requests.post(
-                        f"{base}/me/messages/{reply_draft_id}/attachments",
-                        headers=headers,
-                        json=att,
-                        timeout=30
-                    ),
-                    max_retries=GRAPH_SEND_MAX_RETRIES,
-                )
+                att_resp = transport.attach(reply_handle, attachment)
                 if att_resp.status_code in [200, 201]:
                     print(f"   📎 Attached {attachment['name']}")
             except Exception as e:
@@ -5852,7 +5886,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         decision = get_client_automation_decision(user_id, client_id)
         if decision.denies_autonomous_work:
             _set_reply_campaign_suppression(decision)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             print(f"   🛑 {_get_reply_send_outcome().error}")
             return False
 
@@ -5870,7 +5904,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 outbound_mode,
                 context=f"send_reply_in_thread thread {thread_id} at Graph send",
             )
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            transport.delete_draft(reply_draft_id)
             return False
 
         cap_context = _check_single_provider_send_cap(_fs, user_id)
@@ -5881,18 +5915,14 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 campaign_suppression_kind="maintenance",
             )
             print(f"   🛑 Blocked automatic reply: {cap_context['error']}")
-            if not _delete_graph_reply_draft(headers, reply_draft_id, base=base):
+            if not transport.delete_draft(reply_draft_id):
                 _set_reply_send_outcome(error=f"{cap_context['error']}; cap-blocked draft cleanup failed")
             return False
 
         reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
         _set_reply_send_outcome(send_attempt_at=reply_sent_after)
         try:
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-                max_retries=1,
-                operation="graph_send",
-            )
+            resp = transport.send_prepared_draft(reply_draft_id)
         except requests.exceptions.HTTPError as exc:
             if exc.response is None:
                 raise

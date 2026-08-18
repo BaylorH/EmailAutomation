@@ -388,7 +388,7 @@ class CapturingDrivePublication:
         return {"status": "captured", "fileId": file_id}
 
 
-def _capturing_outbound_transport(run_id: str) -> Any:
+def _capturing_outbound_transport(run_id: str, conversations: Any = None) -> Any:
     """The certification delivery transport.
 
     Imported lazily and taken from ``certification.capture`` rather than
@@ -398,7 +398,7 @@ def _capturing_outbound_transport(run_id: str) -> Any:
     """
     from .certification.capture import CapturingDeliveryTransport
 
-    return CapturingDeliveryTransport(run_id=run_id)
+    return CapturingDeliveryTransport(run_id=run_id, conversations=conversations)
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +505,14 @@ def certification_runtime(
             if conversation_snapshot is not None
             else None
         ),
-        outbound=_capturing_outbound_transport(run_id),
+        outbound=_capturing_outbound_transport(
+            run_id,
+            conversations=(
+                FixtureConversationStateSource(snapshot=conversation_snapshot)
+                if conversation_snapshot is not None
+                else None
+            ),
+        ),
         counters=InMemoryCounterStore(limits=limits),
         now=now or _utc_now,
         firestore=ScopedFirestore(firestore, effect_scope) if firestore is not None else None,
