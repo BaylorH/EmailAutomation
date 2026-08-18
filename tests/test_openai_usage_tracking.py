@@ -1,6 +1,9 @@
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
+
+from email_automation import automation_runtime as ar
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -158,6 +161,127 @@ class OpenAIUsageTrackingTests(unittest.TestCase):
         self.assertIn("operation=\"ai.extract_sheet_updates\"", source[usage_call:usage_call + 700])
         self.assertIn("model=\"gpt-5.2\"", source[usage_call:usage_call + 700])
         self.assertNotIn("\"prompt\"", source[usage_call:usage_call + 700])
+
+
+class ScopedUsageAccountingTests(unittest.TestCase):
+    """Task 7F step 3: usage accounting belongs to the run that caused it.
+
+    Cost is state. A certification run that recorded its spend into a real
+    user's rollups would corrupt that user's billing view, and one that read
+    them would see another tenant's numbers - so the accounting has to land in
+    the run's own store, on the run's own clock, and nowhere else.
+    """
+
+    FIXTURE_UID = "cert-usage-uid"
+    PREFIX = "users/cert-usage-uid"
+
+    def _fixture_store(self):
+        from tests.test_production_certification import FixtureFirestore
+
+        return FixtureFirestore()
+
+    def _runtime(self, store, *, now):
+        return ar.certification_runtime(
+            run_id="cert-run-usage",
+            scope="usage-accounting",
+            firestore=store,
+            firestore_prefix=self.PREFIX,
+            now=now,
+        )
+
+    def test_accounting_lands_in_the_runs_own_store_not_the_ambient_one(self):
+        class Exploding:
+            def __getattr__(self, name):
+                raise AssertionError(f"ambient Firestore was reached: .{name}")
+
+        store = self._fixture_store()
+        fixed = datetime(2026, 8, 18, 9, 30, tzinfo=timezone.utc)
+        runtime = self._runtime(store, now=lambda: fixed)
+
+        record_openai_usage(
+            db=ar.firestore_for(runtime, Exploding()),
+            user_id=self.FIXTURE_UID,
+            operation="ai.extract_sheet_updates",
+            model="gpt-5.2",
+            usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            now=ar.clock_for(runtime, lambda: datetime.now(timezone.utc))(),
+        )
+
+        paths = [path for _kind, path, _payload, _merge in store.writes]
+        self.assertTrue(
+            any(p.startswith(f"{self.PREFIX}/openaiUsageEvents/") for p in paths),
+            f"no usage event landed in the run's store: {paths}",
+        )
+        self.assertIn(f"{self.PREFIX}/openaiUsageDaily/2026-08-18", paths)
+        self.assertEqual(runtime.effect_scope.violations, [])
+
+    def test_the_request_clock_decides_the_rollup_day(self):
+        """Otherwise a replayed run lands on whatever day it happens to run."""
+        store = self._fixture_store()
+        fixed = datetime(2026, 1, 2, 23, 59, tzinfo=timezone.utc)
+        runtime = self._runtime(store, now=lambda: fixed)
+
+        record_openai_usage(
+            db=ar.firestore_for(runtime, None),
+            user_id=self.FIXTURE_UID,
+            operation="ai.extract_sheet_updates",
+            model="gpt-5.2",
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            now=ar.clock_for(runtime, lambda: datetime.now(timezone.utc))(),
+        )
+
+        paths = [path for _kind, path, _payload, _merge in store.writes]
+        self.assertIn(f"{self.PREFIX}/openaiUsageDaily/2026-01-02", paths)
+
+    def test_accounting_for_another_user_is_refused_by_the_fence(self):
+        """The isolation that makes a shared process safe."""
+        store = self._fixture_store()
+        runtime = self._runtime(store, now=lambda: datetime(2026, 8, 18, tzinfo=timezone.utc))
+
+        with self.assertRaises(Exception):
+            record_openai_usage(
+                db=ar.firestore_for(runtime, None),
+                user_id="someone-elses-uid",
+                operation="ai.extract_sheet_updates",
+                model="gpt-5.2",
+                usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                now=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            )
+        self.assertTrue(runtime.effect_scope.violations)
+        self.assertEqual(store.writes, [])
+
+    def test_readback_sees_exactly_what_the_run_wrote(self):
+        store = self._fixture_store()
+        fixed = datetime(2026, 8, 18, 9, 30, tzinfo=timezone.utc)
+        runtime = self._runtime(store, now=lambda: fixed)
+        fenced = ar.firestore_for(runtime, None)
+
+        record_openai_usage(
+            db=fenced,
+            user_id=self.FIXTURE_UID,
+            operation="ai.extract_sheet_updates",
+            model="gpt-5.2",
+            usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            now=fixed,
+        )
+
+        rollup = (
+            fenced.collection("users")
+            .document(self.FIXTURE_UID)
+            .collection("openaiUsageDaily")
+            .document("2026-08-18")
+            .get()
+        )
+        self.assertTrue(rollup.exists)
+        self.assertEqual(runtime.effect_scope.violations, [])
+
+    def test_the_extraction_call_site_resolves_both_through_the_runtime(self):
+        """Structural: the seam exists where the model call actually happens."""
+        source = Path("email_automation/ai_processing.py").read_text()
+        usage_call = source.index("track_openai_usage_safely(")
+        window = source[usage_call:usage_call + 400]
+        self.assertIn("firestore_for(runtime", window)
+        self.assertIn("clock_for(runtime", window)
 
 
 if __name__ == "__main__":

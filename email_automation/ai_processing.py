@@ -14,7 +14,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import unquote, urlsplit, urlunsplit
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
-from .automation_runtime import ai_for
+from .automation_runtime import ai_for, clock_for, firestore_for
 from .messaging import build_conversation_payload
 from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execute_with_retry
 from .column_config import (
@@ -7730,7 +7730,11 @@ OUTPUT ONLY valid JSON in this exact format:
         })
         if not dry_run:
             track_openai_usage_safely(
-                db=_fs,
+                # Cost is state: a certification run must record its spend into
+                # its OWN store on its OWN clock, or it corrupts a real user's
+                # rollups and reads another tenant's numbers back.
+                db=firestore_for(runtime, _fs),
+                now=clock_for(runtime, lambda: datetime.now(timezone.utc))(),
                 user_id=uid,
                 client_id=client_id,
                 thread_id=thread_id,
