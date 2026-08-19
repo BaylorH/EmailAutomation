@@ -26,6 +26,17 @@ What makes this file different from a parity smoke test:
   over accepted values alone can never surface, because the diverging value never
   reaches the comparison. The refusal surface is part of the contract.
 
+Why the pins carry the weight, established by mutation rather than by argument:
+breaking the canonicalizer breaks it for BOTH interpreters at once, because both
+import the same source. Under all twelve canonicalisation mutations that were run
+- key sorting turned off, key sorting made case-folding, separator bytes widened,
+`ensure_ascii` flipped, floats accepted, surrogates accepted, non-string keys
+coerced, each of the three bounds relaxed, the digest uppercased, duplicate keys
+accepted - `test_the_two_interpreters_agree_vector_for_vector` stayed green every
+single time. The two runtimes agreed perfectly about the wrong bytes. Only the
+literal pins noticed. A parity test alone would have certified a broken
+canonicalizer, twice, and reported it as consensus.
+
 Scope, stated precisely and repeated wherever this file makes a claim: what is
 proved here is a **HOST** result - two interpreters installed on this machine. It
 is NOT an in-image result. Proving that the interpreter inside the built container

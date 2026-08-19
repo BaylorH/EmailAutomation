@@ -97,6 +97,28 @@ class CanonicalTypeRejectionTests(unittest.TestCase):
                 with self.assertRaises(CanonicalJSONError):
                     canonical_bytes({"v": value})
 
+    def test_nan_is_stopped_by_the_type_gate_before_json_dumps_is_reached(self):
+        """`allow_nan=False` is unreachable, and this is what keeps it honest.
+
+        Mutating `allow_nan=False` to `True` kills no test - the only mutation in
+        this module that survives. That is not a hole: `_check` refuses every
+        float before `json.dumps` is called, so `allow_nan` is a second lock on a
+        door the first lock already holds. The proof is the message. If json were
+        doing the refusing it would be a bare ValueError about out-of-range
+        floats; because it is the type gate, it is a CanonicalJSONError naming
+        the float rule. Remove the type gate and this test says so immediately.
+        """
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(CanonicalJSONError) as ctx:
+                    canonical_bytes({"v": value})
+                self.assertEqual(
+                    str(ctx.exception),
+                    "float values are not canonical; binary floating point does not "
+                    "round-trip identically across runtimes - use a string or a "
+                    "scaled integer",
+                )
+
     def test_non_string_key_is_rejected(self):
         with self.assertRaises(CanonicalJSONError):
             canonical_bytes({1: "a"})
