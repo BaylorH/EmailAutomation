@@ -1,0 +1,565 @@
+"""`/certification/recover` and `/certification/review-input`.
+
+Two routes with opposite hazards, which is why they are tested together.
+
+`recover` touches a run that MAY ALREADY HAVE EXECUTED. Its hazard is doing
+anything at all: a recovery that runs business logic is how a "recovered" run
+causes a second effect. So most of this file is about what recover must NOT do,
+and the strongest of those tests do not read the implementation's behaviour at
+all -- they read its call graph and poison its execution entry point.
+
+`review-input` is the one route in the instrument that returns raw captured
+text. Its hazard is being reachable. So its tests drive the REAL CLI allowlist
+rather than a retyped copy, and prove the escape from the sanitization contract
+is bounded to exactly this one operation.
+"""
+
+import ast
+import json
+import os
+import socket
+import sys
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("E2E_TEST_MODE", "true")
+
+import service
+from email_automation.certification import ledger as ledger_module
+from email_automation.certification import lifecycle
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
+OPERATOR = "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
+SUB = "104729384756102938475"
+AUDIENCE = "https://process-user-certification-abc123-uc.a.run.app"
+
+TWIN_ENV = {
+    "K_SERVICE": "process-user-certification",
+    "K_REVISION": "process-user-certification-00001-abc",
+    "SITESIFT_SOURCE_REVISION": REVISION,
+    "SITESIFT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+    "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "process-user-00042-xyz",
+    "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "7",
+    "SITESIFT_FIXTURE_CONFIG_DIGEST": "d" * 64,
+    "SITESIFT_CERTIFICATION_AUDIENCE": AUDIENCE,
+    "SITESIFT_CERTIFICATION_OPERATOR_EMAIL": OPERATOR,
+    "SITESIFT_CERTIFICATION_OPERATOR_SUB": SUB,
+}
+
+
+# ---------------------------------------------------------------------------
+# The observable ledger
+# ---------------------------------------------------------------------------
+#
+# This SUBCLASSES the real ``InMemoryRunLedger`` rather than reimplementing it.
+# The state machine under test has to be the shipped one -- a hand-built stub
+# would let recover pass against transitions the real ledger forbids.
+#
+# The only thing added is the recovery observation a durable ledger can answer
+# and an in-process one cannot: server-side record age, lease expiry, and the
+# in-flight/ambiguous registration counts for the revoked generation.
+
+
+class ObservableLedger(ledger_module.InMemoryRunLedger):
+
+    def __init__(self, **observation):
+        super().__init__()
+        self.observation = dict(observation)
+        self.observation_reads = 0
+
+    def recovery_observation(self, run_id):
+        self.observation_reads += 1
+        return dict(self.observation)
+
+
+class HangingLedger(ObservableLedger):
+    """A read with no deadline HANGS; ``except Exception`` cannot catch a hang."""
+
+    def recovery_observation(self, run_id):
+        while True:
+            time.sleep(0.05)
+
+
+class FakeClock:
+    """Advances only when something sleeps. Makes a 75s gate assertable."""
+
+    def __init__(self, start=1_000_000.0):
+        self.now = float(start)
+        self.slept = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept += float(seconds)
+        self.now += float(seconds)
+
+
+def claimed_run(ledger, run_id, *, running=False):
+    """Drive the REAL ledger to CLAIMED (or RUNNING) via its real transitions."""
+    from email_automation.certification.models import (
+        CertificationRequest,
+        RunAuthorization,
+    )
+    from email_automation.certification import scenarios
+    from email_automation.certification.canonical_json import canonical_digest
+
+    request = CertificationRequest(
+        scenario_id="campaign-one-property",
+        run_id=run_id,
+        expected_revision=REVISION,
+    )
+    authorization = RunAuthorization.create(
+        scenario_id=request.scenario_id,
+        run_id=run_id,
+        source_revision=REVISION,
+        image_digest="sha256:" + "b" * 64,
+        certification_service="process-user-certification",
+        certification_revision="process-user-certification-00001-abc",
+        production_candidate_revision="process-user-00042-xyz",
+        caller_identity_digest="c" * 64,
+        fixture_config_secret_version="7",
+        fixture_config_digest="d" * 64,
+        scenario_registry_digest=scenarios.registry_digest(),
+        launch_class="agent_safe",
+        input_producer_kind="backend_registry_v1",
+        canonical_input_digest=canonical_digest({"k": "v"}),
+        input_producer_artifact_digest=canonical_digest({"p": "v"}),
+        authorization_expires_at="2099-01-01T00:00:00Z",
+    )
+    ledger.begin_preparing(request)
+    ledger.mark_prepared(request, authorization)
+    ledger.claim(request, authorization)
+    if running:
+        ledger.mark_running(run_id, "execute")
+    return request
+
+
+def quiescent_observation(state=ledger_module.CLAIMED, age=10_000):
+    return {"state": state, "recordAgeSeconds": age, "leaseExpired": True,
+            "inFlight": 0, "ambiguous": 0}
+
+
+# ---------------------------------------------------------------------------
+# recover: the gates
+# ---------------------------------------------------------------------------
+
+
+class RecoverGateTests(unittest.TestCase):
+    """Every gate refuses BEFORE anything is terminalized."""
+
+    def _recover(self, ledger, run_id, **kwargs):
+        clock = kwargs.pop("clock", None) or FakeClock()
+        return lifecycle.recover(
+            {"runId": run_id, "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64,
+            ledger=ledger,
+            clock=clock.time,
+            sleeper=clock.sleep,
+            **kwargs,
+        )
+
+    def test_an_unknown_run_is_not_invented(self):
+        ledger = ObservableLedger(**quiescent_observation())
+        payload, code = self._recover(ledger, "cert-recover-unknown")
+        self.assertEqual(code, 404)
+        self.assertEqual(payload["reason"], "unknown_run")
+
+    def test_a_prepared_run_belongs_to_abort_not_recovery(self):
+        """The two domains are disjoint by allowlist, not by convention."""
+        ledger = ObservableLedger(
+            **quiescent_observation(state=ledger_module.PREPARED))
+        from email_automation.certification.models import CertificationRequest
+        ledger.begin_preparing(CertificationRequest(
+            scenario_id="campaign-one-property",
+            run_id="cert-recover-prepared", expected_revision=REVISION))
+        payload, code = self._recover(ledger, "cert-recover-prepared")
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "not_recoverable")
+        self.assertEqual(ledger.state("cert-recover-prepared"),
+                         ledger_module.PREPARING)
+
+    def test_recoverable_states_are_an_allowlist(self):
+        self.assertEqual(
+            set(lifecycle.RECOVERABLE_STATES),
+            {ledger_module.CLAIMED, ledger_module.RUNNING},
+        )
+
+    def test_a_record_one_second_short_of_the_threshold_is_refused(self):
+        """719s. An execution started at the service timeout may still be live."""
+        ledger = ObservableLedger(**quiescent_observation(age=719))
+        claimed_run(ledger, "cert-recover-young")
+        payload, code = self._recover(ledger, "cert-recover-young")
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "record_too_recent")
+        self.assertEqual(ledger.state("cert-recover-young"), ledger_module.CLAIMED)
+
+    def test_a_record_exactly_at_the_threshold_is_accepted(self):
+        """720s = the 540s service timeout plus the 180s margin, exactly."""
+        ledger = ObservableLedger(**quiescent_observation(age=720))
+        claimed_run(ledger, "cert-recover-exact")
+        payload, code = self._recover(ledger, "cert-recover-exact")
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(ledger.state("cert-recover-exact"), ledger_module.TERMINAL)
+
+    def test_the_threshold_is_the_service_timeout_plus_the_margin(self):
+        self.assertEqual(lifecycle.RECOVERY_MIN_RECORD_AGE_SECONDS, 720)
+        self.assertEqual(
+            lifecycle.SERVICE_TIMEOUT_SECONDS + lifecycle.RECOVERY_AGE_MARGIN_SECONDS,
+            lifecycle.RECOVERY_MIN_RECORD_AGE_SECONDS,
+        )
+
+    def test_an_unexpired_lease_is_refused(self):
+        observation = quiescent_observation()
+        observation["leaseExpired"] = False
+        ledger = ObservableLedger(**observation)
+        claimed_run(ledger, "cert-recover-leased")
+        payload, code = self._recover(ledger, "cert-recover-leased")
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "lease_active")
+        self.assertEqual(ledger.state("cert-recover-leased"), ledger_module.CLAIMED)
+
+    def test_a_ledger_that_cannot_be_observed_refuses_rather_than_proceeds(self):
+        """The REAL default in-memory ledger cannot answer any of these gates.
+
+        It is process-scoped, so it has no server-side record age, no lease, and
+        no in-flight registrations. Recovery against it must refuse -- not
+        proceed on the assumption that unmeasured means safe.
+        """
+        ledger = ledger_module.InMemoryRunLedger()
+        claimed_run(ledger, "cert-recover-blind")
+        payload, code = lifecycle.recover(
+            {"runId": "cert-recover-blind", "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger)
+        self.assertEqual(code, 503)
+        self.assertEqual(payload["reason"], "record_observation_unavailable")
+        self.assertEqual(ledger.state("cert-recover-blind"), ledger_module.CLAIMED)
+
+    def test_a_hanging_readback_is_bounded_rather_than_waited_on(self):
+        """A Firestore read with no deadline hangs, and no `except` catches it."""
+        ledger = HangingLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-recover-hang")
+        started = time.monotonic()
+        with patch.object(lifecycle, "READBACK_DEADLINE_SECONDS", 0.4):
+            payload, code = self._recover(ledger, "cert-recover-hang")
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, 503)
+        self.assertEqual(payload["reason"], "readback_deadline_exceeded")
+        self.assertLess(elapsed, 10, "the readback was not bounded")
+        self.assertEqual(ledger.state("cert-recover-hang"), ledger_module.CLAIMED)
+
+    def test_an_unanswerable_observation_refuses_rather_than_proceeds(self):
+        """No observation at all is a different fact from a missing field.
+
+        Both refuse. Neither may reach terminalization: a recovery that
+        terminalizes on an unmeasured gate has measured nothing.
+        """
+
+        class SilentLedger(ObservableLedger):
+            def recovery_observation(self, run_id):
+                self.observation_reads += 1
+                return None
+
+        ledger = SilentLedger()
+        claimed_run(ledger, "cert-recover-silent")
+        payload, code = self._recover(ledger, "cert-recover-silent")
+        self.assertEqual(code, 503)
+        self.assertEqual(payload["reason"], "record_observation_unavailable")
+        self.assertEqual(ledger.state("cert-recover-silent"), ledger_module.CLAIMED)
+
+    def test_an_observation_that_vanishes_between_reads_refuses(self):
+        """Each of the three reads is a gate; each must refuse on its own."""
+        for vanish_at in (2, 3):
+            with self.subTest(read=vanish_at):
+
+                class VanishingLedger(ObservableLedger):
+                    def recovery_observation(self, run_id):
+                        self.observation_reads += 1
+                        if self.observation_reads >= vanish_at:
+                            return None
+                        return quiescent_observation()
+
+                ledger = VanishingLedger()
+                run_id = f"cert-recover-vanish-{vanish_at}"
+                claimed_run(ledger, run_id)
+                payload, code = self._recover(ledger, run_id)
+                self.assertEqual(code, 503)
+                self.assertEqual(payload["reason"],
+                                 "record_observation_unavailable")
+                self.assertEqual(ledger.state(run_id), ledger_module.CLAIMED)
+
+    def test_a_wrongly_typed_age_is_unprovable_not_coerced(self):
+        """"720" is a string, not a measurement. Coercing it would skip the gate."""
+        for bad_age in ("720", 720.0, True, None, -1):
+            with self.subTest(age=bad_age):
+                observation = quiescent_observation()
+                observation["recordAgeSeconds"] = bad_age
+                ledger = ObservableLedger(**observation)
+                run_id = f"cert-recover-age-{type(bad_age).__name__}-{bad_age}"
+                claimed_run(ledger, run_id)
+                payload, code = self._recover(ledger, run_id)
+                self.assertEqual(code, 503)
+                self.assertEqual(payload["reason"], "record_age_unprovable")
+                self.assertEqual(ledger.state(run_id), ledger_module.CLAIMED)
+
+    def test_a_wrongly_typed_lease_is_unprovable_not_coerced(self):
+        """A missing lease must never default to "expired"."""
+        for bad_lease in ("expired", 0, 1, None):
+            with self.subTest(lease=bad_lease):
+                observation = quiescent_observation()
+                observation["leaseExpired"] = bad_lease
+                ledger = ObservableLedger(**observation)
+                run_id = f"cert-recover-lease-{type(bad_lease).__name__}-{bad_lease}"
+                claimed_run(ledger, run_id)
+                payload, code = self._recover(ledger, run_id)
+                self.assertEqual(code, 503)
+                self.assertEqual(payload["reason"], "lease_state_unprovable")
+                self.assertEqual(ledger.state(run_id), ledger_module.CLAIMED)
+
+    def test_a_failing_readback_is_refused_rather_than_swallowed(self):
+        """A store that raises is not a store that answered "quiescent"."""
+
+        class BrokenLedger(ObservableLedger):
+            def recovery_observation(self, run_id):
+                raise RuntimeError("the certification store is unreachable")
+
+        ledger = BrokenLedger()
+        claimed_run(ledger, "cert-recover-broken")
+        payload, code = self._recover(ledger, "cert-recover-broken")
+        self.assertEqual(code, 503)
+        self.assertEqual(payload["reason"], "readback_failed")
+        self.assertEqual(ledger.state("cert-recover-broken"), ledger_module.CLAIMED)
+
+    def test_a_second_read_that_disagrees_stops_the_recovery(self):
+        """The record moved between the gate and the revoke. That is a race."""
+
+        class MovingLedger(ObservableLedger):
+            def recovery_observation(self, run_id):
+                self.observation_reads += 1
+                if self.observation_reads == 1:
+                    return quiescent_observation()
+                return quiescent_observation(state=ledger_module.RUNNING)
+
+        ledger = MovingLedger()
+        claimed_run(ledger, "cert-recover-raced")
+        payload, code = self._recover(ledger, "cert-recover-raced")
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "recovery_raced")
+        self.assertEqual(ledger.state("cert-recover-raced"), ledger_module.CLAIMED)
+
+
+# ---------------------------------------------------------------------------
+# recover: quiescence
+# ---------------------------------------------------------------------------
+
+
+class RecoverQuiescenceTests(unittest.TestCase):
+
+    def _recover(self, ledger, run_id, clock):
+        return lifecycle.recover(
+            {"runId": run_id, "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger,
+            clock=clock.time, sleeper=clock.sleep)
+
+    def test_the_gate_waits_at_least_seventy_five_seconds(self):
+        """60s maximum in-flight call plus a 15s margin, before any cleanup."""
+        ledger = ObservableLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-quiesce-wait")
+        clock = FakeClock()
+        payload, code = self._recover(ledger, "cert-quiesce-wait", clock)
+        self.assertEqual(code, 200, payload)
+        self.assertGreaterEqual(clock.slept, 75)
+        self.assertGreaterEqual(payload["quiescenceWaitedSeconds"], 75)
+
+    def test_the_gate_is_the_in_flight_deadline_plus_the_margin(self):
+        self.assertEqual(lifecycle.QUIESCENCE_WAIT_SECONDS, 75)
+        self.assertEqual(
+            lifecycle.MAX_IN_FLIGHT_SECONDS + lifecycle.QUIESCENCE_MARGIN_SECONDS,
+            lifecycle.QUIESCENCE_WAIT_SECONDS,
+        )
+
+    def test_a_still_registered_operation_blocks_terminalization(self):
+        observation = quiescent_observation()
+        observation["inFlight"] = 1
+        ledger = ObservableLedger(**observation)
+        claimed_run(ledger, "cert-quiesce-busy")
+        payload, code = self._recover(ledger, "cert-quiesce-busy", FakeClock())
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "quiescence_timeout")
+        self.assertEqual(ledger.state("cert-quiesce-busy"), ledger_module.CLAIMED)
+
+    def test_an_ambiguous_operation_quarantines_and_never_cleans(self):
+        observation = quiescent_observation()
+        observation["ambiguous"] = 1
+        ledger = ObservableLedger(**observation)
+        claimed_run(ledger, "cert-quiesce-ambiguous")
+        cleaned = []
+        clock = FakeClock()
+        payload, code = lifecycle.recover(
+            {"runId": "cert-quiesce-ambiguous", "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger,
+            clock=clock.time, sleeper=clock.sleep,
+            cleaner=lambda run_id: cleaned.append(run_id) or {"residue": 0})
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(payload["verdict"], "INSTRUMENT_BLOCKED")
+        self.assertEqual(payload["failureCode"], "ambiguous_provider_effect")
+        self.assertTrue(payload["quarantined"])
+        self.assertEqual(cleaned, [], "an ambiguous effect was cleaned up")
+
+    def test_unprovable_registrations_refuse_rather_than_assume_zero(self):
+        observation = quiescent_observation()
+        observation["inFlight"] = None
+        ledger = ObservableLedger(**observation)
+        claimed_run(ledger, "cert-quiesce-blind")
+        payload, code = self._recover(ledger, "cert-quiesce-blind", FakeClock())
+        self.assertEqual(code, 503)
+        self.assertEqual(payload["reason"], "quiescence_unprovable")
+
+
+# ---------------------------------------------------------------------------
+# recover: terminalization honesty
+# ---------------------------------------------------------------------------
+
+
+class RecoverTerminalizationTests(unittest.TestCase):
+
+    def _recover(self, ledger, run_id, **kwargs):
+        clock = FakeClock()
+        return lifecycle.recover(
+            {"runId": run_id, "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger,
+            clock=clock.time, sleeper=clock.sleep, **kwargs)
+
+    def test_a_recovered_run_is_never_recorded_as_not_tested(self):
+        """A CLAIMED run may have executed. NOT_TESTED would be a lie."""
+        for state in (ledger_module.CLAIMED, ledger_module.RUNNING):
+            with self.subTest(state=state):
+                ledger = ObservableLedger(**quiescent_observation(state=state))
+                run_id = f"cert-terminal-{state.lower()}"
+                claimed_run(ledger, run_id, running=(state == ledger_module.RUNNING))
+                payload, code = self._recover(ledger, run_id)
+                self.assertEqual(code, 200, payload)
+                self.assertEqual(payload["verdict"], "INSTRUMENT_BLOCKED")
+                self.assertNotEqual(payload["verdict"], "NOT_TESTED")
+                self.assertEqual(ledger.verdict(run_id), "INSTRUMENT_BLOCKED")
+
+    def test_recovery_can_never_produce_a_pass(self):
+        ledger = ObservableLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-terminal-nopass")
+        payload, _ = self._recover(ledger, "cert-terminal-nopass")
+        self.assertNotEqual(payload["verdict"], "PASS")
+        self.assertEqual(set(lifecycle.RECOVERY_VERDICTS), {"INSTRUMENT_BLOCKED"})
+
+    def test_cleanup_runs_before_terminalization_and_is_appended(self):
+        ledger = ObservableLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-terminal-clean")
+        order = []
+        original = ledger.record_terminal
+
+        def watched(run_id, verdict, digest):
+            order.append("terminalize")
+            return original(run_id, verdict, digest)
+
+        with patch.object(ledger, "record_terminal", watched):
+            payload, code = self._recover(
+                ledger, "cert-terminal-clean",
+                cleaner=lambda run_id: order.append("cleanup") or {"fixtureRows": 0})
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(order, ["cleanup", "terminalize"])
+        self.assertEqual(payload["residue"], {"fixtureRows": 0})
+        row = ledger.export()["cert-terminal-clean"]
+        self.assertEqual(row["residue"], {"fixtureRows": 0})
+        self.assertEqual(len(row["cleanupEvidenceDigests"]), 1)
+
+    def test_a_second_recover_does_not_rewrite_the_terminal_record(self):
+        ledger = ObservableLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-terminal-twice")
+        first, code = self._recover(ledger, "cert-terminal-twice")
+        self.assertEqual(code, 200, first)
+        second, code = self._recover(ledger, "cert-terminal-twice")
+        self.assertEqual(code, 409)
+        self.assertEqual(second["reason"], "not_recoverable")
+        self.assertEqual(ledger.verdict("cert-terminal-twice"), "INSTRUMENT_BLOCKED")
+
+    def test_the_response_carries_no_fixture_value(self):
+        ledger = ObservableLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-terminal-sanitized")
+        payload, _ = self._recover(ledger, "cert-terminal-sanitized")
+        blob = json.dumps(payload, sort_keys=True)
+        for forbidden in ("@", "broker", "100 Fixture Way", "cert-uid-0001"):
+            self.assertNotIn(forbidden, blob)
+
+
+# ---------------------------------------------------------------------------
+# recover over HTTP
+# ---------------------------------------------------------------------------
+
+
+class RecoverRouteTests(unittest.TestCase):
+
+    def setUp(self):
+        service.app.config["TESTING"] = True
+        self.client = service.app.test_client()
+        self.ledger = ObservableLedger(**quiescent_observation())
+        patcher = patch.object(lifecycle, "_DEFAULT_LEDGER", self.ledger)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The route uses the real clock. The 75s gate is proven against a fake
+        # clock in RecoverQuiescenceTests; here it is shortened so the HTTP
+        # surface can be exercised without waiting it out.
+        gate = patch.object(lifecycle, "QUIESCENCE_WAIT_SECONDS", 0)
+        gate.start()
+        self.addCleanup(gate.stop)
+
+    def _decoder(self):
+        return lambda token, audience: {
+            "iss": "https://accounts.google.com", "aud": AUDIENCE,
+            "email": OPERATOR, "email_verified": True, "sub": SUB,
+            "exp": 4102444800,
+        }
+
+    def _post(self, operation, body):
+        with patch.dict(os.environ, TWIN_ENV, clear=False), \
+                patch.object(service, "_caller_decoder", self._decoder()):
+            return self.client.post(
+                f"/certification/{operation}", json=body,
+                headers={"Authorization": "Bearer valid"})
+
+    def test_recover_is_no_longer_not_implemented(self):
+        claimed_run(self.ledger, "cert-route-recover")
+        response = self._post("recover", {"runId": "cert-route-recover",
+                                          "expectedRevision": REVISION})
+        self.assertNotEqual(response.status_code, 501)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["verdict"], "INSTRUMENT_BLOCKED")
+
+    def test_the_recover_request_surface_stays_closed(self):
+        """It may never name a user, client, recipient, body, or resource."""
+        claimed_run(self.ledger, "cert-route-closed")
+        for extra in ({"uid": "real-user"}, {"scenarioId": "campaign-one-property"},
+                      {"recipient": "someone@example.com"}, {"sheetId": "s"}):
+            body = {"runId": "cert-route-closed", "expectedRevision": REVISION}
+            body.update(extra)
+            with self.subTest(extra=extra):
+                response = self._post("recover", body)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.get_json()["reason"], "invalid_request")
+        self.assertEqual(self.ledger.state("cert-route-closed"),
+                         ledger_module.CLAIMED)
+
+    def test_a_wrong_revision_is_refused_before_the_lifecycle(self):
+        claimed_run(self.ledger, "cert-route-revision")
+        response = self._post("recover", {"runId": "cert-route-revision",
+                                          "expectedRevision": "0" * 40})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["reason"], "revision_mismatch")
+        self.assertEqual(self.ledger.state("cert-route-revision"),
+                         ledger_module.CLAIMED)
+
+
+if __name__ == "__main__":
+    unittest.main()

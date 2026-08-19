@@ -342,6 +342,7 @@ _CERTIFICATION_HANDLERS = {
     "run": "run",
     "status": "status",
     "abort": "abort",
+    "recover": "recover",
 }
 
 _CERTIFICATION_REVIEW_KEYS = frozenset(
@@ -390,6 +391,11 @@ def certification_operation(operation: str):
         return jsonify({"status": "error", "reason": "route_not_available"}), 404
 
     body = request.get_json(silent=True)
+    # Narrowed here rather than only inside the helper: everything below indexes
+    # this body, and a route that subscripts a value it has not proven is a dict
+    # turns a malformed request into a 500 instead of a named refusal.
+    if not isinstance(body, dict):
+        return jsonify({"status": "error", "reason": "invalid_request"}), 400
     reason = _certification_schema_error(body, allowed)
     if reason:
         return jsonify({"status": "error", "reason": reason}), 400

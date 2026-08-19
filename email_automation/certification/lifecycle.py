@@ -21,7 +21,9 @@ both implementations agree by construction.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Mapping, Optional, Tuple
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from email_automation.certification import ledger as ledger_module
 from email_automation.certification import scenarios
@@ -273,6 +275,293 @@ def abort(body: Mapping[str, Any], *, caller_identity_digest: str = "",
             "verdict": "NOT_TESTED"}, 200
 
 
+# ---------------------------------------------------------------------------
+# recover
+# ---------------------------------------------------------------------------
+#
+# ``abort`` terminalizes a run PROVEN not to have executed and explicitly
+# refuses CLAIMED. Recovery's domain is exactly what abort refuses: the
+# CLAIMED/RUNNING run that may or may not have executed, whose worker is gone.
+#
+# The single property that matters here is that recovery NEVER EXECUTES. A
+# recovery that runs business logic is how a "recovered" run causes a second
+# effect -- the exact failure the whole ledger exists to prevent. So recover
+# reads back, quiesces, cleans, and terminalizes, and nothing else.
+#
+# It also terminalizes HONESTLY. ``NOT_TESTED`` means "did not execute"; a
+# claimed run may have executed, so recording NOT_TESTED over it would write a
+# falsehood into the permanent record. The only verdict recovery may write is
+# INSTRUMENT_BLOCKED, which says what is true: the instrument lost track, and
+# the capability was not certified.
+
+# 540s Cloud Run request timeout. A record younger than this may still have an
+# execution in flight, because the execution itself has not yet been killed.
+SERVICE_TIMEOUT_SECONDS = 540
+RECOVERY_AGE_MARGIN_SECONDS = 180
+RECOVERY_MIN_RECORD_AGE_SECONDS = SERVICE_TIMEOUT_SECONDS + RECOVERY_AGE_MARGIN_SECONDS
+
+# Every certification provider wrapper carries a 60s maximum client deadline.
+# After revoking the generation, a conclusive old-generation call still has that
+# long to land, so quiescence waits it out plus a margin before anything is
+# cleaned or terminalized.
+MAX_IN_FLIGHT_SECONDS = 60
+QUIESCENCE_MARGIN_SECONDS = 15
+QUIESCENCE_WAIT_SECONDS = MAX_IN_FLIGHT_SECONDS + QUIESCENCE_MARGIN_SECONDS
+QUIESCENCE_POLL_SECONDS = 5
+
+# A Firestore read with NO DEADLINE hangs rather than errors, and no `except`
+# clause can catch a hang. Every readback here is run under this deadline in a
+# daemon thread, so an unresponsive store becomes a refusal instead of a request
+# that never returns.
+READBACK_DEADLINE_SECONDS = 20.0
+
+# ALLOWLIST. A denylist would fail open for any state added later, and the thing
+# on the other side of this check is a permanent terminal record.
+RECOVERABLE_STATES = (ledger_module.CLAIMED, ledger_module.RUNNING)
+
+# The only verdicts recovery may write. Not a style choice: PASS would stamp a
+# capability nobody observed, and NOT_TESTED would deny an execution that may
+# have happened.
+RECOVERY_VERDICTS = ("INSTRUMENT_BLOCKED",)
+
+
+class ReadbackTimeout(RuntimeError):
+    """A readback exceeded its deadline. Distinct from a readback that failed."""
+
+
+@dataclass(frozen=True)
+class RecordObservation:
+    """What a durable ledger can say about an interrupted run.
+
+    Every field is Optional and ``None`` means UNPROVABLE, never "zero" or
+    "old enough". An in-process ledger cannot answer any of them, and recovery
+    refuses rather than assuming.
+    """
+
+    state: Optional[str]
+    record_age_seconds: Optional[int]
+    lease_expired: Optional[bool]
+    in_flight: Optional[int]
+    ambiguous: Optional[int]
+
+
+def _bounded_read(reader: Callable[[str], Any], run_id: str) -> Any:
+    """Run one readback under an explicit deadline, in a daemon thread."""
+    outcome: Dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            outcome["value"] = reader(run_id)
+        except BaseException as exc:      # noqa: BLE001 - re-raised in this thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(READBACK_DEADLINE_SECONDS)
+    if thread.is_alive():
+        raise ReadbackTimeout("readback exceeded its deadline")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
+def _probe(ledger: Any, run_id: str) -> Any:
+    """The raw observation mapping, or None when the ledger cannot observe."""
+    reader = getattr(ledger, "recovery_observation", None)
+    if reader is None:
+        return None
+    return _bounded_read(reader, run_id)
+
+
+def _exact_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _coerce_observation(raw: Any) -> Optional[RecordObservation]:
+    """Strict types only. A value of the wrong type is unprovable, not coerced.
+
+    ``None`` means the ledger could not be observed AT ALL, which is a different
+    fact from an observation with a missing field, and both are refusals.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    row = raw
+    state = row.get("state")
+    lease = row.get("leaseExpired")
+    return RecordObservation(
+        state=state if isinstance(state, str) and state else None,
+        record_age_seconds=_exact_int(row.get("recordAgeSeconds")),
+        lease_expired=lease if isinstance(lease, bool) else None,
+        in_flight=_exact_int(row.get("inFlight")),
+        ambiguous=_exact_int(row.get("ambiguous")),
+    )
+
+
+def _observe(ledger: Any, run_id: str) -> Tuple[Optional[RecordObservation],
+                                                Optional[Response]]:
+    """(observation, None) or (None, refusal). Never a partial observation."""
+    try:
+        raw = _probe(ledger, run_id)
+    except ReadbackTimeout:
+        return None, _error("readback_deadline_exceeded", 503)
+    except Exception:      # noqa: BLE001 - an unreadable record is not a recoverable one
+        return None, _error("readback_failed", 503)
+    return _coerce_observation(raw), None
+
+
+def _quiesce(clock: Callable[[], float], sleeper: Callable[[float], None],
+             revoked_at: float) -> float:
+    """Wait out the maximum in-flight call plus its margin. Returns the wait.
+
+    Bounded rather than ``while True``: a clock that does not advance would
+    otherwise hang the request forever, and the caller has to be able to tell
+    "the gate completed" from "the gate never could".
+    """
+    attempts = 0
+    max_attempts = int(QUIESCENCE_WAIT_SECONDS / QUIESCENCE_POLL_SECONDS) + 3
+    while attempts < max_attempts:
+        waited = clock() - revoked_at
+        remaining = QUIESCENCE_WAIT_SECONDS - waited
+        if remaining <= 0:
+            return waited
+        attempts += 1
+        sleeper(remaining if remaining < QUIESCENCE_POLL_SECONDS
+                else QUIESCENCE_POLL_SECONDS)
+    return clock() - revoked_at
+
+
+def _recovery_digest(run_id: str, failure_code: str, waited: float,
+                     residue: Mapping[str, int]) -> str:
+    """Sanitized recovery facts only: no fixture value can reach this preimage."""
+    return canonical_digest({
+        "recoveredRun": run_id,
+        "failureCode": failure_code,
+        "quiescenceWaitedSeconds": int(waited),
+        "residue": {str(k): int(v) for k, v in dict(residue).items()},
+    })
+
+
+def recover(body: Mapping[str, Any], *, caller_identity_digest: str = "",
+            ledger=None, environ: Optional[Mapping[str, str]] = None,
+            clock: Optional[Callable[[], float]] = None,
+            sleeper: Optional[Callable[[float], None]] = None,
+            cleaner: Optional[Callable[[str], Mapping[str, int]]] = None) -> Response:
+    """Read back, quiesce, clean, terminalize. Never execute.
+
+    There is deliberately no path from here into ``runner``: recovery imports
+    nothing that can run product code, and the whole body runs inside the
+    execution fence so that a future edit reaching for one fails loudly instead
+    of quietly causing a second effect.
+    """
+    ledger = ledger if ledger is not None else default_ledger()
+    clock = clock if clock is not None else _now_float
+    sleeper = sleeper if sleeper is not None else _sleep
+    run_id = body["runId"]
+
+    state = ledger.state(run_id)
+    if state is None:
+        return _error("unknown_run", 404)
+    if state not in RECOVERABLE_STATES:
+        # PREPARING/PREPARED belong to abort, which can prove no execution
+        # happened. TERMINAL is already resolved and is never rewritten.
+        return _error("not_recoverable", 409)
+
+    first, refusal = _observe(ledger, run_id)
+    if refusal is not None:
+        return refusal
+    if first is None:
+        # No observation at all. Naming it separately from a missing FIELD
+        # matters: "the store answered and had no age" and "there was no answer"
+        # need different operator responses, and neither may proceed.
+        return _error("record_observation_unavailable", 503)
+    if first.record_age_seconds is None:
+        return _error("record_age_unprovable", 503)
+    if first.record_age_seconds < RECOVERY_MIN_RECORD_AGE_SECONDS:
+        # Younger than the service timeout plus its margin: an execution
+        # started by the lost worker may still be running right now.
+        return _error("record_too_recent", 409)
+    if first.lease_expired is None:
+        return _error("lease_state_unprovable", 503)
+    if not first.lease_expired:
+        return _error("lease_active", 409)
+
+    # The second read is what makes the first one a decision rather than a
+    # guess: a record that moved between them is being worked on by someone.
+    second, refusal = _observe(ledger, run_id)
+    if refusal is not None:
+        return refusal
+    if second is None:
+        return _error("record_observation_unavailable", 503)
+    if (second.state != first.state
+            or second.lease_expired != first.lease_expired
+            or second.record_age_seconds is None
+            or second.record_age_seconds < first.record_age_seconds):
+        return _error("recovery_raced", 409)
+
+    revoked_at = clock()
+    waited = _quiesce(clock, sleeper, revoked_at)
+    if waited < QUIESCENCE_WAIT_SECONDS:
+        # The gate did not complete. Nothing below this line may run: cleanup
+        # and terminalization both assume no old-generation call can still land.
+        return _error("quiescence_incomplete", 503)
+
+    settled, refusal = _observe(ledger, run_id)
+    if refusal is not None:
+        return refusal
+    if settled is None:
+        return _error("record_observation_unavailable", 503)
+    if settled.ambiguous is None or settled.in_flight is None:
+        return _error("quiescence_unprovable", 503)
+
+    if settled.ambiguous:
+        # An ambiguous operation may have committed at the provider after the
+        # client gave up. Cleaning would destroy the only evidence that could
+        # ever resolve it, so the resources stay quarantined and the run
+        # terminalizes as blocked rather than as a verdict.
+        digest = _recovery_digest(run_id, "ambiguous_provider_effect", waited, {})
+        ledger.record_terminal(run_id, "INSTRUMENT_BLOCKED", digest)
+        return {"status": "ok", "state": "TERMINAL", "runId": run_id,
+                "verdict": "INSTRUMENT_BLOCKED",
+                "failureCode": "ambiguous_provider_effect",
+                "quarantined": True, "quiescenceWaitedSeconds": int(waited),
+                "residueProven": False, "residue": {},
+                "recoveryDigest": digest}, 200
+
+    if settled.in_flight:
+        # Not quiescent. Terminalizing now would race a live worker's write.
+        return _error("quiescence_timeout", 409)
+
+    residue: Dict[str, int] = {}
+    residue_proven = False
+    if cleaner is not None:
+        residue = {str(k): int(v) for k, v in dict(cleaner(run_id)).items()}
+        residue_proven = True
+
+    digest = _recovery_digest(run_id, "recovered_after_interruption", waited, residue)
+    ledger.record_terminal(run_id, "INSTRUMENT_BLOCKED", digest)
+    if residue_proven:
+        ledger.append_cleanup_result(run_id, digest, residue)
+
+    return {"status": "ok", "state": "TERMINAL", "runId": run_id,
+            "verdict": "INSTRUMENT_BLOCKED",
+            "failureCode": "recovered_after_interruption",
+            "quarantined": False, "quiescenceWaitedSeconds": int(waited),
+            "residueProven": residue_proven, "residue": residue,
+            "recoveryDigest": digest}, 200
+
+
 def _now_epoch() -> int:
     import time
     return int(time.time())
+
+
+def _now_float() -> float:
+    import time
+    return time.time()
+
+
+def _sleep(seconds: float) -> None:
+    import time
+    time.sleep(seconds)
