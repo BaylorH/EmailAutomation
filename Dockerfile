@@ -25,6 +25,45 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 # Application source.
 COPY . .
 
+# Record the deployable source bytes actually present in this layer.
+#
+# A test suite run against a checkout proves something about the CHECKOUT. A
+# certification stamp is about the IMAGE, and those are the same bytes only if
+# somebody checks. `COPY . .` behind a .dockerignore is precisely what drifts
+# quietly -- widen one ignore rule and a file the reviewer read stops shipping,
+# with nothing red anywhere.
+#
+# Written AFTER the copy, or it would describe an empty image. Excludes itself
+# (its own digest cannot be known before it is written) and interpreter caches.
+# scripts/verify_image_source_manifest.py recomputes this from the reviewed
+# checkout and fails on any added, omitted, or changed file.
+RUN python - <<'PYMANIFEST'
+import hashlib, json, os
+root = "/app"
+name = ".sitesift-source-manifest.json"
+files = []
+for base, dirs, names in os.walk(root):
+    dirs[:] = [d for d in dirs if d != "__pycache__"]
+    for filename in names:
+        if filename == name or filename.endswith((".pyc", ".pyo")):
+            continue
+        full = os.path.join(base, filename)
+        if not os.path.isfile(full) or os.path.islink(full):
+            continue
+        with open(full, "rb") as handle:
+            raw = handle.read()
+        files.append({
+            "path": os.path.relpath(full, root),
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+files.sort(key=lambda entry: entry["path"])
+document = {"schemaVersion": "sitesift-image-source-manifest-v1", "files": files}
+with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+    json.dump(document, handle, ensure_ascii=False, sort_keys=True,
+              separators=(",", ":"))
+PYMANIFEST
+
 # Run as an unprivileged user. /app (== WORKDIR == CWD) is chowned to appuser
 # so the token cache (msal_token_cache.bin), which the pipeline writes next to
 # itself via a relative path, remains writable at runtime.
