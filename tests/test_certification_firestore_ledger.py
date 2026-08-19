@@ -812,5 +812,165 @@ class TheClaimConsumesTheAuthorizationInOneTransactionTests(LedgerCase):
         self.assertEqual(loser.state(request.run_id), "PREPARING")
 
 
+class DurableRowsStaySanitizedTests(LedgerCase):
+    """What a permanent row is allowed to hold, checked against a REAL run.
+
+    A hand-built row would only test the test. So this drives the actual
+    lifecycle -- the real scenario registry, the real runner, the real evidence
+    digest -- into a FirestoreRunLedger and then reads what physically landed in
+    the store.
+
+    The stake is specific to durability. A fixture value written to a durable
+    ledger outlives both the fixture it came from and the cleanup that erases
+    it, which is exactly the residue certification exists to prove absent. An
+    in-memory ledger cannot fail this way for long enough to matter; this one
+    can, permanently.
+    """
+
+    REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
+    SCENARIO_ID = "campaign-one-property"
+    RUN_ID = "cert-firestore-sanitized-0001"
+
+    def _env(self):
+        return {
+            "SITESIFT_SOURCE_REVISION": self.REVISION,
+            "SITESIFT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+            "K_SERVICE": "process-user-certification",
+            "K_REVISION": "process-user-certification-00001-abc",
+            "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "process-user-00042-xyz",
+            "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "7",
+            "SITESIFT_FIXTURE_CONFIG_DIGEST": "d" * 64,
+        }
+
+    def _drive_a_real_run(self):
+        from email_automation.certification import lifecycle as lc
+
+        ledger = self.firestore_ledger()
+        body = {
+            "scenarioId": self.SCENARIO_ID,
+            "runId": self.RUN_ID,
+            "expectedRevision": self.REVISION,
+        }
+        prepared, prepared_code = lc.prepare(
+            body, caller_identity_digest="c" * 64, ledger=ledger, environ=self._env()
+        )
+        self.assertEqual(prepared_code, 200, prepared)
+        ran, ran_code = lc.run(
+            {"runId": self.RUN_ID, "expectedRevision": self.REVISION},
+            ledger=ledger,
+            environ=self._env(),
+        )
+        self.assertEqual(ran_code, 200, ran)
+        return ledger, prepared, ran
+
+    def _forbidden_values(self):
+        """Every fixture identity the run could have leaked, from the REAL
+        fixture module and the REAL registry entry -- not a guessed list."""
+        from email_automation.certification import fixtures as fx
+        from email_automation.certification import scenarios
+
+        scenario = scenarios.get(self.SCENARIO_ID)
+        return [
+            fx.FIXTURE_UID,
+            fx.FIXTURE_CLIENT,
+            fx.FIXTURE_SHEET,
+            fx.FIXTURE_RECIPIENT,
+            fx.FIXTURE_SENDER,
+            fx.FIXTURE_PREFIX,
+            scenario["logicalFixtureKey"],
+            scenario["oracleProjectionKey"],
+        ]
+
+    def test_a_real_run_persists_only_allowlisted_keys(self):
+        ledger, _prepared, _ran = self._drive_a_real_run()
+        ledger.append_cleanup_result(self.RUN_ID, "e" * 64, {"nonfixture_write": 0})
+        row = ledger.export()[self.RUN_ID]
+        self.assertEqual(sorted(row), sorted(lg.DURABLE_ROW_KEYS))
+        self.assertEqual(row["state"], "TERMINAL")
+        self.assertRegex(row["evidenceDigest"], r"^[0-9a-f]{64}$")
+
+    def test_a_real_run_leaves_no_fixture_identity_in_the_store(self):
+        ledger, _prepared, _ran = self._drive_a_real_run()
+        ledger.append_cleanup_result(self.RUN_ID, "e" * 64, {"nonfixture_write": 0})
+        blob = json.dumps(self.store.docs, sort_keys=True, default=str)
+        for forbidden in self._forbidden_values():
+            self.assertNotIn(forbidden, blob, f"{forbidden!r} reached the ledger")
+        for forbidden in ("@", "Hi Pat", "100 Fixture Way", "Traceback"):
+            self.assertNotIn(forbidden, blob, f"{forbidden!r} reached the ledger")
+
+    def test_no_committed_snapshot_ever_held_a_fixture_identity(self):
+        """Scanning only the final store misses a value that was written and
+        then overwritten -- and a durable row that briefly held a recipient was
+        still readable, replicated, and backed up while it did.
+
+        Found the hard way: a mutation that seeded a fixture recipient into the
+        row's residue field passed the end-state scan, because the cleanup step
+        overwrote that field before the scan ran.
+        """
+        ledger, _prepared, _ran = self._drive_a_real_run()
+        ledger.append_cleanup_result(self.RUN_ID, "e" * 64, {"nonfixture_write": 0})
+        self.assertTrue(self.store.history, "no committed snapshot was recorded")
+        forbidden = self._forbidden_values() + ["@", "Hi Pat", "100 Fixture Way",
+                                                "Traceback"]
+        for index, snapshot in enumerate(self.store.history):
+            blob = json.dumps(snapshot, sort_keys=True, default=str)
+            for value in forbidden:
+                self.assertNotIn(
+                    value, blob, f"{value!r} was readable in commit {index}"
+                )
+
+    def test_the_residue_scan_would_catch_a_fixture_identity(self):
+        """Negative control for the scan itself. A test that only ever looks at
+        clean rows cannot tell a working scan from a scan that matches nothing.
+        """
+        blob = json.dumps({"row": {"recipient": self._forbidden_values()[3]}})
+        found = [v for v in self._forbidden_values() if v in blob]
+        self.assertTrue(found, "the residue scan matches nothing at all")
+
+    def test_the_allowlist_is_exactly_the_shape_the_machine_creates(self):
+        """The allowlist and the row builder must not drift. If a new field is
+        added to a row without being allowlisted the write refuses; if it is
+        allowlisted without being created, this catches the dead key."""
+        row = lg.InMemoryRunLedger()._new_row(self.request())
+        self.assertEqual(set(row), set(lg.DURABLE_ROW_KEYS))
+
+    def test_the_in_memory_ledger_holds_the_same_allowlisted_keys(self):
+        """The sanitization guard lives on the durable path, but the two ledgers
+        must persist the same shape or the swap changes what a row means."""
+        ledger, request = lg.InMemoryRunLedger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        ledger.claim(request, self.auth())
+        ledger.record_terminal(request.run_id, "PASS", "d" * 64)
+        for row in ledger.export().values():
+            self.assertLessEqual(set(row), set(lg.DURABLE_ROW_KEYS))
+
+    def test_the_ephemeral_record_holds_only_authorization_scalars(self):
+        """The one-use half is short-lived but it is still written down. Its
+        keys are exactly the authorization's own fields and its digest -- there
+        is no sealed body, recipient, or oracle riding along."""
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        stored = self.store.docs[
+            f"{lg.DEFAULT_AUTHORIZATIONS_COLLECTION}/{request.run_id}"
+        ]
+        self.assertEqual(
+            set(stored), set(m.AUTHORIZATION_FIELDS) | {"authorization_digest"}
+        )
+
+    def test_a_refusal_message_names_states_and_never_a_value(self):
+        """Sanitized refusals matter more here than in memory: these strings are
+        what a route returns and what an operator pastes into a ticket."""
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        with self.assertRaises(lg.LedgerStateError) as caught:
+            ledger.claim(request, self.auth())
+        message = str(caught.exception)
+        self.assertIn("PREPARED", message)
+        for forbidden in self._forbidden_values():
+            self.assertNotIn(forbidden, message)
+
+
 if __name__ == "__main__":
     unittest.main()
