@@ -25,6 +25,7 @@ surface as one rather than be tuned away in the observer.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 from contextlib import ExitStack
@@ -126,11 +127,89 @@ def _drive_campaign_outreach(runtime: Any, fixture: fx.PreparedFixture,
         )
 
 
+
+# -- cleanup, allocated before the fixture is opened -------------------------
+#
+# Ordering is the property, not politeness. A fixture opened before its cleanup
+# handle exists can leak on any fault between the two, and the leak is invisible
+# because nothing yet knows the fixture is there to clean.
+#
+# A fixture teardown is a DELETE. An inventory scoped to "what can send?" is
+# blind to it, so it is enumerated here as the destructive operation it is.
+
+CLEANUP_MAX_ATTEMPTS = 3
+
+
+class CleanupHandle:
+    """Owns the delete list for one run, from before the fixture exists."""
+
+    def __init__(self, prefix: str, seq: int) -> None:
+        self.prefix = prefix
+        self.allocated_seq = seq
+        self.attempts = 0
+        self.deleted: List[str] = []
+        self.failures: List[str] = []
+
+    def _scoped_ref(self, firestore: Any, path: str) -> Any:
+        """Walk collection/document alternately, so the fence sees every hop."""
+        segments = path.split("/")
+        ref = firestore.collection(segments[0])
+        for index, segment in enumerate(segments[1:], start=1):
+            ref = ref.document(segment) if index % 2 else ref.collection(segment)
+        return ref
+
+    def run(self, firestore: Any, store: Any) -> None:
+        """Delete every fixture artifact through the FENCED client.
+
+        Deleting through the scoped client rather than the raw store is what
+        proves the fence permits a fixture delete and would refuse anything
+        outside the prefix - teardown is exactly where an over-broad delete
+        would otherwise be indistinguishable from a tidy one.
+        """
+        for _attempt in range(CLEANUP_MAX_ATTEMPTS):
+            self.attempts += 1
+            remaining = [p for p in list(store.data) if p.startswith(self.prefix)]
+            if not remaining:
+                return
+            self.failures = []
+            for path in sorted(remaining, key=lambda p: -p.count("/")):
+                try:
+                    self._scoped_ref(firestore, path).delete()
+                    self.deleted.append(path)
+                except Exception as exc:      # noqa: BLE001 - a refusal is data
+                    self.failures.append(f"{path}: {type(exc).__name__}")
+        return
+
+    def residue(self, store: Any) -> List[str]:
+        return sorted(p for p in store.data if p.startswith(self.prefix))
+
+
+def _replay(runtime: Any, fixture: "fx.PreparedFixture",
+            sentinel: NetworkSentinel) -> int:
+    """Re-execute the same scenario. A converged run does nothing the second time.
+
+    Not a repeat of the first run for confidence - a DIFFERENT claim. The first
+    run proves the effects happen; the replay proves they happen exactly once,
+    which is the property a retry, a duplicate event, or a redelivered queue
+    message would break.
+    """
+    captured_before = len(getattr(runtime.outbound, "captured", ()))
+    writes_before = len(fixture.firestore.writes)
+    try:
+        _drive_campaign_outreach(runtime, fixture, sentinel)
+    except Exception:                          # noqa: BLE001 - counted, not raised
+        pass
+    captured_after = len(getattr(runtime.outbound, "captured", ()))
+    writes_after = len(fixture.firestore.writes)
+    return (captured_after - captured_before) + (writes_after - writes_before)
+
+
 # -- observation -------------------------------------------------------------
 
 
 def _observe(runtime: Any, fixture: fx.PreparedFixture,
-             sentinel: NetworkSentinel) -> Dict[str, int]:
+             sentinel: NetworkSentinel, *,
+             replay_delta: int, cleanup_residue: int) -> Dict[str, int]:
     """Measure what the run actually did. No scenario knowledge here."""
     store = fixture.firestore
     prefix = fixture.prefix
@@ -160,12 +239,12 @@ def _observe(runtime: Any, fixture: fx.PreparedFixture,
         "global_counter_effect": sum(
             1 for p in write_paths if "sendCounters" in p or "/counters/" in p
         ),
-        "cleanup_residue": 0,   # measured by the cleanup phase; not yet wired
-        "replay_delta": 0,      # measured by the replay phase; not yet wired
+        "cleanup_residue": cleanup_residue,
+        "replay_delta": replay_delta,
     }
 
 
-UNWIRED = ("cleanup_residue", "replay_delta")
+UNWIRED: Tuple[str, ...] = ()
 
 
 def _compare(scenario: Mapping[str, Any],
@@ -218,7 +297,13 @@ def run_scenario(scenario_id: str, *, run_id: str,
         )
         return record, {"reason": "lane_not_wired", "logical_key": logical_key}
 
+    # Cleanup is allocated BEFORE the fixture is opened. Between these two
+    # statements there is nothing to leak; after them there always is.
+    sequence = itertools.count(1)
+    cleanup = CleanupHandle(fx.FIXTURE_PREFIX, next(sequence))
+
     fixture = fx.prepare(logical_key)
+    fixture_opened_seq = next(sequence)
     sentinel = NetworkSentinel()
     runtime = ar.certification_runtime(
         run_id=run_id,
@@ -237,9 +322,38 @@ def run_scenario(scenario_id: str, *, run_id: str,
     except BaseException as exc:            # noqa: BLE001 - a crash is a verdict
         error = exc
 
+    # Readback happens BEFORE replay and cleanup, and that ordering is load
+    # bearing rather than stylistic. Teardown is itself a stream of DELETEs
+    # against the fixture, so an observer that reads after cleanup counts the
+    # teardown as product behaviour - which is exactly how fixture_audit and
+    # fixture_thread_index first came back at 2 for a run that emitted one of
+    # each. Measure the product, then dismantle the fixture.
     phase = "readback"
-    observed = _observe(runtime, fixture, sentinel)
     violations = [str(v) for v in getattr(runtime.effect_scope, "violations", ())]
+    observed = _observe(runtime, fixture, sentinel,
+                        replay_delta=0, cleanup_residue=0)
+
+    # Replay BEFORE cleanup: replaying a torn-down fixture proves only that a
+    # missing fixture does nothing.
+    phase = "replay"
+    replay_ran = False
+    replay_delta = 0
+    if error is None:
+        replay_delta = _replay(runtime, fixture, sentinel)
+        replay_ran = True
+
+    phase = "cleanup"
+    cleanup.run(runtime.firestore, fixture.firestore)
+    residue_paths = cleanup.residue(fixture.firestore)
+
+    # The global policy document sits OUTSIDE the fixture prefix. A cleanup that
+    # walked it would be deleting live campaign authority while reporting clean.
+    surviving_global = sorted(
+        p for p in fixture.firestore.data if not p.startswith(fixture.prefix)
+    )
+
+    observed["replay_delta"] = replay_delta
+    observed["cleanup_residue"] = len(residue_paths)
     observed["nonfixture_write"] += len(violations)
 
     mismatches, unmeasured = _compare(scenario, observed)
@@ -256,6 +370,15 @@ def run_scenario(scenario_id: str, *, run_id: str,
         "network_attempts": list(sentinel.attempts),
         "error": f"{type(error).__name__}: {error}" if error else None,
         "expected_verdict": scenario.get("expectedVerdict"),
+        "replay_ran": replay_ran,
+        "replay_delta": replay_delta,
+        "cleanup_attempts": cleanup.attempts,
+        "cleanup_deleted": len(cleanup.deleted),
+        "cleanup_failures": cleanup.failures,
+        "cleanup_residue_paths": residue_paths,
+        "surviving_global_paths": surviving_global,
+        "cleanup_allocated_seq": cleanup.allocated_seq,
+        "fixture_opened_seq": fixture_opened_seq,
     }
 
     if error is not None:

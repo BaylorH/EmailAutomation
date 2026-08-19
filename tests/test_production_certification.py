@@ -1189,3 +1189,53 @@ class EvidenceProjectionTests(unittest.TestCase):
         for forbidden in (FIXTURE_RECIPIENT, FIXTURE_SHEET, FIXTURE_UID, "Hi Pat"):
             with self.subTest(token=forbidden):
                 self.assertNotIn(forbidden, rendered)
+
+
+class CertificationRunnerTests(unittest.TestCase):
+    """Task 9: seed -> execute -> readback -> replay -> cleanup, as one machine.
+
+    The bootstrap scenario already executed and reconciled. What it could not do
+    was finish: a run that captures the right effects but leaves the fixture
+    behind has not proved zero-residue, and a run that never re-executes has not
+    proved convergence. Those two gaps are exactly why the first run returned
+    INSTRUMENT_BLOCKED rather than a verdict.
+    """
+
+    REVISION = VALID_REVISION
+
+    def _run(self, run_id):
+        from email_automation.certification import runner as rn
+        return rn.run_scenario(BOOTSTRAP_SCENARIO_ID, run_id=run_id, revision=self.REVISION)
+
+    def test_replay_produces_zero_additional_effect(self):
+        """A converged run re-executed must do nothing the second time."""
+        _record, detail = self._run("cert-runner-replay-0001")
+        self.assertEqual(detail["observed"]["replay_delta"], 0)
+        self.assertTrue(detail["replay_ran"], "replay phase never executed")
+
+    def test_cleanup_leaves_zero_fixture_residue(self):
+        _record, detail = self._run("cert-runner-cleanup-0001")
+        self.assertEqual(detail["observed"]["cleanup_residue"], 0)
+        self.assertEqual(detail["cleanup_residue_paths"], [])
+
+    def test_cleanup_never_deletes_the_global_policy_document(self):
+        """Teardown is a DELETE. An over-broad one is a production effect.
+
+        The campaign-authority document lives outside the fixture prefix and is
+        readable-but-never-writable. A cleanup that walked it would be deleting
+        real global policy while reporting a clean certification run.
+        """
+        from email_automation.certification import fixtures as fx
+        _record, detail = self._run("cert-runner-policy-0001")
+        self.assertIn(fx.CAMPAIGN_AUTHORITY_PATH, detail["surviving_global_paths"])
+
+    def test_a_finished_run_reaches_a_real_verdict_not_instrument_blocked(self):
+        record, detail = self._run("cert-runner-verdict-0001")
+        self.assertEqual(detail["unmeasured"], [])
+        self.assertEqual(record.outcome, "pass", detail.get("mismatches"))
+
+    def test_cleanup_is_allocated_before_the_fixture_is_opened(self):
+        """Ordering, not politeness: a fixture opened before cleanup exists can
+        leak on any fault between the two."""
+        _record, detail = self._run("cert-runner-order-0001")
+        self.assertLess(detail["cleanup_allocated_seq"], detail["fixture_opened_seq"])
