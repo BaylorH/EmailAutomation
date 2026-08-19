@@ -100,6 +100,27 @@ from .sent_mail_guard import (
     find_sent_conversation_continuation_for_retry,
 )
 from .app_config import INBOX_SCAN_WINDOW_HOURS
+
+
+def _await_index_read_after_write(seconds: float = 0.2) -> None:
+    """Let a just-written message index become visible before verifying it.
+
+    Firestore can serve a stale read immediately after an index write, so the
+    verification read below is preceded by a short delay. The delay is real
+    latency insurance in production and pure wall-clock in E2E_TEST_MODE, where
+    the store is an in-memory double whose write is visible on the next call.
+
+    Measured: 143 calls to this site cost 28.60s of the 30.95s runtime of
+    tests/test_compound_nonviable_processing.py -- 92% of the module -- which
+    pushed it past the certification sweep's 25s cutoff and got it recorded as
+    a HANG in every baseline. It never hung. The env var is read live rather
+    than through the frozen app_config.E2E_TEST_MODE constant so a caller that
+    sets it after import still gets the no-op.
+    """
+    if os.getenv("E2E_TEST_MODE") == "true":
+        return
+    time.sleep(seconds)
+
 from .column_config import (
     find_client_comment_column_index,
     find_notes_comment_column_index,
@@ -6776,7 +6797,7 @@ def process_inbox_message(
         msg_indexed = False
         for attempt in range(MAX_RETRIES):
             if index_message_id(user_id, internet_message_id, thread_id):
-                time.sleep(0.2)
+                _await_index_read_after_write()
                 if lookup_thread_by_message_id(user_id, internet_message_id) == thread_id:
                     msg_indexed = True
                     break
