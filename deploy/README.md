@@ -299,11 +299,25 @@ default `--dry-run` executes zero `gcloud` commands and reports the deterministi
 requires the existing service to have one sole 100 percent revision with the
 single `release-a` mapping, plus explicit revision-pinned canonical
 `spec.traffic` with unique well-formed tags. Auxiliary pinned tags are permitted
-only when their exact mappings remain unchanged. Before building, the script
+only when their exact mappings remain unchanged. Before deploying, the script
 also reads the complete service revision inventory to prove the deterministic
 candidate does not already exist and describes the baseline positive revision
-for an exact configuration comparison. It then builds and resolves an immutable
-image digest.
+for an exact configuration comparison.
+
+**The script never builds.** It requires `TESTED_IMAGE_DIGEST` — an
+already-built, already-tested `repository@sha256:<64 lowercase hex>` — and
+refuses a tag, an alias, a digest naming an unexpected repository, or a digest
+the registry does not already report. This is not a convenience: staging and the
+certification twin must consume the *same* artifact, and a rebuild from an
+identical commit produces a different digest and therefore certifies something
+other than what production ships. A build step inside a staging script silently
+breaks any digest-pinned proof chain, which is exactly what this one is for.
+
+The script also stamps the candidate with `SITESIFT_SOURCE_REVISION` and
+`SITESIFT_IMAGE_DIGEST`. Without that release stamp the twin contract
+comparator rejects every twin, because the same two keys set on the twin would
+be asymmetric and unclassified.
+
 It deploys that digest with `--no-traffic` and the deterministic
 `--revision-suffix`, without any `--tag`, and fails unless service and revision
 readback prove all of the following:
