@@ -252,6 +252,57 @@ production. If a verdict is wrong, that is a new review, not an undo.
 
 ---
 
+## STOP — three blockers now sit between step 4 and any verdict
+
+Found by mutation testing and cross-artifact comparison after this runbook was
+first written. **Do not work through steps 1–5 expecting a verdict at the end.**
+Each of these fails closed and names its cause, so none is dangerous; together
+they mean the twin cannot currently certify anything.
+
+### A. No capability lane is wired — this is the big one
+
+`email_automation/certification/runner.py`:
+
+```python
+LANES = {
+    "certification-integrity/campaign-one-property": BOOTSTRAP_LANE,
+}
+```
+
+One entry. That map is what connects a scenario to the product code path it is
+supposed to drive. **All 91 capability scenarios return `lane_not_wired`**, and
+they would do so even with the twin deployed and the runtime launched. The two
+bootstrap/refutation scenarios are the only ones with a lane.
+
+So the certification program can currently prove things about *itself* — that it
+runs, isolates, captures, replays, cleans up, and can produce a real FAIL — and
+nothing about any product capability. Wiring a lane per capability is unbuilt
+work, not a launch you can perform.
+
+### B. The twin will 503 on every `prepare`
+
+`lifecycle.REQUIRED_IDENTITY_ENV` demands seven deployment facts, including
+`SITESIFT_FIXTURE_CONFIG_DIGEST`. **`scripts/deploy_certification_twin.sh` never
+sets it** (grep count: 0). `_identity()` returns `None` when any one is missing
+and `prepare` answers `instrument_unavailable` 503 — correctly, since a missing
+fixture-config digest means the stamp would not be bound to the fixture that ran.
+
+Fix before deploying: either have the deploy script compute and set the digest,
+or establish why it should not be required. Do not default it — a defaulted
+digest binds a stamp to something nobody deployed.
+
+### C. The twin scaffold would have written to the PRODUCTION database
+
+`deploy/cloudrun-certification-service.yaml` never set `FIRESTORE_DATABASE`, so a
+twin built from the scaffold would have used the production database rather than
+`sitesift-certification`. **Fixed**, and both artifacts are now pinned by
+set-equality of env names in both directions. The scaffold is a contract document
+that nothing applies — no shipped script references it — so this was never live.
+It is recorded because the scaffold is what a human reads to learn what the twin
+is, and it was teaching two wrong things at once.
+
+---
+
 ## Known blocker between steps 4 and 5 — your call, ~30 seconds
 
 **The twin contract comparator will currently refuse every twin that
