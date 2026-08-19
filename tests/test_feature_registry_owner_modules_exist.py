@@ -5,6 +5,22 @@ that actually exists. Prior to this test, `ownerModules.backend` could name a
 module that had been renamed or never existed (e.g. `usage_tracking.py`,
 `graph_scan_health.py`) and no test caught the drift — a "looks tracked, isn't"
 failure the rubric is supposed to eliminate.
+
+Paired record for two removals (2026-08-19). `core.health_recovery` named
+`email_automation/recovery_payload.py` and `core.scheduler_scope` named
+`email_automation/campaign_capabilities.py`. Neither was a rename: both were
+registered by 88c291e ("docs: register policy review backend ownership") ahead
+of Task 0 of docs/superpowers/plans/2026-08-12-policy-blocked-reply-review.md,
+which was to cherry-pick those modules onto this line and never ran. The code
+exists only on the unmerged branch codex/policy-blocked-reply-review-20260812
+(creating commits e70cc53, 4f5c41e; head-of-file c6375dc); nothing on this
+branch implements a canonical N=1 recovery payload or a v2 campaign-capability
+resolver -- `initialDispatch` / `inboundAutomation` appear nowhere in this
+checkout. The same commit also registered `email_automation/reply_reviews.py`,
+which DID land, which is why one of its three registrations is true and two
+were not. The two paths are removed rather than repointed because no module
+here owns that behaviour; re-add them in the commit that lands the code, not
+before.
 """
 
 import json

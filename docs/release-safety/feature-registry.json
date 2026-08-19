@@ -463,7 +463,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py", "email_automation/recovery_payload.py"],
+        "backend": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py"],
         "frontend": ["src/components/EmailSchedulerButton.jsx", "src/components/HealthWidget.jsx"],
         "functions": [],
         "firestoreRules": []
@@ -524,7 +524,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["main.py", "app.py", "email_automation/scheduler_scope.py", "email_automation/scheduler_lease.py", "email_automation/clients.py", "email_automation/campaign_capabilities.py"],
+        "backend": ["main.py", "app.py", "email_automation/scheduler_scope.py", "email_automation/scheduler_lease.py", "email_automation/clients.py"],
         "frontend": ["src/components/HealthWidget.jsx"],
         "functions": [],
         "firestoreRules": [],
