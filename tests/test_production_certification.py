@@ -20,6 +20,7 @@ from email_automation.certification.models import (
     CertificationRequest,
     CertificationRequestError,
 )
+from email_automation.certification import evidence as ev
 from email_automation.certification import scenarios
 
 
@@ -1009,3 +1010,182 @@ class CertificationLogCanaryTests(unittest.TestCase):
         self.assertIn("does not match sheet row 7", scrubbed)
         self.assertNotIn("broker@example.com", scrubbed)
         self.assertIn("subject-", scrubbed)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 - evidence projections
+# ---------------------------------------------------------------------------
+
+
+class EvidenceProjectionTests(unittest.TestCase):
+    """Evidence is durable, exported, and read by people not entitled to the
+    fixture. So the guarantee has to be structural, not diligent.
+
+    Task 7G established why: a static scan flagged 75 candidate log sites and
+    the real leaks were only found by driving the lane. Evidence cannot rely on
+    that kind of after-the-fact discovery, so it is built from an ALLOW-LIST of
+    safe field kinds and refuses anything else on sight.
+    """
+
+    VALID = dict(
+        run_id="cert-20260818-0001",
+        scenario_id="campaign-one-property",
+        revision="1a20ba44a46e0aeed7620a6408856c0aacf6c7d9",
+        outcome="pass",
+        phase="execute",
+    )
+
+    def test_a_minimal_record_projects_and_round_trips(self):
+        record = ev.project_evidence(**self.VALID)
+        payload = record.to_dict()
+        self.assertEqual(payload["runId"], self.VALID["run_id"])
+        self.assertEqual(payload["outcome"], "pass")
+        self.assertNotIn("failureCode", payload)
+
+    def test_the_record_is_immutable(self):
+        record = ev.project_evidence(**self.VALID)
+        with self.assertRaises(Exception):
+            record.outcome = "fail"  # type: ignore[misc]
+
+    def test_its_digest_changes_when_any_field_changes(self):
+        base = ev.project_evidence(**self.VALID).canonical_digest()
+        for override in (
+            {"outcome": "fail"},
+            {"phase": "cleanup"},
+            {"run_id": "cert-20260818-0002"},
+            {"counts": {"sent": 1}},
+        ):
+            with self.subTest(override=override):
+                other = ev.project_evidence(**{**self.VALID, **override})
+                self.assertNotEqual(base, other.canonical_digest())
+
+    # -- the refusals that make the guarantee structural -------------------
+
+    def test_an_address_is_refused_wherever_it_is_offered(self):
+        for field_name, payload in (
+            ("summary", {"summary": "could not reach broker@example.com"}),
+            ("run_id", {"run_id": "broker@example.com"}),
+            ("scenario_id", {"scenario_id": "scenario-broker@example.com"}),
+        ):
+            with self.subTest(field=field_name):
+                with self.assertRaises(ev.EvidenceProjectionError) as ctx:
+                    ev.project_evidence(**{**self.VALID, **payload})
+                self.assertIn("e-mail address", str(ctx.exception))
+
+    def test_a_provider_token_is_refused(self):
+        with self.assertRaises(ev.EvidenceProjectionError):
+            ev.project_evidence(**{**self.VALID, "summary": "Bearer abc.def.ghijklmnop"})
+
+    def test_a_firestore_path_is_refused(self):
+        with self.assertRaises(ev.EvidenceProjectionError):
+            ev.project_evidence(
+                **{**self.VALID, "summary": "write refused at users/uid-1/outbox"}
+            )
+
+    def test_a_long_opaque_blob_is_refused(self):
+        """Base64 image bytes are the shape most likely to arrive by accident."""
+        with self.assertRaises(ev.EvidenceProjectionError):
+            ev.project_evidence(**{**self.VALID, "summary": "iVBORw0KGgo" + "A" * 70})
+
+    def test_raw_exception_text_cannot_masquerade_as_a_failure_code(self):
+        """A code is a lookup key; a description is a disclosure channel."""
+        for bad in (
+            "Traceback (most recent call last): KeyError",
+            "could not send to the broker",
+            "Timeout after 30s",
+            "",
+        ):
+            with self.subTest(value=bad):
+                with self.assertRaises(ev.EvidenceProjectionError):
+                    ev.project_evidence(**{**self.VALID, "failure_code": bad})
+
+    def test_a_bounded_summary_is_still_checked_for_shape_first(self):
+        """Truncation is not redaction.
+
+        A 200-character clip of a customer's message is still 200 characters of
+        a customer's message, so the shape checks run before the length bound.
+        """
+        short_but_unsafe = "failed for broker@example.com"
+        self.assertLess(len(short_but_unsafe), ev.MAX_SUMMARY_LENGTH)
+        with self.assertRaises(ev.EvidenceProjectionError):
+            ev.project_evidence(**{**self.VALID, "summary": short_but_unsafe})
+
+    def test_an_oversized_summary_is_refused_rather_than_truncated(self):
+        with self.assertRaises(ev.EvidenceProjectionError):
+            ev.project_evidence(**{**self.VALID, "summary": "a" * 400})
+
+    def test_counts_must_be_plain_non_negative_integers(self):
+        for bad in ({"sent": -1}, {"sent": "1"}, {"sent": True}, {"sent": 1.5}):
+            with self.subTest(counts=bad):
+                with self.assertRaises(ev.EvidenceProjectionError):
+                    ev.project_evidence(**{**self.VALID, "counts": bad})
+
+    def test_a_digest_field_must_actually_be_a_digest(self):
+        for bad in ("not-a-digest", "ABC123", "a" * 63, ""):
+            with self.subTest(value=bad):
+                with self.assertRaises(ev.EvidenceProjectionError):
+                    ev.project_evidence(**{**self.VALID, "digests": {"body": bad}})
+
+    def test_a_phase_outside_the_enumeration_is_refused(self):
+        with self.assertRaises(ev.EvidenceProjectionError):
+            ev.project_evidence(**{**self.VALID, "phase": "sending-the-email"})
+
+    def test_an_unknown_outcome_is_refused(self):
+        with self.assertRaises(ev.EvidenceProjectionError):
+            ev.project_evidence(**{**self.VALID, "outcome": "probably-fine"})
+
+    def test_there_is_no_arbitrary_passthrough(self):
+        """The moment evidence accepts arbitrary keys, the allow-list is over."""
+        with self.assertRaises(TypeError):
+            ev.project_evidence(**self.VALID, raw_body="Hi Pat, the rent is...")
+
+    # -- the sanctioned way to reference a fixture value -------------------
+
+    def test_a_fixture_value_may_be_referenced_only_by_digest(self):
+        body = "Hi Pat, could you share the asking rent?"
+        record = ev.project_evidence(
+            **self.VALID, digests={"body": ev.digest_of_text(body)}
+        )
+        self.assertNotIn(body, str(record.to_dict()))
+        self.assertEqual(len(record.to_dict()["digests"]["body"]), 64)
+
+    def test_the_same_logical_value_digests_identically_regardless_of_key_order(self):
+        """Canonical bytes, so evidence can be diffed across runs and languages."""
+        self.assertEqual(
+            ev.digest_of({"a": 1, "b": [2, 3]}),
+            ev.digest_of({"b": [2, 3], "a": 1}),
+        )
+
+    def test_different_values_digest_differently(self):
+        self.assertNotEqual(ev.digest_of_text("one"), ev.digest_of_text("two"))
+
+    # -- instrument-blocked is not failure ---------------------------------
+
+    def test_instrument_blocked_is_distinct_from_failure(self):
+        """Collapsing them would make 'never exercised' look like 'broken'.
+
+        Only the second should ever block a release, so the distinction has to
+        survive into the exported record.
+        """
+        record = ev.instrument_blocked(
+            run_id=self.VALID["run_id"],
+            scenario_id=self.VALID["scenario_id"],
+            revision=self.VALID["revision"],
+            phase="execute",
+        )
+        payload = record.to_dict()
+        self.assertEqual(payload["outcome"], "instrument_blocked")
+        self.assertEqual(payload["failureCode"], "user_runtime_launch_required")
+        self.assertNotEqual(payload["outcome"], "fail")
+
+    def test_every_projected_record_survives_the_log_canary_rules(self):
+        """Cross-check against Task 7G: evidence must not leak what logs must not."""
+        record = ev.project_evidence(
+            **self.VALID,
+            counts={"sent": 1, "captured": 1},
+            digests={"body": ev.digest_of_text("Hi Pat")},
+        )
+        rendered = json.dumps(record.to_dict())
+        for forbidden in (FIXTURE_RECIPIENT, FIXTURE_SHEET, FIXTURE_UID, "Hi Pat"):
+            with self.subTest(token=forbidden):
+                self.assertNotIn(forbidden, rendered)
