@@ -3,25 +3,26 @@
 Only the OpenAI response is faked.  ``propose_sheet_updates`` and every
 deterministic reconciliation guard are the same code used by the inbound worker.
 
-STATUS 2026-08-19: red, pre-existing, and NOT caused by the parallel
-certification build. Measured identically at commit 0a656fa (the base all four
-tracks branched from) and at the tip after Track D's commits:
+STATUS 2026-08-19: green (Ran 21 / OK). It was previously red at 45 failures
+and 20 errors, and the earlier note here read that as a semantic gap across the
+reconciliation rules. It was not. The fixture's ``CONFIG["mappings"]`` keyed the
+address column as ``"address"``, which is not a canonical field — the canonical
+key is ``property_address``, as every sibling fixture in this suite writes it.
+``propose_sheet_updates`` validates the contract before it does anything else
+and returns ``None`` on an unsafe one, printing
 
-    Ran 21 tests in 0.013s
-    FAILED (failures=45, errors=20)
+    Refusing unsafe columnConfig: columnConfig.mappings contains unknown canonical fields
 
-The two runs were compared in a separate detached worktree rather than with
-`git stash`, because a bare stash in this checkout would have taken three other
-agents' uncommitted work with it. Static confirmation agrees with the
-measurement: this module imports only email_automation.ai_processing, and no
-commit in the Track D range touches that module.
+so all 21 methods asserted against ``None`` and the module exercised no
+reconciliation logic at all. It had that typo in its first commit, so it had
+never once run the pipeline; the four ``fix:`` commits recorded against it were
+landed with their regression tests inert.
 
-20 distinct test methods are red across the drive-in evidence state machine
-(target provenance, terminal-vs-review classification, correction recency,
-evidence locality). That is a semantic gap in the reconciliation rules, not a
-mechanical breakage, and nobody should read a fix for it into a triage pass.
-Anyone diffing a sweep should treat 45/20 as the baseline for this module and
-investigate only a change from it.
+The suite is now live, not merely green: mutating
+``_current_target_drive_evidence`` to yield no evidence kills 55 subtests, and
+mutating ``_detect_target_terminal_reason`` to yield no reason kills the
+terminal-precedence method that survives the first mutation. Treat 21/OK as the
+baseline and investigate any change from it.
 """
 
 import json
@@ -54,7 +55,7 @@ HEADER = [
 ]
 CONFIG = {
     "mappings": {
-        "address": "Property Address",
+        "property_address": "Property Address",
         "total_sf": "Total SF",
         "rent_sf_yr": "Rent/SF/Yr",
         "ops_ex_sf": "Ops Ex / SF",
