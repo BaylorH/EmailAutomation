@@ -1997,3 +1997,174 @@ class CertificationCliTests(unittest.TestCase):
         cli = self._cli()
         self.assertNotEqual(cli.new_run_id("campaign-one-property", nonce="a"),
                             cli.new_run_id("campaign-one-property", nonce="b"))
+
+
+class CertificationTwinDeployTests(unittest.TestCase):
+    """The candidate/twin normalized-difference comparator.
+
+    The twin must be the SAME artifact as the production candidate in every way
+    that could change behaviour, and deliberately different in a short, named
+    list of ways that make it unable to cause an effect. Everything else being
+    equal is the point: a twin that differed in a model name, a send cap, or a
+    budget would be certifying different software.
+
+    So differences are not deleted before comparison -- they are replaced with
+    PAIRED SENTINELS. Deleting an asymmetric key hides both the approved
+    difference and any unapproved one that happens to share its name.
+    """
+
+    def _comparator(self):
+        from email_automation.certification import twin_contract as tc
+        return tc
+
+    def _candidate(self, **overrides):
+        spec = {
+            "image": "region-docker.pkg.dev/p/r/email-automation@sha256:" + "a" * 64,
+            "serviceName": "process-user",
+            "serviceAccount": "123-compute@developer.gserviceaccount.com",
+            "trafficPercent": 0,
+            "env": {
+                "SITESIFT_SOURCE_REVISION": "1" * 40,
+                "SITESIFT_IMAGE_DIGEST": "sha256:" + "a" * 64,
+                "OPENAI_API_KEY": "secret://openai-api-key/latest",
+                "USAGE_MONTHLY_BUDGET_USD": "50",
+                "AZURE_API_CLIENT_SECRET": "secret://azure/latest",
+                "FIREBASE_API_KEY": "secret://firebase/latest",
+                "PROCESS_USER_AUTH": "secret://auth/latest",
+            },
+            "containerConcurrency": 1,
+            "timeoutSeconds": 540,
+        }
+        spec.update(overrides)
+        return spec
+
+    def _twin(self, **overrides):
+        spec = {
+            "image": "region-docker.pkg.dev/p/r/email-automation@sha256:" + "a" * 64,
+            "serviceName": "process-user-certification",
+            "serviceAccount": "sitesift-certification-runtime@p.iam.gserviceaccount.com",
+            "trafficPercent": 0,
+            "env": {
+                "SITESIFT_SOURCE_REVISION": "1" * 40,
+                "SITESIFT_IMAGE_DIGEST": "sha256:" + "a" * 64,
+                "OPENAI_API_KEY": "secret://openai-api-key/latest",
+                "USAGE_MONTHLY_BUDGET_USD": "50",
+                "K_SERVICE": "process-user-certification",
+                "FIRESTORE_DATABASE": "sitesift-certification",
+                "CERTIFICATION_FIXTURE_CONFIG":
+                    "sitesift-certification-fixture-config:7",
+            },
+            "containerConcurrency": 1,
+            "timeoutSeconds": 540,
+        }
+        spec.update(overrides)
+        return spec
+
+    # -- the approved shape -------------------------------------------------
+
+    def test_a_valid_candidate_and_twin_compare_clean(self):
+        self.assertEqual(self._comparator().compare(self._candidate(), self._twin()), [])
+
+    # -- must equal ---------------------------------------------------------
+
+    def test_a_different_image_digest_is_a_hard_failure(self):
+        """The twin certifying a different build certifies different software."""
+        twin = self._twin(image="region-docker.pkg.dev/p/r/email-automation@sha256:"
+                                + "f" * 64)
+        differences = self._comparator().compare(self._candidate(), twin)
+        self.assertTrue(any("image" in d for d in differences), differences)
+
+    def test_an_image_referenced_by_tag_is_refused(self):
+        """A tag can be repointed after review; a digest cannot."""
+        twin = self._twin(image="region-docker.pkg.dev/p/r/email-automation:latest")
+        self.assertTrue(self._comparator().compare(self._candidate(), twin))
+
+    def test_a_differing_budget_or_model_field_is_a_hard_failure(self):
+        twin = self._twin()
+        twin["env"]["USAGE_MONTHLY_BUDGET_USD"] = "999"
+        differences = self._comparator().compare(self._candidate(), twin)
+        self.assertTrue(any("USAGE_MONTHLY_BUDGET_USD" in d for d in differences),
+                        differences)
+
+    def test_differing_concurrency_or_timeout_is_a_hard_failure(self):
+        for field, value in (("containerConcurrency", 8), ("timeoutSeconds", 60)):
+            with self.subTest(field=field):
+                twin = self._twin(**{field: value})
+                self.assertTrue(self._comparator().compare(self._candidate(), twin))
+
+    # -- must be absent from the twin ---------------------------------------
+
+    def test_any_production_credential_on_the_twin_is_a_hard_failure(self):
+        for leaked in ("AZURE_API_CLIENT_SECRET", "FIREBASE_API_KEY",
+                       "GOOGLE_REFRESH_TOKEN", "PROCESS_USER_AUTH",
+                       "SITESIFT_AUTO_REPLY_ALLOWLIST"):
+            with self.subTest(env=leaked):
+                twin = self._twin()
+                twin["env"][leaked] = "anything"
+                differences = self._comparator().compare(self._candidate(), twin)
+                self.assertTrue(any(leaked in d for d in differences), differences)
+
+    # -- must exist only on the twin ----------------------------------------
+
+    def test_a_missing_certification_database_is_a_hard_failure(self):
+        twin = self._twin()
+        del twin["env"]["FIRESTORE_DATABASE"]
+        self.assertTrue(self._comparator().compare(self._candidate(), twin))
+
+    def test_a_floating_fixture_secret_version_is_refused(self):
+        """A stamp binds the exact secret version it executed against."""
+        for bad in ("sitesift-certification-fixture-config:latest",
+                    "sitesift-certification-fixture-config:0",
+                    "sitesift-certification-fixture-config:v7",
+                    "sitesift-certification-fixture-config:07",
+                    "some-other-secret:7"):
+            with self.subTest(reference=bad):
+                twin = self._twin()
+                twin["env"]["CERTIFICATION_FIXTURE_CONFIG"] = bad
+                self.assertTrue(self._comparator().compare(self._candidate(), twin),
+                                bad)
+
+    def test_the_certification_database_may_not_appear_on_the_candidate(self):
+        candidate = self._candidate()
+        candidate["env"]["FIRESTORE_DATABASE"] = "sitesift-certification"
+        self.assertTrue(self._comparator().compare(candidate, self._twin()))
+
+    # -- must differ exactly -------------------------------------------------
+
+    def test_the_twin_may_never_be_a_production_traffic_target(self):
+        twin = self._twin(trafficPercent=1)
+        differences = self._comparator().compare(self._candidate(), twin)
+        self.assertTrue(any("traffic" in d.lower() for d in differences), differences)
+
+    def test_the_twin_may_not_run_as_the_production_service_account(self):
+        twin = self._twin(serviceAccount="123-compute@developer.gserviceaccount.com")
+        self.assertTrue(self._comparator().compare(self._candidate(), twin))
+
+    def test_an_unexpected_service_account_is_refused_not_normalised(self):
+        """Sentinels are inserted only after the exact expected value is
+        validated. Normalising first would make any two values look equal."""
+        twin = self._twin(serviceAccount="something-else@p.iam.gserviceaccount.com")
+        self.assertTrue(self._comparator().compare(self._candidate(), twin))
+
+    # -- the comparator's own integrity --------------------------------------
+
+    def test_an_unknown_asymmetric_field_is_refused_rather_than_ignored(self):
+        """Every difference is either approved and paired, or a failure. There
+        is no third category, because that is where a real one would hide."""
+        twin = self._twin()
+        twin["env"]["SOMETHING_NOBODY_CLASSIFIED"] = "1"
+        differences = self._comparator().compare(self._candidate(), twin)
+        self.assertTrue(any("SOMETHING_NOBODY_CLASSIFIED" in d for d in differences),
+                        differences)
+
+    def test_approved_differences_are_paired_not_deleted(self):
+        """Deleting an asymmetric key hides both the approved difference and any
+        unapproved one that happens to share its name."""
+        tc = self._comparator()
+        left, right = tc.normalize(self._candidate(), self._twin())
+        self.assertEqual(left["serviceName"], right["serviceName"])
+        self.assertTrue(str(left["serviceName"]).startswith(tc.SENTINEL_PREFIX))
+        self.assertIn("PROCESS_USER_AUTH", left["env"])
+        self.assertIn("PROCESS_USER_AUTH", right["env"])
+        self.assertEqual(left["env"]["PROCESS_USER_AUTH"],
+                         right["env"]["PROCESS_USER_AUTH"])
