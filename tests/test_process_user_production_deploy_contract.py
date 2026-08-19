@@ -1,4 +1,20 @@
-"""Black-box safety contract for the process-user Release A deployment."""
+"""Black-box safety contract for the process-user Release A deployment.
+
+RUNTIME, and why the sweep calls this a HANG: it does not hang. It passes, and
+it is simply slower than the certification sweep's 25s per-module cutoff, so
+subprocess.TimeoutExpired is recorded as HANG. Every test here shells out to
+bash (fake gcloud/git shims on PATH, no network at all), and the per-process
+cost is the whole runtime.
+
+Measured 2026-08-19, three consecutive runs: 46 tests OK in 23.8s, 26.7s,
+25.5s. It straddles the cutoff, which is why it has flipped HANG<->PASS on
+timing alone. ~/.sitesift-certification/sweep.py already lists it as NOISY
+for that reason but attributes it to the module "reaching network". It
+reaches no network: the runbook runs against fake gcloud and git shims
+placed on PATH, and a real network call would make the assertions on the
+recorded call log fail. Raising the sweep cutoff to ~45s -- or budgeting
+this module separately -- turns it into a stable PASS.
+"""
 
 from pathlib import Path
 import json

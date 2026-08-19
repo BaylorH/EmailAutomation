@@ -1,4 +1,17 @@
-"""Black-box contract for effect-bounded process-user tagless staging."""
+"""Black-box contract for effect-bounded process-user tagless staging.
+
+RUNTIME, and why the sweep calls this a HANG: it does not hang. It passes, and
+it is simply slower than the certification sweep's 25s per-module cutoff, so
+subprocess.TimeoutExpired is recorded as HANG. Every test here shells out to
+bash (fake gcloud/git shims on PATH, no network at all), and the per-process
+cost is the whole runtime.
+
+Measured 2026-08-19, three consecutive runs: 53 tests OK in 38.6s, 41.9s,
+41.6s. Unlike its sibling this one is never close to the cutoff, so it is
+recorded HANG deterministically, in every baseline, while being green.
+Raising the sweep cutoff to ~45s -- or budgeting this module separately --
+is what would make its real status visible.
+"""
 
 from pathlib import Path
 import json
