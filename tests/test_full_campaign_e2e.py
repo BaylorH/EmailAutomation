@@ -702,7 +702,6 @@ def stage8_followup(world):
     thread_ref.set({
         "clientId": CLIENT_ID,
         "followUpStatus": "waiting",
-        "hasInboundReply": True,
         "followUpConfig": {
             "enabled": True,
             "currentFollowUpIndex": 0,
@@ -710,6 +709,33 @@ def stage8_followup(world):
             "nextFollowUpAt": datetime.now(timezone.utc) - timedelta(days=1),
         },
     }, merge=True)
+
+    # Defense in depth, checked on the hand-built waiting+replied state BEFORE the
+    # real transition runs: even if a thread were somehow left waiting with a
+    # broker reply on it, the send gate must still refuse. This is the real
+    # production predicate, called directly.
+    assert followup_mod._followup_terminal_block_reason(
+        {"followUpStatus": "waiting", "hasInboundReply": True},
+        {"enabled": True, "currentFollowUpIndex": 0,
+         "followUps": [{"waitTime": 3, "waitUnit": "days"}]},
+        0,
+    ) == "the broker has already replied"
+
+    # The broker's reply is now recorded by the function that actually owns that
+    # transition in production: cancel_followup_on_response, called from
+    # processing.py on inbound detection. It is what sets BOTH hasInboundReply
+    # and followUpStatus="paused", inside one Firestore transaction.
+    #
+    # This stage used to hand-write {"followUpStatus": "waiting",
+    # "hasInboundReply": True} and then assert that check_and_send_followups
+    # flipped the status to "paused". It never can: check_and_send_followups only
+    # WITHHOLDS (via _followup_terminal_block_reason above) and mutates no
+    # follow-up status, so the assertion was pinned on the wrong function. Worse,
+    # the hand-written pair is a state production never leaves behind, because
+    # recording the inbound reply sets both fields together. The stage was
+    # asserting against its own fixture rather than against the system.
+    followup_mod.cancel_followup_on_response(USER_ID, world.thread_root)
+
     # Neutralize only the business-hours scheduler (a calendar helper, NOT a safety
     # gate) so the run deterministically reaches the REAL broker-reply pause branch
     # instead of a weekend deferral. The reply-withhold logic itself stays real.
