@@ -145,10 +145,23 @@ TWIN_REVISION = "process-user-certification-1234567890ab"
 TWIN_RUNTIME_SA = (
     "sitesift-certification-runtime@email-automation-cache.iam.gserviceaccount.com"
 )
-TWIN_OPERATOR_SA = (
-    "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
-)
 FIXTURE_CONFIG_SECRET = "sitesift-certification-fixture-config"
+
+# The twin-only values the SHIPPED deploy script really sets, read off
+# scripts/deploy_certification_twin.sh rather than restated. The derivation
+# lives once, in tests/test_certification_mutation_controls.py.
+#
+# This is the whole point of the fixture below: while it named three twin-only
+# fields and the script set eight, `test_exact_twin_stamp_is_accepted` passed
+# against a twin nobody could deploy, and the rollout comparator would have
+# refused every real one at promotion time.
+from tests.test_certification_mutation_controls import (  # noqa: E402
+    DEPLOYED_TWIN_ENV as _DEPLOYED_TWIN_ENV,
+)
+
+TWIN_OPERATOR_SA = _DEPLOYED_TWIN_ENV["SITESIFT_CERTIFICATION_OPERATOR_EMAIL"]
+TWIN_AUDIENCE = _DEPLOYED_TWIN_ENV["SITESIFT_CERTIFICATION_AUDIENCE"]
+TWIN_OPERATOR_SUB = _DEPLOYED_TWIN_ENV["SITESIFT_CERTIFICATION_OPERATOR_SUB"]
 
 
 def twin_service(
@@ -158,12 +171,21 @@ def twin_service(
     name=TWIN_SERVICE_NAME,
     service_account=TWIN_RUNTIME_SA,
     fixture_version="7",
+    fixture_version_env=None,
     fixture_secret=FIXTURE_CONFIG_SECRET,
+    candidate_revision=CANDIDATE,
+    audience=TWIN_AUDIENCE,
+    operator_email=TWIN_OPERATOR_SA,
+    operator_sub=TWIN_OPERATOR_SUB,
     ingress="internal",
     traffic_revision=TWIN_REVISION,
     extra_env=(),
     drop_env=(),
 ):
+    # The two spellings of the fixture version are ONE fact, so they default
+    # together; a case that wants them to disagree has to say so.
+    if fixture_version_env is None:
+        fixture_version_env = fixture_version
     env = [
         {
             "name": "OPENAI_API_KEY",
@@ -180,6 +202,19 @@ def twin_service(
                 "secretKeyRef": {"name": fixture_secret, "key": fixture_version}
             },
         },
+        # The five the deploy script also sets, and the rollout comparator did
+        # not classify. Each is REQUIRED here and FORBIDDEN on the candidate.
+        {
+            "name": "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
+            "value": candidate_revision,
+        },
+        {
+            "name": "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
+            "value": fixture_version_env,
+        },
+        {"name": "SITESIFT_CERTIFICATION_AUDIENCE", "value": audience},
+        {"name": "SITESIFT_CERTIFICATION_OPERATOR_EMAIL", "value": operator_email},
+        {"name": "SITESIFT_CERTIFICATION_OPERATOR_SUB", "value": operator_sub},
     ]
     env = [entry for entry in env if entry["name"] not in drop_env]
     env.extend(dict(entry) for entry in extra_env)
@@ -799,6 +834,7 @@ class ValidatorTests(unittest.TestCase):
             "candidate_spec": revision(CANDIDATE, CANDIDATE_IMAGE)["spec"],
             "expected_image": CANDIDATE_IMAGE,
             "expected_source_revision": HEAD_SHA,
+            "expected_candidate_revision": CANDIDATE,
             "production": phase1_rollout.validate_topology(
                 service(),
                 expected_positive=OLD_REVISION,
@@ -809,10 +845,273 @@ class ValidatorTests(unittest.TestCase):
         arguments.update(overrides)
         return arguments
 
+    def _twin_refusal(self, twin=None, policy=None, **call):
+        """The exact sentence one rule emits, not 'something was refused'."""
+        with self.assertRaises(phase1_rollout.RolloutError) as caught:
+            phase1_rollout.validate_twin_stamp(
+                twin_service() if twin is None else twin,
+                twin_policy() if policy is None else policy,
+                **self._twin_call(**call),
+            )
+        return str(caught.exception)
+
     def test_exact_twin_stamp_is_accepted(self):
+        """The vacuity guard for every case below, and the one that caught the
+        drift: this fixture is the twin scripts/deploy_certification_twin.sh
+        really deploys, so a comparator that refuses it refuses every real
+        twin -- at promotion time, under the lock."""
         phase1_rollout.validate_twin_stamp(
             twin_service(), twin_policy(), **self._twin_call()
         )
+
+    # -- one classification, not two -----------------------------------------
+
+    def test_the_rollout_and_the_contract_share_one_classification(self):
+        """These were two hand-maintained copies of one allowlist and they
+        drifted, so the rollout would have refused every deploy-script twin.
+
+        Three assertions, because equality alone is not a binding: two literal
+        tuples that happen to agree today satisfy it, and that is precisely the
+        state this defect was in. So this pins (1) that the rollout's names are
+        the very objects of the module it loaded -- no local copy anywhere in
+        scripts/phase1_rollout.py -- (2) that the module it loaded is THIS
+        contract file and not some other one, and only then (3) that the values
+        agree. Retyping the tuple in the rollout breaks (1); pointing the loader
+        somewhere else breaks (2).
+        """
+        from email_automation.certification import twin_contract
+
+        loaded = phase1_rollout.twin_contract
+        self.assertIs(phase1_rollout.TWIN_ONLY_ENV, loaded.TWIN_ONLY)
+        self.assertIs(phase1_rollout.TWIN_FORBIDDEN_ENV, loaded.FORBIDDEN_ON_TWIN)
+
+        self.assertEqual(
+            Path(loaded.__file__).resolve(), Path(twin_contract.__file__).resolve()
+        )
+
+        self.assertEqual(phase1_rollout.TWIN_ONLY_ENV, twin_contract.TWIN_ONLY)
+        self.assertEqual(
+            phase1_rollout.TWIN_FORBIDDEN_ENV, twin_contract.FORBIDDEN_ON_TWIN
+        )
+
+    def test_the_rollout_states_no_second_copy_of_the_classification(self):
+        """The binding above is only as good as there being nothing to drift.
+
+        A future edit that pastes the allowlist back into
+        scripts/phase1_rollout.py would leave the import in place and every
+        other case green -- which is exactly the state this defect was found in.
+        So the absence of a second LIST is asserted on the source itself.
+
+        Naming one field to check its value is not a restatement and stays
+        legal; collecting two or more of them into a literal sequence is a
+        second allowlist, and that is what is refused here.
+        """
+        classified = set(phase1_rollout.TWIN_ONLY_ENV) | set(
+            phase1_rollout.TWIN_FORBIDDEN_ENV
+        )
+        self.assertGreaterEqual(len(classified), 8)  # vacuity guard
+
+        offenders = []
+        for node in ast.walk(ast.parse(MODULE_PATH.read_text())):
+            if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                continue
+            literals = {
+                element.value
+                for element in node.elts
+                if isinstance(element, ast.Constant)
+                and isinstance(element.value, str)
+            }
+            if len(literals & classified) >= 2:
+                offenders.append((node.lineno, sorted(literals & classified)))
+        self.assertEqual(
+            offenders,
+            [],
+            "the classification is restated in the rollout instead of imported",
+        )
+
+    def test_the_shared_classification_is_not_vacuously_small(self):
+        """If the import silently produced an empty tuple, every 'must be
+        present' case below would pass while proving nothing."""
+        self.assertGreaterEqual(len(phase1_rollout.TWIN_ONLY_ENV), 8)
+        self.assertIn(
+            phase1_rollout.TWIN_FIXTURE_CONFIG_NAME, phase1_rollout.TWIN_ONLY_ENV
+        )
+        for name in (
+            "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
+            "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
+            "SITESIFT_CERTIFICATION_AUDIENCE",
+            "SITESIFT_CERTIFICATION_OPERATOR_EMAIL",
+            "SITESIFT_CERTIFICATION_OPERATOR_SUB",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, phase1_rollout.TWIN_ONLY_ENV)
+
+    def test_every_classified_field_is_refused_in_both_directions(self):
+        """Approved differences are PAIRED, never waved through. Each name is
+        required on the twin and forbidden on the candidate."""
+        for name in phase1_rollout.TWIN_ONLY_ENV:
+            with self.subTest(name=name, direction="missing from twin"):
+                self.assertEqual(
+                    self._twin_refusal(twin=twin_service(drop_env=(name,))),
+                    f"twin is missing required certification field {name}",
+                )
+            with self.subTest(name=name, direction="present on candidate"):
+                polluted = revision(CANDIDATE, CANDIDATE_IMAGE)["spec"]
+                polluted["containers"][0]["env"].append(
+                    {"name": name, "value": "anything"}
+                )
+                self.assertEqual(
+                    self._twin_refusal(candidate_spec=polluted),
+                    f"{name} must not appear on the candidate",
+                )
+
+    # -- the five newly classified values, each by its own sentence -----------
+
+    def test_twin_must_name_the_candidate_revision_under_certification(self):
+        """A classified name with an unchecked value is a hole with a label on
+        it: the twin could name any revision at all and the allowlist would be
+        satisfied."""
+        self.assertEqual(
+            self._twin_refusal(
+                twin=twin_service(candidate_revision="process-user-stage-000000000000")
+            ),
+            "twin does not name the production candidate under certification",
+        )
+
+    def test_a_twin_naming_its_own_revision_is_refused_by_its_own_rule(self):
+        """A twin that certifies itself certifies nothing. The twin's service
+        name has the certification prefix, so this must be caught BEFORE the
+        equality rule or it would report the wrong reason."""
+        self.assertEqual(
+            self._twin_refusal(twin=twin_service(candidate_revision=TWIN_REVISION)),
+            "twin production candidate revision names the twin's own service",
+        )
+        self.assertEqual(
+            self._twin_refusal(twin=twin_service(candidate_revision=TWIN_SERVICE_NAME)),
+            "twin production candidate revision names the twin's own service",
+        )
+
+    def test_the_two_spellings_of_the_fixture_version_must_agree(self):
+        """The deploy script sets the env var and the secret reference from ONE
+        variable. Disagreement means the run cannot say which fixture it
+        executed against -- and the residual comparison cannot see it, because
+        both names are classified twin-only."""
+        self.assertEqual(
+            self._twin_refusal(twin=twin_service(fixture_version_env="8")),
+            "twin fixture config version and secret reference disagree",
+        )
+
+    def test_the_fixture_version_env_must_be_a_positive_decimal(self):
+        for spelling in ("latest", "0", "07", "v7", "", "1.0", "-1"):
+            with self.subTest(spelling=spelling):
+                self.assertIn(
+                    self._twin_refusal(
+                        twin=twin_service(fixture_version_env=spelling)
+                    ),
+                    (
+                        "twin fixture config secret version is not a positive decimal",
+                        "twin SITESIFT_FIXTURE_CONFIG_SECRET_VERSION is not a "
+                        "plain literal value",
+                    ),
+                )
+
+    def test_the_certification_audience_must_be_the_twins_own_url(self):
+        """An audience naming another service is the confused-deputy shape
+        audience verification exists to stop: a token minted for the twin would
+        be replayable against whatever the audience really named."""
+        for wrong in (
+            "https://process-user-abcdef-uc.a.run.app",
+            "https://process-user-certification.example.com",
+            "http://process-user-certification-abcdef-uc.a.run.app",
+            "https://process-user-certification-abcdef-uc.a.run.app/extra",
+            "process-user-certification-abcdef-uc.a.run.app",
+        ):
+            with self.subTest(audience=wrong):
+                self.assertEqual(
+                    self._twin_refusal(twin=twin_service(audience=wrong)),
+                    "twin certification audience is not the twin's own URL",
+                )
+
+    def test_the_certification_operator_must_be_the_approved_account(self):
+        """The twin verifies incoming tokens against this address. Any other
+        one points it at an identity nobody approved."""
+        for wrong in (
+            "sitesift-certification-runtime@email-automation-cache."
+            "iam.gserviceaccount.com",
+            "sitesift-certification-operator@somewhere-else."
+            "iam.gserviceaccount.com",
+            "bp21harrison@gmail.com",
+            "248289505828-compute@developer.gserviceaccount.com",
+        ):
+            with self.subTest(operator=wrong):
+                self.assertEqual(
+                    self._twin_refusal(twin=twin_service(operator_email=wrong)),
+                    "twin certification operator is not the approved operator account",
+                )
+
+    def test_the_certification_operator_subject_must_be_numeric(self):
+        """An address can be reassigned to a new principal; the numeric subject
+        is what actually pins the identity, so a non-numeric one pins nothing."""
+        for wrong in ("not-a-number", "104729384756019283746x", "1.5", "-1"):
+            with self.subTest(subject=wrong):
+                self.assertEqual(
+                    self._twin_refusal(twin=twin_service(operator_sub=wrong)),
+                    "twin certification operator subject is not a numeric uniqueId",
+                )
+
+    def test_a_twin_only_field_may_not_hide_behind_a_secret_reference(self):
+        """A value the comparator cannot read is not a value it may approve.
+        Refuse, never sanitise."""
+        for name in (
+            "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
+            "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
+            "SITESIFT_CERTIFICATION_AUDIENCE",
+            "SITESIFT_CERTIFICATION_OPERATOR_EMAIL",
+            "SITESIFT_CERTIFICATION_OPERATOR_SUB",
+        ):
+            with self.subTest(name=name):
+                hidden = twin_service(drop_env=(name,))
+                hidden["spec"]["template"]["spec"]["containers"][0]["env"].append(
+                    {
+                        "name": name,
+                        "valueFrom": {
+                            "secretKeyRef": {"name": "somewhere", "key": "1"}
+                        },
+                    }
+                )
+                self.assertEqual(
+                    self._twin_refusal(twin=hidden),
+                    f"twin {name} is not a plain literal value",
+                )
+
+    def test_the_expected_candidate_revision_itself_must_be_a_revision_name(self):
+        """The rule compares the twin's claim against a caller-supplied name. A
+        caller that supplied junk would make the comparison meaningless, so the
+        input is refused rather than compared."""
+        self.assertEqual(
+            self._twin_refusal(expected_candidate_revision="Not A Revision"),
+            "expected candidate revision is not a revision name",
+        )
+
+    def test_none_of_the_new_rules_fire_on_the_deployable_twin(self):
+        """Vacuity guards. An assertion that would also hold if the thing it
+        checks disappeared is not a pin, and a rule that fires on good input is
+        not a rule anyone can deploy past."""
+        for sentence in (
+            "twin does not name the production candidate under certification",
+            "twin production candidate revision names the twin's own service",
+            "twin fixture config version and secret reference disagree",
+            "twin fixture config secret version is not a positive decimal",
+            "twin certification audience is not the twin's own URL",
+            "twin certification operator is not the approved operator account",
+            "twin certification operator subject is not a numeric uniqueId",
+        ):
+            with self.subTest(sentence=sentence):
+                # Raises nothing at all on the deployable twin; if it did, the
+                # exact-stamp case above would already be failing.
+                phase1_rollout.validate_twin_stamp(
+                    twin_service(), twin_policy(), **self._twin_call()
+                )
 
     def test_twin_must_run_the_candidate_artifact_byte_for_byte(self):
         other = CANDIDATE_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64

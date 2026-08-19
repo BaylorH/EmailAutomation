@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,39 @@ from typing import Any, Callable, Mapping
 import urllib.error
 import urllib.parse
 import urllib.request
+
+
+# --- the candidate/twin classification, IMPORTED and never restated ----------
+#
+# This module and email_automation/certification/twin_contract.py enforce ONE
+# classification of how a certification twin may differ from the production
+# candidate. They used to hold two copies of it, and the copies drifted: the
+# contract widened to the eight twin-only fields that
+# scripts/deploy_certification_twin.sh really sets while this side still named
+# three, so the rollout comparator would have refused EVERY twin the deploy
+# script can produce -- at promotion time, under the lock, after the queue was
+# already paused. A duplicated allowlist with nothing binding the two copies is
+# how one classification became two files in the first place.
+#
+# Loaded BY PATH rather than as a package import, so this script keeps the
+# stdlib-only isolation the docstring above promises: nothing is added to
+# sys.path, no package __init__ runs, and twin_contract itself imports only
+# copy/re/typing. A missing or unreadable contract raises here, at import, which
+# is the fail-closed direction -- a rollout that cannot read the classification
+# must not run with a guessed one.
+_TWIN_CONTRACT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "email_automation"
+    / "certification"
+    / "twin_contract.py"
+)
+_TWIN_CONTRACT_SPEC = importlib.util.spec_from_file_location(
+    "phase1_rollout_twin_contract", _TWIN_CONTRACT_PATH
+)
+if _TWIN_CONTRACT_SPEC is None or _TWIN_CONTRACT_SPEC.loader is None:
+    raise ImportError(f"twin contract not loadable from {_TWIN_CONTRACT_PATH}")
+twin_contract = importlib.util.module_from_spec(_TWIN_CONTRACT_SPEC)
+_TWIN_CONTRACT_SPEC.loader.exec_module(twin_contract)
 
 
 ACCOUNT = "bp21harrison@gmail.com"
@@ -122,25 +156,25 @@ TWIN_FIXTURE_CONFIG_SECRET = "sitesift-certification-fixture-config"
 # the same number -- which would give one deployment two names for its own
 # identity.
 SECRET_VERSION_RE = re.compile(r"[1-9][0-9]*")
+# The twin's OWN url. An OIDC audience naming some other service is the
+# confused-deputy shape audience verification exists to stop. Cloud Run mints
+# `https://<service>-<suffix>.<zone>.run.app`, and the service component has to
+# be THIS service. Deliberately the same shape the contract enforces: two
+# regexes for one fact is how two spellings of it drift apart.
+TWIN_AUDIENCE_RE = re.compile(
+    r"https://"
+    + re.escape(TWIN_SERVICE)
+    + r"-[A-Za-z0-9][A-Za-z0-9-]*\.[A-Za-z0-9-]+\.run\.app"
+)
+# The operator service account's numeric uniqueId. An address can be reassigned
+# to a new principal; the numeric subject is what actually pins the identity, so
+# a non-numeric one pins nothing.
+OPERATOR_SUB_RE = re.compile(r"[0-9]+")
 # Each of these is a capability to cause a real effect, so its PRESENCE on the
-# twin is the failure, independent of value.
-TWIN_FORBIDDEN_ENV = (
-    "FIREBASE_BUCKET",
-    "AZURE_API_APP_ID",
-    "AZURE_API_CLIENT_SECRET",
-    "FIREBASE_API_KEY",
-    "GOOGLE_OAUTH_CLIENT_ID",
-    "GOOGLE_OAUTH_CLIENT_SECRET",
-    "GOOGLE_REFRESH_TOKEN",
-    "PROCESS_USER_AUTH",
-    "SITESIFT_AUTO_REPLY_ALLOWLIST",
-    "SITESIFT_TOUR_ACTION_ALLOWLIST",
-)
-TWIN_ONLY_ENV = (
-    "K_SERVICE",
-    "FIRESTORE_DATABASE",
-    TWIN_FIXTURE_CONFIG_NAME,
-)
+# twin is the failure, independent of value. Both tuples come from the contract
+# rather than being restated -- see the loader at the top of this module.
+TWIN_FORBIDDEN_ENV = twin_contract.FORBIDDEN_ON_TWIN
+TWIN_ONLY_ENV = twin_contract.TWIN_ONLY
 TWIN_EXPECTED_IAM = {
     "roles/run.invoker": (f"serviceAccount:{TWIN_OPERATOR_SERVICE_ACCOUNT}",),
 }
@@ -723,6 +757,98 @@ def _validate_twin_fixture_secret(entry: Mapping[str, Any]) -> None:
         )
 
 
+def _twin_only_literal(twin_env: Mapping[str, Any], name: str) -> str:
+    """The literal value of a twin-only field, or a refusal.
+
+    Allowlisted: only a PLAIN literal is readable. A secret reference here would
+    make the value unknowable at validation time, and a value the comparator has
+    to guess at is not a value it may approve. Extra keys are refused for the
+    same reason -- an entry carrying both a literal and a reference has two
+    answers, and the comparator may not pick one.
+    """
+    entry = twin_env[name]
+    value = entry.get("value")
+    if set(entry) != {"name", "value"} or not isinstance(value, str) or not value:
+        raise RolloutError(f"twin {name} is not a plain literal value")
+    return value
+
+
+def _validate_twin_certification_identity(
+    twin_env: Mapping[str, Any], *, expected_candidate_revision: str
+) -> None:
+    """The five twin-only fields the deploy script sets, held to exact values.
+
+    Classifying a name is not the same as excusing it. The allowlist above
+    proves only that the NAME is approved; without these rules a twin could
+    carry an audience naming another service, an operator nobody authorised, or
+    a fixture version disagreeing with the secret it actually mounted, and the
+    comparator would report nothing at all.
+
+    Each rule raises its OWN sentence, distinct from the generic
+    "exists only on the twin and is unclassified" refusal. A rule whose only
+    evidence is a message an adjacent generic check also produces is decorative:
+    it goes on passing after the rule is deleted. Two rules in the sibling
+    comparator were found to be exactly that.
+    """
+    if TAG_RE.fullmatch(expected_candidate_revision) is None:
+        raise RolloutError("expected candidate revision is not a revision name")
+
+    revision = _twin_only_literal(
+        twin_env, "SITESIFT_PRODUCTION_CANDIDATE_REVISION"
+    )
+    # Checked BEFORE the equality below because the twin's own service name has
+    # the candidate's certification prefix: a twin naming a revision of itself
+    # is certifying itself, and that deserves its own refusal rather than the
+    # generic "not the candidate" one.
+    if revision == TWIN_SERVICE or revision.startswith(f"{TWIN_SERVICE}-"):
+        raise RolloutError(
+            "twin production candidate revision names the twin's own service"
+        )
+    if revision != expected_candidate_revision:
+        raise RolloutError(
+            "twin does not name the production candidate under certification"
+        )
+
+    # The second spelling of the fixture version. The deploy script sets this
+    # and the secret reference from ONE variable, so disagreement means the run
+    # cannot say which fixture it executed against.
+    version = _twin_only_literal(
+        twin_env, "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION"
+    )
+    if SECRET_VERSION_RE.fullmatch(version) is None:
+        raise RolloutError(
+            "twin fixture config secret version is not a positive decimal"
+        )
+    mounted = (
+        twin_env[TWIN_FIXTURE_CONFIG_NAME]
+        .get("valueFrom", {})
+        .get("secretKeyRef", {})
+        .get("key")
+    )
+    if version != mounted:
+        raise RolloutError(
+            "twin fixture config version and secret reference disagree"
+        )
+
+    audience = _twin_only_literal(twin_env, "SITESIFT_CERTIFICATION_AUDIENCE")
+    if TWIN_AUDIENCE_RE.fullmatch(audience) is None:
+        raise RolloutError("twin certification audience is not the twin's own URL")
+
+    operator = _twin_only_literal(
+        twin_env, "SITESIFT_CERTIFICATION_OPERATOR_EMAIL"
+    )
+    if operator != TWIN_OPERATOR_SERVICE_ACCOUNT:
+        raise RolloutError(
+            "twin certification operator is not the approved operator account"
+        )
+
+    subject = _twin_only_literal(twin_env, "SITESIFT_CERTIFICATION_OPERATOR_SUB")
+    if OPERATOR_SUB_RE.fullmatch(subject) is None:
+        raise RolloutError(
+            "twin certification operator subject is not a numeric uniqueId"
+        )
+
+
 def validate_twin_stamp(
     service_value: Any,
     policy: Any,
@@ -730,6 +856,7 @@ def validate_twin_stamp(
     candidate_spec: Any,
     expected_image: str,
     expected_source_revision: str,
+    expected_candidate_revision: str,
     production: Topology,
 ) -> None:
     """Prove the twin is the same artifact with none of the authority.
@@ -802,6 +929,9 @@ def validate_twin_stamp(
     if twin_env["FIRESTORE_DATABASE"].get("value") != TWIN_FIRESTORE_DATABASE:
         raise RolloutError("twin FIRESTORE_DATABASE is not the certification database")
     _validate_twin_fixture_secret(twin_env[TWIN_FIXTURE_CONFIG_NAME])
+    _validate_twin_certification_identity(
+        twin_env, expected_candidate_revision=expected_candidate_revision
+    )
 
     for name, value in stamp.items():
         if twin_env.get(name, {}).get("value") != value:
@@ -982,6 +1112,7 @@ class Phase1Rollout:
             candidate_spec=spec,
             expected_image=image,
             expected_source_revision=self.head_sha,
+            expected_candidate_revision=self.candidate,
             production=topology,
         )
         validate_queue(self.ops.get_queue(), "PAUSED")
