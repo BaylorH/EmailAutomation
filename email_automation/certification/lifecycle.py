@@ -155,15 +155,24 @@ def default_ledger() -> Any:
     return ledger
 
 
-def resolved_ledger() -> Tuple[Optional[Any], Optional["Response"]]:
-    """(ledger, None) or (None, refusal). The route's one resolution point."""
+def resolved_ledger() -> Tuple[Any, Optional["Response"]]:
+    """(ledger, None) or (None, refusal). The route's one resolution point.
+
+    The two halves are CORRELATED: a refusal is returned only with a ``None``
+    ledger, and a ledger only with a ``None`` refusal. Every caller returns the
+    refusal before it touches the ledger, which is what keeps an unresolvable
+    store a named 503 instead of an ``AttributeError`` -- and an
+    ``AttributeError`` here would not even surface, because call sites in this
+    program are wrapped in broad ``except Exception`` and it would read as a
+    clean early return.
+    """
     try:
         return resolve_default_ledger(), None
     except LedgerUnavailable:
         return None, _error(LEDGER_UNAVAILABLE_REASON, 503)
 
 
-def _ledger_or_refusal(ledger: Any) -> Tuple[Optional[Any], Optional["Response"]]:
+def _ledger_or_refusal(ledger: Any) -> Tuple[Any, Optional["Response"]]:
     """The injected ledger, or the resolved default, or a named refusal.
 
     The refusal is returned rather than raised because every caller of this is a

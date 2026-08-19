@@ -1010,6 +1010,152 @@ class DurableLedgerRouteDriveTests(unittest.TestCase):
         self.assertEqual(mismatched.get_json()["reason"], "revision_mismatch")
 
 
+class NoResolvableLedgerRefusesEveryOperationTests(unittest.TestCase):
+    """Every entry point, driven with the resolution FAILING.
+
+    The refusal and the ledger come back from one helper as a correlated pair,
+    and every one of these functions goes on to call a method on the ledger. If
+    any of them used the value without consuming the refusal, an unresolvable
+    store would surface as an ``AttributeError`` on ``None`` -- which in this
+    program is not even a visible failure, because call sites are wrapped in
+    broad ``except Exception`` and it would read as a clean early return. So the
+    property is driven rather than reviewed, once per operation.
+    """
+
+    OPERATIONS = ("prepare", "run", "status", "review_input", "abort",
+                  "recover", "cleanup")
+
+    def setUp(self):
+        def exploding():
+            raise RuntimeError("no application default credentials")
+
+        for target, value in (("_DEFAULT_LEDGER", None),
+                              ("_firestore_client", exploding)):
+            patcher = patch.object(lifecycle, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _call(self, operation):
+        body = {"scenarioId": BOOTSTRAP, "runId": "cert-wiring-noledger",
+                "expectedRevision": REVISION}
+        return getattr(lifecycle, operation)(
+            body, caller_identity_digest="c" * 64, environ=TWIN_ENV)
+
+    def test_every_operation_answers_with_the_named_refusal(self):
+        for operation in self.OPERATIONS:
+            with self.subTest(operation=operation):
+                payload, code = self._call(operation)
+                self.assertEqual(code, 503, payload)
+                self.assertEqual(payload["reason"],
+                                 lifecycle.LEDGER_UNAVAILABLE_REASON)
+
+    def test_no_operation_raises_on_a_none_ledger(self):
+        """An AttributeError here would be swallowed as a clean early return."""
+        for operation in self.OPERATIONS:
+            with self.subTest(operation=operation):
+                try:
+                    self._call(operation)
+                except AttributeError as exc:
+                    self.fail(f"{operation} reached a method on None: {exc}")
+
+    def test_run_does_not_answer_no_prepared_run(self):
+        """A broken instrument must not look like an unprepared run.
+
+        ``no_prepared_run`` is a fact about the RUN. `instrument_blocked` stays
+        distinct from a verdict, and this is the same distinction one layer up.
+        """
+        payload, code = self._call("run")
+        self.assertEqual(code, 503)
+        self.assertNotEqual(payload["reason"], "no_prepared_run")
+
+    def test_a_refused_prepare_consumes_no_run_id(self):
+        """`begin_preparing` claims a run id PERMANENTLY and is recorded first,
+        so that a failure later leaves a recoverable record. A resolution that
+        failed after that point would burn the id while telling the caller
+        nothing was prepared."""
+        refused, code = self._call("prepare")
+        self.assertEqual(code, 503, refused)
+
+        ledger = ledger_module.InMemoryRunLedger()
+        payload, code = lifecycle.prepare(
+            {"scenarioId": BOOTSTRAP, "runId": "cert-wiring-noledger",
+             "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger, environ=TWIN_ENV)
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(ledger.state("cert-wiring-noledger"),
+                         ledger_module.PREPARED)
+
+
+class TamperedAuthorizationAgainstTheDurableLedgerTests(unittest.TestCase):
+    """The sharp edge the swap exposes, driven against the real durable ledger.
+
+    ``InMemoryRunLedger.peek_ephemeral`` only ever returns a value or ``None``.
+    The durable one rebuilds the stored record and RAISES when it was edited in
+    the database -- deliberately, so a tamper and an absence do not look alike.
+    Existing tests prove ``run`` handles that against a subclass that raises on
+    demand; this one edits a row in the store and lets the shipped
+    ``from_stored`` decide.
+    """
+
+    ENV = dict(TWIN_ENV)
+
+    def setUp(self):
+        self.store = ClockedFirestore()
+        self.ledger = durable_ledger(self.store)
+
+    def _run(self, run_id):
+        return lifecycle.run(
+            {"scenarioId": BOOTSTRAP, "runId": run_id,
+             "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=self.ledger,
+            environ=self.ENV)
+
+    def test_an_edited_stored_authorization_is_a_named_refusal(self):
+        run_id = "cert-wiring-tamper"
+        prepared, code = lifecycle.prepare(
+            {"scenarioId": BOOTSTRAP, "runId": run_id,
+             "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=self.ledger,
+            environ=self.ENV)
+        self.assertEqual(code, 200, prepared)
+
+        # One field edited in the database, digest left as it was.
+        self.store.docs[f"certificationRunAuthorizations/{run_id}"][
+            "scenario_id"] = REFUTATION
+
+        def never(*args, **kwargs):
+            raise AssertionError("a tampered authorization reached the runner")
+
+        with patch.object(runner_module, "run_scenario", never):
+            payload, code = self._run(run_id)
+
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "authorization_invalid")
+        self.assertEqual(self.ledger.state(run_id), ledger_module.PREPARED,
+                         "a tampered run was claimed anyway")
+
+    def test_a_tamper_and_an_absence_stay_distinguishable(self):
+        run_id = "cert-wiring-tamper-b"
+        lifecycle.prepare(
+            {"scenarioId": BOOTSTRAP, "runId": run_id,
+             "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=self.ledger,
+            environ=self.ENV)
+        self.store.docs[f"certificationRunAuthorizations/{run_id}"][
+            "scenario_id"] = REFUTATION
+        tampered, tampered_code = self._run(run_id)
+        absent, absent_code = self._run("cert-wiring-never-prepared")
+
+        self.assertEqual((tampered_code, absent_code), (409, 409))
+        self.assertNotEqual(tampered["reason"], absent["reason"])
+        self.assertEqual(absent["reason"], "no_prepared_run")
+        # Neither answer names a run id, so neither is a probe for which exist.
+        import json as _json
+        for payload in (tampered, absent):
+            self.assertEqual(set(payload), {"status", "reason"})
+            self.assertNotIn("cert-wiring", _json.dumps(payload))
+
+
 # ---------------------------------------------------------------------------
 # Gap 3: recovery does NOT emit evidence records, and why
 # ---------------------------------------------------------------------------
