@@ -29,6 +29,8 @@ CANDIDATE_IMAGE = (
     "us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/"
     "process-user@sha256:" + "e" * 64
 )
+CANDIDATE_DIGEST = CANDIDATE_IMAGE.split("@", 1)[1]
+HEAD_SHA = "1234567890abcdef1234567890abcdef12345678"
 SERVICE_URL = "https://process-user-example.run.app"
 AUX_TAGS = {
     "jill-one": "process-user-jill-one-202608020520",
@@ -81,6 +83,17 @@ def revision(name, image):
         }},
     ]
     if is_candidate:
+        # The stamp is what binds this revision to one reviewed source commit
+        # and one built artifact. It sits before the gate because the gate is
+        # addressed positionally by the native-gate cases below.
+        environment.append({
+            "name": "SITESIFT_IMAGE_DIGEST",
+            "value": image.split("@", 1)[1],
+        })
+        environment.append({
+            "name": "SITESIFT_SOURCE_REVISION",
+            "value": HEAD_SHA,
+        })
         environment.append({
             "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
             "value": "false",
@@ -469,6 +482,7 @@ class ValidatorTests(unittest.TestCase):
             revision(CANDIDATE, CANDIDATE_IMAGE),
             revision(OLD_REVISION, OLD_IMAGE),
             CANDIDATE, CANDIDATE_IMAGE,
+            expected_source_revision=HEAD_SHA,
         )
         changed = revision(CANDIDATE, CANDIDATE_IMAGE)
         changed["spec"]["containerConcurrency"] = 2
@@ -476,6 +490,7 @@ class ValidatorTests(unittest.TestCase):
             phase1_rollout.validate_candidate(
                 changed, revision(OLD_REVISION, OLD_IMAGE),
                 CANDIDATE, CANDIDATE_IMAGE,
+                expected_source_revision=HEAD_SHA,
             )
 
     def test_candidate_functional_metadata_must_match_baseline(self):
@@ -496,7 +511,11 @@ class ValidatorTests(unittest.TestCase):
                 mutate(changed)
                 with self.assertRaises(phase1_rollout.RolloutError):
                     phase1_rollout.validate_candidate(
-                        changed, baseline, CANDIDATE, CANDIDATE_IMAGE
+                        changed,
+                        baseline,
+                        CANDIDATE,
+                        CANDIDATE_IMAGE,
+                        expected_source_revision=HEAD_SHA,
                     )
 
     def test_candidate_requires_one_exact_false_native_image_gate(self):
@@ -506,6 +525,7 @@ class ValidatorTests(unittest.TestCase):
             baseline,
             CANDIDATE,
             CANDIDATE_IMAGE,
+            expected_source_revision=HEAD_SHA,
         )
 
         def candidate_with_gate(gate):
@@ -543,7 +563,11 @@ class ValidatorTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaises(phase1_rollout.RolloutError):
                     phase1_rollout.validate_candidate(
-                        candidate, baseline, CANDIDATE, CANDIDATE_IMAGE
+                        candidate,
+                        baseline,
+                        CANDIDATE,
+                        CANDIDATE_IMAGE,
+                        expected_source_revision=HEAD_SHA,
                     )
 
         polluted_baseline = revision(OLD_REVISION, OLD_IMAGE)
@@ -557,6 +581,104 @@ class ValidatorTests(unittest.TestCase):
                 polluted_baseline,
                 CANDIDATE,
                 CANDIDATE_IMAGE,
+                expected_source_revision=HEAD_SHA,
+            )
+
+
+    def test_candidate_release_stamp_must_bind_this_source_and_this_artifact(self):
+        baseline = revision(OLD_REVISION, OLD_IMAGE)
+        phase1_rollout.validate_candidate(
+            revision(CANDIDATE, CANDIDATE_IMAGE),
+            baseline,
+            CANDIDATE,
+            CANDIDATE_IMAGE,
+            expected_source_revision=HEAD_SHA,
+        )
+
+        def candidate_with_stamp(entries):
+            value = revision(CANDIDATE, CANDIDATE_IMAGE)
+            environment = value["spec"]["containers"][0]["env"]
+            value["spec"]["containers"][0]["env"] = [
+                entry
+                for entry in environment
+                if entry.get("name")
+                not in ("SITESIFT_IMAGE_DIGEST", "SITESIFT_SOURCE_REVISION")
+            ]
+            value["spec"]["containers"][0]["env"][-1:-1] = entries
+            return value
+
+        rejected = {
+            "missing-both": candidate_with_stamp([]),
+            "missing-source": candidate_with_stamp([
+                {"name": "SITESIFT_IMAGE_DIGEST", "value": CANDIDATE_DIGEST},
+            ]),
+            "missing-digest": candidate_with_stamp([
+                {"name": "SITESIFT_SOURCE_REVISION", "value": HEAD_SHA},
+            ]),
+            "forged-source": candidate_with_stamp([
+                {"name": "SITESIFT_IMAGE_DIGEST", "value": CANDIDATE_DIGEST},
+                {"name": "SITESIFT_SOURCE_REVISION", "value": "0" * 40},
+            ]),
+            "forged-digest": candidate_with_stamp([
+                {"name": "SITESIFT_IMAGE_DIGEST", "value": "sha256:" + "f" * 64},
+                {"name": "SITESIFT_SOURCE_REVISION", "value": HEAD_SHA},
+            ]),
+            "duplicate-source": candidate_with_stamp([
+                {"name": "SITESIFT_IMAGE_DIGEST", "value": CANDIDATE_DIGEST},
+                {"name": "SITESIFT_SOURCE_REVISION", "value": HEAD_SHA},
+                {"name": "SITESIFT_SOURCE_REVISION", "value": HEAD_SHA},
+            ]),
+            "secret-bound-source": candidate_with_stamp([
+                {"name": "SITESIFT_IMAGE_DIGEST", "value": CANDIDATE_DIGEST},
+                {
+                    "name": "SITESIFT_SOURCE_REVISION",
+                    "valueFrom": {
+                        "secretKeyRef": {"name": "stamp", "key": "latest"}
+                    },
+                },
+            ]),
+            "extra-keyed-source": candidate_with_stamp([
+                {"name": "SITESIFT_IMAGE_DIGEST", "value": CANDIDATE_DIGEST},
+                {
+                    "name": "SITESIFT_SOURCE_REVISION",
+                    "value": HEAD_SHA,
+                    "unexpected": "field",
+                },
+            ]),
+        }
+        for label, candidate in rejected.items():
+            with self.subTest(label=label):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_candidate(
+                        candidate,
+                        baseline,
+                        CANDIDATE,
+                        CANDIDATE_IMAGE,
+                        expected_source_revision=HEAD_SHA,
+                    )
+
+    def test_baseline_carrying_a_release_stamp_is_refused(self):
+        polluted = revision(OLD_REVISION, OLD_IMAGE)
+        polluted["spec"]["containers"][0]["env"].append(
+            {"name": "SITESIFT_SOURCE_REVISION", "value": HEAD_SHA}
+        )
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_candidate(
+                revision(CANDIDATE, CANDIDATE_IMAGE),
+                polluted,
+                CANDIDATE,
+                CANDIDATE_IMAGE,
+                expected_source_revision=HEAD_SHA,
+            )
+
+    def test_a_stamp_from_another_checkout_is_refused(self):
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_candidate(
+                revision(CANDIDATE, CANDIDATE_IMAGE),
+                revision(OLD_REVISION, OLD_IMAGE),
+                CANDIDATE,
+                CANDIDATE_IMAGE,
+                expected_source_revision="b" * 40,
             )
 
 
@@ -565,7 +687,7 @@ class StateMachineTests(unittest.TestCase):
         sleeps = []
         rollout = phase1_rollout.Phase1Rollout(
             ops=ops,
-            head_sha="1234567890abcdef1234567890abcdef12345678",
+            head_sha=HEAD_SHA,
             sleeper=sleeps.append,
             nonce_factory=lambda: nonce,
         )
@@ -842,7 +964,7 @@ class StateMachineTests(unittest.TestCase):
         ops.lock_nonce = "a" * 64
         lock = phase1_rollout.RolloutLock(
             owner_nonce="a" * 64,
-            head_sha="1234567890abcdef1234567890abcdef12345678",
+            head_sha=HEAD_SHA,
             update_time="2026-08-12T00:00:00Z",
         )
         rollout, _ = self.make_rollout(ops)
@@ -862,7 +984,7 @@ class StateMachineTests(unittest.TestCase):
         ops.queue["state"] = "PAUSED"
         lock = phase1_rollout.RolloutLock(
             owner_nonce="a" * 64,
-            head_sha="1234567890abcdef1234567890abcdef12345678",
+            head_sha=HEAD_SHA,
             update_time="2026-08-12T00:00:00Z",
         )
         rollout, _ = self.make_rollout(ops)
@@ -883,7 +1005,7 @@ class StateMachineTests(unittest.TestCase):
                 ops.task_snapshots = task_snapshots
                 lock = phase1_rollout.RolloutLock(
                     owner_nonce="a" * 64,
-                    head_sha="1234567890abcdef1234567890abcdef12345678",
+                    head_sha=HEAD_SHA,
                     update_time="2026-08-12T00:00:00Z",
                 )
                 rollout, _ = self.make_rollout(ops)

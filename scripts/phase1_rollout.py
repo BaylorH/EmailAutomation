@@ -45,6 +45,12 @@ OLD_IMAGE = (
 )
 NATIVE_IMAGE_GATE_NAME = "SITESIFT_NATIVE_IMAGE_INGESTION"
 NATIVE_IMAGE_GATE_VALUE = "false"
+# The release stamp binds a serving revision to one reviewed source commit and
+# one built artifact. Sorted, because the canonical comparison is on a sorted
+# list and one spelling of the expected value is the whole point of a stamp.
+RELEASE_STAMP_DIGEST_NAME = "SITESIFT_IMAGE_DIGEST"
+RELEASE_STAMP_SOURCE_NAME = "SITESIFT_SOURCE_REVISION"
+RELEASE_STAMP_NAMES = (RELEASE_STAMP_DIGEST_NAME, RELEASE_STAMP_SOURCE_NAME)
 RULES_HASH = "7acf2bdbe2a7a42221efaa1ae15c2b406e4d6bef6b2c4131b3b0a6b5de8f8ee8"
 HOSTING_VERSION = "a3758fb175d427f5"
 INDEX_HASH = "33a041852c11a578b5d4836c64e76b7208afbbf20ccac2208d1b2fc10e0182c0"
@@ -426,8 +432,24 @@ def validate_project_iam(value: Any) -> None:
         raise RolloutError("project invoker policy is not the exact private contract")
 
 
+def release_stamp(expected_image: str, expected_source_revision: str) -> dict[str, str]:
+    """The exact stamp a revision built from this commit and image must carry."""
+    _, separator, digest = expected_image.partition("@")
+    if not separator or DIGEST_RE.fullmatch(digest) is None:
+        raise RolloutError("expected image is not pinned by an exact digest")
+    if SHA_RE.fullmatch(expected_source_revision) is None:
+        raise RolloutError("expected source revision is not an exact lowercase SHA")
+    return {
+        RELEASE_STAMP_DIGEST_NAME: digest,
+        RELEASE_STAMP_SOURCE_NAME: expected_source_revision,
+    }
+
+
 def _canonical_revision_spec(
-    value: Any, *, require_native_image_gate: bool
+    value: Any,
+    *,
+    require_native_image_gate: bool,
+    expected_stamp: Mapping[str, str] | None,
 ) -> dict[str, Any]:
     result = copy.deepcopy(_object(value, "revision spec"))
     containers = result.get("containers")
@@ -439,6 +461,7 @@ def _canonical_revision_spec(
     if not isinstance(environment, list):
         raise RolloutError("revision environment is not a list")
     gate_entries = []
+    stamp_entries = []
     retained_environment = []
     for raw_entry in environment:
         entry = _object(raw_entry, "revision environment entry")
@@ -446,6 +469,8 @@ def _canonical_revision_spec(
             raise RolloutError("revision environment entry name is invalid")
         if entry.get("name") == NATIVE_IMAGE_GATE_NAME:
             gate_entries.append(entry)
+        elif entry.get("name") in RELEASE_STAMP_NAMES:
+            stamp_entries.append(entry)
         else:
             retained_environment.append(entry)
     expected_gate_entries = (
@@ -455,6 +480,19 @@ def _canonical_revision_spec(
     )
     if gate_entries != expected_gate_entries:
         raise RolloutError("native image gate is not the exact dark contract")
+    # Validate the stamp against its exact expected value BEFORE pairing it
+    # away. Dropping an approved difference first would make any stamp -- a
+    # forged one, or one from a different build -- compare equal to a baseline
+    # that carries none.
+    expected_stamp_entries = (
+        [{"name": name, "value": expected_stamp[name]} for name in RELEASE_STAMP_NAMES]
+        if expected_stamp is not None
+        else []
+    )
+    if sorted(
+        stamp_entries, key=lambda entry: entry["name"]
+    ) != expected_stamp_entries:
+        raise RolloutError("release stamp is not the exact source and image binding")
     container["env"] = retained_environment
     container.pop("image", None)
     return result
@@ -483,6 +521,8 @@ def validate_candidate_dark_identity(
     candidate: Any,
     expected_name: str,
     expected_image: str,
+    *,
+    expected_source_revision: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = _object(candidate, "candidate revision")
     metadata = _object(candidate.get("metadata"), "candidate metadata")
@@ -516,7 +556,11 @@ def validate_candidate_dark_identity(
     ]
     if len(ready) != 1 or ready[0].get("status") != "True":
         raise RolloutError("candidate is not exactly Ready")
-    _canonical_revision_spec(spec, require_native_image_gate=True)
+    _canonical_revision_spec(
+        spec,
+        require_native_image_gate=True,
+        expected_stamp=release_stamp(expected_image, expected_source_revision),
+    )
     return metadata, spec
 
 
@@ -524,13 +568,15 @@ def _validate_candidate_parity(
     metadata: Any,
     spec: Any,
     baseline: Any,
+    *,
+    expected_stamp: Mapping[str, str],
 ) -> None:
     baseline = _object(baseline, "baseline revision")
     baseline_spec = _object(baseline.get("spec"), "baseline spec")
     if _canonical_revision_spec(
-        spec, require_native_image_gate=True
+        spec, require_native_image_gate=True, expected_stamp=expected_stamp
     ) != _canonical_revision_spec(
-        baseline_spec, require_native_image_gate=False
+        baseline_spec, require_native_image_gate=False, expected_stamp=None
     ):
         raise RolloutError("candidate config differs from baseline beyond image")
     if _canonical_revision_metadata(metadata) != _canonical_revision_metadata(
@@ -544,11 +590,21 @@ def validate_candidate(
     baseline: Any,
     expected_name: str,
     expected_image: str,
+    *,
+    expected_source_revision: str,
 ) -> None:
     metadata, spec = validate_candidate_dark_identity(
-        candidate, expected_name, expected_image
+        candidate,
+        expected_name,
+        expected_image,
+        expected_source_revision=expected_source_revision,
     )
-    _validate_candidate_parity(metadata, spec, baseline)
+    _validate_candidate_parity(
+        metadata,
+        spec,
+        baseline,
+        expected_stamp=release_stamp(expected_image, expected_source_revision),
+    )
 
 
 def validate_old_revision(value: Any) -> None:
@@ -660,7 +716,13 @@ class Phase1Rollout:
             )
         )
         candidate = self.ops.get_revision(self.candidate)
-        validate_candidate(candidate, old, self.candidate, image)
+        validate_candidate(
+            candidate,
+            old,
+            self.candidate,
+            image,
+            expected_source_revision=self.head_sha,
+        )
         validate_queue(self.ops.get_queue(), "RUNNING")
         return old, candidate, image
 
@@ -687,11 +749,19 @@ class Phase1Rollout:
             raise RolloutError("artifact image is invalid")
         candidate = self.ops.get_revision(self.candidate)
         metadata, spec = validate_candidate_dark_identity(
-            candidate, self.candidate, image
+            candidate,
+            self.candidate,
+            image,
+            expected_source_revision=self.head_sha,
         )
         rollback = self.ops.get_revision(OLD_REVISION)
         validate_old_revision(rollback)
-        _validate_candidate_parity(metadata, spec, rollback)
+        _validate_candidate_parity(
+            metadata,
+            spec,
+            rollback,
+            expected_stamp=release_stamp(image, self.head_sha),
+        )
         self.ops.verify_rules_ui_switches()
         topology = validate_topology(
             self.ops.get_service(),
@@ -876,6 +946,7 @@ class Phase1Rollout:
                 self.ops.get_revision(OLD_REVISION),
                 self.candidate,
                 self.ops.artifact_image(),
+                expected_source_revision=self.head_sha,
             )
             validate_queue(self.ops.get_queue(), "PAUSED")
             if not self._tasks_are_empty():
