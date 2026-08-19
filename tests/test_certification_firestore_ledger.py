@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 import json
 import unittest
+from pathlib import Path
 
 from google.api_core import exceptions as gcp_exceptions
 
@@ -970,6 +971,266 @@ class DurableRowsStaySanitizedTests(LedgerCase):
         self.assertIn("PREPARED", message)
         for forbidden in self._forbidden_values():
             self.assertNotIn(forbidden, message)
+
+
+class OneStateMachineDrivesBothLedgersTests(LedgerCase):
+    """The claim the module docstring makes, turned into something that fails.
+
+    "Both implementations agree by construction rather than by review" is only
+    true if there is nothing to review -- if a second copy of the transition
+    table does not exist to drift. These tests are what stops a future backend
+    from restating it and passing because its own copy happens to match today.
+    """
+
+    LEDGER_SOURCE = Path(lg.__file__).read_text(encoding="utf-8")
+
+    def test_both_ledgers_inherit_the_same_machine(self):
+        self.assertTrue(issubclass(lg.InMemoryRunLedger, lg._RunLedgerStateMachine))
+        self.assertTrue(issubclass(lg.FirestoreRunLedger, lg._RunLedgerStateMachine))
+
+    def test_the_transition_methods_are_the_identical_function_objects(self):
+        """Not "equivalent". The same object, so there is no second body that
+        could be edited on one side only."""
+        for name in (
+            "_new_row",
+            "_refuse_reuse",
+            "_require_row",
+            "_require",
+            "_advance",
+            "_validate_verdict",
+            "_apply_prepared",
+            "_apply_claim",
+            "_apply_running",
+            "_apply_terminal",
+            "_apply_cleanup",
+        ):
+            with self.subTest(method=name):
+                mine = getattr(lg.InMemoryRunLedger, name)
+                theirs = getattr(lg.FirestoreRunLedger, name)
+                self.assertIs(
+                    getattr(mine, "__func__", mine), getattr(theirs, "__func__", theirs)
+                )
+
+    def test_the_transition_table_is_declared_once_and_read_once(self):
+        """A source-level pin. Two declarations is exactly the failure the
+        docstring names, and it would otherwise be invisible to every
+        behavioural test as long as the copies agreed."""
+        occurrences = self.LEDGER_SOURCE.count("_ALLOWED_TRANSITIONS")
+        self.assertEqual(
+            occurrences,
+            2,
+            "_ALLOWED_TRANSITIONS should appear exactly twice: declared once and "
+            f"read once in _advance; found {occurrences}",
+        )
+        for state in ("PREPARING", "PREPARED", "CLAIMED", "RUNNING", "TERMINAL"):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    self.LEDGER_SOURCE.count(f'"{state}"'),
+                    1,
+                    f"the literal {state!r} is spelled out more than once; state "
+                    "names are constants, not strings each backend retypes",
+                )
+
+    def test_the_state_names_are_the_exact_strings_that_get_persisted(self):
+        """These are on disk once the ledger is durable. Renaming one silently
+        orphans every row already written under the old name."""
+        self.assertEqual(lg.PREPARING, "PREPARING")
+        self.assertEqual(lg.PREPARED, "PREPARED")
+        self.assertEqual(lg.CLAIMED, "CLAIMED")
+        self.assertEqual(lg.RUNNING, "RUNNING")
+        self.assertEqual(lg.TERMINAL, "TERMINAL")
+
+    def test_the_table_is_the_machine_the_plan_describes(self):
+        self.assertEqual(
+            {state: sorted(nexts) for state, nexts in lg._ALLOWED_TRANSITIONS.items()},
+            {
+                "PREPARING": ["PREPARED", "TERMINAL"],
+                "PREPARED": ["CLAIMED", "TERMINAL"],
+                "CLAIMED": ["RUNNING", "TERMINAL"],
+                "RUNNING": ["RUNNING", "TERMINAL"],
+                "TERMINAL": [],
+            },
+        )
+
+    def test_editing_the_one_table_changes_BOTH_ledgers(self):
+        """The direct proof, and the mutation evidence for the table pin at
+        once: narrow the single table and both implementations refuse the same
+        step. If either kept its own copy, only one of them would move."""
+        narrowed = dict(lg._ALLOWED_TRANSITIONS)
+        narrowed["PREPARED"] = frozenset({lg.TERMINAL})
+
+        def try_claim(ledger):
+            request = self.request(run_id="cert-shared-table-0001")
+            ledger.begin_preparing(request)
+            ledger.mark_prepared(request, self.auth(run_id=request.run_id))
+            try:
+                ledger.claim(request, self.auth(run_id=request.run_id))
+            except lg.LedgerStateError as error:
+                return str(error)
+            return None
+
+        self.assertIsNone(try_claim(lg.InMemoryRunLedger()))
+        self.assertIsNone(try_claim(self.firestore_ledger()))
+
+        original = lg._ALLOWED_TRANSITIONS
+        lg._ALLOWED_TRANSITIONS = narrowed
+        try:
+            self.store = FakeFirestore()
+            in_memory_refusal = try_claim(lg.InMemoryRunLedger())
+            firestore_refusal = try_claim(self.firestore_ledger())
+        finally:
+            lg._ALLOWED_TRANSITIONS = original
+
+        self.assertEqual(in_memory_refusal, "refused transition PREPARED -> CLAIMED")
+        self.assertEqual(firestore_refusal, in_memory_refusal)
+
+
+class TheTwoLedgersAgreeStepForStepTests(LedgerCase):
+    """Same scripts, both backends, identical outcomes.
+
+    The interesting half is the refusals: it is easy for two ledgers to walk the
+    happy path alike and disagree about which hostile sequence is refused, and
+    the refusals are the entire safety story.
+    """
+
+    SCRIPTS = {
+        "happy path": [
+            ("begin_preparing",),
+            ("mark_prepared",),
+            ("claim",),
+            ("mark_running", "fixture_open"),
+            ("mark_running", "execute"),
+            ("record_terminal", "PASS", "d" * 64),
+            ("append_cleanup_result", "e" * 64, {"nonfixture_write": 0}),
+        ],
+        "claim before prepare": [("begin_preparing",), ("claim",)],
+        "re-prepare after claim": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",), ("mark_prepared",),
+        ],
+        "reuse a spent run id": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",),
+            ("record_terminal", "PASS", "d" * 64), ("begin_preparing",),
+        ],
+        "claim twice": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",), ("claim",),
+        ],
+        "run without claiming": [("begin_preparing",), ("mark_running", "execute")],
+        "run after terminal": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",),
+            ("record_terminal", "PASS", "d" * 64), ("mark_running", "execute"),
+        ],
+        "terminal twice, identical": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",),
+            ("record_terminal", "FAIL", "d" * 64),
+            ("record_terminal", "FAIL", "d" * 64),
+        ],
+        "terminal twice, different verdict": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",),
+            ("record_terminal", "FAIL", "d" * 64),
+            ("record_terminal", "PASS", "d" * 64),
+        ],
+        "terminal twice, different evidence": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",),
+            ("record_terminal", "FAIL", "d" * 64),
+            ("record_terminal", "FAIL", "a" * 64),
+        ],
+        "unknown verdict": [
+            ("begin_preparing",), ("mark_prepared",), ("claim",),
+            ("record_terminal", "MOSTLY_PASS", "d" * 64),
+        ],
+        "cleanup before terminal": [
+            ("begin_preparing",),
+            ("append_cleanup_result", "e" * 64, {"nonfixture_write": 0}),
+        ],
+        "abort from prepared": [
+            ("begin_preparing",), ("mark_prepared",),
+            ("record_terminal", "NOT_TESTED", "d" * 64),
+        ],
+        "abort from preparing": [
+            ("begin_preparing",), ("record_terminal", "NOT_TESTED", "d" * 64),
+        ],
+        "claim with a mismatched authorization": [
+            ("begin_preparing",), ("mark_prepared",), ("claim_other_scenario",),
+        ],
+        "prepare with a mismatched authorization": [
+            ("begin_preparing",), ("mark_prepared_other_scenario",),
+        ],
+        "transition an unknown run": [("mark_running", "execute")],
+    }
+
+    def _drive(self, ledger, script):
+        request = self.request()
+        trace = []
+        for step in script:
+            op, args = step[0], step[1:]
+            try:
+                if op == "begin_preparing":
+                    result = ledger.begin_preparing(request)
+                elif op == "mark_prepared":
+                    result = ledger.mark_prepared(request, self.auth())
+                elif op == "mark_prepared_other_scenario":
+                    result = ledger.mark_prepared(
+                        request, self.auth(scenario_id="some-other-scenario")
+                    )
+                elif op == "claim":
+                    result = ledger.claim(request, self.auth())
+                elif op == "claim_other_scenario":
+                    result = ledger.claim(
+                        request, self.auth(scenario_id="some-other-scenario")
+                    )
+                elif op == "mark_running":
+                    result = ledger.mark_running(request.run_id, *args)
+                elif op == "record_terminal":
+                    result = ledger.record_terminal(request.run_id, *args)
+                elif op == "append_cleanup_result":
+                    result = ledger.append_cleanup_result(request.run_id, *args)
+                else:  # pragma: no cover - a typo in the script, not a behaviour
+                    raise AssertionError(f"unknown script op {op}")
+            except Exception as error:  # noqa: BLE001 - the outcome IS the value
+                trace.append((op, type(error).__name__, str(error)))
+            else:
+                if isinstance(result, m.RunAuthorization):
+                    result = result.authorization_digest
+                trace.append((op, "ok", result))
+        trace.append(("final", "state", ledger.state(request.run_id)))
+        trace.append(("final", "verdict", ledger.verdict(request.run_id)))
+        trace.append(
+            ("final", "ephemeral", ledger.peek_ephemeral(request.run_id) is not None)
+        )
+        return trace
+
+    def test_every_script_produces_the_identical_trace_on_both_ledgers(self):
+        for name, script in self.SCRIPTS.items():
+            with self.subTest(script=name):
+                self.store = FakeFirestore()
+                self.assertEqual(
+                    self._drive(lg.InMemoryRunLedger(), script),
+                    self._drive(self.firestore_ledger(), script),
+                )
+
+    # The only scripts that are supposed to run clean through. Named rather
+    # than counted, so adding a script that silently stops refusing shows up
+    # here instead of being absorbed by a threshold.
+    SCRIPTS_WITH_NO_REFUSAL = frozenset({
+        "happy path",
+        "terminal twice, identical",
+        "abort from prepared",
+        "abort from preparing",
+    })
+
+    def test_the_scripts_actually_exercise_refusals(self):
+        """A parity suite made only of happy paths would pass against a ledger
+        that refused nothing at all, so the refusals are pinned by name."""
+        clean = set()
+        for name, script in self.SCRIPTS.items():
+            self.store = FakeFirestore()
+            trace = self._drive(self.firestore_ledger(), script)
+            if not any(
+                outcome in ("LedgerStateError", "AuthorizationInvalid")
+                for _op, outcome, _detail in trace
+            ):
+                clean.add(name)
+        self.assertEqual(clean, self.SCRIPTS_WITH_NO_REFUSAL)
 
 
 if __name__ == "__main__":
