@@ -62,9 +62,35 @@ _SECRET_VERSION = re.compile(r"^[1-9][0-9]*$")
 _TWIN_RUNTIME_SA = re.compile(r"^sitesift-certification-runtime@[^@]+$")
 _IMAGE_BY_DIGEST = re.compile(r"^[^\s]+@sha256:[0-9a-f]{64}$")
 
+# A canonical non-negative decimal. `007` and ` 0 ` are other spellings of a
+# number the comparator was never handed, and a share it has to guess at is not
+# a share it may act on.
+_TRAFFIC_SHARE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
 
 class TwinContractError(RuntimeError):
     """Malformed input. Distinct from "the two specs differ"."""
+
+
+def _traffic_share(value: Any) -> int | None:
+    """The traffic share as a non-negative int, or None when it cannot be read.
+
+    Allowlisted rather than denylisted, because it guards an irreversible
+    effect: only a value that is PRESENT and spelled as a canonical
+    non-negative decimal is readable. Absent, empty, negative, zero-padded,
+    boolean, float, or a word all come back None and are refused BY NAME.
+
+    Coercing an unreadable value to the safe 0 would be sanitising: it hides
+    the caller's mistake and ships the verdict anyway. A refusal names the
+    field that tried to escape.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and _TRAFFIC_SHARE.match(value):
+        return int(value)
+    return None
 
 
 def _env(spec: Mapping[str, Any]) -> Dict[str, str]:
@@ -96,6 +122,25 @@ def _validate(candidate: Mapping[str, Any],
     # -- the twin is never a production traffic target -------------------
     if int(twin.get("trafficPercent", 0)) != 0:
         problems.append("twin carries production traffic; it may never be a target")
+
+    # -- and the candidate is not one YET --------------------------------
+    # Proof precedes promotion. The rollout holds 100% of positive traffic on
+    # the old revision until the stamp exists -- validate_topology(
+    # expected_positive=OLD_REVISION) in scripts/phase1_rollout.py -- so a
+    # candidate already carrying a share has had the effect this proof is
+    # supposed to gate. Certifying it afterwards is a record, not a gate.
+    #
+    # The residual comparison below cannot stand in for this rule. When the
+    # candidate and the twin carry the SAME nonzero share, normalization leaves
+    # two identical specs and the residual reports nothing at all; the input
+    # that matters most is exactly the one it is blind to.
+    candidate_share = _traffic_share(candidate.get("trafficPercent"))
+    if candidate_share is None:
+        problems.append("candidate trafficPercent is missing or unreadable; an "
+                        "unreadable share is not a share of zero")
+    elif candidate_share != 0:
+        problems.append("candidate carries production traffic; the promotion "
+                        "this proof gates has already happened")
 
     # -- credentials must be ABSENT from the twin ------------------------
     for name in FORBIDDEN_ON_TWIN:
