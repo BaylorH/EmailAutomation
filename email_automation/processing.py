@@ -7399,7 +7399,9 @@ def process_inbox_message(
                         proposal["skip_response"] = True
 
                 # Build event key for deduplication
-                event_key = build_event_key(event_type, event, thread_id)
+                event_key = build_event_key(
+                    event_type, event, thread_id, row_anchor=row_anchor
+                )
                 if (
                     event_type == "tour_requested"
                     and _is_tour_invite_thread(thread_data)

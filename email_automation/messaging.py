@@ -820,19 +820,20 @@ def mark_event_handled(user_id: str, thread_id: str, event_key: str,
         return False
 
 
-def build_event_key(event_type: str, event: dict = None, thread_id: str = None) -> str:
+def build_event_key(event_type: str, event: dict = None, thread_id: str = None,
+                    row_anchor: str = None) -> str:
     """
     Build a unique event key for deduplication.
 
     Different event types have different uniqueness requirements:
     - needs_user_input: unique per reason (confidential, scheduling, etc.)
-    - call_requested, tour_requested: unique per thread
-    - property_unavailable: unique per thread
+    - call_requested, tour_requested: unique per thread AND property
+    - property_unavailable: unique per thread AND property
     - new_property: unique per address+city
     - contact_optout: unique per thread
     - wrong_contact: unique per suggested contact
     - property_issue: unique per issue text
-    - close_conversation: unique per thread
+    - close_conversation: unique per thread AND property
     """
     event_data = event if isinstance(event, dict) else {}
 
@@ -862,6 +863,35 @@ def build_event_key(event_type: str, event: dict = None, thread_id: str = None) 
         return f"contact_optout:{reason}"
 
     else:
-        # For call_requested, tour_requested, property_unavailable, close_conversation
-        # These are unique per thread (one of each type per conversation)
-        return event_type
+        # call_requested, tour_requested, property_unavailable, close_conversation.
+        #
+        # These were "unique per thread (one of each type per conversation)" --
+        # the bare event type, with no property in the key at all.
+        #
+        # LIVE break (2026-08-06 production campaign), recorded as one of eight
+        # defects: "suppressed tour-action notification". A thread SURVIVES
+        # property replacement: when the original property goes unavailable and
+        # a replacement row is inserted, the same thread now concerns a
+        # different property. The replacement's tour hit the original's
+        # already-handled entry, is_event_handled returned True, and processing
+        # skipped it. The operator never saw the tour.
+        #
+        # These four are property-scoped, not thread-scoped, so the property
+        # belongs in the key -- exactly as new_property above already keys on
+        # address+city. Without it, "one per conversation" quietly means "one
+        # per conversation for the rest of the conversation's life, no matter
+        # how many properties it comes to be about".
+        #
+        # Direction of failure is deliberate: adding the property makes an
+        # already-handled event re-fire at most once after deploy. A duplicate
+        # notification is visible and recoverable; a suppressed one is
+        # invisible, which is the defect being fixed.
+        anchor = str(row_anchor or "").strip()
+        if not anchor:
+            # get_row_anchor really returns "Row data incomplete"/"Unknown
+            # property" for rows it cannot read, so an unidentified property is
+            # a normal occurrence rather than an impossible one. Keep such
+            # events distinguishable by thread instead of letting every
+            # unidentified property on every thread collapse onto one key.
+            anchor = f"unanchored:{str(thread_id or 'unknown-thread')}"
+        return f"{event_type}:{anchor}"

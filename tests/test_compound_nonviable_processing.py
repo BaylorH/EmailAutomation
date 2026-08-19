@@ -1255,7 +1255,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                handled["eventKey"] == "tour_requested"
+                handled["eventKey"].startswith("tour_requested:")
                 and handled["notifId"] == real_result["notifications"][0]["id"]
                 for handled in real_result["handledEvents"]
             )
@@ -1898,7 +1898,15 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             persist_handled_events=True,
         )
 
-        self.assertIn("tour_requested", thread_ref._data["handledEvents"])
+        # Property-scoped since the 2026-08-06 fix: a tour on a REPLACEMENT
+        # property must not collide with the original's handled entry on the
+        # same thread. Asserting the bare "tour_requested" key here is what
+        # encoded that collision.
+        self.assertTrue(
+            any(k.startswith("tour_requested:") for k in thread_ref._data["handledEvents"]),
+            f'expected a property-scoped tour_requested key, got '
+            f'{sorted(thread_ref._data["handledEvents"])}',
+        )
         offer_result["sendReply"].assert_not_called()
 
         # The operator reviewed the first action and sent a tour invite. The
