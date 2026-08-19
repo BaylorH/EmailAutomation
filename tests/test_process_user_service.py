@@ -547,3 +547,105 @@ class ProcessUserAuthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BidirectionalServiceFenceTests(unittest.TestCase):
+    """One image, two services, and neither may run the other's routes.
+
+    The certification twin runs the EXACT immutable candidate image, which is
+    the whole point -- proving a different build proves nothing about the one
+    being shipped. But the same image therefore contains `/process-user` and
+    `/process-outbox`, and on the twin those routes must be unreachable rather
+    than merely unused. The fence runs BEFORE the body is parsed and before any
+    provider client is constructed, because a route that validates first has
+    already touched the thing it was supposed to refuse.
+    """
+
+    ORDINARY = "process-user"
+    CERTIFICATION = "process-user-certification"
+
+    def setUp(self):
+        service.app.config["TESTING"] = True
+        self.client = service.app.test_client()
+
+    def _as(self, k_service):
+        return patch.dict(os.environ, {"K_SERVICE": k_service}, clear=False)
+
+    # -- ordinary routes are inert on the certification twin ---------------
+
+    def test_process_user_is_inert_on_the_certification_service(self):
+        with self._as(self.CERTIFICATION), \
+                patch("service.refresh_and_process_user") as pipeline, \
+                patch("service.run_with_user_lease") as lease:
+            response = self.client.post("/process-user", json={"uid": "real-user"})
+        self.assertEqual(response.status_code, 404)
+        pipeline.assert_not_called()
+        lease.assert_not_called()
+
+    def test_process_outbox_is_inert_on_the_certification_service(self):
+        with self._as(self.CERTIFICATION), \
+                patch("service.process_outbox_item_entry") as entry, \
+                patch("service.run_with_user_lease") as lease:
+            response = self.client.post(
+                "/process-outbox", json={"uid": "real-user", "outboxId": "outbox-1"}
+            )
+        self.assertEqual(response.status_code, 404)
+        entry.assert_not_called()
+        lease.assert_not_called()
+
+    def test_the_twin_refuses_the_ordinary_route_without_reading_the_body(self):
+        """A malformed body must not change the answer.
+
+        If the fence ran after parsing, a bad body would return 400 and a good
+        body 404 -- and that difference is a probe telling a caller which
+        service it reached.
+        """
+        with self._as(self.CERTIFICATION):
+            malformed = self.client.post("/process-user", data="{{not json")
+            wellformed = self.client.post("/process-user", json={"uid": "real-user"})
+        self.assertEqual(malformed.status_code, 404)
+        self.assertEqual(wellformed.status_code, 404)
+        self.assertEqual(malformed.get_json(), wellformed.get_json())
+
+    # -- certification routes are inert on ordinary production -------------
+
+    def test_every_certification_route_is_inert_on_ordinary_process_user(self):
+        operations = ("prepare", "run", "status", "review-input",
+                      "review", "abort", "recover", "cleanup")
+        with self._as(self.ORDINARY):
+            for operation in operations:
+                with self.subTest(operation=operation):
+                    response = self.client.post(
+                        f"/certification/{operation}",
+                        json={"scenarioId": "campaign-one-property",
+                              "runId": "r-1", "expectedRevision": "x"},
+                    )
+                    self.assertEqual(response.status_code, 404)
+
+    def test_certification_routes_are_reachable_on_the_twin(self):
+        """Guards against a fence that passes by disabling both directions."""
+        with self._as(self.CERTIFICATION):
+            response = self.client.post("/certification/status", json={})
+        self.assertNotEqual(response.status_code, 404)
+
+    # -- health is the only shared route -----------------------------------
+
+    def test_health_answers_on_both_services(self):
+        for k_service in (self.ORDINARY, self.CERTIFICATION):
+            with self.subTest(service=k_service), self._as(k_service):
+                self.assertEqual(self.client.get("/health").status_code, 200)
+                self.assertEqual(self.client.get("/healthz").status_code, 200)
+
+    # -- an unknown identity is not a free pass ----------------------------
+
+    def test_an_unrecognised_k_service_refuses_both_families(self):
+        """Fail closed. An unknown service name means the deployment changed in
+        a way this fence cannot reason about, and guessing either way is worse
+        than refusing both."""
+        with self._as("some-other-service"), \
+                patch("service.refresh_and_process_user") as pipeline:
+            ordinary = self.client.post("/process-user", json={"uid": "real-user"})
+            certification = self.client.post("/certification/status", json={})
+        self.assertEqual(ordinary.status_code, 404)
+        self.assertEqual(certification.status_code, 404)
+        pipeline.assert_not_called()

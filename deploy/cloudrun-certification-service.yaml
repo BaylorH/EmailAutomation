@@ -1,0 +1,135 @@
+# Cloud Run SERVICE definition for the PRIVATE certification twin.
+#
+# The twin runs the EXACT immutable candidate image -- byte-identical to the one
+# staged for production, referenced BY DIGEST, never by tag. Certifying a
+# differently-built artifact would prove nothing about the artifact being
+# shipped, which is the entire reason this service exists rather than a local
+# harness.
+#
+# What makes it safe is not that it behaves differently. It is that it CANNOT
+# reach anything real:
+#
+#   * a dedicated service account with NO mailbox, send, queue, or
+#     production-data authority;
+#   * ingress restricted to internal, and IAM invoker limited to the single
+#     certification operator principal -- there is no public route to it;
+#   * every mailbox/AI/Drive-publication secret deliberately ABSENT, so the
+#     transports cannot construct a provider client even if a code path tried;
+#   * K_SERVICE=process-user-certification, which the in-app bidirectional fence
+#     (service.py) uses to make /process-user and /process-outbox inert here,
+#     and /certification/* inert on ordinary production.
+#
+# The fence and this manifest are independent defenses on purpose. The fence
+# stops a route being served; the missing secrets and least-privilege identity
+# stop it mattering if one ever were.
+#
+# SCAFFOLD ONLY -- every ALL_CAPS_PLACEHOLDER must be replaced before
+# `gcloud run services replace`. Secret VALUES live in Secret Manager and are
+# referenced, never inlined. Do NOT build/push/deploy from this file
+# automatically.
+#
+# Apply (does NOT run automatically -- see deploy/README.md):
+#   gcloud run services replace deploy/cloudrun-certification-service.yaml \
+#     --region REGION --project PROJECT_ID_PLACEHOLDER
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: process-user-certification
+  labels:
+    app: email-automation
+    component: certification-twin
+  annotations:
+    run.googleapis.com/launch-stage: GA
+    # PRIVATE. Internal ingress only; the operator reaches it over an
+    # authenticated internal path. There is no unauthenticated surface, and no
+    # public URL, at any point in the run.
+    run.googleapis.com/ingress: internal
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "1"
+    spec:
+      # 540s matches the ordinary service. The runner's recovery threshold of
+      # 720s is this timeout plus a 180s margin, so a record younger than the
+      # threshold may still have an in-flight request behind it and must never
+      # be treated as stale.
+      timeoutSeconds: 540
+      # Exactly one in-flight request. Two concurrent certification runs sharing
+      # an instance could interleave fixture state, and a run that cannot be
+      # attributed to one fixture is not evidence.
+      containerConcurrency: 1
+      # NOT the compute default SA. This identity has access ONLY to the
+      # certification Firestore project/database and the exact shared fixture
+      # Sheet/Drive folder. No mailbox, send, queue, or production-data role.
+      serviceAccountName: sitesift-certification-runtime@PROJECT_ID_PLACEHOLDER.iam.gserviceaccount.com
+      containers:
+        - name: certification
+          # BY DIGEST, never by tag. A tag can be repointed after review; a
+          # digest is the identity the stamp is bound to. The CLI independently
+          # compares this digest against the staged production candidate and
+          # refuses the run if they differ.
+          image: REGION-docker.pkg.dev/PROJECT_ID_PLACEHOLDER/AR_REPO_PLACEHOLDER/email-automation@sha256:IMAGE_DIGEST_PLACEHOLDER
+          command: ["gunicorn"]
+          args:
+            - "--bind=:8080"
+            - "--workers=1"
+            - "--threads=8"
+            - "--max-requests=1"
+            - "--timeout=0"
+            - "service:app"
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          env:
+            # --- Service identity. The in-app bidirectional fence keys off this
+            #     exact value; an absent or unrecognised name fails closed. ---
+            - name: K_SERVICE
+              value: process-user-certification
+            # --- Revision binding. Both must be present, canonical, and equal
+            #     on candidate and twin. The route independently matches them
+            #     against Git and the Cloud Run Admin API; forged or missing
+            #     values reject the run rather than degrade it. ---
+            - name: SITESIFT_SOURCE_REVISION
+              value: SOURCE_REVISION_PLACEHOLDER
+            - name: SITESIFT_IMAGE_DIGEST
+              value: sha256:IMAGE_DIGEST_PLACEHOLDER
+            # --- The immutable NUMERIC fixture-config secret version. Every
+            #     concrete identity the run touches -- client, recipient, Sheet,
+            #     Drive folder -- is resolved from this, never from a request.
+            #     `latest` is deliberately NOT used: a stamp must bind the exact
+            #     version it executed against. ---
+            - name: SITESIFT_FIXTURE_CONFIG_SECRET_VERSION
+              value: FIXTURE_CONFIG_SECRET_VERSION_PLACEHOLDER
+            - name: SITESIFT_FIXTURE_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: sitesift-certification-fixture-config
+                  key: FIXTURE_CONFIG_SECRET_VERSION_PLACEHOLDER
+            #
+            # DELIBERATELY ABSENT, and each absence is a control, not an
+            # oversight. Re-adding any of these silently converts the twin into
+            # something that can cause a real effect:
+            #
+            #   AZURE_API_CLIENT_SECRET / AZURE_API_APP_ID
+            #       -> no Graph credential, so no mailbox read, send, or delete.
+            #   OPENAI_API_KEY
+            #       -> no model call. Model scenarios stop at
+            #          INSTRUMENT_BLOCKED:user_runtime_launch_required, which is
+            #          the correct verdict rather than a degraded one.
+            #   GOOGLE_OAUTH_CLIENT_ID / _SECRET / GOOGLE_REFRESH_TOKEN
+            #       -> no helper-account Drive authority, so no public link.
+            #   PROCESS_USER_AUTH
+            #       -> the ordinary shared-secret gate is meaningless here; the
+            #          ordinary routes are already inert on this service.
+            #   FIREBASE_API_KEY / FIREBASE_BUCKET
+            #       -> no production storage or client-API surface.
+            #
+            # GOOGLE_APPLICATION_CREDENTIALS is absent for the ordinary reason:
+            # Cloud Run supplies ADC from the service account above, so no key
+            # file exists in the image or on disk.

@@ -116,6 +116,56 @@ def _valid_document_id(value: str, *, max_length: int | None = None) -> bool:
     return len(value.encode("utf-8")) <= _MAX_FIRESTORE_DOCUMENT_ID_BYTES
 
 
+
+# ---------------------------------------------------------------------------
+# Bidirectional service fence
+# ---------------------------------------------------------------------------
+#
+# The certification twin runs the EXACT immutable candidate image. That is the
+# whole point -- certifying a differently-built artifact would prove nothing
+# about the one being shipped. The consequence is that the twin's image also
+# contains `/process-user` and `/process-outbox`, and the certification routes
+# ship inside ordinary production.
+#
+# So the fence runs in BOTH directions, and it runs in `before_request`: ahead
+# of body parsing, ahead of any provider client, ahead of the lease. A route
+# that validates before it refuses has already touched what it meant to refuse,
+# and a route whose refusal depends on the body leaks which service answered.
+
+ORDINARY_SERVICE = "process-user"
+CERTIFICATION_SERVICE = "process-user-certification"
+
+# Cloud Run always injects K_SERVICE. Absent means "not on Cloud Run" -- a local
+# dev server or a test process -- which stays ordinary so existing behavior is
+# unchanged. A PRESENT but unrecognised name is different: the deployment
+# changed in a way this fence cannot reason about, and guessing either way is
+# worse than refusing both families.
+_SHARED_PATHS = frozenset({"/health", "/healthz"})
+_CERTIFICATION_PREFIX = "/certification/"
+
+
+def _service_identity() -> str:
+    return (os.getenv("K_SERVICE") or ORDINARY_SERVICE).strip()
+
+
+def _route_family_allowed(path: str, identity: str) -> bool:
+    if path in _SHARED_PATHS:
+        return True
+    if path.startswith(_CERTIFICATION_PREFIX):
+        return identity == CERTIFICATION_SERVICE
+    return identity == ORDINARY_SERVICE
+
+
+@app.before_request
+def _enforce_service_fence():
+    """Refuse the other service's routes before anything else happens."""
+    if _route_family_allowed(request.path, _service_identity()):
+        return None
+    # 404, not 403: a distinguishable rejection is a probe that tells a caller
+    # which service it reached. The body is constant for the same reason.
+    return jsonify({"status": "error", "reason": "route_not_available"}), 404
+
+
 @app.get("/health")
 @app.get("/healthz")
 def healthz():
@@ -185,6 +235,77 @@ def process_outbox():
     if not isinstance(status, str) or status not in _PROCESS_OUTBOX_STATUSES:
         return jsonify({"status": "error", "reason": "processing_failed"}), 500
     return jsonify({"status": status}), 200
+
+
+
+# ---------------------------------------------------------------------------
+# Private revision-bound certification routes
+# ---------------------------------------------------------------------------
+#
+# Reachable ONLY on `process-user-certification` (see the fence above). The
+# request surface is closed: a caller names an approved scenario, a run id, and
+# the revision it expects. It may never name a user, client, recipient, body,
+# spreadsheet, thread, resource location, or oracle -- if it could, certification
+# could be pointed at a real person or made to assert its own success, and no
+# stamp would mean anything.
+#
+# NOT YET IMPLEMENTED, deliberately and visibly: the prepare/claim lifecycle
+# needs the permanent certification run ledger, which is a separate task. These
+# routes validate the locked schema and then return 501. A 501 here is a real
+# answer -- the route exists, the fence admits it, the schema is enforced -- and
+# it is never mistaken for a verdict, because a verdict can only come from the
+# runner's terminal record.
+
+_CERTIFICATION_RUN_KEYS = frozenset({"scenarioId", "runId", "expectedRevision"})
+_CERTIFICATION_RUN_SCOPED_KEYS = frozenset({"runId", "expectedRevision"})
+
+_CERTIFICATION_OPERATIONS = {
+    "prepare": _CERTIFICATION_RUN_KEYS,
+    "run": _CERTIFICATION_RUN_KEYS,
+    "status": _CERTIFICATION_RUN_SCOPED_KEYS,
+    "review-input": _CERTIFICATION_RUN_SCOPED_KEYS,
+    "abort": _CERTIFICATION_RUN_SCOPED_KEYS,
+    "recover": _CERTIFICATION_RUN_SCOPED_KEYS,
+    "cleanup": _CERTIFICATION_RUN_SCOPED_KEYS,
+}
+
+_CERTIFICATION_REVIEW_KEYS = frozenset(
+    {"runId", "expectedRevision", "reviewSetDigest", "rubricVersion", "reviews"}
+)
+
+
+def _certification_schema_error(body, allowed_keys) -> str | None:
+    """Exact keys, exact types. Anything else is a refusal, not a coercion."""
+    if not isinstance(body, dict):
+        return "invalid_request"
+    if set(body) != set(allowed_keys):
+        return "invalid_request"
+    for key in allowed_keys:
+        value = body[key]
+        if not isinstance(value, str) or not value or value != value.strip():
+            return "invalid_request"
+    return None
+
+
+@app.post("/certification/<operation>")
+def certification_operation(operation: str):
+    if operation == "review":
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or set(body) != _CERTIFICATION_REVIEW_KEYS:
+            return jsonify({"status": "error", "reason": "invalid_request"}), 400
+        if not isinstance(body.get("reviews"), list):
+            return jsonify({"status": "error", "reason": "invalid_request"}), 400
+        return jsonify({"status": "error", "reason": "not_implemented"}), 501
+
+    allowed = _CERTIFICATION_OPERATIONS.get(operation)
+    if allowed is None:
+        return jsonify({"status": "error", "reason": "route_not_available"}), 404
+
+    reason = _certification_schema_error(request.get_json(silent=True), allowed)
+    if reason:
+        return jsonify({"status": "error", "reason": reason}), 400
+
+    return jsonify({"status": "error", "reason": "not_implemented"}), 501
 
 
 if __name__ == "__main__":
