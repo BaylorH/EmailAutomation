@@ -505,5 +505,125 @@ class ADurableWriteNeverSilentlyPersistsNothingTests(LedgerCase):
         self.assertEqual(transaction._writes, [])
 
 
+class TerminalRecordingIsIdempotentTests(LedgerCase):
+    """A retried write must converge. A rewrite must not be possible.
+
+    Durable storage is what makes the distinction matter: the retry arrives from
+    a different process, minutes later, possibly after someone has already read
+    the result and acted on it. "Converge" and "overwrite" look identical from
+    the caller and are opposite facts.
+    """
+
+    def _claimed(self, ledger, request):
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        ledger.claim(request, self.auth())
+
+    def test_the_first_write_reports_true_and_an_identical_repeat_reports_false(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        self._claimed(ledger, request)
+        self.assertTrue(ledger.record_terminal(request.run_id, "FAIL", "d" * 64))
+        self.assertFalse(ledger.record_terminal(request.run_id, "FAIL", "d" * 64))
+        self.assertEqual(ledger.verdict(request.run_id), "FAIL")
+
+    def test_a_repeat_from_a_second_instance_also_converges(self):
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        self._claimed(first, request)
+        self.assertTrue(first.record_terminal(request.run_id, "FAIL", "d" * 64))
+        self.assertFalse(second.record_terminal(request.run_id, "FAIL", "d" * 64))
+
+    def test_a_repeat_carrying_a_different_verdict_is_refused(self):
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        self._claimed(first, request)
+        first.record_terminal(request.run_id, "FAIL", "d" * 64)
+        with self.assertRaises(lg.LedgerStateError):
+            second.record_terminal(request.run_id, "PASS", "d" * 64)
+        self.assertEqual(first.verdict(request.run_id), "FAIL")
+
+    def test_a_repeat_carrying_a_different_evidence_digest_is_refused(self):
+        """Same verdict, different evidence. Accepting it would leave a stamp
+        pointing at evidence that is not the evidence the verdict came from."""
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        self._claimed(first, request)
+        first.record_terminal(request.run_id, "PASS", "d" * 64)
+        with self.assertRaises(lg.LedgerStateError):
+            second.record_terminal(request.run_id, "PASS", "a" * 64)
+        row = self.store.docs[f"{lg.DEFAULT_RUNS_COLLECTION}/{request.run_id}"]
+        self.assertEqual(row["evidenceDigest"], "d" * 64)
+
+    def test_a_converging_repeat_writes_nothing_at_all(self):
+        """Not merely "changes nothing". A repeat that re-set the row would bump
+        it under any concurrent reader and could resurrect a consumed
+        authorization, so the convergent path commits no write."""
+        ledger, request = self.firestore_ledger(), self.request()
+        self._claimed(ledger, request)
+        ledger.record_terminal(request.run_id, "PASS", "d" * 64)
+        path = f"{lg.DEFAULT_RUNS_COLLECTION}/{request.run_id}"
+        version_before = self.store.versions[path]
+        self.assertFalse(ledger.record_terminal(request.run_id, "PASS", "d" * 64))
+        self.assertEqual(self.store.versions[path], version_before)
+
+    def test_an_unknown_verdict_is_refused_before_a_transaction_is_opened(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        self._claimed(ledger, request)
+        begins_before = self.store.begins
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.record_terminal(request.run_id, "MOSTLY_PASS", "d" * 64)
+        self.assertEqual(self.store.begins, begins_before)
+
+    def test_every_allowed_verdict_is_accepted(self):
+        for index, verdict in enumerate(lg.ALLOWED_VERDICTS):
+            with self.subTest(verdict=verdict):
+                store = FakeFirestore()
+                self.store = store
+                ledger = self.firestore_ledger()
+                request = self.request(run_id=f"cert-auth-000{index}")
+                ledger.begin_preparing(request)
+                self.assertTrue(
+                    ledger.record_terminal(request.run_id, verdict, "d" * 64)
+                )
+
+    def test_terminalizing_consumes_the_authorization_in_the_same_commit(self):
+        """A run that terminalizes from PREPARED -- an abort -- must not leave a
+        spendable authorization behind for a caller who still holds the run id."""
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        commits_before = self.store.commits
+        ledger.record_terminal(request.run_id, "NOT_TESTED", "d" * 64)
+        self.assertEqual(self.store.commits, commits_before + 1)
+        self.assertIsNone(ledger.peek_ephemeral(request.run_id))
+
+
+class CleanupEvidenceAppendsTests(LedgerCase):
+    """Repair evidence is additive and terminal-only. It never moves a verdict."""
+
+    def _terminal(self, ledger, request, verdict="FAIL"):
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        ledger.claim(request, self.auth())
+        ledger.record_terminal(request.run_id, verdict, "d" * 64)
+
+    def test_cleanup_evidence_appends_without_changing_the_verdict(self):
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        self._terminal(first, request)
+        self.assertTrue(second.append_cleanup_result(request.run_id, "e" * 64, {"residue": 0}))
+        self.assertTrue(first.append_cleanup_result(request.run_id, "f" * 64, {"residue": 2}))
+        row = first.export()[request.run_id]
+        self.assertEqual(row["verdict"], "FAIL")
+        self.assertEqual(row["cleanupEvidenceDigests"], ["e" * 64, "f" * 64])
+        self.assertEqual(row["residue"], {"residue": 2})
+
+    def test_cleanup_evidence_is_refused_before_the_run_is_terminal(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.append_cleanup_result(request.run_id, "e" * 64, {"residue": 0})
+
+
 if __name__ == "__main__":
     unittest.main()
