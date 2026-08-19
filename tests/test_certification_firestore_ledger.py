@@ -312,5 +312,198 @@ class FirestoreLedgerWalksTheMachineTests(LedgerCase):
             lg.FirestoreRunLedger(None)
 
 
+class RunIdsAreSingleUseAcrossInstancesTests(LedgerCase):
+    """The property the in-memory ledger structurally cannot demonstrate.
+
+    ``InMemoryRunLedger`` keeps its rows in one process, so "a run id is
+    consumed permanently" only ever means "for as long as this process lives".
+    Two ledger instances over one store is the smallest honest simulation of two
+    processes, and it is the only place the word "permanently" can be checked.
+    """
+
+    def _terminalized(self, ledger, request):
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        ledger.claim(request, self.auth())
+        ledger.record_terminal(request.run_id, "PASS", "d" * 64)
+
+    def test_a_second_instance_refuses_a_run_id_the_first_one_used(self):
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        first.begin_preparing(request)
+        with self.assertRaises(lg.LedgerStateError):
+            second.begin_preparing(request)
+
+    def test_a_terminalized_run_id_is_still_consumed_for_a_second_instance(self):
+        """Terminal is not a release. A finished run's id is the cheapest way to
+        make one authorization cover a second execution, so it stays spent."""
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        self._terminalized(first, request)
+        with self.assertRaises(lg.LedgerStateError):
+            second.begin_preparing(self.request())
+
+    def test_a_second_instance_reads_the_state_the_first_one_wrote(self):
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        first.begin_preparing(request)
+        self.assertEqual(second.state(request.run_id), "PREPARING")
+        first.mark_prepared(request, self.auth())
+        self.assertEqual(second.state(request.run_id), "PREPARED")
+        self.assertIsNotNone(second.peek_ephemeral(request.run_id))
+        first.claim(request, self.auth())
+        self.assertEqual(second.state(request.run_id), "CLAIMED")
+        self.assertIsNone(second.peek_ephemeral(request.run_id))
+
+    def test_a_run_prepared_by_one_instance_is_claimable_by_the_other_exactly_once(self):
+        first, second = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        first.begin_preparing(request)
+        first.mark_prepared(request, self.auth())
+        claimed = second.claim(request, self.auth())
+        self.assertEqual(claimed.run_id, request.run_id)
+        with self.assertRaises(lg.LedgerStateError):
+            first.claim(request, self.auth())
+
+
+class TransitionsAreMonotonicTests(LedgerCase):
+    """Forward only. A backwards step is how a claimed run runs twice."""
+
+    def test_state_never_moves_backwards(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        ledger.claim(request, self.auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.mark_prepared(request, self.auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.begin_preparing(request)
+
+    def test_a_run_cannot_be_claimed_before_it_is_prepared(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.claim(request, self.auth())
+
+    def test_only_a_claimed_run_may_run(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.mark_running(request.run_id, "execute")
+
+    def test_a_terminal_run_accepts_no_further_phase(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        ledger.claim(request, self.auth())
+        ledger.record_terminal(request.run_id, "PASS", "d" * 64)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.mark_running(request.run_id, "execute")
+
+    def test_an_unknown_run_is_not_transitionable(self):
+        ledger = self.firestore_ledger()
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.mark_running("never-seen", "execute")
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.record_terminal("never-seen", "PASS", "d" * 64)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.append_cleanup_result("never-seen", "e" * 64, {"residue": 0})
+
+
+class TheAuthorizationIsRevalidatedAtTheBoundaryTests(LedgerCase):
+    """A durable store makes the stored authorization editable between the
+    prepare and the claim, so the claim rechecks rather than trusting."""
+
+    def test_a_claim_whose_authorization_mismatches_the_request_is_refused(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        with self.assertRaises(m.AuthorizationInvalid):
+            ledger.claim(request, self.auth(scenario_id="some-other-scenario"))
+        self.assertEqual(ledger.state(request.run_id), "PREPARED")
+        self.assertIsNotNone(ledger.peek_ephemeral(request.run_id))
+
+    def test_a_claim_against_a_different_authorization_than_prepared_is_refused(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.claim(request, self.auth(fixture_config_secret_version="8"))
+
+    def test_a_wholesale_substituted_pair_is_caught_by_the_prepared_binding(self):
+        """Swapping BOTH request and authorization keeps them consistent with
+        each other, so the request binding cannot see it. What refuses it is
+        that the run was PREPARED under a different authorization."""
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.claim(
+                self.request(scenario_id="some-other-scenario"),
+                self.auth(scenario_id="some-other-scenario"),
+            )
+
+    def test_a_stored_authorization_edited_in_the_database_is_refused(self):
+        """The case only a DURABLE ledger has: the record sat in a database
+        between prepare and claim and a field was changed without recomputing
+        the digest. It fails on the way back in, and does NOT read as
+        'never prepared' -- those are different facts."""
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        path = f"{lg.DEFAULT_AUTHORIZATIONS_COLLECTION}/{request.run_id}"
+        self.store.docs[path]["source_revision"] = "0" * 40
+        with self.assertRaises(m.AuthorizationInvalid):
+            ledger.claim(request, self.auth())
+        self.assertEqual(ledger.state(request.run_id), "PREPARED")
+
+    def test_a_refused_step_commits_nothing(self):
+        """A transaction that raises rolls back, so a refusal leaves no partial
+        row behind -- there is no 'half prepared' state to recover from."""
+        ledger, request = self.firestore_ledger(), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+        commits_before = self.store.commits
+        with self.assertRaises(m.AuthorizationInvalid):
+            ledger.claim(request, self.auth(scenario_id="some-other-scenario"))
+        self.assertEqual(self.store.commits, commits_before)
+        self.assertGreater(self.store.rollbacks, 0)
+
+
+class ADurableWriteNeverSilentlyPersistsNothingTests(LedgerCase):
+    """A missing row reaching the write path must be LOUD.
+
+    ``claim`` and ``record_terminal`` both read a row that may not exist and then
+    write it. The shared transition rules refuse a missing row first, so the
+    write is unreachable with one -- but "unreachable today" is not a property.
+    Every call site in this codebase is wrapped in a broad ``except Exception``,
+    so a write that quietly did nothing would surface as a clean early return
+    and the caller would believe a terminal record was persisted when none was.
+    On the terminal and claim paths that is indistinguishable from success,
+    which is the exact failure a durable ledger exists to remove.
+    """
+
+    def test_writing_a_missing_row_is_refused_rather_than_skipped(self):
+        ledger = self.firestore_ledger()
+        transaction = self.store.transaction()
+        with self.assertRaises(lg.LedgerStateError) as caught:
+            ledger._write_row(transaction, "cert-auth-0001", None)
+        self.assertIn("cert-auth-0001", str(caught.exception))
+        self.assertEqual(transaction._writes, [], "a refused write buffered a write")
+
+    def test_a_row_carrying_an_unallowed_key_is_refused_at_the_write(self):
+        """The sanitization guard runs on the way OUT, immediately before the
+        write, so no future edit anywhere upstream can add a durable field
+        without this refusing it."""
+        ledger = self.firestore_ledger()
+        transaction = self.store.transaction()
+        row = dict(ledger._new_row(self.request()))
+        row["recipient"] = "broker@fixture.example.com"
+        with self.assertRaises(lg.LedgerStateError) as caught:
+            ledger._write_row(transaction, "cert-auth-0001", row)
+        self.assertIn("recipient", str(caught.exception))
+        self.assertEqual(transaction._writes, [])
+
+
 if __name__ == "__main__":
     unittest.main()

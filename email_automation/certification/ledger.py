@@ -38,10 +38,14 @@ from __future__ import annotations
 
 import hmac
 import threading
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
+# ``AuthorizationInvalid`` is deliberately NOT imported. Nothing here raises it:
+# the authorization revalidates ITSELF, in ``RunAuthorization.verify`` and
+# ``assert_matches_request``, and the exception travels through this module to
+# the caller. An import kept "for the exception this module raises" would be a
+# standing hint that the refusal lives here, and it does not.
 from email_automation.certification.models import (
-    AuthorizationInvalid,
     CertificationRequest,
     RunAuthorization,
 )
@@ -528,7 +532,26 @@ class FirestoreRunLedger(_RunLedgerStateMachine):
         transaction = self._client.transaction(max_attempts=self._max_attempts)
         return transactional(body)(transaction)
 
-    def _write_row(self, transaction: Any, run_id: str, row: Mapping[str, Any]) -> None:
+    def _write_row(
+        self, transaction: Any, run_id: str, row: Optional[Mapping[str, Any]]
+    ) -> None:
+        """Persist one durable row, refusing a missing one by name.
+
+        A row read from the store is ``Optional`` and the shared transition
+        rules refuse a missing one before this is reached -- so today the
+        ``None`` branch is unreachable. It is written anyway, because every
+        call site above is wrapped in a broad ``except Exception``: a write that
+        blew up on ``None``, or worse quietly wrote nothing, would surface as a
+        clean early return and the caller would believe a terminal record had
+        been persisted when none was. On the claim and terminal paths that is
+        indistinguishable from success, which is precisely the failure a durable
+        ledger exists to remove. So it refuses, loudly, naming the run.
+        """
+        if row is None:
+            raise LedgerStateError(
+                f"run {run_id} has no ledger row to persist; a durable write "
+                "with no row would record nothing while appearing to succeed"
+            )
         transaction.set(self._run_ref(run_id), dict(assert_row_is_sanitized(row)))
 
     # -- lifecycle ----------------------------------------------------------
