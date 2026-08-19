@@ -495,6 +495,156 @@ class RecoverTerminalizationTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# recover never executes -- structurally
+# ---------------------------------------------------------------------------
+#
+# "recover does not call execute()" is trivially true of any implementation on
+# the day it is written. These tests are about the day after: they must fail for
+# an edit that reintroduces execution, without anyone remembering to look.
+
+
+def recover_call_graph():
+    """Every call reachable from ``recover`` through lifecycle's own helpers.
+
+    Read from the SHIPPED source, not from a copy: this is the artifact that
+    runs, and a retyped call graph would only be testing itself.
+    """
+    source = (REPO_ROOT / "email_automation" / "certification" / "lifecycle.py")
+    tree = ast.parse(source.read_text())
+    functions = {node.name: node for node in tree.body
+                 if isinstance(node, ast.FunctionDef)}
+
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = dotted(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        return "<computed>"
+
+    seen, calls = set(), set()
+
+    def walk(name):
+        if name in seen or name not in functions:
+            return
+        seen.add(name)
+        for node in ast.walk(functions[name]):
+            if isinstance(node, ast.Call):
+                target = dotted(node.func)
+                calls.add(target)
+                walk(target)
+
+    walk("recover")
+    return calls, seen
+
+
+class RecoverNeverExecutesTests(unittest.TestCase):
+
+    # An ALLOWLIST of every call recovery is permitted to make. A denylist of
+    # execution verbs would fail open for the next entry point nobody named,
+    # and the thing on the other side of this check is a second real effect on
+    # a run that may already have caused its first.
+    ALLOWED_CALLS = frozenset({
+        # lifecycle's own read/quiesce/terminalize helpers
+        "_error", "_observe", "_probe", "_bounded_read", "_coerce_observation",
+        "_exact_int", "_quiesce", "_recovery_digest", "_recover_under_fence",
+        "default_ledger", "execution_forbidden",
+        # types and sanctioned digesting
+        "ReadbackTimeout", "RecordObservation", "canonical_digest",
+        # injected callables the caller owns
+        "clock", "sleeper", "cleaner", "reader",
+        # the ledger surface recovery may touch: read, terminalize, append
+        "ledger.state", "ledger.record_terminal", "ledger.append_cleanup_result",
+        # bounded readback machinery
+        "threading.Thread", "thread.start", "thread.join", "thread.is_alive",
+        "outcome.get", "row.get", "residue_rows.items",
+        # builtins
+        "dict", "getattr", "int", "isinstance", "str",
+    })
+
+    def test_recovery_calls_only_what_it_is_allowed_to_call(self):
+        calls, _reached = recover_call_graph()
+        self.assertEqual(
+            calls, self.ALLOWED_CALLS,
+            "recover's call graph changed. Every call it makes is approved "
+            "explicitly, because the one it must never make is an execution.",
+        )
+
+    def test_no_execution_entry_point_is_reachable_from_recovery(self):
+        """Stated separately from the allowlist so the intent survives a rename."""
+        calls, _reached = recover_call_graph()
+        rendered = " ".join(sorted(calls))
+        for forbidden in ("run_scenario", "execute", "send_outboxes",
+                          "runner", "claim", "mark_running", "certification_runtime"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_the_execution_fence_is_closed_while_recovery_runs(self):
+        ledger = ObservableLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-fence-closed")
+        observed = []
+        clock = FakeClock()
+        self.assertFalse(lifecycle.execution_is_forbidden())
+        payload, code = lifecycle.recover(
+            {"runId": "cert-fence-closed", "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger,
+            clock=clock.time, sleeper=clock.sleep,
+            cleaner=lambda run_id: (
+                observed.append(lifecycle.execution_is_forbidden()) or {"rows": 0}))
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(observed, [True])
+        self.assertFalse(lifecycle.execution_is_forbidden(),
+                         "the fence outlived the recovery that opened it")
+
+    def test_the_fence_refuses_an_execution_attempted_inside_it(self):
+        """The guard that would catch a future edit routing recovery into run()."""
+        with lifecycle.execution_forbidden():
+            with self.assertRaises(lifecycle.ExecutionForbidden):
+                lifecycle.run({"runId": "cert-fence-run",
+                               "expectedRevision": REVISION})
+
+    def test_the_fence_does_not_leak_to_an_ordinary_run(self):
+        """A process-global fence would break every legitimate run. Thread-local."""
+        with lifecycle.execution_forbidden():
+            leaked = []
+            thread = threading.Thread(
+                target=lambda: leaked.append(lifecycle.execution_is_forbidden()))
+            thread.start()
+            thread.join(5)
+        self.assertEqual(leaked, [False])
+
+    def test_recovery_completes_with_the_runner_poisoned(self):
+        """Runtime proof, not source reading.
+
+        The execution module is replaced with one that raises on ANY attribute
+        access, and the real product send entry point is replaced with a raiser.
+        A recovery that touched either would fail here rather than quietly
+        cause a second effect in production.
+        """
+
+        class PoisonedRunner:
+            def __getattr__(self, name):
+                raise AssertionError(f"recovery reached the runner: {name}")
+
+        def exploding_send(*args, **kwargs):
+            raise AssertionError("recovery reached the product send lane")
+
+        from email_automation import email as email_module
+
+        ledger = ObservableLedger(**quiescent_observation())
+        claimed_run(ledger, "cert-poisoned")
+        clock = FakeClock()
+        with patch.dict(sys.modules,
+                        {"email_automation.certification.runner": PoisonedRunner()}), \
+                patch.object(email_module, "send_outboxes", exploding_send):
+            payload, code = lifecycle.recover(
+                {"runId": "cert-poisoned", "expectedRevision": REVISION},
+                caller_identity_digest="c" * 64, ledger=ledger,
+                clock=clock.time, sleeper=clock.sleep)
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(payload["verdict"], "INSTRUMENT_BLOCKED")
+
+
+# ---------------------------------------------------------------------------
 # recover over HTTP
 # ---------------------------------------------------------------------------
 

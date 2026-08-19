@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
@@ -188,8 +189,41 @@ def prepare(body: Mapping[str, Any], *, caller_identity_digest: str,
     }, 200
 
 
+class ExecutionForbidden(RuntimeError):
+    """Business logic was reached from a lane that may never execute."""
+
+
+# Thread-local, not process-global: a global fence would refuse every
+# legitimate concurrent run, and a fence that breaks ordinary operation gets
+# removed by the next person who needs the instrument to work.
+_execution_fence = threading.local()
+
+
+@contextmanager
+def execution_forbidden():
+    """Close the fence for this thread. Restores whatever it replaced."""
+    previous = getattr(_execution_fence, "forbidden", False)
+    _execution_fence.forbidden = True
+    try:
+        yield
+    finally:
+        _execution_fence.forbidden = previous
+
+
+def execution_is_forbidden() -> bool:
+    return bool(getattr(_execution_fence, "forbidden", False))
+
+
 def run(body: Mapping[str, Any], *, caller_identity_digest: str = "",
         ledger=None, environ: Optional[Mapping[str, str]] = None) -> Response:
+    # Checked BEFORE the runner is even imported. Recovery runs its whole body
+    # inside the fence, so an edit that routes recovery through here raises
+    # instead of quietly causing a second effect on a run that may already have
+    # caused its first.
+    if execution_is_forbidden():
+        raise ExecutionForbidden(
+            "execution was attempted inside a lane that may never execute")
+
     from email_automation.certification import runner as runner_module
 
     ledger = ledger if ledger is not None else default_ledger()
@@ -435,11 +469,12 @@ def _quiesce(clock: Callable[[], float], sleeper: Callable[[float], None],
 def _recovery_digest(run_id: str, failure_code: str, waited: float,
                      residue: Mapping[str, int]) -> str:
     """Sanitized recovery facts only: no fixture value can reach this preimage."""
+    residue_rows = dict(residue)
     return canonical_digest({
         "recoveredRun": run_id,
         "failureCode": failure_code,
         "quiescenceWaitedSeconds": int(waited),
-        "residue": {str(k): int(v) for k, v in dict(residue).items()},
+        "residue": {str(k): int(v) for k, v in residue_rows.items()},
     })
 
 
@@ -450,11 +485,23 @@ def recover(body: Mapping[str, Any], *, caller_identity_digest: str = "",
             cleaner: Optional[Callable[[str], Mapping[str, int]]] = None) -> Response:
     """Read back, quiesce, clean, terminalize. Never execute.
 
-    There is deliberately no path from here into ``runner``: recovery imports
-    nothing that can run product code, and the whole body runs inside the
-    execution fence so that a future edit reaching for one fails loudly instead
-    of quietly causing a second effect.
+    The whole body runs inside the execution fence. That is the structural half
+    of the guarantee: recovery imports nothing that can run product code, and if
+    a later edit routes it into one anyway, ``run`` raises rather than causing a
+    second effect on a run that may already have caused its first.
     """
+    with execution_forbidden():
+        return _recover_under_fence(
+            body, caller_identity_digest=caller_identity_digest, ledger=ledger,
+            environ=environ, clock=clock, sleeper=sleeper, cleaner=cleaner)
+
+
+def _recover_under_fence(
+        body: Mapping[str, Any], *, caller_identity_digest: str = "",
+        ledger=None, environ: Optional[Mapping[str, str]] = None,
+        clock: Optional[Callable[[], float]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
+        cleaner: Optional[Callable[[str], Mapping[str, int]]] = None) -> Response:
     ledger = ledger if ledger is not None else default_ledger()
     clock = clock if clock is not None else _now_float
     sleeper = sleeper if sleeper is not None else _sleep
@@ -536,7 +583,8 @@ def recover(body: Mapping[str, Any], *, caller_identity_digest: str = "",
     residue: Dict[str, int] = {}
     residue_proven = False
     if cleaner is not None:
-        residue = {str(k): int(v) for k, v in dict(cleaner(run_id)).items()}
+        residue_rows = dict(cleaner(run_id))
+        residue = {str(k): int(v) for k, v in residue_rows.items()}
         residue_proven = True
 
     digest = _recovery_digest(run_id, "recovered_after_interruption", waited, residue)
