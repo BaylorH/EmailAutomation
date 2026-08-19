@@ -1,6 +1,22 @@
 """
 Integration tests that call the actual OpenAI API to validate extraction behavior.
 This tests the real propose_sheet_updates() function with simulated conversations.
+
+NOT A UNITTEST MODULE, despite the test_ prefix, and not runnable in the
+certification sweep on two independent counts.
+
+First, mechanically: there is no unittest.TestCase here. `python -m unittest
+tests.test_ai_integration` collects zero tests and exits 5, which the sweep
+records as FAIL. That is the filename, not the code -- see the same note in
+tests/test_harness.py, which explains why renaming is the real fix and why a
+triage pass is not the place to do it.
+
+Second, by design: call_openai() below issues a live
+openai_client.responses.create against gpt-4o. This module is a manual
+integration script that costs money and needs a real key, and it can never run
+in an offline sweep. Nothing here should be converted into automated coverage;
+the import-time guard already degrades to HAS_OPENAI = False, and the __main__
+guard keeps the sweep's import from making any call.
 """
 
 import sys

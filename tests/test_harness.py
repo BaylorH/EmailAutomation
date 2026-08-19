@@ -1,6 +1,31 @@
 """
 Test harness for email automation system.
 Simulates the conversation -> extraction -> sheet update pipeline.
+
+NOT A UNITTEST MODULE, despite the test_ prefix. There is no
+unittest.TestCase here; `python -m unittest tests.test_harness` collects zero
+tests and exits 5, which the certification sweep records as FAIL. It has been
+FAIL in every recorded baseline for that reason, and the reason is the filename.
+This file and tests/test_ai_integration.py are the only two test_*.py files in
+tests/ that are not unittest modules -- the directory's forty-odd other script
+harnesses are named for what they are (e2e_harness.py, integration_test.py,
+full_flow_test.py, standalone_test.py), which is why the sweep's test_*.py glob
+does not pick them up. Both arrived in 38d3f81 (2026-01-14), seven months before
+the certification instrument existed.
+
+Renaming is the actual fix and is deliberately NOT done here: it would drop the
+sweep from 200 modules to 198, and sweep.py's diff only walks modules present in
+the new run, so a disappeared module is silently ignored. Two FAILs would leave
+the diff with no signal at all. That is the orchestrator's call to make, not a
+triage pass's.
+
+Also worth knowing before anyone tries to "fix" the scenarios: this is a
+SIMULATOR. simulate_ai_extraction below is hand-written logic in this file, not
+product code, so its scenarios are checked against expectations written in the
+same file. run_all_scenarios() offline reports 13/15, with
+complete_info_first_reply and close_conversation disagreeing with their own
+fixtures. Reconciling those two would be reconciling the harness with itself and
+would say nothing about the pipeline.
 """
 
 import sys
