@@ -1565,10 +1565,15 @@ class NativeImageThreadBatchingTests(unittest.TestCase):
                     authenticated_mailbox_email=self.MAILBOX,
                 )
 
+        # attachment_snapshot=None: see bf3ddfd. The full-readback path acquires
+        # nothing ahead of time, so it must reach Graph itself; pinning the
+        # explicit None keeps that visible instead of letting a supplied
+        # snapshot slip in unnoticed.
         attachment_fetch.assert_called_once_with(
             self.HEADERS,
             messages[0]["id"],
             target_property_hint="912 Gemini St",
+            attachment_snapshot=None,
         )
 
     def test_success_marks_only_processed_predecessor_and_defers_later_messages(self):

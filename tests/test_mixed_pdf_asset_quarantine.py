@@ -494,9 +494,17 @@ class MixedPdfAssetQuarantineTests(unittest.TestCase):
         append_ai_meta.assert_not_called()
         insert_row.assert_not_called()
         send_reply.assert_not_called()
+        # attachment_snapshot=None is the production call shape: bf3ddfd threads
+        # an optional already-acquired snapshot through fetch_and_process_pdfs,
+        # and this path supplies none, so it must forward the explicit None. The
+        # kwarg is pinned rather than relaxed away -- a caller that quietly
+        # started supplying bytes here would be sourcing attachments from
+        # somewhere other than Graph, which is exactly what this test exists to
+        # notice.
         fetch_pdf_attachments.assert_called_once_with(
             {"Authorization": "Bearer fictional-token"},
             graph_message_id,
+            attachment_snapshot=None,
         )
         upload_pdf_to_drive.assert_called_once_with(PDF_NAME, self.pdf_bytes)
         upload_property_image.assert_called_once()
