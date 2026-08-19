@@ -43,11 +43,31 @@ OPERATOR_SERVICE_ACCOUNT = (
     "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
 )
 
-# Operations an agent may invoke. review-input returns raw captured subjects and
-# bodies for human naturalness review; it is Baylor's to read locally, and an
-# agent that fetched it would be holding fixture text it must never hold.
+# Operations an agent may invoke, and the ones it may not. EVERY route
+# operation appears in exactly one of these sets: an operation in neither used
+# to be refused only by the accident that its name was unknown, and an accident
+# stops protecting anything the day somebody types the name.
 AGENT_ALLOWED_OPERATIONS = frozenset({"prepare", "run", "status", "abort", "recover"})
-HUMAN_ONLY_OPERATIONS = frozenset({"review-input", "review"})
+
+# Human-only, each with the reason stated rather than implied. A list with no
+# reasons attached is a list somebody shortens.
+HUMAN_ONLY_REASONS = {
+    "review-input": (
+        "returns raw captured message text; it is a Baylor-manual command and "
+        "an agent may not call it or capture its output"
+    ),
+    "review": (
+        "records a human naturalness verdict; an agent recording one would be "
+        "certifying its own output"
+    ),
+    "cleanup": (
+        "is terminal-only repair: it mutates fixture state, appends durable "
+        "repair evidence to a permanent record, and destroys the review pack a "
+        "human has not necessarily read yet. Nothing in the agent's own flow "
+        "needs it, and the agent-safe surface stays as small as it can be"
+    ),
+}
+HUMAN_ONLY_OPERATIONS = frozenset(HUMAN_ONLY_REASONS)
 
 # Counts that must be present before a verdict means anything. A PASS without a
 # replay has not shown convergence; without a cleanup readback it has not shown
@@ -100,11 +120,13 @@ def read_source_state(repo: Path = REPO_ROOT) -> Tuple[bool, str, str]:
 
 
 def assert_agent_may_call(operation: str) -> None:
-    if operation in HUMAN_ONLY_OPERATIONS:
-        raise CertifyRefused(
-            f"{operation} returns raw captured message text; it is a Baylor-manual "
-            "command and an agent may not call it or capture its output"
-        )
+    """Refuse anything not explicitly agent-allowed, and say why when it is
+    known. "unknown certification operation" is the answer for a name nobody
+    classified, which is a refusal by accident -- so the human-only set carries
+    its own reasons and a test drives the REAL route table through this."""
+    reason = HUMAN_ONLY_REASONS.get(operation)
+    if reason is not None:
+        raise CertifyRefused(f"{operation} {reason}")
     if operation not in AGENT_ALLOWED_OPERATIONS:
         raise CertifyRefused(f"unknown certification operation: {operation}")
 

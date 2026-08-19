@@ -250,11 +250,15 @@ def process_outbox():
 # could be pointed at a real person or made to assert its own success, and no
 # stamp would mean anything.
 #
-# `review` and `cleanup` are NOT YET IMPLEMENTED, deliberately and visibly: they
-# validate the locked schema and then return 501. A 501 here is a real answer --
-# the route exists, the fence admits it, the schema is enforced -- and it is
-# never mistaken for a verdict, because a verdict can only come from the
-# runner's terminal record.
+# `review` is NOT YET IMPLEMENTED, deliberately and visibly: it validates the
+# locked schema and then returns 501. A 501 here is a real answer -- the route
+# exists, the fence admits it, the schema is enforced -- and it is never
+# mistaken for a verdict, because a verdict can only come from the runner's
+# terminal record.
+#
+# `cleanup` is implemented and is TERMINAL-ONLY REPAIR: it appends repair
+# evidence and discards the transient review pack, and it can reach no line that
+# writes a verdict. It is human-only in the CLI.
 #
 # `review-input` is the one operation whose response is NOT sanitized: it
 # returns redacted captured subjects and bodies for human naturalness review.
@@ -348,6 +352,9 @@ _CERTIFICATION_HANDLERS = {
     "status": "status",
     "abort": "abort",
     "recover": "recover",
+    # Terminal-only repair. It appends and discards; it can reach no line that
+    # writes a verdict, and the CLI classifies it human-only.
+    "cleanup": "cleanup",
     # The one handler whose response is not sanitized. It exists for Baylor's
     # manual CLI use; the agent-facing CLI has no capability to call it.
     "review-input": "review_input",
@@ -413,9 +420,9 @@ def certification_operation(operation: str):
 
     handler = _CERTIFICATION_HANDLERS.get(operation)
     if handler is None:
-        # `cleanup` is a real operation with a real contract that is not built
-        # yet. 501 says so; it is never a verdict, because a verdict can only
-        # come from the ledger's terminal record.
+        # An operation with a real contract that is not built yet. 501 says so;
+        # it is never a verdict, because a verdict can only come from the
+        # ledger's terminal record.
         return jsonify({"status": "error", "reason": "not_implemented"}), 501
 
     # Imported lazily so ordinary production never loads the certification

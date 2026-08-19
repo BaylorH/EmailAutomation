@@ -779,6 +779,110 @@ def _recover_under_fence(
             "recoveryDigest": digest}, 200
 
 
+# ---------------------------------------------------------------------------
+# cleanup
+# ---------------------------------------------------------------------------
+#
+# TERMINAL-ONLY REPAIR, and the third disjoint domain: ``abort`` owns the run
+# proven not to have executed, ``recover`` owns the one that may have, and
+# cleanup owns what both leave behind -- a run whose verdict is already on the
+# record and whose artifacts may not be. Cleaning anything earlier would delete
+# a fixture out from under an execution that could still be running.
+#
+# Two properties carry it, and both are structural rather than reviewed.
+#
+# IT NEVER EXECUTES. Its whole body runs inside the same execution fence
+# recovery uses, and its call graph is approved by its OWN allowlist in the
+# tests -- not recovery's widened to fit both, which would have handed recovery
+# a discard and cleanup a terminalization.
+#
+# IT NEVER CHANGES A VERDICT. Not "does not today": ``record_terminal`` is not
+# in its call graph at all, so there is no line it can reach that writes one.
+# ``append_cleanup_result`` is documented as appending exactly because a verdict
+# somebody may already have acted on is not rewritable.
+#
+# What it may do is narrow and stated: read the state and the verdict, discard
+# the transient review pack (the one artifact holding raw captured prose, which
+# ``review_input`` already documents as cleanup's to own), run a caller-supplied
+# residue reader, and append what that reader MEASURED. When there is no reader
+# there is no measurement, and the answer is ``residueProven: false`` -- never an
+# empty residue map, which would read as a proven zero and would blank a zero
+# some earlier recovery actually proved.
+
+# ALLOWLIST, for the same reason recovery has one: a denylist fails open for any
+# state added later, and cleanup deletes things.
+CLEANABLE_STATES = (ledger_module.TERMINAL,)
+
+
+def _cleanup_digest(run_id: str, residue: Mapping[str, int],
+                    review_pack_discarded: bool) -> str:
+    """Sanitized repair facts only: no fixture value can reach this preimage."""
+    residue_rows = dict(residue)
+    return canonical_digest({
+        "cleanedRun": run_id,
+        "residue": {str(k): int(v) for k, v in residue_rows.items()},
+        "reviewPackDiscarded": bool(review_pack_discarded),
+    })
+
+
+def cleanup(body: Mapping[str, Any], *, caller_identity_digest: str = "",
+            ledger=None, environ: Optional[Mapping[str, str]] = None,
+            store=None,
+            cleaner: Optional[Callable[[str], Mapping[str, int]]] = None) -> Response:
+    """Discard, sweep, append. Never execute, and never rewrite a verdict.
+
+    The whole body runs inside the execution fence, so a later edit that routes
+    cleanup into an execution lane raises rather than causing an effect on a run
+    whose result is already recorded and may already have been acted on.
+    """
+    with execution_forbidden():
+        return _cleanup_under_fence(
+            body, caller_identity_digest=caller_identity_digest, ledger=ledger,
+            environ=environ, store=store, cleaner=cleaner)
+
+
+def _cleanup_under_fence(
+        body: Mapping[str, Any], *, caller_identity_digest: str = "",
+        ledger=None, environ: Optional[Mapping[str, str]] = None,
+        store=None,
+        cleaner: Optional[Callable[[str], Mapping[str, int]]] = None) -> Response:
+    ledger, refusal = _ledger_or_refusal(ledger)
+    if refusal is not None:
+        return refusal
+    store = store if store is not None else default_review_store()
+    run_id = body["runId"]
+
+    state = ledger.state(run_id)
+    if state is None:
+        return _error("unknown_run", 404)
+    if state not in CLEANABLE_STATES:
+        # PREPARING/PREPARED belong to abort and CLAIMED/RUNNING to recovery.
+        # Both of those can still become a verdict; this one already is.
+        return _error("not_cleanable", 409)
+
+    # READ, never written. It is echoed so a caller can see what cleanup left
+    # alone, and it is the only place the verdict appears in this function.
+    verdict = ledger.verdict(run_id) or ""
+
+    discarded = bool(store.discard(run_id))
+
+    residue: Dict[str, int] = {}
+    residue_proven = False
+    if cleaner is not None:
+        residue_rows = dict(cleaner(run_id))
+        residue = {str(k): int(v) for k, v in residue_rows.items()}
+        residue_proven = True
+
+    digest = _cleanup_digest(run_id, residue, discarded)
+    if residue_proven:
+        ledger.append_cleanup_result(run_id, digest, residue)
+
+    return {"status": "ok", "state": ledger_module.TERMINAL, "runId": run_id,
+            "verdict": verdict, "residueProven": residue_proven,
+            "residue": residue, "reviewPackDiscarded": discarded,
+            "cleanupDigest": digest}, 200
+
+
 def _now_epoch() -> int:
     import time
     return int(time.time())
