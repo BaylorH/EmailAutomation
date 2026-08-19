@@ -17,6 +17,7 @@ until now: it was caught only incidentally, by the generic post-normalization
 residual comparison, and only when the two sides happened to disagree.
 """
 
+import inspect
 import os
 import unittest
 from pathlib import Path
@@ -155,6 +156,10 @@ UNREADABLE_CANDIDATE_SHARE_REFUSAL = (
     "not a share of zero"
 )
 TWIN_TRAFFIC_REFUSAL = "twin carries production traffic; it may never be a target"
+UNREADABLE_TWIN_SHARE_REFUSAL = (
+    "twin trafficPercent is missing or unreadable; an unreadable share is not "
+    "a share of zero"
+)
 RESIDUAL_MARKER = "unpaired difference after normalization"
 
 
@@ -321,6 +326,200 @@ class CandidateTrafficIsSpecifiedNotIncidentalTests(unittest.TestCase):
         twin_only = tc._validate(_candidate(), _twin(trafficPercent=100))
         self.assertIn(TWIN_TRAFFIC_REFUSAL, twin_only)
         self.assertNotIn(CANDIDATE_TRAFFIC_REFUSAL, twin_only)
+
+
+class TwinTrafficIsReadOnTheSameAllowlistTests(unittest.TestCase):
+    """The twin's gate is specified identically to the candidate's.
+
+    The candidate gate above reads its share through ``_traffic_share`` -- an
+    ALLOWLIST: only a value that is PRESENT and spelled as a canonical
+    non-negative decimal is readable, and everything else is refused BY NAME.
+    The twin gate was still denylist-shaped (``int(twin.get("trafficPercent",
+    0)) != 0``), which had two consequences and both of them point the wrong
+    way for a gate whose whole job is proving a twin carries no traffic:
+
+    * an ABSENT key was silently read as zero -- "we could not find the value"
+      became "the value is safely zero";
+    * a non-numeric value raised a bare ``ValueError`` out of ``_validate`` --
+      an uncaught crash rather than a refusal, which blurs
+      ``instrument_blocked`` against ``fail``. Never-exercised must not read as
+      exercised-and-clean, and a crash reads as neither.
+
+    Asymmetry between the two sides of a comparison is itself the defect: the
+    two gates must be specified the same way or one of them is guessing.
+    """
+
+    # -- vacuity guards: the rules must be SILENT on good input -------------
+
+    def test_a_baseline_candidate_and_twin_still_compare_clean(self):
+        """If the fixtures did not agree to begin with, every assertion below
+        would pass for the wrong reason."""
+        self.assertEqual(tc.compare(_candidate(), _twin()), [])
+
+    def test_a_zero_traffic_twin_produces_neither_twin_traffic_complaint(self):
+        """A rule that always fires pins nothing. Both spellings of a readable
+        zero -- the int and the canonical string -- must be silent."""
+        for share in (0, "0"):
+            with self.subTest(trafficPercent=share):
+                problems = tc._validate(_candidate(), _twin(trafficPercent=share))
+                self.assertNotIn(TWIN_TRAFFIC_REFUSAL, problems)
+                self.assertNotIn(UNREADABLE_TWIN_SHARE_REFUSAL, problems)
+
+    # -- an unreadable share is refused, never coerced to a safe zero -------
+
+    def test_an_unreadable_twin_share_is_refused_rather_than_read_as_zero(self):
+        """Allowlist, not denylist. Missing is the case that matters most: a
+        gate that reads an absent key as zero proves nothing about a twin, it
+        only proves the key was absent. Unprovable must refuse.
+
+        Refuse rather than sanitize -- a coerced 0 hides the caller's mistake
+        and ships the verdict anyway; a refusal names the field that tried to
+        escape.
+        """
+        missing = _twin()
+        del missing["trafficPercent"]
+        cases = {
+            "missing": missing,
+            "empty string": _twin(trafficPercent=""),
+            "non numeric": _twin(trafficPercent="fifty"),
+            "none": _twin(trafficPercent=None),
+            "float": _twin(trafficPercent=0.0),
+            "bool": _twin(trafficPercent=False),
+            "negative": _twin(trafficPercent=-1),
+            "leading zero": _twin(trafficPercent="00"),
+            "padded": _twin(trafficPercent=" 0 "),
+        }
+        for label, spec in cases.items():
+            with self.subTest(share=label):
+                self.assertIn(UNREADABLE_TWIN_SHARE_REFUSAL,
+                              tc._validate(_candidate(), spec))
+
+    def test_the_refusal_names_the_field_that_tried_to_escape(self):
+        """A refusal that did not say WHICH field was unreadable would send the
+        reader back to guess between two identically-shaped gates."""
+        self.assertIn("twin trafficPercent", UNREADABLE_TWIN_SHARE_REFUSAL)
+
+    def test_an_unreadable_twin_share_is_not_reported_as_carrying_traffic(self):
+        """"We cannot read it" and "it is serving users" are different facts and
+        must not share a sentence."""
+        missing = _twin()
+        del missing["trafficPercent"]
+        problems = tc._validate(_candidate(), missing)
+        self.assertIn(UNREADABLE_TWIN_SHARE_REFUSAL, problems)
+        self.assertNotIn(TWIN_TRAFFIC_REFUSAL, problems)
+
+    # -- no bare ValueError may escape _validate ---------------------------
+
+    def test_a_non_numeric_share_refuses_instead_of_crashing_out_of_validate(self):
+        """A crash is neither ``fail`` nor ``instrument_blocked``; it destroys
+        the distinction the whole instrument rests on. ``int("fifty")`` raised a
+        bare ValueError straight out of ``_validate``.
+        """
+        for spec in (_twin(trafficPercent="fifty"),
+                     _twin(trafficPercent=None),
+                     _twin(trafficPercent=" 0 ")):
+            with self.subTest(trafficPercent=spec.get("trafficPercent")):
+                try:
+                    problems = tc._validate(_candidate(), spec)
+                except tc.TwinContractError:
+                    continue
+                except Exception as exc:  # noqa: BLE001 -- that is the point
+                    self.fail(f"bare {type(exc).__name__} escaped _validate: {exc}")
+                self.assertIn(UNREADABLE_TWIN_SHARE_REFUSAL, problems)
+
+    def test_compare_refuses_an_unreadable_twin_share_without_crashing(self):
+        """The same property at the public entry point, since ``compare`` is
+        what a caller actually reaches."""
+        try:
+            differences = tc.compare(_candidate(), _twin(trafficPercent="fifty"))
+        except tc.TwinContractError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.fail(f"bare {type(exc).__name__} escaped compare: {exc}")
+        self.assertIn(UNREADABLE_TWIN_SHARE_REFUSAL, differences)
+
+    # -- the rule must hold where normalization cannot reach ---------------
+
+    def test_the_rule_holds_when_both_sides_are_unreadable_the_same_way(self):
+        """The case the generic residual comparison structurally cannot see.
+
+        Both specs are missing ``trafficPercent``, so normalization leaves two
+        specs that agree about it and the residual reports nothing about it at
+        all. There is no ``trafficPercent: unpaired difference after
+        normalization`` line to lean on. This input is caught by the named rule
+        or by nothing.
+        """
+        candidate, twin = _candidate(), _twin()
+        del candidate["trafficPercent"]
+        del twin["trafficPercent"]
+        self.assertIn(UNREADABLE_TWIN_SHARE_REFUSAL, tc._validate(candidate, twin))
+
+    def test_the_residual_comparison_is_blind_to_that_same_missing_key(self):
+        """Proof of the sentence above rather than an assertion about it: after
+        normalization the two specs are byte-identical, so every difference the
+        residual loop could report is already gone."""
+        candidate, twin = _candidate(), _twin()
+        del candidate["trafficPercent"]
+        del twin["trafficPercent"]
+        left, right = tc.normalize(candidate, twin)
+        self.assertEqual(left, right)
+
+    def test_the_named_rule_is_not_the_generic_residual_wearing_a_new_name(self):
+        """A pin matching the substring "traffic" would be satisfied by
+        ``trafficPercent: unpaired difference after normalization``. Key on the
+        exact sentence instead."""
+        differences = tc.compare(_candidate(), _twin(trafficPercent=""))
+        self.assertTrue(
+            any(RESIDUAL_MARKER not in d and d == UNREADABLE_TWIN_SHARE_REFUSAL
+                for d in differences),
+            f"only the generic residual reported it: {differences}",
+        )
+
+    # -- neither rule may be deleted in favour of the other ----------------
+
+    def test_the_twin_rule_is_not_the_candidate_rule_wearing_a_new_name(self):
+        """The mirror image of
+        ``test_the_candidate_rule_is_not_the_twin_rule_wearing_a_new_name``.
+        Each side is refused on its own sentence, so deleting either rule
+        changes an outcome.
+        """
+        self.assertNotEqual(UNREADABLE_TWIN_SHARE_REFUSAL,
+                            UNREADABLE_CANDIDATE_SHARE_REFUSAL)
+
+        twin_only = _twin()
+        del twin_only["trafficPercent"]
+        problems = tc._validate(_candidate(), twin_only)
+        self.assertIn(UNREADABLE_TWIN_SHARE_REFUSAL, problems)
+        self.assertNotIn(UNREADABLE_CANDIDATE_SHARE_REFUSAL, problems)
+
+        candidate_only = _candidate()
+        del candidate_only["trafficPercent"]
+        problems = tc._validate(candidate_only, _twin())
+        self.assertIn(UNREADABLE_CANDIDATE_SHARE_REFUSAL, problems)
+        self.assertNotIn(UNREADABLE_TWIN_SHARE_REFUSAL, problems)
+
+    def test_both_sides_unreadable_are_reported_separately_not_once(self):
+        """Two broken fields are two facts. Collapsing them would let a fix to
+        one look like a fix to both."""
+        candidate, twin = _candidate(), _twin()
+        del candidate["trafficPercent"]
+        del twin["trafficPercent"]
+        problems = tc._validate(candidate, twin)
+        self.assertIn(UNREADABLE_CANDIDATE_SHARE_REFUSAL, problems)
+        self.assertIn(UNREADABLE_TWIN_SHARE_REFUSAL, problems)
+
+    def test_both_gates_read_their_share_through_the_same_helper(self):
+        """The asymmetry WAS the bug. If one side ever grows its own reader
+        again, the two gates stop being specified the same way and this test is
+        the only place that would say so.
+        """
+        source = inspect.getsource(tc._validate)
+        self.assertNotIn('twin.get("trafficPercent", 0)', source)
+        self.assertEqual(
+            2, source.count("_traffic_share("),
+            "both the candidate and the twin gate must read through "
+            f"_traffic_share:\n{source}")
+
 
 
 if __name__ == "__main__":

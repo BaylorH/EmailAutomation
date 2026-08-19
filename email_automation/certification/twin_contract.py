@@ -120,7 +120,22 @@ def _validate(candidate: Mapping[str, Any],
             problems.append(f"{field} differs: {candidate.get(field)} vs {twin.get(field)}")
 
     # -- the twin is never a production traffic target -------------------
-    if int(twin.get("trafficPercent", 0)) != 0:
+    # Read through the SAME allowlist helper as the candidate below. This gate
+    # was denylist-shaped -- an int() of the raw value defaulted to zero -- and
+    # the asymmetry between the two sides of one comparison was itself the
+    # defect:
+    # an ABSENT key was read as a safe zero, so "we could not find the value"
+    # became "the value is fine" -- the wrong direction for a gate whose whole
+    # job is to prove a twin carries no traffic. A missing field is unprovable,
+    # and unprovable must refuse. A non-numeric value additionally raised a bare
+    # ValueError straight out of _validate, which is neither `fail` nor
+    # `instrument_blocked`: never-exercised must not read as exercised-and-clean,
+    # and a crash reads as neither.
+    twin_share = _traffic_share(twin.get("trafficPercent"))
+    if twin_share is None:
+        problems.append("twin trafficPercent is missing or unreadable; an "
+                        "unreadable share is not a share of zero")
+    elif twin_share != 0:
         problems.append("twin carries production traffic; it may never be a target")
 
     # -- and the candidate is not one YET --------------------------------
