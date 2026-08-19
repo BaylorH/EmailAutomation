@@ -2036,6 +2036,32 @@ class CertificationCliTests(unittest.TestCase):
                             cli.new_run_id("campaign-one-property", nonce="b"))
 
 
+# -- the twin the shipped deploy script really produces -----------------------
+#
+# READ off the shipped artifacts, never restated here. The derivation itself
+# lives once, in tests/test_certification_mutation_controls.py -- which already
+# parses scripts/deploy_certification_twin.sh for the IAM-denial pins -- and is
+# imported rather than copied, so there is exactly one place in this suite that
+# knows how to read those artifacts.
+#
+# The alternative was to type these nine values out with a comment naming their
+# provenance. That was tried and rejected on evidence: renaming the service in
+# deploy/cloudrun-service.yaml left the typed-out copy green, because a fixture
+# that restates a value it should be reading only ever tests its own copy. That
+# is the exact defect this project has now paid for repeatedly, and it is the
+# reason the fixture pair below described a twin nobody could deploy.
+#
+#   PRODUCTION_SERVICE  deploy/cloudrun-service.yaml, metadata.name
+#   TWIN_ONLY_ENV       scripts/deploy_certification_twin.sh, --set-env-vars
+#                       and --set-secrets, filtered to twin_contract.TWIN_ONLY
+from tests.test_certification_mutation_controls import (  # noqa: E402
+    PRODUCTION_SERVICE as CANDIDATE_SERVICE,
+    TWIN_ONLY_ENV as DEPLOYED_TWIN_ONLY_ENV,
+)
+
+TWIN_SERVICE = DEPLOYED_TWIN_ONLY_ENV["K_SERVICE"]
+
+
 class CertificationTwinDeployTests(unittest.TestCase):
     """The candidate/twin normalized-difference comparator.
 
@@ -2057,7 +2083,7 @@ class CertificationTwinDeployTests(unittest.TestCase):
     def _candidate(self, **overrides):
         spec = {
             "image": "region-docker.pkg.dev/p/r/email-automation@sha256:" + "a" * 64,
-            "serviceName": "process-user",
+            "serviceName": CANDIDATE_SERVICE,
             "serviceAccount": "123-compute@developer.gserviceaccount.com",
             "trafficPercent": 0,
             "env": {
@@ -2078,7 +2104,7 @@ class CertificationTwinDeployTests(unittest.TestCase):
     def _twin(self, **overrides):
         spec = {
             "image": "region-docker.pkg.dev/p/r/email-automation@sha256:" + "a" * 64,
-            "serviceName": "process-user-certification",
+            "serviceName": TWIN_SERVICE,
             "serviceAccount": "sitesift-certification-runtime@p.iam.gserviceaccount.com",
             "trafficPercent": 0,
             "env": {
@@ -2086,10 +2112,12 @@ class CertificationTwinDeployTests(unittest.TestCase):
                 "SITESIFT_IMAGE_DIGEST": "sha256:" + "a" * 64,
                 "OPENAI_API_KEY": "secret://openai-api-key/latest",
                 "USAGE_MONTHLY_BUDGET_USD": "50",
-                "K_SERVICE": "process-user-certification",
-                "FIRESTORE_DATABASE": "sitesift-certification",
-                "CERTIFICATION_FIXTURE_CONFIG":
-                    "sitesift-certification-fixture-config:7",
+                # All EIGHT approved twin-only fields, with the values the
+                # shipped script would really set. This fixture named three of
+                # them while the script set eight, so it described a twin that
+                # could not be deployed -- and the vacuity guard that was
+                # supposed to notice was the thing that broke.
+                **DEPLOYED_TWIN_ONLY_ENV,
             },
             "containerConcurrency": 1,
             "timeoutSeconds": 540,
@@ -2165,6 +2193,23 @@ class CertificationTwinDeployTests(unittest.TestCase):
         candidate = self._candidate()
         candidate["env"]["FIRESTORE_DATABASE"] = "sitesift-certification"
         self.assertTrue(self._comparator().compare(candidate, self._twin()))
+
+    def test_every_twin_only_field_is_refused_in_both_directions(self):
+        """An entry that only said "ignore this key" would be a hole with a
+        label on it. Each classified name is REQUIRED on the twin and FORBIDDEN
+        on the candidate, and both directions are refused BY NAME."""
+        tc = self._comparator()
+        for name in tc.TWIN_ONLY:
+            with self.subTest(name=name, direction="missing from twin"):
+                twin = self._twin()
+                del twin["env"][name]
+                self.assertIn(f"{name} is missing from the twin",
+                              tc.compare(self._candidate(), twin))
+            with self.subTest(name=name, direction="present on candidate"):
+                candidate = self._candidate()
+                candidate["env"][name] = self._twin()["env"][name]
+                self.assertIn(f"{name} must not appear on the candidate",
+                              tc.compare(candidate, self._twin()))
 
     # -- must differ exactly -------------------------------------------------
 

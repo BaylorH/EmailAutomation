@@ -41,12 +41,16 @@ import shlex
 import unittest
 from pathlib import Path
 
+import yaml
+
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 from email_automation.certification import twin_contract as tc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TWIN_DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_certification_twin.sh"
+TWIN_MANIFEST = REPO_ROOT / "deploy" / "cloudrun-certification-service.yaml"
+ORDINARY_MANIFEST = REPO_ROOT / "deploy" / "cloudrun-service.yaml"
 
 # The exact sentences the rules emit. Keying on these is the whole point: the
 # generic residual comparison produces a DIFFERENT sentence for the same input,
@@ -59,10 +63,119 @@ TWIN_TRAFFIC_REFUSAL = "twin carries production traffic; it may never be a targe
 RESIDUAL_MARKER = "unpaired difference after normalization"
 
 
+# -- reading the shipped artifacts -------------------------------------------
+#
+# Parsed rather than restated. A flag cannot be satisfied by an unrelated
+# mention in a comment or a printf, reordering the flags does not break a pin,
+# and -- the point of this whole block -- a fixture that rebuilds a value which
+# already exists in a real artifact is only testing its own copy.
+
+_DEFAULTED = re.compile(r"\$\{(\w+):-([^}]*)\}")
+_BRACED = re.compile(r"\$\{(\w+)\}")
+_BARE = re.compile(r"\$(\w+)")
+_UNRESOLVED = re.compile(r"\$\{[^}]*\}")
+
+
+def _expand(token: str, values: dict) -> str:
+    token = _DEFAULTED.sub(lambda m: values.get(m.group(1), m.group(2)), token)
+    token = _BRACED.sub(lambda m: values.get(m.group(1), m.group(0)), token)
+    return _BARE.sub(lambda m: values.get(m.group(1), m.group(0)), token)
+
+
+def _assignments(source: str) -> dict:
+    """The script's own top-level constants, read off the script.
+
+    Resolved from the file rather than restated here on purpose: a test that
+    rebuilds a value which already exists in the real artifact is only checking
+    its own copy. ``${VAR:-default}`` resolves to the default, which is what an
+    operator running the script with a clean environment gets.
+    """
+    values: dict = {}
+    for name, raw in re.findall(r'^([A-Z_]+)="([^"]*)"$', source, re.M):
+        values[name] = raw
+    for _ in range(len(values) + 1):        # resolve chained references
+        values = {name: _expand(value, values) for name, value in values.items()}
+    return values
+
+
+def _command_array(source: str, name: str) -> list:
+    """The tokens of one shell array literal in the real deploy script.
+
+    Parsed rather than grepped so a flag cannot be satisfied by an unrelated
+    mention in a comment or a printf, and so reordering the flags does not
+    break the pin. Shell variables are expanded from the script's own constants,
+    so the assertions below see the identities the command would really carry.
+    """
+    match = re.search(rf"^{re.escape(name)}=\(\n(.*?)^\)$", source,
+                      re.S | re.M)
+    if match is None:
+        raise AssertionError(f"{name} array not found in the deploy script")
+    values = _assignments(source)
+    return [_expand(token, values)
+            for token in shlex.split(match.group(1), comments=True)]
+
+
+TWIN_DEPLOY_SOURCE = TWIN_DEPLOY_SCRIPT.read_text()
+TWIN_DEPLOY_COMMAND = _command_array(TWIN_DEPLOY_SOURCE, "deploy_command")
+TWIN_INVOKER_COMMAND = _command_array(TWIN_DEPLOY_SOURCE, "invoker_command")
+
+# The candidate service name, read off the shipped ordinary manifest. The
+# comparator derives the expected shape of
+# ``SITESIFT_PRODUCTION_CANDIDATE_REVISION`` from the candidate's own service
+# name, so a fixture naming a service nobody deploys would be proving a rule
+# against itself.
+PRODUCTION_SERVICE = yaml.safe_load(
+    ORDINARY_MANIFEST.read_text())["metadata"]["name"]
+
+# The only values an operator supplies at deploy time; everything else in the
+# twin fixture comes from the script. The revision is built from the shipped
+# production service name rather than typed, because that relationship -- the
+# twin names a revision OF the candidate service -- is exactly what the
+# comparator checks.
+OPERATOR_INPUTS = {
+    "SOURCE_REVISION": "1" * 40,
+    "PRODUCTION_CANDIDATE_REVISION": f"{PRODUCTION_SERVICE}-00042-abc",
+    "FIXTURE_CONFIG_SECRET_VERSION": "7",
+    "CERTIFICATION_OPERATOR_SUB": "104729384756019283746",
+}
+
+
+def _fill(token: str) -> str:
+    return _UNRESOLVED.sub(
+        lambda m: OPERATOR_INPUTS.get(m.group(0)[2:-1], m.group(0)), token)
+
+
+def _flag_value(tokens: list, flag: str) -> str:
+    return tokens[tokens.index(flag) + 1]
+
+
+def _deployed_twin_env() -> dict:
+    """The twin's environment exactly as ``--set-env-vars`` and
+    ``--set-secrets`` spell it in the shipped deploy script."""
+    env = {}
+    for pair in _flag_value(TWIN_DEPLOY_COMMAND, "--set-env-vars").split(","):
+        name, _, value = pair.partition("=")
+        env[name] = _fill(value)
+    name, _, value = _flag_value(
+        TWIN_DEPLOY_COMMAND, "--set-secrets").partition("=")
+    env[name] = _fill(value)
+    return env
+
+
+DEPLOYED_TWIN_ENV = _deployed_twin_env()
+# The eight approved twin-only fields, with the values the shipped script would
+# really set. Taken from the artifact rather than restated: this fixture pair
+# was hand-built with three of the eight, so it described a twin the deploy
+# script could not produce -- and the vacuity guard that was supposed to notice
+# was the thing that broke.
+TWIN_ONLY_ENV = {name: value for name, value in DEPLOYED_TWIN_ENV.items()
+                 if name in tc.TWIN_ONLY}
+
+
 def _candidate(**overrides):
     spec = {
         "image": "region-docker.pkg.dev/p/r/email-automation@sha256:" + "a" * 64,
-        "serviceName": "process-user",
+        "serviceName": PRODUCTION_SERVICE,
         "serviceAccount": "123-compute@developer.gserviceaccount.com",
         "trafficPercent": 0,
         "env": {
@@ -92,15 +205,67 @@ def _twin(**overrides):
             "SITESIFT_IMAGE_DIGEST": "sha256:" + "a" * 64,
             "OPENAI_API_KEY": "secret://openai-api-key/latest",
             "USAGE_MONTHLY_BUDGET_USD": "50",
-            "K_SERVICE": "process-user-certification",
-            "FIRESTORE_DATABASE": "sitesift-certification",
-            "CERTIFICATION_FIXTURE_CONFIG": "sitesift-certification-fixture-config:7",
+            **TWIN_ONLY_ENV,
         },
         "containerConcurrency": 1,
         "timeoutSeconds": 540,
     }
     spec.update(overrides)
     return spec
+
+
+class TheFixturesDescribeADeployableTwinTests(unittest.TestCase):
+    """The fixtures above are only evidence if the script could deploy them.
+
+    Every case in this file rests on ``_twin()`` describing a twin that
+    ``scripts/deploy_certification_twin.sh`` really produces. When the
+    classification widened from three twin-only fields to eight, this pair still
+    named three -- so it described a twin nobody could deploy, and the vacuity
+    guard failed rather than the rules. These cases fail on the CAUSE instead of
+    leaving it to be diagnosed from a comparator diff.
+    """
+
+    def test_the_deploy_script_parse_actually_produced_the_twin_environment(self):
+        """Vacuity guard. A silently empty parse would make every assertion
+        below pass while proving nothing."""
+        self.assertGreater(len(TWIN_DEPLOY_COMMAND), 10, TWIN_DEPLOY_COMMAND)
+        self.assertEqual(TWIN_DEPLOY_COMMAND[:4],
+                         ["gcloud", "run", "deploy", "process-user-certification"])
+        self.assertGreater(len(DEPLOYED_TWIN_ENV), 5, DEPLOYED_TWIN_ENV)
+
+    def test_no_operator_placeholder_survived_into_the_fixture(self):
+        """An unresolved ``${VAR}`` would be compared as a literal, and a rule
+        that only ever sees a placeholder is a rule nothing exercises."""
+        for name, value in _twin()["env"].items():
+            with self.subTest(name=name):
+                self.assertNotRegex(value, r"\$\{")
+
+    def test_every_classified_twin_only_field_is_one_the_script_sets(self):
+        """Both directions. A name classified but never deployed would be a
+        rule no twin can satisfy; a name deployed but never classified is the
+        'exists only on the twin and is unclassified' refusal that blocked
+        every twin the script could produce."""
+        deployed = set(DEPLOYED_TWIN_ENV)
+        stamp = {"SITESIFT_SOURCE_REVISION", "SITESIFT_IMAGE_DIGEST"}
+        self.assertEqual(sorted(deployed - stamp), sorted(tc.TWIN_ONLY))
+
+    def test_the_fixture_carries_the_deployed_value_not_a_retyped_one(self):
+        """The values are read off the script, so a change there reaches this
+        fixture. Retyping them here is the defect this file exists to stop."""
+        env = _twin()["env"]
+        for name in tc.TWIN_ONLY:
+            with self.subTest(name=name):
+                self.assertEqual(env[name], DEPLOYED_TWIN_ENV[name])
+
+    def test_the_candidate_service_is_the_one_the_shipped_manifest_names(self):
+        """``SITESIFT_PRODUCTION_CANDIDATE_REVISION`` must be a revision of the
+        candidate service. A fixture naming a service nobody deploys would prove
+        that rule against itself."""
+        self.assertEqual(_candidate()["serviceName"], PRODUCTION_SERVICE)
+        self.assertTrue(
+            _twin()["env"]["SITESIFT_PRODUCTION_CANDIDATE_REVISION"].startswith(
+                f"{PRODUCTION_SERVICE}-"),
+            _twin()["env"]["SITESIFT_PRODUCTION_CANDIDATE_REVISION"])
 
 
 class ImageEqualityIsSpecifiedNotIncidentalTests(unittest.TestCase):
@@ -181,50 +346,6 @@ class TwinTrafficIsSpecifiedNotIncidentalTests(unittest.TestCase):
         self.assertNotIn(TWIN_TRAFFIC_REFUSAL, tc._validate(_candidate(), _twin()))
 
 
-_DEFAULTED = re.compile(r"\$\{(\w+):-([^}]*)\}")
-_BRACED = re.compile(r"\$\{(\w+)\}")
-_BARE = re.compile(r"\$(\w+)")
-
-
-def _assignments(source: str) -> dict:
-    """The script's own top-level constants, read off the script.
-
-    Resolved from the file rather than restated here on purpose: a test that
-    rebuilds a value which already exists in the real artifact is only checking
-    its own copy. ``${VAR:-default}`` resolves to the default, which is what an
-    operator running the script with a clean environment gets.
-    """
-    values: dict = {}
-    for name, raw in re.findall(r'^([A-Z_]+)="([^"]*)"$', source, re.M):
-        values[name] = raw
-    for _ in range(len(values) + 1):        # resolve chained references
-        values = {name: _expand(value, values) for name, value in values.items()}
-    return values
-
-
-def _expand(token: str, values: dict) -> str:
-    token = _DEFAULTED.sub(lambda m: values.get(m.group(1), m.group(2)), token)
-    token = _BRACED.sub(lambda m: values.get(m.group(1), m.group(0)), token)
-    return _BARE.sub(lambda m: values.get(m.group(1), m.group(0)), token)
-
-
-def _command_array(source: str, name: str) -> list:
-    """The tokens of one shell array literal in the real deploy script.
-
-    Parsed rather than grepped so a flag cannot be satisfied by an unrelated
-    mention in a comment or a printf, and so reordering the flags does not
-    break the pin. Shell variables are expanded from the script's own constants,
-    so the assertions below see the identities the command would really carry.
-    """
-    match = re.search(rf"^{re.escape(name)}=\(\n(.*?)^\)$", source,
-                      re.S | re.M)
-    if match is None:
-        raise AssertionError(f"{name} array not found in the deploy script")
-    values = _assignments(source)
-    return [_expand(token, values)
-            for token in shlex.split(match.group(1), comments=True)]
-
-
 class TwinDeployIamDenialTests(unittest.TestCase):
     """The twin's IAM denial, read off the script that actually deploys it.
 
@@ -235,9 +356,9 @@ class TwinDeployIamDenialTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.source = TWIN_DEPLOY_SCRIPT.read_text()
-        cls.deploy = _command_array(cls.source, "deploy_command")
-        cls.invoker = _command_array(cls.source, "invoker_command")
+        cls.source = TWIN_DEPLOY_SOURCE
+        cls.deploy = TWIN_DEPLOY_COMMAND
+        cls.invoker = TWIN_INVOKER_COMMAND
 
     # -- vacuity guards -----------------------------------------------------
 
