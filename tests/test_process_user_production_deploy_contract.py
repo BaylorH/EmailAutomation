@@ -55,8 +55,9 @@ TAG = (
     f"cloud-run-source-deploy/process-user:{SHORT_SHA}"
 )
 DIGEST = "sha256:" + "a" * 64
+IMAGE_REPOSITORY = TAG.rsplit(":", 1)[0]
 IMAGE = f"{TAG}@{DIGEST}"
-CANONICAL_IMAGE = f"{TAG.rsplit(':', 1)[0]}@{DIGEST}"
+CANONICAL_IMAGE = f"{IMAGE_REPOSITORY}@{DIGEST}"
 SERVICE_ACCOUNT = "248289505828-compute@developer.gserviceaccount.com"
 ROLLBACK_REVISION = "process-user-stage-9491133f15d5"
 ROLLBACK_DIGEST = (
@@ -76,7 +77,9 @@ ENV_VARS = (
     "SITESIFT_GLOBAL_DAILY_SEND_CAP=20:"
     "SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:"
     "SITESIFT_NATIVE_IMAGE_INGESTION=false:"
-    "SITESIFT_OUTBOUND_MODE=live"
+    "SITESIFT_OUTBOUND_MODE=live:"
+    f"SITESIFT_SOURCE_REVISION={SHA}:"
+    f"SITESIFT_IMAGE_DIGEST={DIGEST}"
 )
 SECRETS = (
     "AZURE_API_APP_ID=AZURE_API_APP_ID:latest,"
@@ -127,7 +130,7 @@ class DeployScriptContractTests(unittest.TestCase):
                     esac
                     exit 0
                     ;;
-                  "rev-parse --short=12 HEAD") printf '%s\\n' "${FAKE_GIT_SHA%????????????????????????????}"; exit 0 ;;
+                  "rev-parse HEAD") printf '%s\\n' "$FAKE_GIT_SHA"; exit 0 ;;
                 esac
                 exit 64
                 """
@@ -161,6 +164,7 @@ class DeployScriptContractTests(unittest.TestCase):
         cwd: Path = REPO_ROOT,
         impersonation_env: str | None = None,
         auth_override_env: tuple[str, str] | None = None,
+        tested_image_digest: str | None = CANONICAL_IMAGE,
     ):
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -196,6 +200,10 @@ class DeployScriptContractTests(unittest.TestCase):
             env.pop("GCLOUD_ACCOUNT", None)
         else:
             env["GCLOUD_ACCOUNT"] = account
+        if tested_image_digest is None:
+            env.pop("TESTED_IMAGE_DIGEST", None)
+        else:
+            env["TESTED_IMAGE_DIGEST"] = tested_image_digest
         return subprocess.run(
             ["bash", str(DEPLOY_SCRIPT), *args],
             cwd=cwd,
@@ -220,7 +228,7 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self._gcloud_calls(), [])
         self.assertEqual(self._git_calls(), self._git_preflight_calls())
-        self.assertIn(TAG, result.stdout)
+        self.assertIn(CANONICAL_IMAGE, result.stdout)
         self.assertIn("dry-run", result.stdout.lower())
 
     def test_deploy_script_sources_shared_preflight_helper(self):
@@ -395,7 +403,7 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self._gcloud_calls(), [self._config_call()])
 
-    def test_absolute_script_path_builds_repository_root_not_caller_directory(self):
+    def test_absolute_script_path_reads_repository_root_not_caller_directory(self):
         foreign = self.tmp / "foreign"
         foreign.mkdir()
         result = self._run("--apply", cwd=foreign)
@@ -403,8 +411,10 @@ class DeployScriptContractTests(unittest.TestCase):
         calls = self._gcloud_calls()
         self.assertIn(self._deploy_call(), calls)
         self.assertEqual(
-            calls[len(self._apply_gate_calls()) + 3], self._build_call()
+            calls[len(self._apply_gate_calls()) + 3], self._digest_call()
         )
+        # every git call is pinned to the repository root, not the caller cwd
+        self.assertEqual(self._git_calls(), self._git_preflight_calls())
 
     def test_auth_missing_stops_before_project_or_mutation(self):
         result = self._run("--apply", scenario="auth_missing")
@@ -461,7 +471,6 @@ class DeployScriptContractTests(unittest.TestCase):
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
-                self._build_call(),
                 self._digest_call(),
             ],
         )
@@ -470,7 +479,7 @@ class DeployScriptContractTests(unittest.TestCase):
         result = self._run("--apply", scenario="invalid_digest")
         self.assertNotEqual(result.returncode, 0)
         calls = self._gcloud_calls()
-        self.assertEqual(len(calls), len(self._apply_gate_calls()) + 5)
+        self.assertEqual(len(calls), len(self._apply_gate_calls()) + 4)
         self.assertEqual(calls[-1], self._digest_call())
         self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
 
@@ -484,13 +493,45 @@ class DeployScriptContractTests(unittest.TestCase):
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
-                self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
                 self._service_describe_call(),
                 self._revision_describe_call(),
             ],
         )
+
+    def test_deploy_script_has_no_build_step_at_all(self):
+        source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        for forbidden in ("builds submit", "docker build", "pack build", "--tag "):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_apply_stages_the_pre_built_digest_and_never_builds(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._gcloud_calls()
+        self.assertEqual([], [call for call in calls if call[:1] == ["builds"]])
+        deploy = self._find_deploy_call()
+        self.assertEqual(deploy[deploy.index("--image") + 1], CANONICAL_IMAGE)
+
+    def test_registry_read_failure_stops_before_deploy(self):
+        result = self._run("--apply", scenario="registry_read_failure")
+        self.assertNotEqual(0, result.returncode)
+        calls = self._gcloud_calls()
+        self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
+        self.assertEqual(calls[-1], self._digest_call())
+
+    def test_registry_digest_disagreement_stops_before_deploy(self):
+        result = self._run("--apply", scenario="digest_mismatch")
+        self.assertNotEqual(0, result.returncode)
+        calls = self._gcloud_calls()
+        self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
+
+    def test_missing_tested_image_digest_refuses_before_any_cloud_call(self):
+        result = self._run("--apply", tested_image_digest=None)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+        self.assertIn("TESTED_IMAGE_DIGEST", result.stderr)
 
     def test_deploy_omits_service_wide_scaling_flags(self):
         result = self._run("--apply")
@@ -548,7 +589,7 @@ class DeployScriptContractTests(unittest.TestCase):
         prefix = ["-C", str(REPO_ROOT)]
         return [
             [*prefix, "status", "--porcelain"],
-            [*prefix, "rev-parse", "--short=12", "HEAD"],
+            [*prefix, "rev-parse", "HEAD"],
         ]
 
     def _find_deploy_call(self) -> list[str]:
@@ -611,17 +652,6 @@ class DeployScriptContractTests(unittest.TestCase):
         ]
 
     @staticmethod
-    def _build_call() -> list[str]:
-        return [
-            "builds",
-            "submit",
-            "--account", ACCOUNT,
-            "--project", PROJECT,
-            "--tag", TAG,
-            str(REPO_ROOT),
-        ]
-
-    @staticmethod
     def _service_describe_call() -> list[str]:
         return [
             "run", "services", "describe", SERVICE,
@@ -646,7 +676,7 @@ class DeployScriptContractTests(unittest.TestCase):
             "docker",
             "images",
             "describe",
-            TAG,
+            CANONICAL_IMAGE,
             "--account", ACCOUNT,
             "--project", PROJECT,
             "--format=value(image_summary.digest)",
@@ -661,7 +691,7 @@ class DeployScriptContractTests(unittest.TestCase):
             "--account", ACCOUNT,
             "--project", PROJECT,
             "--region", REGION,
-            "--image", IMAGE,
+            "--image", CANONICAL_IMAGE,
             "--command", "gunicorn",
             "--args=--bind=:8080,--workers=1,--threads=8,--max-requests=1,--timeout=0,service:app",
             "--service-account", SERVICE_ACCOUNT,

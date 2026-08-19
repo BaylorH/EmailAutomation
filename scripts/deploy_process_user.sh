@@ -29,24 +29,41 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
   printf 'Refusing: deployment checkout must be clean.\n' >&2
   exit 67
 fi
-short_sha="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)"
-if [[ ! "$short_sha" =~ ^[0-9a-f]{12}$ ]]; then
-  printf 'Refusing: git HEAD did not resolve to a 12-character lowercase SHA.\n' >&2
+head_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'Refusing: git HEAD did not resolve to a 40-character lowercase SHA.\n' >&2
   exit 68
 fi
-image_tag="${IMAGE_REPOSITORY}:${short_sha}"
+short_sha="${head_sha:0:12}"
 revision_suffix="stage-${short_sha}"
 candidate_revision="${SERVICE}-${revision_suffix}"
 
-build_command=(
-  gcloud builds submit
-  --account "$ACCOUNT"
-  --project "$PROJECT"
-  --tag "$image_tag"
-  "$REPO_ROOT"
-)
+# This script never builds, and that is the contract rather than a convenience.
+# The certification twin has to run the byte-identical artifact production
+# stages; a rebuild from the same commit produces a different digest and would
+# therefore certify a different artifact than the one shipped. The one already
+# built and tested digest is an INPUT here, never something staging creates.
+if [[ -z "${TESTED_IMAGE_DIGEST:-}" ]]; then
+  printf 'Refusing: set TESTED_IMAGE_DIGEST to the exact already-built and already-tested repository@sha256 image.\n' >&2
+  exit 69
+fi
+if [[ ! "$TESTED_IMAGE_DIGEST" =~ ^([^[:space:]@]+)@(sha256:[0-9a-f]{64})$ ]]; then
+  printf 'Refusing: TESTED_IMAGE_DIGEST must be repository@sha256:<64 lowercase hex>, never a tag or alias.\n' >&2
+  exit 70
+fi
+tested_repository="${BASH_REMATCH[1]}"
+digest="${BASH_REMATCH[2]}"
+# One allowed repository, named exactly. A denylist of "wrong" registries would
+# admit whichever one nobody thought to list.
+if [[ "$tested_repository" != "$IMAGE_REPOSITORY" ]]; then
+  printf 'Refusing: TESTED_IMAGE_DIGEST names repository %q, not %q.\n' \
+    "$tested_repository" "$IMAGE_REPOSITORY" >&2
+  exit 71
+fi
+immutable_image="${IMAGE_REPOSITORY}@${digest}"
+
 digest_command=(
-  gcloud artifacts docker images describe "$image_tag"
+  gcloud artifacts docker images describe "$immutable_image"
   --account "$ACCOUNT"
   --project "$PROJECT"
   --format=value\(image_summary.digest\)
@@ -59,7 +76,7 @@ service_describe_command=(
   --format=json
 )
 
-env_vars="^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_DAILY_SEND_CAP=20:SITESIFT_GLOBAL_DAILY_SEND_CAP=20:SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_NATIVE_IMAGE_INGESTION=false:SITESIFT_OUTBOUND_MODE=live"
+env_vars="^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_DAILY_SEND_CAP=20:SITESIFT_GLOBAL_DAILY_SEND_CAP=20:SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:SITESIFT_NATIVE_IMAGE_INGESTION=false:SITESIFT_OUTBOUND_MODE=live:SITESIFT_SOURCE_REVISION=${head_sha}:SITESIFT_IMAGE_DIGEST=${digest}"
 secrets="AZURE_API_APP_ID=AZURE_API_APP_ID:latest,AZURE_API_CLIENT_SECRET=AZURE_API_CLIENT_SECRET:latest,FIREBASE_API_KEY=FIREBASE_API_KEY:latest,OPENAI_API_KEY=OPENAI_API_KEY:latest,GOOGLE_OAUTH_CLIENT_ID=GOOGLE_OAUTH_CLIENT_ID:latest,GOOGLE_OAUTH_CLIENT_SECRET=GOOGLE_OAUTH_CLIENT_SECRET:latest,GOOGLE_REFRESH_TOKEN=GOOGLE_REFRESH_TOKEN:latest"
 
 print_command() {
@@ -68,14 +85,37 @@ print_command() {
   printf '\n'
 }
 
+deploy_command=(
+  gcloud run deploy "$SERVICE"
+  --account "$ACCOUNT"
+  --project "$PROJECT"
+  --region "$REGION"
+  --image "$immutable_image"
+  --command gunicorn
+  '--args=--bind=:8080,--workers=1,--threads=8,--max-requests=1,--timeout=0,service:app'
+  --service-account "$SERVICE_ACCOUNT"
+  --concurrency 1
+  --memory 2Gi
+  --timeout 540
+  --min-instances 0
+  --max-instances 10
+  --no-allow-unauthenticated
+  --update-env-vars "$env_vars"
+  --update-secrets "$secrets"
+  --no-traffic
+  --revision-suffix "$revision_suffix"
+)
+
 if [[ "$mode" == "dry-run" ]]; then
   printf 'dry-run: zero gcloud commands will execute\n'
-  printf 'image tag: %s\n' "$image_tag"
+  printf 'no build: the already-tested digest is staged as-is\n'
+  printf 'immutable image: %s\n' "$immutable_image"
   printf 'candidate revision: %s\n' "$candidate_revision"
+  printf 'release stamp: SITESIFT_SOURCE_REVISION=%s SITESIFT_IMAGE_DIGEST=%s\n' \
+    "$head_sha" "$digest"
   printf 'staging contract: untagged at 0%% traffic; existing release-a and positive traffic are not mutated\n'
-  print_command "${build_command[@]}"
   print_command "${digest_command[@]}"
-  printf 'deploy image after digest resolution: %s@sha256:<64-hex-digest>\n' "$image_tag"
+  print_command "${deploy_command[@]}"
   exit 0
 fi
 
@@ -279,34 +319,18 @@ then
   exit 82
 fi
 
-"${build_command[@]}"
-digest="$("${digest_command[@]}")"
-if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  printf 'Refusing to deploy: Artifact Registry returned invalid digest %q.\n' "$digest" >&2
+# The registry must already hold this exact digest. Nothing here creates it: a
+# digest that is absent is a staging refusal, never a reason to build one.
+if ! registry_digest="$("${digest_command[@]}")"; then
+  printf 'Refusing to deploy: the tested digest is not readable in Artifact Registry.\n' >&2
+  exit 72
+fi
+if [[ "$registry_digest" != "$digest" ]]; then
+  printf 'Refusing to deploy: Artifact Registry reports %q for the tested image, not %q.\n' \
+    "$registry_digest" "$digest" >&2
   exit 72
 fi
 
-immutable_image="${image_tag}@${digest}"
-deploy_command=(
-  gcloud run deploy "$SERVICE"
-  --account "$ACCOUNT"
-  --project "$PROJECT"
-  --region "$REGION"
-  --image "$immutable_image"
-  --command gunicorn
-  '--args=--bind=:8080,--workers=1,--threads=8,--max-requests=1,--timeout=0,service:app'
-  --service-account "$SERVICE_ACCOUNT"
-  --concurrency 1
-  --memory 2Gi
-  --timeout 540
-  --min-instances 0
-  --max-instances 10
-  --no-allow-unauthenticated
-  --update-env-vars "$env_vars"
-  --update-secrets "$secrets"
-  --no-traffic
-  --revision-suffix "$revision_suffix"
-)
 "${deploy_command[@]}"
 
 if ! post_service_json="$("${service_describe_command[@]}")"; then
@@ -473,6 +497,8 @@ if ! REVISION_JSON="$candidate_revision_json" \
     EXPECTED_REVISION="$candidate_revision" \
     EXPECTED_IMAGE="${IMAGE_REPOSITORY}@${digest}" \
     EXPECTED_SERVICE_ACCOUNT="$SERVICE_ACCOUNT" \
+    EXPECTED_SOURCE_REVISION="$head_sha" \
+    EXPECTED_IMAGE_DIGEST="$digest" \
     python3 - <<'PY'
 import json
 import os
@@ -588,6 +614,8 @@ expected_values = {
     "SITESIFT_TOUR_ACTION_ALLOWLIST": "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
     "SITESIFT_NATIVE_IMAGE_INGESTION": "false",
     "SITESIFT_OUTBOUND_MODE": "live",
+    "SITESIFT_SOURCE_REVISION": os.environ["EXPECTED_SOURCE_REVISION"],
+    "SITESIFT_IMAGE_DIGEST": os.environ["EXPECTED_IMAGE_DIGEST"],
 }
 for name, value in expected_values.items():
     if by_name.get(name, {}).get("value") != value:
@@ -606,7 +634,10 @@ for name in (
     if secret_ref.get("name") != name or secret_ref.get("key") != "latest":
         refuse(f"candidate secret reference does not match for {name}")
 
-def canonical_spec(value, *, require_native_image_gate):
+RELEASE_STAMP_NAMES = ("SITESIFT_IMAGE_DIGEST", "SITESIFT_SOURCE_REVISION")
+
+
+def canonical_spec(value, *, require_native_image_gate, expected_stamp):
     value = json.loads(json.dumps(value))
     containers = value.get("containers")
     if not isinstance(containers, list) or len(containers) != 1:
@@ -633,10 +664,29 @@ def canonical_spec(value, *, require_native_image_gate):
     )
     if gate_entries != expected_gate_entries:
         refuse("native image release gate is not exact")
+    # The stamp is an approved candidate-only difference. It is validated
+    # against its exact expected value FIRST and only then paired away, because
+    # dropping it before checking would make any stamp -- including a forged
+    # one, or one from another build -- compare equal to the baseline.
+    stamp_entries = sorted(
+        (entry for entry in environment if entry.get("name") in RELEASE_STAMP_NAMES),
+        key=lambda entry: entry["name"],
+    )
+    expected_stamp_entries = (
+        [
+            {"name": name, "value": expected_stamp[name]}
+            for name in RELEASE_STAMP_NAMES
+        ]
+        if expected_stamp is not None
+        else []
+    )
+    if stamp_entries != expected_stamp_entries:
+        refuse("release source/image stamp is not the exact expected binding")
     container["env"] = [
         entry
         for entry in environment
         if entry.get("name") != "SITESIFT_NATIVE_IMAGE_INGESTION"
+        and entry.get("name") not in RELEASE_STAMP_NAMES
     ]
     container.pop("image", None)
     return value
@@ -645,9 +695,14 @@ def canonical_spec(value, *, require_native_image_gate):
 if canonical_spec(
     spec,
     require_native_image_gate=True,
+    expected_stamp={
+        "SITESIFT_SOURCE_REVISION": os.environ["EXPECTED_SOURCE_REVISION"],
+        "SITESIFT_IMAGE_DIGEST": os.environ["EXPECTED_IMAGE_DIGEST"],
+    },
 ) != canonical_spec(
     baseline_spec,
     require_native_image_gate=False,
+    expected_stamp=None,
 ):
     refuse(
         "candidate config differs from baseline beyond immutable image "

@@ -43,8 +43,9 @@ TAG = (
     f"cloud-run-source-deploy/process-user:{SHORT_SHA}"
 )
 DIGEST = "sha256:" + "a" * 64
+IMAGE_REPOSITORY = TAG.rsplit(":", 1)[0]
 IMAGE = f"{TAG}@{DIGEST}"
-CANONICAL_IMAGE = f"{TAG.rsplit(':', 1)[0]}@{DIGEST}"
+CANONICAL_IMAGE = f"{IMAGE_REPOSITORY}@{DIGEST}"
 SERVICE_ACCOUNT = "248289505828-compute@developer.gserviceaccount.com"
 
 ENV_VARS = (
@@ -55,7 +56,9 @@ ENV_VARS = (
     "SITESIFT_GLOBAL_DAILY_SEND_CAP=20:"
     "SITESIFT_TOUR_ACTION_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2:"
     "SITESIFT_NATIVE_IMAGE_INGESTION=false:"
-    "SITESIFT_OUTBOUND_MODE=live"
+    "SITESIFT_OUTBOUND_MODE=live:"
+    f"SITESIFT_SOURCE_REVISION={SHA}:"
+    f"SITESIFT_IMAGE_DIGEST={DIGEST}"
 )
 SECRETS = (
     "AZURE_API_APP_ID=AZURE_API_APP_ID:latest,"
@@ -114,10 +117,10 @@ class TaglessStagingContractTests(unittest.TestCase):
                     esac
                     exit 0
                     ;;
-                  "rev-parse --short=12 HEAD")
+                  "rev-parse HEAD")
                     case "$FAKE_GCLOUD_SCENARIO" in
-                      invalid_sha) printf '%s\\n' 'ABCDEF123456' ;;
-                      *) printf '%s\\n' "${FAKE_GIT_SHA%????????????????????????????}" ;;
+                      invalid_sha) printf '%s\\n' 'NOTASHA' ;;
+                      *) printf '%s\\n' "$FAKE_GIT_SHA" ;;
                     esac
                     exit 0
                     ;;
@@ -151,6 +154,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         cwd: Path = REPO_ROOT,
         impersonation_env: str | None = None,
         auth_override_env: tuple[str, str] | None = None,
+        tested_image_digest: str | None = CANONICAL_IMAGE,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -186,6 +190,10 @@ class TaglessStagingContractTests(unittest.TestCase):
             env.pop("GCLOUD_ACCOUNT", None)
         else:
             env["GCLOUD_ACCOUNT"] = account
+        if tested_image_digest is None:
+            env.pop("TESTED_IMAGE_DIGEST", None)
+        else:
+            env["TESTED_IMAGE_DIGEST"] = tested_image_digest
         return subprocess.run(
             ["bash", str(DEPLOY_SCRIPT), *args],
             cwd=cwd,
@@ -231,7 +239,6 @@ class TaglessStagingContractTests(unittest.TestCase):
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
-                self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
                 self._service_describe_call(),
@@ -257,7 +264,7 @@ class TaglessStagingContractTests(unittest.TestCase):
             call for call in self._gcloud_calls() if call[:2] == ["run", "deploy"]
         )
         self.assertEqual(deploy, self._deploy_call())
-        self.assertEqual(deploy[deploy.index("--image") + 1], IMAGE)
+        self.assertEqual(deploy[deploy.index("--image") + 1], CANONICAL_IMAGE)
         self.assertIn("--no-traffic", deploy)
         self.assertNotIn("--tag", deploy)
         self.assertNotIn("release-a", deploy)
@@ -282,7 +289,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         result = self._run("--apply", scenario="invalid_sha")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self._gcloud_calls(), [])
-        self.assertIn("12-character lowercase", result.stderr)
+        self.assertIn("40-character lowercase", result.stderr)
 
     def test_missing_positive_baseline_stops_before_build(self):
         self._assert_baseline_refused("missing_positive")
@@ -452,11 +459,107 @@ class TaglessStagingContractTests(unittest.TestCase):
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
-                self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
             ],
         )
+
+    # -- the script never builds ------------------------------------------
+    #
+    # The twin has to run the byte-identical artifact production stages. A
+    # rebuild from the same commit produces a different digest, so it would
+    # certify a different artifact than the one shipped. The already built and
+    # tested digest is therefore an INPUT to staging, never something staging
+    # can create.
+
+    def test_apply_never_builds_an_image(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [],
+            [call for call in self._gcloud_calls() if call[:1] == ["builds"]],
+            "staging must offer the already built digest, never rebuild it",
+        )
+        source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("builds submit", source)
+        self.assertNotIn("docker build", source)
+
+    def test_missing_tested_image_digest_refuses_before_any_cloud_call(self):
+        result = self._run("--apply", tested_image_digest=None)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+        self.assertIn("TESTED_IMAGE_DIGEST", result.stderr)
+
+    def test_dry_run_also_requires_the_tested_digest(self):
+        result = self._run("--dry-run", tested_image_digest=None)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_mutable_or_malformed_tested_image_reference_is_refused(self):
+        for value in (
+            TAG,
+            f"{IMAGE_REPOSITORY}:latest",
+            IMAGE,
+            f"{IMAGE_REPOSITORY}@sha256:{'a' * 63}",
+            f"{IMAGE_REPOSITORY}@sha256:{'A' * 64}",
+            f"{IMAGE_REPOSITORY}@sha512:{'a' * 64}",
+            f"{IMAGE_REPOSITORY}@{DIGEST} ",
+        ):
+            with self.subTest(value=value):
+                self.setUp()
+                result = self._run("--apply", tested_image_digest=value)
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual([], self._gcloud_calls())
+
+    def test_foreign_repository_digest_is_refused(self):
+        result = self._run(
+            "--apply",
+            tested_image_digest=(
+                "us-central1-docker.pkg.dev/attacker-project/"
+                f"cloud-run-source-deploy/process-user@{DIGEST}"
+            ),
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self._gcloud_calls())
+
+    def test_registry_digest_disagreement_stops_before_deploy(self):
+        result = self._run("--apply", scenario="digest_mismatch")
+        self.assertNotEqual(0, result.returncode)
+        calls = self._gcloud_calls()
+        self.assertFalse(any(call[:2] == ["run", "deploy"] for call in calls))
+        self.assertEqual(calls[-1], self._digest_call())
+
+    def test_deploy_binds_the_release_stamp_to_source_and_image(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deploy = next(
+            call for call in self._gcloud_calls() if call[:2] == ["run", "deploy"]
+        )
+        env_argument = deploy[deploy.index("--update-env-vars") + 1]
+        self.assertIn(f"SITESIFT_SOURCE_REVISION={SHA}", env_argument)
+        self.assertIn(f"SITESIFT_IMAGE_DIGEST={DIGEST}", env_argument)
+        self.assertEqual(deploy[deploy.index("--image") + 1], CANONICAL_IMAGE)
+
+    def test_missing_candidate_source_stamp_is_refused(self):
+        self._assert_revision_refused("candidate_missing_source_stamp")
+
+    def test_missing_candidate_digest_stamp_is_refused(self):
+        self._assert_revision_refused("candidate_missing_digest_stamp")
+
+    def test_forged_candidate_source_stamp_is_refused(self):
+        self._assert_revision_refused("candidate_forged_source_stamp")
+
+    def test_forged_candidate_digest_stamp_is_refused(self):
+        self._assert_revision_refused("candidate_forged_digest_stamp")
+
+    def test_duplicate_candidate_source_stamp_is_refused(self):
+        self._assert_revision_refused("candidate_duplicate_source_stamp")
+
+    def test_secret_bound_candidate_source_stamp_is_refused(self):
+        self._assert_revision_refused("candidate_secret_source_stamp")
+
+    def test_baseline_carrying_a_release_stamp_is_refused(self):
+        self._assert_revision_refused("baseline_source_stamp")
 
     def _assert_baseline_refused(self, scenario: str) -> None:
         result = self._run("--apply", scenario=scenario)
@@ -476,7 +579,6 @@ class TaglessStagingContractTests(unittest.TestCase):
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
-                self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
                 self._service_describe_call(),
@@ -493,7 +595,6 @@ class TaglessStagingContractTests(unittest.TestCase):
                 self._service_describe_call(),
                 self._revision_list_call(),
                 self._baseline_revision_describe_call(),
-                self._build_call(),
                 self._digest_call(),
                 self._deploy_call(),
                 self._service_describe_call(),
@@ -531,7 +632,7 @@ class TaglessStagingContractTests(unittest.TestCase):
         prefix = ["-C", str(REPO_ROOT)]
         return [
             [*prefix, "status", "--porcelain"],
-            [*prefix, "rev-parse", "--short=12", "HEAD"],
+            [*prefix, "rev-parse", "HEAD"],
         ]
 
     @staticmethod
@@ -607,19 +708,9 @@ class TaglessStagingContractTests(unittest.TestCase):
         ]
 
     @staticmethod
-    def _build_call() -> list[str]:
-        return [
-            "builds", "submit",
-            "--account", ACCOUNT,
-            "--project", PROJECT,
-            "--tag", TAG,
-            str(REPO_ROOT),
-        ]
-
-    @staticmethod
     def _digest_call() -> list[str]:
         return [
-            "artifacts", "docker", "images", "describe", TAG,
+            "artifacts", "docker", "images", "describe", CANONICAL_IMAGE,
             "--account", ACCOUNT,
             "--project", PROJECT,
             "--format=value(image_summary.digest)",
@@ -632,7 +723,7 @@ class TaglessStagingContractTests(unittest.TestCase):
             "--account", ACCOUNT,
             "--project", PROJECT,
             "--region", REGION,
-            "--image", IMAGE,
+            "--image", CANONICAL_IMAGE,
             "--command", "gunicorn",
             "--args=--bind=:8080,--workers=1,--threads=8,--max-requests=1,--timeout=0,service:app",
             "--service-account", SERVICE_ACCOUNT,
@@ -690,6 +781,8 @@ class TaglessStagingContractTests(unittest.TestCase):
             old = os.environ["FAKE_OLD_REVISION"]
             other = os.environ["FAKE_OTHER_REVISION"]
             canonical_image = os.environ["FAKE_CANONICAL_IMAGE"]
+            source_revision = os.environ["FAKE_GIT_SHA"]
+            image_digest = "sha256:" + canonical_image.rsplit("sha256:", 1)[1]
 
             def save():
                 state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -794,6 +887,19 @@ class TaglessStagingContractTests(unittest.TestCase):
                     "SITESIFT_OUTBOUND_MODE": "live",
                     "SITESIFT_SOURCE_COORDINATOR_MODE": "locked",
                 }
+                if is_baseline and scenario == "baseline_source_stamp":
+                    values["SITESIFT_SOURCE_REVISION"] = source_revision
+                if not is_baseline:
+                    values["SITESIFT_SOURCE_REVISION"] = source_revision
+                    values["SITESIFT_IMAGE_DIGEST"] = image_digest
+                    if scenario == "candidate_missing_source_stamp":
+                        values.pop("SITESIFT_SOURCE_REVISION")
+                    elif scenario == "candidate_missing_digest_stamp":
+                        values.pop("SITESIFT_IMAGE_DIGEST")
+                    elif scenario == "candidate_forged_source_stamp":
+                        values["SITESIFT_SOURCE_REVISION"] = "0" * 40
+                    elif scenario == "candidate_forged_digest_stamp":
+                        values["SITESIFT_IMAGE_DIGEST"] = "sha256:" + "f" * 64
                 if is_baseline and scenario == "baseline_native_gate":
                     values["SITESIFT_NATIVE_IMAGE_INGESTION"] = "false"
                 if not is_baseline:
@@ -829,6 +935,24 @@ class TaglessStagingContractTests(unittest.TestCase):
                     }
                     for name in secret_names
                 )
+                if not is_baseline and scenario == "candidate_duplicate_source_stamp":
+                    env.append({
+                        "name": "SITESIFT_SOURCE_REVISION",
+                        "value": source_revision,
+                    })
+                if not is_baseline and scenario == "candidate_secret_source_stamp":
+                    stamp = next(
+                        entry
+                        for entry in env
+                        if entry.get("name") == "SITESIFT_SOURCE_REVISION"
+                    )
+                    stamp.pop("value")
+                    stamp["valueFrom"] = {
+                        "secretKeyRef": {
+                            "name": "SITESIFT_SOURCE_REVISION",
+                            "key": "latest",
+                        }
+                    }
                 if not is_baseline and scenario == "candidate_duplicate_native_gate":
                     env.append({
                         "name": "SITESIFT_NATIVE_IMAGE_INGESTION",
@@ -964,6 +1088,11 @@ class TaglessStagingContractTests(unittest.TestCase):
                 if scenario == "invalid_digest":
                     print("latest")
                     raise SystemExit(0)
+                if scenario == "digest_mismatch":
+                    print("sha256:" + "b" * 64)
+                    raise SystemExit(0)
+                if scenario == "registry_read_failure":
+                    raise SystemExit(1)
                 print("sha256:" + "a" * 64)
                 raise SystemExit(0)
             if args[:2] == ["run", "deploy"]:
