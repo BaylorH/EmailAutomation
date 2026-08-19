@@ -250,12 +250,17 @@ def process_outbox():
 # could be pointed at a real person or made to assert its own success, and no
 # stamp would mean anything.
 #
-# NOT YET IMPLEMENTED, deliberately and visibly: the prepare/claim lifecycle
-# needs the permanent certification run ledger, which is a separate task. These
-# routes validate the locked schema and then return 501. A 501 here is a real
-# answer -- the route exists, the fence admits it, the schema is enforced -- and
-# it is never mistaken for a verdict, because a verdict can only come from the
+# `review` and `cleanup` are NOT YET IMPLEMENTED, deliberately and visibly: they
+# validate the locked schema and then return 501. A 501 here is a real answer --
+# the route exists, the fence admits it, the schema is enforced -- and it is
+# never mistaken for a verdict, because a verdict can only come from the
 # runner's terminal record.
+#
+# `review-input` is the one operation whose response is NOT sanitized: it
+# returns redacted captured subjects and bodies for human naturalness review.
+# It exists for Baylor's manual CLI use. `scripts/certify_production.py` has no
+# capability to call it -- the refusal is in the transport itself, before a
+# request is built.
 
 
 # --- revision binding ------------------------------------------------------
@@ -408,9 +413,9 @@ def certification_operation(operation: str):
 
     handler = _CERTIFICATION_HANDLERS.get(operation)
     if handler is None:
-        # review-input and recover are real operations with real contracts that
-        # are not built yet. 501 says so; it is never a verdict, because a
-        # verdict can only come from the ledger's terminal record.
+        # `cleanup` is a real operation with a real contract that is not built
+        # yet. 501 says so; it is never a verdict, because a verdict can only
+        # come from the ledger's terminal record.
         return jsonify({"status": "error", "reason": "not_implemented"}), 501
 
     # Imported lazily so ordinary production never loads the certification

@@ -1,4 +1,4 @@
-"""prepare → run → status → abort, driven through the permanent run ledger.
+"""prepare → run → status → review-input → abort/recover, over the run ledger.
 
 The HTTP routes are a thin shell over this module. Keeping the lifecycle out of
 the request context is what lets the cases that actually matter -- a reused run
@@ -9,6 +9,16 @@ Every function returns ``(payload, http_status)``. Payloads are SANITIZED by
 construction: states, verdicts, phases, counts and digests. No recipient, body,
 subject, sheet id, fixture alias, or exception text, because a route response is
 the easiest place for a fixture value to escape the fixture.
+
+``review_input`` is the ONE exception, named in ``UNSANITIZED_OPERATIONS``. It
+returns redacted but otherwise raw captured subjects and bodies, because a human
+naturalness verdict cannot be reached from a digest. It is bounded, ordered,
+transient, and unreachable from any agent path; nothing else in this module
+relaxes to accommodate it.
+
+``recover`` is the counterpart hazard. It handles the CLAIMED/RUNNING run whose
+worker vanished, and it NEVER EXECUTES: its whole body runs inside the execution
+fence below, and its call graph is approved by allowlist in the tests.
 
 One deliberate limitation, stated rather than hidden: the default ledger is
 in-memory and therefore process-scoped. It enforces the full state machine but
