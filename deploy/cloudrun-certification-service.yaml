@@ -121,11 +121,26 @@ spec:
             #     version it executed against. ---
             - name: SITESIFT_FIXTURE_CONFIG_SECRET_VERSION
               value: FIXTURE_CONFIG_SECRET_VERSION_PLACEHOLDER
-            - name: SITESIFT_FIXTURE_CONFIG
+            # The secret itself. The NAME is load-bearing, not decorative: this
+            # entry read SITESIFT_FIXTURE_CONFIG while
+            # scripts/deploy_certification_twin.sh, twin_contract.TWIN_ONLY and
+            # the rollout comparator all use CERTIFICATION_FIXTURE_CONFIG. A
+            # twin applied from this scaffold would have been refused TWICE --
+            # missing a required field, and carrying an unclassified one -- and
+            # the two spellings must stay equal to the fixture version above,
+            # because one deployment may not carry two spellings of the fixture
+            # it ran.
+            - name: CERTIFICATION_FIXTURE_CONFIG
               valueFrom:
                 secretKeyRef:
                   name: sitesift-certification-fixture-config
                   key: FIXTURE_CONFIG_SECRET_VERSION_PLACEHOLDER
+            # --- The certification Firestore database. Absent from this
+            #     scaffold until now, though the deploy script has always set
+            #     it: a twin without it writes to the production database, and
+            #     the comparator refuses it by name for exactly that reason. ---
+            - name: FIRESTORE_DATABASE
+              value: sitesift-certification
             #
             # DELIBERATELY ABSENT, and each absence is a control, not an
             # oversight. Re-adding any of these silently converts the twin into

@@ -346,6 +346,87 @@ class TwinTrafficIsSpecifiedNotIncidentalTests(unittest.TestCase):
         self.assertNotIn(TWIN_TRAFFIC_REFUSAL, tc._validate(_candidate(), _twin()))
 
 
+class TheScaffoldAndTheDeployerNameTheSameTwinTests(unittest.TestCase):
+    """deploy/cloudrun-certification-service.yaml against the script that deploys.
+
+    Two artifacts describe one twin, and only one of them deploys it.
+    ``scripts/deploy_certification_twin.sh`` runs ``gcloud run deploy`` with
+    explicit flags; the manifest is a scaffold whose own header says
+    "SCAFFOLD ONLY" and "Do NOT build/push/deploy from this file
+    automatically", and no shipped script applies it. So where the two disagree
+    the SCRIPT is authoritative and the scaffold is what gets corrected.
+
+    They did disagree, in two ways, and both would have refused the twin:
+
+      * the scaffold mounted the fixture secret as ``SITESIFT_FIXTURE_CONFIG``
+        while the script, the contract and the rollout all use
+        ``CERTIFICATION_FIXTURE_CONFIG``. A twin applied from the scaffold would
+        be missing a required field AND carrying an unclassified one -- refused
+        twice, by name.
+      * the scaffold omitted ``FIRESTORE_DATABASE`` entirely, so a twin applied
+        from it would have written to the production database rather than the
+        certification one, had anything let it get that far.
+
+    A scaffold nobody applies is a lower-urgency finding than a live mismatch,
+    but it is not a harmless one: it is the document a human reads to learn what
+    the twin is, and it was teaching a name that the comparator refuses.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = yaml.safe_load(TWIN_MANIFEST.read_text())
+        container = cls.doc["spec"]["template"]["spec"]["containers"][0]
+        cls.env = {entry["name"]: entry for entry in container["env"]}
+
+    def test_the_manifest_parse_actually_produced_an_environment(self):
+        """Vacuity guard. Every name comparison below would pass against an
+        empty parse in one direction or the other."""
+        self.assertGreater(len(self.env), 5, sorted(self.env))
+        self.assertEqual(self.doc["metadata"]["name"], "process-user-certification")
+
+    def test_the_scaffold_sets_exactly_the_environment_the_script_deploys(self):
+        """Set equality in BOTH directions. A name only in the scaffold is one
+        the comparator would refuse as unclassified; a name only in the script
+        is one the scaffold's reader would never know the twin needs."""
+        self.assertEqual(sorted(self.env), sorted(DEPLOYED_TWIN_ENV))
+
+    def test_the_fixture_secret_is_mounted_under_the_classified_name(self):
+        """The one that was actually wrong. Keyed on the exact name rather than
+        on 'some env mentions the fixture config', because the scaffold's old
+        spelling would have satisfied that."""
+        self.assertIn("CERTIFICATION_FIXTURE_CONFIG", self.env)
+        self.assertIn("CERTIFICATION_FIXTURE_CONFIG", tc.TWIN_ONLY)
+        reference = self.env["CERTIFICATION_FIXTURE_CONFIG"]["valueFrom"]["secretKeyRef"]
+        self.assertEqual(reference["name"], tc.FIXTURE_CONFIG_SECRET)
+
+    def test_no_unclassified_name_survives_in_the_scaffold(self):
+        """Allowlist, not denylist: the release stamp is the only pair that is
+        neither twin-only nor forbidden, and everything else must be classified
+        or the comparator refuses the twin by name."""
+        stamp = {"SITESIFT_SOURCE_REVISION", "SITESIFT_IMAGE_DIGEST"}
+        unclassified = sorted(set(self.env) - set(tc.TWIN_ONLY) - stamp)
+        self.assertEqual(unclassified, [])
+
+    def test_every_classified_twin_only_field_is_present_in_the_scaffold(self):
+        missing = sorted(set(tc.TWIN_ONLY) - set(self.env))
+        self.assertEqual(missing, [])
+
+    def test_no_shipped_script_applies_the_scaffold(self):
+        """The finding that decides which artifact is authoritative.
+
+        If some script applied this manifest it would be a live mismatch and the
+        two would have to be reconciled the other way round. Nothing does: the
+        twin is deployed by flags, and the scaffold is a contract document.
+        """
+        appliers = []
+        for script in sorted((REPO_ROOT / "scripts").glob("*.sh")):
+            body = script.read_text()
+            if "cloudrun-certification-service.yaml" in body:
+                appliers.append(script.name)
+        self.assertEqual(appliers, [])
+        self.assertIn("--set-env-vars", TWIN_DEPLOY_COMMAND)
+
+
 class TwinDeployIamDenialTests(unittest.TestCase):
     """The twin's IAM denial, read off the script that actually deploys it.
 
