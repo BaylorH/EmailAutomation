@@ -17,6 +17,7 @@ is bounded to exactly this one operation.
 import ast
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -28,6 +29,7 @@ from unittest.mock import patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 import service
+from email_automation.certification import input_handoff
 from email_automation.certification import ledger as ledger_module
 from email_automation.certification import lifecycle
 
@@ -713,3 +715,395 @@ class RecoverRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# review-input: the one route that returns raw captured text
+# ---------------------------------------------------------------------------
+#
+# Every other lifecycle payload is sanitized BY CONSTRUCTION. This one is not,
+# and pretending otherwise would be worse than the exception: the whole point of
+# human naturalness review is that Baylor reads what the product actually wrote.
+#
+# So the escape is made explicit rather than quiet, and it is bounded on all
+# four sides -- one named operation, an ordered whole set, hard size limits, and
+# no agent path that can reach it.
+
+
+def fixture_flavoured_messages():
+    """Bodies carrying values from the REAL fixture, not invented lookalikes.
+
+    A redaction test that redacts a string the test made up proves the regex
+    compiles. Using the shipped fixture's own recipient and Firestore prefix
+    proves it removes the values that would actually be in a captured message.
+    """
+    from email_automation.certification import fixtures as fx
+    return [
+        {"kind": "outreach",
+         "subject": f"Following up for {fx.FIXTURE_RECIPIENT}",
+         "body": f"Hi Pat, writing about 100 Fixture Way. Reply to "
+                 f"{fx.FIXTURE_SENDER}. Record {fx.FIXTURE_PREFIX}/outbox/1."},
+        {"kind": "reply",
+         "subject": "Re: 100 Fixture Way",
+         "body": "Thanks for getting back to me about the property."},
+    ]
+
+
+class ReviewProjectionTests(unittest.TestCase):
+
+    def _project(self, messages, now_epoch=1_000_000):
+        return input_handoff.project_review_set(
+            "cert-review-run", messages, now_epoch=now_epoch)
+
+    def test_the_projection_is_ordered_and_whole(self):
+        """One array, every message, ordinals from one. It never paginates."""
+        messages = fixture_flavoured_messages() * 3
+        projected = self._project(messages)
+        self.assertEqual(len(projected.messages), len(messages))
+        self.assertEqual([m.ordinal for m in projected.messages],
+                         list(range(1, len(messages) + 1)))
+
+    def test_every_message_projects_exactly_five_fields(self):
+        projected = self._project(fixture_flavoured_messages())
+        for message in projected.messages:
+            self.assertEqual(set(message.to_dict()),
+                             {"ordinal", "kind", "bodyDigest", "subject", "body"})
+
+    def test_an_address_from_the_real_fixture_is_removed(self):
+        from email_automation.certification import fixtures as fx
+        projected = self._project(fixture_flavoured_messages())
+        blob = json.dumps([m.to_dict() for m in projected.messages])
+        self.assertNotIn(fx.FIXTURE_RECIPIENT, blob)
+        self.assertNotIn(fx.FIXTURE_SENDER, blob)
+        self.assertNotIn(fx.FIXTURE_PREFIX, blob)
+        # The prose survives -- redaction, not deletion of the thing under review.
+        self.assertIn("100 Fixture Way", blob)
+
+    def test_the_projection_is_checked_by_the_real_sanitizer(self):
+        from email_automation.certification import evidence as ev
+        projected = self._project(fixture_flavoured_messages())
+        for message in projected.messages:
+            ev.assert_safe_text("subject", message.subject)
+            ev.assert_safe_text("body", message.body)
+
+    def test_a_long_body_is_bounded_after_it_is_redacted(self):
+        from email_automation.certification import fixtures as fx
+        padding = "ordinary broker prose. " * 400
+        body = f"Reply to {fx.FIXTURE_RECIPIENT}. {padding}"
+        self.assertGreater(len(body), input_handoff.MAX_REVIEW_BODY_CHARS)
+        projected = self._project([{"kind": "outreach", "subject": "s",
+                                    "body": body}])
+        projected_body = projected.messages[0].body
+        self.assertLessEqual(len(projected_body),
+                             input_handoff.MAX_REVIEW_BODY_CHARS)
+        self.assertNotIn(fx.FIXTURE_RECIPIENT, projected_body)
+        self.assertIn(input_handoff.REDACTED_ADDRESS, projected_body)
+
+    def test_shape_is_checked_before_the_length_bound(self):
+        """Truncation is not redaction.
+
+        This is the case that tells the two orders apart. An unsafe shape sits
+        PAST the length bound. Bounding first would cut it out of the visible
+        text and the message would be served as checked -- checked against a
+        string that no longer contained the thing wrong with it. Checking first
+        refuses the whole set, which is the only honest answer.
+        """
+        from email_automation.certification import fixtures as fx
+        padding = "ordinary broker prose. " * 400
+        body = f"{padding}{fx.FIXTURE_RECIPIENT}"
+        self.assertGreater(body.index(fx.FIXTURE_RECIPIENT),
+                           input_handoff.MAX_REVIEW_BODY_CHARS)
+        with patch.object(input_handoff, "_redact", lambda text: text):
+            with self.assertRaises(input_handoff.ReviewProjectionRefused):
+                self._project([{"kind": "outreach", "subject": "s", "body": body}])
+
+    def test_a_body_whose_address_survives_redaction_refuses_the_whole_set(self):
+        """Refuse, do not ship a partially redacted body."""
+        with patch.object(input_handoff, "_redact", lambda text: text):
+            with self.assertRaises(input_handoff.ReviewProjectionRefused):
+                self._project(fixture_flavoured_messages())
+
+    def test_too_many_messages_refuses_rather_than_truncating_the_list(self):
+        messages = fixture_flavoured_messages()[:1] * (
+            input_handoff.MAX_REVIEW_MESSAGES + 1)
+        with self.assertRaises(input_handoff.ReviewProjectionRefused):
+            self._project(messages)
+
+    def test_an_unknown_kind_is_refused_by_allowlist(self):
+        with self.assertRaises(input_handoff.ReviewProjectionRefused):
+            self._project([{"kind": "invented_later", "subject": "s", "body": "b"}])
+
+    def test_the_body_digest_is_over_the_text_that_is_shown(self):
+        from email_automation.certification import evidence as ev
+        projected = self._project(fixture_flavoured_messages())
+        for message in projected.messages:
+            self.assertEqual(message.body_digest, ev.digest_of_text(message.body))
+
+    def test_the_set_digest_carries_no_text(self):
+        projected = self._project(fixture_flavoured_messages())
+        self.assertRegex(projected.set_digest, r"^[0-9a-f]{64}$")
+
+
+class ReviewStoreTests(unittest.TestCase):
+
+    def setUp(self):
+        self.store = input_handoff.TransientReviewStore()
+
+    def test_a_deposited_set_is_readable_once_deposited(self):
+        self.store.deposit("cert-store-1", fixture_flavoured_messages(),
+                           now_epoch=1_000_000)
+        self.assertIsNotNone(self.store.get("cert-store-1", now_epoch=1_000_001))
+
+    def test_a_second_deposit_is_refused(self):
+        self.store.deposit("cert-store-2", fixture_flavoured_messages(),
+                           now_epoch=1_000_000)
+        with self.assertRaises(input_handoff.ReviewProjectionRefused):
+            self.store.deposit("cert-store-2", fixture_flavoured_messages(),
+                               now_epoch=1_000_000)
+
+    def test_an_expired_set_is_neither_served_nor_retained(self):
+        self.store.deposit("cert-store-3", fixture_flavoured_messages(),
+                           now_epoch=1_000_000)
+        expired_at = 1_000_000 + input_handoff.REVIEW_SET_TTL_SECONDS + 1
+        self.assertIsNone(self.store.get("cert-store-3", now_epoch=expired_at))
+        self.assertEqual(self.store.export_run_ids(), ())
+
+    def test_the_ttl_is_bounded_to_one_day(self):
+        self.assertEqual(input_handoff.REVIEW_SET_TTL_SECONDS, 24 * 60 * 60)
+
+    def test_discard_is_how_cleanup_owns_the_artifact(self):
+        self.store.deposit("cert-store-4", fixture_flavoured_messages(),
+                           now_epoch=1_000_000)
+        self.assertTrue(self.store.discard("cert-store-4"))
+        self.assertIsNone(self.store.get("cert-store-4", now_epoch=1_000_001))
+
+
+class ReviewInputLifecycleTests(unittest.TestCase):
+
+    def setUp(self):
+        self.ledger = ObservableLedger(**quiescent_observation())
+        self.store = input_handoff.TransientReviewStore()
+
+    def _call(self, run_id):
+        return lifecycle.review_input(
+            {"runId": run_id, "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=self.ledger,
+            store=self.store, now_epoch=1_000_001)
+
+    def test_an_unknown_run_is_not_invented(self):
+        payload, code = self._call("cert-review-unknown")
+        self.assertEqual(code, 404)
+        self.assertEqual(payload["reason"], "unknown_run")
+
+    def test_a_run_with_nothing_awaiting_review_is_refused(self):
+        claimed_run(self.ledger, "cert-review-none")
+        payload, code = self._call("cert-review-none")
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "no_review_pending")
+
+    def test_the_whole_ordered_set_is_returned(self):
+        claimed_run(self.ledger, "cert-review-set")
+        self.store.deposit("cert-review-set", fixture_flavoured_messages(),
+                           now_epoch=1_000_000)
+        payload, code = self._call("cert-review-set")
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(len(payload["messages"]), 2)
+        self.assertEqual([m["ordinal"] for m in payload["messages"]], [1, 2])
+        for message in payload["messages"]:
+            self.assertEqual(set(message),
+                             {"ordinal", "kind", "bodyDigest", "subject", "body"})
+
+    def test_an_expired_review_set_is_not_served(self):
+        claimed_run(self.ledger, "cert-review-expired")
+        self.store.deposit("cert-review-expired", fixture_flavoured_messages(),
+                           now_epoch=1_000_000)
+        payload, code = lifecycle.review_input(
+            {"runId": "cert-review-expired", "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=self.ledger,
+            store=self.store,
+            now_epoch=1_000_000 + input_handoff.REVIEW_SET_TTL_SECONDS + 1)
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "no_review_pending")
+
+
+class ReviewInputRouteTests(unittest.TestCase):
+
+    def setUp(self):
+        service.app.config["TESTING"] = True
+        self.client = service.app.test_client()
+        self.ledger = ObservableLedger(**quiescent_observation())
+        self.store = input_handoff.TransientReviewStore()
+        for target, value in (("_DEFAULT_LEDGER", self.ledger),
+                              ("_DEFAULT_REVIEW_STORE", self.store)):
+            patcher = patch.object(lifecycle, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _post(self, operation, body):
+        decoder = lambda token, audience: {
+            "iss": "https://accounts.google.com", "aud": AUDIENCE,
+            "email": OPERATOR, "email_verified": True, "sub": SUB,
+            "exp": 4102444800,
+        }
+        with patch.dict(os.environ, TWIN_ENV, clear=False), \
+                patch.object(service, "_caller_decoder", decoder):
+            return self.client.post(
+                f"/certification/{operation}", json=body,
+                headers={"Authorization": "Bearer valid"})
+
+    def test_review_input_is_no_longer_not_implemented(self):
+        claimed_run(self.ledger, "cert-route-review")
+        self.store.deposit("cert-route-review", fixture_flavoured_messages(),
+                           now_epoch=int(time.time()))
+        response = self._post("review-input", {"runId": "cert-route-review",
+                                               "expectedRevision": REVISION})
+        self.assertNotEqual(response.status_code, 501)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(len(response.get_json()["messages"]), 2)
+
+    def test_the_review_input_request_surface_stays_closed(self):
+        claimed_run(self.ledger, "cert-route-review-closed")
+        for extra in ({"uid": "real-user"}, {"recipient": "someone@example.com"},
+                      {"ordinal": "1"}, {"body": "text"}):
+            body = {"runId": "cert-route-review-closed",
+                    "expectedRevision": REVISION}
+            body.update(extra)
+            with self.subTest(extra=extra):
+                response = self._post("review-input", body)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.get_json()["reason"], "invalid_request")
+
+
+# ---------------------------------------------------------------------------
+# The escape from the sanitization contract is bounded and agent-unreachable
+# ---------------------------------------------------------------------------
+
+
+def real_cli():
+    """Load the SHIPPED CLI. A retyped allowlist would only test itself."""
+    import importlib.util
+    path = REPO_ROOT / "scripts" / "certify_production.py"
+    spec = importlib.util.spec_from_file_location("certify_production", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class AgentCannotReachRawTextTests(unittest.TestCase):
+
+    def test_the_real_allowlist_refuses_review_input(self):
+        cli = real_cli()
+        for operation in sorted(cli.HUMAN_ONLY_OPERATIONS):
+            with self.subTest(operation=operation):
+                with self.assertRaises(cli.CertifyRefused):
+                    cli.assert_agent_may_call(operation)
+
+    def test_the_two_real_operation_sets_do_not_overlap(self):
+        cli = real_cli()
+        self.assertEqual(
+            cli.AGENT_ALLOWED_OPERATIONS & cli.HUMAN_ONLY_OPERATIONS, frozenset())
+
+    def test_every_real_route_operation_is_classified_by_the_real_cli(self):
+        """Driven from the shipped route table, so a new route cannot slip in
+        unclassified and default to reachable."""
+        cli = real_cli()
+        for operation in sorted(service._CERTIFICATION_OPERATIONS):
+            with self.subTest(operation=operation):
+                if operation in cli.AGENT_ALLOWED_OPERATIONS:
+                    cli.assert_agent_may_call(operation)
+                else:
+                    with self.assertRaises(cli.CertifyRefused):
+                        cli.assert_agent_may_call(operation)
+
+    def test_the_refusal_precedes_the_transport(self):
+        """`call` refuses before it builds a request, not after it reads one."""
+        cli = real_cli()
+        attempts = []
+
+        def record(*args, **kwargs):
+            attempts.append(args)
+            raise AssertionError("the CLI opened a connection for review-input")
+
+        with patch.object(socket, "getaddrinfo", record), \
+                patch.object(socket, "create_connection", record), \
+                patch.object(socket.socket, "connect", record):
+            with self.assertRaises(cli.CertifyRefused):
+                cli.call("http://127.0.0.1:1", "review-input",
+                         {"runId": "r", "expectedRevision": REVISION}, token="t")
+        self.assertEqual(attempts, [])
+
+    def test_recover_is_agent_callable_and_review_input_is_not(self):
+        cli = real_cli()
+        cli.assert_agent_may_call("recover")
+        with self.assertRaises(cli.CertifyRefused):
+            cli.assert_agent_may_call("review-input")
+
+
+class SanitizationContractTests(unittest.TestCase):
+    """review-input is the ONLY unsanitized payload, and it says so out loud."""
+
+    def test_the_exception_is_named_and_is_exactly_one_operation(self):
+        self.assertEqual(set(lifecycle.UNSANITIZED_OPERATIONS), {"review-input"})
+
+    def test_the_unsanitized_operation_is_human_only_in_the_real_cli(self):
+        cli = real_cli()
+        self.assertTrue(
+            set(lifecycle.UNSANITIZED_OPERATIONS) <= set(cli.HUMAN_ONLY_OPERATIONS))
+
+    def test_every_other_lifecycle_payload_passes_the_real_sanitizer(self):
+        from email_automation.certification import evidence as ev
+
+        ledger = ObservableLedger(**quiescent_observation())
+        store = input_handoff.TransientReviewStore()
+        run_id = "cert-sanitized-run"
+        environ = dict(TWIN_ENV)
+        payloads = []
+
+        prepared, _ = lifecycle.prepare(
+            {"scenarioId": "campaign-one-property", "runId": run_id,
+             "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger, environ=environ)
+        payloads.append(prepared)
+        payloads.append(lifecycle.status({"runId": run_id}, ledger=ledger)[0])
+
+        claimed_run(ledger, "cert-sanitized-recover")
+        clock = FakeClock()
+        payloads.append(lifecycle.recover(
+            {"runId": "cert-sanitized-recover", "expectedRevision": REVISION},
+            ledger=ledger, clock=clock.time, sleeper=clock.sleep)[0])
+
+        from email_automation.certification.models import CertificationRequest
+        ledger.begin_preparing(CertificationRequest(
+            scenario_id="campaign-one-property", run_id="cert-sanitized-abort",
+            expected_revision=REVISION))
+        payloads.append(lifecycle.abort(
+            {"runId": "cert-sanitized-abort"}, ledger=ledger)[0])
+
+        # And the one that is deliberately NOT sanitized, to prove the check
+        # would have caught it.
+        claimed_run(ledger, "cert-sanitized-review")
+        store.deposit("cert-sanitized-review",
+                      [{"kind": "outreach", "subject": "s",
+                        "body": "reach me at real.person@example.com"}],
+                      now_epoch=1_000_000)
+        unsanitized, _ = lifecycle.review_input(
+            {"runId": "cert-sanitized-review"}, ledger=ledger, store=store,
+            now_epoch=1_000_001)
+
+        # Digests are 64 hex characters and legitimately look like an opaque
+        # blob, so they are excluded by their exact shape rather than by
+        # loosening the check for everything else.
+        digest = re.compile(r"^[0-9a-f]{64}$")
+        checked = 0
+        for payload in payloads:
+            for key, value in payload.items():
+                if isinstance(value, str) and not digest.match(value):
+                    ev.assert_safe_text(f"payload.{key}", value)
+                    checked += 1
+        self.assertGreater(checked, 0)
+
+        # review-input's own payload is only safe because it was REDACTED, not
+        # because it was sanitized: the raw prose is still there by design.
+        blob = json.dumps(unsanitized, sort_keys=True)
+        self.assertNotIn("real.person@example.com", blob)
+        self.assertIn("reach me at", blob)

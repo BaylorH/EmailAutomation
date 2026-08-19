@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from email_automation.certification import ledger as ledger_module
 from email_automation.certification import scenarios
 from email_automation.certification.canonical_json import canonical_digest
+from email_automation.certification import input_handoff
 from email_automation.certification.input_handoff import SealedInput
 from email_automation.certification.models import (
     AuthorizationInvalid,
@@ -66,9 +67,24 @@ REQUIRED_IDENTITY_ENV = (
 
 _DEFAULT_LEDGER = ledger_module.InMemoryRunLedger()
 
+# Transient, process-scoped, and never persisted. See input_handoff for why the
+# raw review text may not go anywhere else.
+_DEFAULT_REVIEW_STORE = input_handoff.TransientReviewStore()
+
+# The ONE operation whose payload is not sanitized, named here so the exception
+# is a declared fact instead of an omission somebody discovers later. Human
+# naturalness review cannot be done against digests; everything else can, and
+# does. This set is asserted against the CLI's human-only operations by test, so
+# an unsanitized route can never become agent-callable without failing.
+UNSANITIZED_OPERATIONS = frozenset({"review-input"})
+
 
 def default_ledger() -> ledger_module.InMemoryRunLedger:
     return _DEFAULT_LEDGER
+
+
+def default_review_store() -> input_handoff.TransientReviewStore:
+    return _DEFAULT_REVIEW_STORE
 
 
 def _error(reason: str, status: int) -> Response:
@@ -287,6 +303,42 @@ def status(body: Mapping[str, Any], *, caller_identity_digest: str = "",
         return _error("unknown_run", 404)
     return {"status": "ok", "state": state, "runId": run_id,
             "verdict": ledger.verdict(run_id) or ""}, 200
+
+
+def review_input(body: Mapping[str, Any], *, caller_identity_digest: str = "",
+                 ledger=None, environ: Optional[Mapping[str, str]] = None,
+                 store=None, now_epoch: Optional[int] = None) -> Response:
+    """The bounded ordered projection of every captured message for one run.
+
+    THE ONE UNSANITIZED PAYLOAD IN THE INSTRUMENT. It returns subjects and
+    bodies, because a naturalness verdict cannot be reached from a digest.
+
+    Everything about it is narrowed to make that survivable. The text is
+    redacted by shape and re-verified with the real evidence sanitizer before
+    any length bound applies; the pack is whole and ordered or it is refused;
+    the artifact expires within a day and cleanup owns it; and no agent path can
+    reach the route -- ``scripts/certify_production.py`` refuses the operation
+    before it builds a request, which is a capability the CLI does not have
+    rather than a guard it chooses not to use.
+    """
+    ledger = ledger if ledger is not None else default_ledger()
+    store = store if store is not None else default_review_store()
+    run_id = body["runId"]
+
+    if ledger.state(run_id) is None:
+        return _error("unknown_run", 404)
+
+    moment = now_epoch if now_epoch is not None else _now_epoch()
+    review_set = store.get(run_id, now_epoch=moment)
+    if review_set is None:
+        # Covers "nothing captured", "already reviewed", and "expired" alike.
+        # None of them is a state in which raw text may be served.
+        return _error("no_review_pending", 409)
+
+    return {"status": "ok", "state": "AWAITING_REVIEW", "runId": run_id,
+            "reviewSetDigest": review_set.set_digest,
+            "expiresAtEpoch": review_set.expires_at_epoch,
+            "messages": [message.to_dict() for message in review_set.messages]}, 200
 
 
 def abort(body: Mapping[str, Any], *, caller_identity_digest: str = "",

@@ -343,6 +343,9 @@ _CERTIFICATION_HANDLERS = {
     "status": "status",
     "abort": "abort",
     "recover": "recover",
+    # The one handler whose response is not sanitized. It exists for Baylor's
+    # manual CLI use; the agent-facing CLI has no capability to call it.
+    "review-input": "review_input",
 }
 
 _CERTIFICATION_REVIEW_KEYS = frozenset(
