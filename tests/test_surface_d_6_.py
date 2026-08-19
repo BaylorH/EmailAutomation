@@ -630,6 +630,31 @@ class InboxAutoReplyWrongRecipientTests(unittest.TestCase):
     with a clean recipient set proves the block fires on recipient identity.
     """
 
+    def setUp(self):
+        # Disable the per-user daily send-cap rail for this class only.
+        #
+        # email._check_single_provider_send_cap keeps that rail ON by default
+        # (DEFAULT_DAILY_SEND_CAP = 500), and reserving against it needs
+        # fs.transaction() plus a transactional ref.get()/set(). _AutoReplyFakeFs
+        # models none of that, so every send in this class was failing closed on
+        # "atomic daily send reservation unavailable: '_AutoReplyFakeFs' object
+        # has no attribute 'transaction'" -- an unmodelled counter, not the
+        # recipient-identity rule these tests exist to prove. Blanking the cap
+        # (the same lever tests/test_processing_reply_indexing.py pulls in its
+        # own setUp) puts the recipient filter back on the critical path.
+        #
+        # This does not relax any assertion; it removes an upstream blocker that
+        # could stand in for one. Checked rather than assumed: with the rail off,
+        # all 8 tests in this module pass, so none of the blocking tests was
+        # relying on the failed reservation to produce its block, and each keeps
+        # its own specific last_outcome.
+        cap_env = patch.dict(os.environ, {
+            "SITESIFT_DAILY_SEND_CAP": "0",
+            "SITESIFT_GLOBAL_DAILY_SEND_CAP": "0",
+        })
+        cap_env.start()
+        self.addCleanup(cap_env.stop)
+
     def _run(self, opted_out_addresses):
         user_id = "uid-allowlisted"
         posts = []
