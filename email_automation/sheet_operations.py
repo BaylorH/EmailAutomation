@@ -1,3 +1,4 @@
+import re
 from typing import Optional, List, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs, _sheets_client
@@ -206,10 +207,36 @@ def sync_thread_row_numbers_after_insert(user_id: str, insert_row: int, client_i
         return 0
 
 
+def _normalize_header_key(name: str) -> str:
+    """Collapse a header to alnum-only lowercase so spacing and punctuation differ freely.
+
+    'Ops Ex / SF' == 'Ops Ex /SF' == 'ops ex/sf' == 'opsexsf'.
+
+    LIVE break (2026-08-06 production campaign), recorded as one of eight
+    defects: "missing Gross Rent formula on the replacement row after facts
+    applied". `_find_header_position` compared on bare `.strip().lower()`, so
+    the real sheet's 'Ops Ex / SF' matched neither alias ('ops ex /sf',
+    'ops ex/sf'). The lookup returned None, `_build_gross_rent_formula_for_row`
+    returned None, and `_apply_gross_rent_formula_for_row` returned False
+    WITHOUT raising -- so the row shipped with no Gross Rent formula and looked
+    finished. Gross Rent is the column the customer screens on.
+
+    This is the same defect, on the same header, that
+    `ai_processing._normalize_required_col_key` was written to fix for
+    `check_missing_required_fields` (where it caused already-filled columns to
+    be re-requested forever). That fix was never applied here. Matching on a
+    normalized key rather than an exact string is what stops a third instance:
+    a spelling nobody enumerated can no longer silently mean "column absent".
+    """
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
 def _find_header_position(header: List[str], aliases: List[str]) -> Optional[int]:
-    normalized_aliases = {alias.strip().lower() for alias in aliases}
+    normalized_aliases = {_normalize_header_key(alias) for alias in aliases}
+    normalized_aliases.discard("")
     for idx, column in enumerate(header, start=1):
-        if (column or "").strip().lower() in normalized_aliases:
+        key = _normalize_header_key(column)
+        if key and key in normalized_aliases:
             return idx
     return None
 
