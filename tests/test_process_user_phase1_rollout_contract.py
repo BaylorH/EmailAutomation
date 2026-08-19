@@ -140,6 +140,74 @@ def revision(name, image):
     }
 
 
+TWIN_SERVICE_NAME = "process-user-certification"
+TWIN_REVISION = "process-user-certification-1234567890ab"
+TWIN_RUNTIME_SA = (
+    "sitesift-certification-runtime@email-automation-cache.iam.gserviceaccount.com"
+)
+TWIN_OPERATOR_SA = (
+    "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
+)
+FIXTURE_CONFIG_SECRET = "sitesift-certification-fixture-config"
+
+
+def twin_service(
+    *,
+    image=CANDIDATE_IMAGE,
+    source_revision=HEAD_SHA,
+    name=TWIN_SERVICE_NAME,
+    service_account=TWIN_RUNTIME_SA,
+    fixture_version="7",
+    fixture_secret=FIXTURE_CONFIG_SECRET,
+    ingress="internal",
+    traffic_revision=TWIN_REVISION,
+    extra_env=(),
+    drop_env=(),
+):
+    env = [
+        {
+            "name": "OPENAI_API_KEY",
+            "valueFrom": {"secretKeyRef": {"name": "OPENAI_API_KEY", "key": "latest"}},
+        },
+        {"name": "SITESIFT_IMAGE_DIGEST", "value": image.split("@", 1)[1]},
+        {"name": "SITESIFT_SOURCE_REVISION", "value": source_revision},
+        {"name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "false"},
+        {"name": "K_SERVICE", "value": name},
+        {"name": "FIRESTORE_DATABASE", "value": "sitesift-certification"},
+        {
+            "name": "CERTIFICATION_FIXTURE_CONFIG",
+            "valueFrom": {
+                "secretKeyRef": {"name": fixture_secret, "key": fixture_version}
+            },
+        },
+    ]
+    env = [entry for entry in env if entry["name"] not in drop_env]
+    env.extend(dict(entry) for entry in extra_env)
+    traffic = [{"revisionName": traffic_revision, "percent": 100}]
+    return {
+        "metadata": {
+            "name": name,
+            "annotations": {"run.googleapis.com/ingress": ingress},
+        },
+        "spec": {
+            "traffic": [dict(row) for row in traffic],
+            "template": {
+                "spec": {
+                    "serviceAccountName": service_account,
+                    "containers": [{"image": image, "env": env}],
+                }
+            },
+        },
+        "status": {"traffic": [dict(row) for row in traffic]},
+    }
+
+
+def twin_policy(members=None, role="roles/run.invoker"):
+    if members is None:
+        members = [f"serviceAccount:{TWIN_OPERATOR_SA}"]
+    return {"bindings": [{"role": role, "members": list(members)}]}
+
+
 def queue(state="RUNNING"):
     return {
         "name": "projects/email-automation-cache/locations/us-central1/queues/graph-process-user",
@@ -205,6 +273,8 @@ class FakeOps:
         self.post_tag_removal_fault = None
         self.tag_removed = False
         self.post_tag_service_calls = 0
+        self.twin_service = twin_service()
+        self.twin_policy = twin_policy()
 
     def _post_tag_fault(self, name):
         return self.tag_removed and self.post_tag_removal_fault == name
@@ -283,6 +353,18 @@ class FakeOps:
         source = self.candidate_revision if name == CANDIDATE else self.old_revision
         return json.loads(json.dumps(source))
 
+    def get_twin_service(self):
+        self.events.append("twin:service")
+        if self._post_tag_fault("twin_read"):
+            raise phase1_rollout.RolloutError("twin service read failed")
+        return json.loads(json.dumps(self.twin_service))
+
+    def get_twin_iam_policy(self):
+        self.events.append("twin:iam")
+        if self._post_tag_fault("twin_iam_read"):
+            raise phase1_rollout.RolloutError("twin IAM read failed")
+        return json.loads(json.dumps(self.twin_policy))
+
     def get_queue(self):
         self.events.append("queue")
         result = json.loads(json.dumps(self.queue))
@@ -335,6 +417,36 @@ class FakeOps:
             wrong = OLD_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
             self.old_revision["spec"]["containers"][0]["image"] = wrong
             self.old_revision["status"]["imageDigest"] = wrong
+        elif fault == "twin_image":
+            self.twin_service = twin_service(
+                image=CANDIDATE_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
+            )
+        elif fault == "twin_service_account":
+            self.twin_service = twin_service(
+                service_account="248289505828-compute@developer.gserviceaccount.com"
+            )
+        elif fault == "twin_identity":
+            self.twin_service = twin_service(name="process-user")
+        elif fault == "twin_stamp":
+            self.twin_service = twin_service(source_revision="0" * 40)
+        elif fault == "twin_fixture_alias":
+            self.twin_service = twin_service(fixture_version="latest")
+        elif fault == "twin_forbidden_env":
+            self.twin_service = twin_service(
+                extra_env=[{"name": "FIREBASE_BUCKET", "value": "bucket"}]
+            )
+        elif fault == "twin_unclassified_env":
+            self.twin_service = twin_service(
+                extra_env=[{"name": "UNAPPROVED_MODE", "value": "1"}]
+            )
+        elif fault == "twin_public_invoker":
+            self.twin_policy = twin_policy(members=["allUsers"])
+        elif fault == "twin_production_traffic":
+            self.twin_service = twin_service(traffic_revision=CANDIDATE)
+        elif fault == "twin_read":
+            pass
+        elif fault == "twin_iam_read":
+            pass
         elif fault == "lock_before":
             self.lose_lock_on_assert = self.lock_assertions + 2
         elif fault == "lock_after":
@@ -682,6 +794,235 @@ class ValidatorTests(unittest.TestCase):
             )
 
 
+    def _twin_call(self, **overrides):
+        arguments = {
+            "candidate_spec": revision(CANDIDATE, CANDIDATE_IMAGE)["spec"],
+            "expected_image": CANDIDATE_IMAGE,
+            "expected_source_revision": HEAD_SHA,
+            "production": phase1_rollout.validate_topology(
+                service(),
+                expected_positive=OLD_REVISION,
+                expected_release=OLD_REVISION,
+                expected_aux=AUX_TAGS,
+            ),
+        }
+        arguments.update(overrides)
+        return arguments
+
+    def test_exact_twin_stamp_is_accepted(self):
+        phase1_rollout.validate_twin_stamp(
+            twin_service(), twin_policy(), **self._twin_call()
+        )
+
+    def test_twin_must_run_the_candidate_artifact_byte_for_byte(self):
+        other = CANDIDATE_IMAGE.rsplit("sha256:", 1)[0] + "sha256:" + "d" * 64
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(image=other), twin_policy(), **self._twin_call()
+            )
+        # A twin whose stamp still claims this build while the container runs a
+        # different one: only the image comparison can catch this.
+        lying = twin_service()
+        lying["spec"]["template"]["spec"]["containers"][0]["image"] = other
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                lying, twin_policy(), **self._twin_call()
+            )
+        # ...and a twin pinned to a mutable tag rather than a digest.
+        tagged = twin_service()
+        tagged["spec"]["template"]["spec"]["containers"][0]["image"] = (
+            CANDIDATE_IMAGE.split("@", 1)[0] + ":latest"
+        )
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                tagged, twin_policy(), **self._twin_call()
+            )
+
+    def test_twin_identity_and_runtime_account_must_be_the_certification_pair(self):
+        for label, document in (
+            ("production name", twin_service(name="process-user")),
+            (
+                "production runtime",
+                twin_service(
+                    service_account=(
+                        "248289505828-compute@developer.gserviceaccount.com"
+                    )
+                ),
+            ),
+            ("unknown runtime", twin_service(service_account="someone@example.com")),
+            ("public ingress", twin_service(ingress="all")),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_twin_stamp(
+                        document, twin_policy(), **self._twin_call()
+                    )
+
+    def test_twin_is_never_a_production_traffic_target(self):
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(traffic_revision=CANDIDATE),
+                twin_policy(),
+                **self._twin_call(),
+            )
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(),
+                twin_policy(),
+                **self._twin_call(
+                    production=phase1_rollout.validate_topology(
+                        service(extra={"twin": TWIN_REVISION}),
+                        expected_positive=OLD_REVISION,
+                        expected_release=OLD_REVISION,
+                        expected_aux=AUX_TAGS,
+                        expected_extra={"twin": TWIN_REVISION},
+                    )
+                ),
+            )
+
+    def test_twin_stamp_must_name_this_commit_and_this_artifact(self):
+        for label, document in (
+            ("foreign source", twin_service(source_revision="0" * 40)),
+            (
+                "dropped source",
+                twin_service(drop_env=("SITESIFT_SOURCE_REVISION",)),
+            ),
+            ("dropped digest", twin_service(drop_env=("SITESIFT_IMAGE_DIGEST",))),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_twin_stamp(
+                        document, twin_policy(), **self._twin_call()
+                    )
+
+        # Candidate and twin agreeing with each other while both disagree with
+        # the reviewed commit. Symmetry proves nothing here: only the check
+        # against the expected value can see it.
+        other = "b" * 40
+        agreed = revision(CANDIDATE, CANDIDATE_IMAGE)["spec"]
+        for entry in agreed["containers"][0]["env"]:
+            if entry["name"] == "SITESIFT_SOURCE_REVISION":
+                entry["value"] = other
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(source_revision=other),
+                twin_policy(),
+                **self._twin_call(candidate_spec=agreed),
+            )
+
+    def test_twin_fixture_secret_must_pin_a_positive_decimal_version(self):
+        for version in ("latest", "0", "07", "", "1.0", "-1", "v1"):
+            with self.subTest(version=version):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_twin_stamp(
+                        twin_service(fixture_version=version),
+                        twin_policy(),
+                        **self._twin_call(),
+                    )
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(fixture_secret="some-other-secret"),
+                twin_policy(),
+                **self._twin_call(),
+            )
+
+    def test_twin_must_not_carry_production_capabilities(self):
+        for name in (
+            "FIREBASE_BUCKET",
+            "AZURE_API_APP_ID",
+            "AZURE_API_CLIENT_SECRET",
+            "FIREBASE_API_KEY",
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "GOOGLE_OAUTH_CLIENT_SECRET",
+            "GOOGLE_REFRESH_TOKEN",
+            "PROCESS_USER_AUTH",
+            "SITESIFT_AUTO_REPLY_ALLOWLIST",
+            "SITESIFT_TOUR_ACTION_ALLOWLIST",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_twin_stamp(
+                        twin_service(extra_env=[{"name": name, "value": "x"}]),
+                        twin_policy(),
+                        **self._twin_call(),
+                    )
+
+    def test_unclassified_twin_difference_is_a_failure_not_a_third_category(self):
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(extra_env=[{"name": "UNAPPROVED_MODE", "value": "1"}]),
+                twin_policy(),
+                **self._twin_call(),
+            )
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(
+                    extra_env=[
+                        {"name": "SITESIFT_NATIVE_IMAGE_INGESTION", "value": "false"}
+                    ]
+                ),
+                twin_policy(),
+                **self._twin_call(),
+            )
+
+    def test_shared_configuration_must_be_identical_on_both_surfaces(self):
+        drifted = twin_service(drop_env=("SITESIFT_NATIVE_IMAGE_INGESTION",))
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                drifted, twin_policy(), **self._twin_call()
+            )
+        changed = twin_service()
+        for entry in changed["spec"]["template"]["spec"]["containers"][0]["env"]:
+            if entry["name"] == "SITESIFT_NATIVE_IMAGE_INGESTION":
+                entry["value"] = "true"
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                changed, twin_policy(), **self._twin_call()
+            )
+
+    def test_only_the_certification_operator_may_invoke_the_twin(self):
+        for label, policy in (
+            ("public", twin_policy(members=["allUsers"])),
+            ("authenticated", twin_policy(members=["allAuthenticatedUsers"])),
+            ("human token", twin_policy(members=["user:bp21harrison@gmail.com"])),
+            (
+                "production runtime",
+                twin_policy(
+                    members=[
+                        "serviceAccount:248289505828-compute@"
+                        "developer.gserviceaccount.com"
+                    ]
+                ),
+            ),
+            (
+                "extra member",
+                twin_policy(
+                    members=[
+                        f"serviceAccount:{TWIN_OPERATOR_SA}",
+                        "user:bp21harrison@gmail.com",
+                    ]
+                ),
+            ),
+            ("wrong role", twin_policy(role="roles/run.admin")),
+            ("no bindings", {"bindings": []}),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(phase1_rollout.RolloutError):
+                    phase1_rollout.validate_twin_stamp(
+                        twin_service(), policy, **self._twin_call()
+                    )
+
+    def test_duplicate_twin_environment_names_are_refused(self):
+        with self.assertRaises(phase1_rollout.RolloutError):
+            phase1_rollout.validate_twin_stamp(
+                twin_service(
+                    extra_env=[{"name": "K_SERVICE", "value": TWIN_SERVICE_NAME}]
+                ),
+                twin_policy(),
+                **self._twin_call(),
+            )
+
+
 class StateMachineTests(unittest.TestCase):
     def make_rollout(self, ops, nonce="a" * 64):
         sleeps = []
@@ -750,6 +1091,8 @@ class StateMachineTests(unittest.TestCase):
                 "prerequisites",
                 "service",
                 "service-access",
+                "twin:service",
+                "twin:iam",
                 "queue",
                 "tasks",
                 "lock:assert",
@@ -760,6 +1103,67 @@ class StateMachineTests(unittest.TestCase):
             ops.events[remove_index - 1:promote_index + 2],
         )
         self.assertEqual("RUNNING", ops.queue["state"])
+
+    def test_twin_stamp_checks_sit_inside_the_authorization_lock(self):
+        # A check outside the lock is a check something can change between
+        # passing and being relied on. The twin reads must therefore be bounded
+        # by a lock assertion on BOTH sides, with no mutation in between.
+        ops = FakeOps()
+        rollout, _ = self.make_rollout(ops)
+        rollout.apply()
+        remove_index = ops.events.index("tag:remove")
+        promote_index = ops.events.index("promote")
+        slice_events = ops.events[remove_index:promote_index]
+        self.assertIn("twin:service", slice_events)
+        self.assertIn("twin:iam", slice_events)
+
+        first = ops.events.index("twin:service")
+        last = ops.events.index("twin:iam")
+        self.assertLess(first, last)
+        opening = max(
+            index
+            for index, event in enumerate(ops.events[:first])
+            if event == "lock:assert"
+        )
+        closing = min(
+            index
+            for index, event in enumerate(ops.events)
+            if index > last and event == "lock:assert"
+        )
+        self.assertLess(opening, first)
+        self.assertLess(last, closing)
+        mutations = {"pause", "resume", "tag:add", "tag:remove", "promote", "rollback"}
+        self.assertEqual(
+            set(),
+            mutations & set(ops.events[opening:closing]),
+            "no mutation may run between the twin check and the lock assertion "
+            "that certifies it",
+        )
+        self.assertEqual(1, ops.events.count("twin:service"))
+        self.assertEqual(1, ops.events.count("twin:iam"))
+
+    def test_twin_is_never_read_once_the_authorization_lock_is_gone(self):
+        # If the twin were inspected before the slice re-asserts the lock, this
+        # would still record a twin read after ownership was lost.
+        ops = FakeOps()
+        ops.post_tag_removal_fault = "lock_before"
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaises(phase1_rollout.RolloutError):
+            rollout.apply()
+        remove_index = ops.events.index("tag:remove")
+        self.assertNotIn("twin:service", ops.events[remove_index:])
+        self.assertNotIn("promote", ops.events)
+
+    def test_twin_reads_never_happen_before_the_lock_is_acquired(self):
+        ops = FakeOps()
+        rollout, _ = self.make_rollout(ops)
+        rollout.apply()
+        acquire = ops.events.index("lock:acquire")
+        release = ops.events.index("lock:release")
+        for event in ("twin:service", "twin:iam"):
+            with self.subTest(event=event):
+                self.assertLess(acquire, ops.events.index(event))
+                self.assertLess(ops.events.index(event), release)
 
     def test_every_post_tag_pre_promotion_revalidation_failure_stops_traffic(self):
         expected_events = {
@@ -772,6 +1176,17 @@ class StateMachineTests(unittest.TestCase):
             "switches": "prerequisites",
             "topology": "service",
             "iam": "service-access",
+            "twin_read": "twin:service",
+            "twin_iam_read": "twin:iam",
+            "twin_image": "twin:service",
+            "twin_service_account": "twin:service",
+            "twin_identity": "twin:service",
+            "twin_stamp": "twin:service",
+            "twin_fixture_alias": "twin:service",
+            "twin_forbidden_env": "twin:service",
+            "twin_unclassified_env": "twin:service",
+            "twin_public_invoker": "twin:iam",
+            "twin_production_traffic": "twin:service",
             "queue": "queue",
             "task_read": "tasks",
             "lock_before": "lock:assert",

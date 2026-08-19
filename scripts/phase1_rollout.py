@@ -101,6 +101,49 @@ EXPECTED_IAM = {
         "serviceAccount:248289505828-compute@developer.gserviceaccount.com",
     ),
 }
+# --- the certification twin -------------------------------------------------
+#
+# The twin exists to run the SAME artifact under fixtures. It is IAM-private,
+# carries no production traffic, and holds a service account with no mailbox,
+# send, queue, or production-data authority. Everything below is an allowlist:
+# a difference that is not named here is a failure, never a third category.
+TWIN_SERVICE = "process-user-certification"
+TWIN_RUNTIME_SERVICE_ACCOUNT = (
+    f"sitesift-certification-runtime@{PROJECT}.iam.gserviceaccount.com"
+)
+TWIN_OPERATOR_SERVICE_ACCOUNT = (
+    f"sitesift-certification-operator@{PROJECT}.iam.gserviceaccount.com"
+)
+TWIN_FIRESTORE_DATABASE = "sitesift-certification"
+TWIN_FIXTURE_CONFIG_NAME = "CERTIFICATION_FIXTURE_CONFIG"
+TWIN_FIXTURE_CONFIG_SECRET = "sitesift-certification-fixture-config"
+# A positive decimal with no leading zero. `latest` is an alias that can be
+# repointed after review, `0` is not a version, and `07` is a second spelling of
+# the same number -- which would give one deployment two names for its own
+# identity.
+SECRET_VERSION_RE = re.compile(r"[1-9][0-9]*")
+# Each of these is a capability to cause a real effect, so its PRESENCE on the
+# twin is the failure, independent of value.
+TWIN_FORBIDDEN_ENV = (
+    "FIREBASE_BUCKET",
+    "AZURE_API_APP_ID",
+    "AZURE_API_CLIENT_SECRET",
+    "FIREBASE_API_KEY",
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "GOOGLE_OAUTH_CLIENT_SECRET",
+    "GOOGLE_REFRESH_TOKEN",
+    "PROCESS_USER_AUTH",
+    "SITESIFT_AUTO_REPLY_ALLOWLIST",
+    "SITESIFT_TOUR_ACTION_ALLOWLIST",
+)
+TWIN_ONLY_ENV = (
+    "K_SERVICE",
+    "FIRESTORE_DATABASE",
+    TWIN_FIXTURE_CONFIG_NAME,
+)
+TWIN_EXPECTED_IAM = {
+    "roles/run.invoker": (f"serviceAccount:{TWIN_OPERATOR_SERVICE_ACCOUNT}",),
+}
 AUTH_OVERRIDE_ENV = (
     "CLOUDSDK_AUTH_ACCESS_TOKEN",
     "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
@@ -621,6 +664,165 @@ def validate_old_revision(value: Any) -> None:
         raise RolloutError("old revision digest is wrong")
 
 
+def _environment_by_name(container: Any, label: str) -> dict[str, dict[str, Any]]:
+    container = _object(container, f"{label} container")
+    environment = container.get("env")
+    if not isinstance(environment, list):
+        raise RolloutError(f"{label} environment is not a list")
+    by_name: dict[str, dict[str, Any]] = {}
+    for raw_entry in environment:
+        entry = _object(raw_entry, f"{label} environment entry")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise RolloutError(f"{label} environment entry name is invalid")
+        if name in by_name:
+            raise RolloutError(f"{label} environment duplicates {name}")
+        by_name[name] = entry
+    return by_name
+
+
+def _validate_twin_iam(policy: Any) -> None:
+    policy = _object(policy, "twin IAM policy")
+    bindings = policy.get("bindings")
+    if not isinstance(bindings, list):
+        raise RolloutError("twin IAM bindings are missing")
+    normalized: dict[str, tuple[str, ...]] = {}
+    for row in bindings:
+        row = _object(row, "twin IAM binding")
+        if set(row) != {"role", "members"}:
+            raise RolloutError("twin IAM binding contains unexpected fields")
+        role = row.get("role")
+        members = row.get("members")
+        if (
+            not isinstance(role, str)
+            or role in normalized
+            or not isinstance(members, list)
+            or not all(isinstance(member, str) for member in members)
+        ):
+            raise RolloutError("twin IAM binding shape is invalid")
+        normalized[role] = tuple(sorted(members))
+    if normalized != TWIN_EXPECTED_IAM:
+        raise RolloutError("twin IAM policy is not the exact private contract")
+
+
+def _validate_twin_fixture_secret(entry: Mapping[str, Any]) -> None:
+    if "value" in entry:
+        raise RolloutError("twin fixture config is a literal, not a secret reference")
+    reference = entry.get("valueFrom")
+    if not isinstance(reference, dict) or set(reference) != {"secretKeyRef"}:
+        raise RolloutError("twin fixture config reference shape is invalid")
+    secret = reference.get("secretKeyRef")
+    if not isinstance(secret, dict) or set(secret) != {"name", "key"}:
+        raise RolloutError("twin fixture config secret reference shape is invalid")
+    if secret.get("name") != TWIN_FIXTURE_CONFIG_SECRET:
+        raise RolloutError("twin fixture config names the wrong secret")
+    version = secret.get("key")
+    if not isinstance(version, str) or SECRET_VERSION_RE.fullmatch(version) is None:
+        raise RolloutError(
+            "twin fixture config must pin a positive decimal secret version"
+        )
+
+
+def validate_twin_stamp(
+    service_value: Any,
+    policy: Any,
+    *,
+    candidate_spec: Any,
+    expected_image: str,
+    expected_source_revision: str,
+    production: Topology,
+) -> None:
+    """Prove the twin is the same artifact with none of the authority.
+
+    Approved asymmetries are named and checked against their exact expected
+    values. Anything else -- an extra name, a missing name, a differing value --
+    is a failure, because an unclassified difference is exactly where a real one
+    would hide.
+    """
+    stamp = release_stamp(expected_image, expected_source_revision)
+    service_value = _object(service_value, "twin service")
+    metadata = _object(service_value.get("metadata"), "twin metadata")
+    if metadata.get("name") != TWIN_SERVICE:
+        raise RolloutError("twin service identity is not exact")
+    annotations = metadata.get("annotations", {})
+    if not isinstance(annotations, dict) or annotations.get(
+        "run.googleapis.com/ingress"
+    ) != "internal":
+        raise RolloutError("twin ingress is not internal")
+
+    spec = _object(service_value.get("spec"), "twin spec")
+    template = _object(spec.get("template"), "twin template")
+    template_spec = _object(template.get("spec"), "twin template spec")
+    if template_spec.get("serviceAccountName") != TWIN_RUNTIME_SERVICE_ACCOUNT:
+        raise RolloutError("twin does not run as the certification runtime account")
+    candidate_spec = _object(candidate_spec, "candidate spec")
+    if template_spec.get("serviceAccountName") == candidate_spec.get(
+        "serviceAccountName"
+    ):
+        raise RolloutError("twin runs as the production service account")
+
+    containers = template_spec.get("containers")
+    if not isinstance(containers, list) or len(containers) != 1:
+        raise RolloutError("twin must have exactly one container")
+    if containers[0].get("image") != expected_image:
+        raise RolloutError("twin does not run the exact candidate artifact")
+
+    # The twin is never a traffic target -- neither its own routes pointing at a
+    # production revision, nor a production route pointing at the twin.
+    twin_revisions: set[str] = set()
+    for surface in ("spec", "status"):
+        rows = _object(service_value.get(surface), f"twin {surface}").get("traffic")
+        positive, tags, _ = _parse_traffic(rows, f"twin {surface}")
+        twin_revisions.update(positive)
+        twin_revisions.update(tags.values())
+    for name in twin_revisions:
+        if not name.startswith(f"{TWIN_SERVICE}-"):
+            raise RolloutError("twin routes traffic to a revision it does not own")
+    production_revisions = {production.positive_revision, *production.tags.values()}
+    for name in production_revisions:
+        if name == TWIN_SERVICE or name.startswith(f"{TWIN_SERVICE}-"):
+            raise RolloutError("the twin is a production traffic target")
+
+    twin_env = _environment_by_name(containers[0], "twin")
+    candidate_containers = candidate_spec.get("containers")
+    if not isinstance(candidate_containers, list) or len(candidate_containers) != 1:
+        raise RolloutError("candidate must have exactly one container")
+    candidate_env = _environment_by_name(candidate_containers[0], "candidate")
+
+    for name in TWIN_FORBIDDEN_ENV:
+        if name in twin_env:
+            raise RolloutError(f"twin carries production capability {name}")
+    for name in TWIN_ONLY_ENV:
+        if name not in twin_env:
+            raise RolloutError(f"twin is missing required certification field {name}")
+        if name in candidate_env:
+            raise RolloutError(f"{name} must not appear on the candidate")
+    if twin_env["K_SERVICE"].get("value") != TWIN_SERVICE:
+        raise RolloutError("twin K_SERVICE is not the certification service")
+    if twin_env["FIRESTORE_DATABASE"].get("value") != TWIN_FIRESTORE_DATABASE:
+        raise RolloutError("twin FIRESTORE_DATABASE is not the certification database")
+    _validate_twin_fixture_secret(twin_env[TWIN_FIXTURE_CONFIG_NAME])
+
+    for name, value in stamp.items():
+        if twin_env.get(name, {}).get("value") != value:
+            raise RolloutError(f"twin release stamp {name} is not this build")
+
+    approved = set(TWIN_FORBIDDEN_ENV) | set(TWIN_ONLY_ENV)
+    for name in sorted(set(twin_env) | set(candidate_env)):
+        if name in approved:
+            continue
+        if name not in candidate_env:
+            raise RolloutError(f"{name} exists only on the twin and is unclassified")
+        if name not in twin_env:
+            raise RolloutError(
+                f"{name} exists only on the candidate and is unclassified"
+            )
+        if twin_env[name] != candidate_env[name]:
+            raise RolloutError(f"{name} differs between candidate and twin")
+
+    _validate_twin_iam(policy)
+
+
 def _validate_legacy_health(value: Any) -> None:
     if value != {"status": "ok"}:
         raise RolloutError("legacy health response is not exact")
@@ -770,6 +972,18 @@ class Phase1Rollout:
             expected_aux=AUX_TAGS,
         )
         self.ops.verify_service_access(topology)
+        # Under the same lock, and before any traffic change: the certification
+        # twin must still be the same artifact with none of the authority. A
+        # twin proved outside this lock is a twin something can replace between
+        # the proof and the promotion that relies on it.
+        validate_twin_stamp(
+            self.ops.get_twin_service(),
+            self.ops.get_twin_iam_policy(),
+            candidate_spec=spec,
+            expected_image=image,
+            expected_source_revision=self.head_sha,
+            production=topology,
+        )
         validate_queue(self.ops.get_queue(), "PAUSED")
         if not self._tasks_are_empty():
             raise RolloutError("task appeared before promotion")
@@ -1534,6 +1748,17 @@ class SubprocessOps:
     def get_revision(self, name: str) -> Any:
         return self._json_command(
             ["run", "revisions", "describe", name, "--region", REGION], 60
+        )
+
+    def get_twin_service(self) -> Any:
+        return self._json_command(
+            ["run", "services", "describe", TWIN_SERVICE, "--region", REGION], 60
+        )
+
+    def get_twin_iam_policy(self) -> Any:
+        return self._json_command(
+            ["run", "services", "get-iam-policy", TWIN_SERVICE, "--region", REGION],
+            60,
         )
 
     def get_queue(self) -> Any:
