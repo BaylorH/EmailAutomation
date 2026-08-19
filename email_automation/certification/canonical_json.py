@@ -18,6 +18,11 @@ The rules, and why each exists:
 * **Floats refused.** Binary floating point does not round-trip identically across
   every runtime and platform, so a float in a digested payload is a latent identity
   bug. Money and measurements enter certification as strings or scaled integers.
+* **Unpaired surrogates refused.** A lone surrogate code point has no UTF-8
+  encoding at all. Left unguarded it escapes as a raw `UnicodeEncodeError` from
+  `str.encode`, outside the `CanonicalJSONError` surface every caller guards on,
+  and `json.loads` will happily hand one back from a U+D800 escape - so a payload
+  could be parsed and sealed, then detonate when re-serialized.
 * **Duplicate keys refused at parse.** `json.loads` silently keeps the last value,
   which lets one payload have two meanings - exactly the ambiguity a sealed input
   exists to prevent.
@@ -50,6 +55,22 @@ class CanonicalJSONError(ValueError):
     """
 
 
+def _reject_unpaired_surrogate(text: str, role: str) -> str:
+    """Refuse a string that has no UTF-8 encoding, as a typed refusal.
+
+    `role` is "string value" or "object key". The message carries the index only,
+    never the offending text, so refusals stay safe to log.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CanonicalJSONError(
+            f"{role} contains an unpaired surrogate at index {exc.start}; an "
+            "unpaired surrogate has no UTF-8 encoding, so it cannot be canonicalized"
+        ) from None
+    return text
+
+
 def _check(value: Any, depth: int) -> Any:
     """Validate and normalize recursively. Returns a structure safe to serialize."""
     if depth > MAX_DEPTH:
@@ -57,8 +78,11 @@ def _check(value: Any, depth: int) -> Any:
             f"payload exceeds maximum nesting depth of {MAX_DEPTH}"
         )
 
-    if value is None or isinstance(value, str):
+    if value is None:
         return value
+
+    if isinstance(value, str):
+        return _reject_unpaired_surrogate(value, "string value")
 
     # bool must be tested before int: in Python, bool IS a subclass of int.
     if isinstance(value, bool):
@@ -84,6 +108,7 @@ def _check(value: Any, depth: int) -> Any:
                 raise CanonicalJSONError(
                     f"object keys must be strings; found {type(key).__name__}"
                 )
+            _reject_unpaired_surrogate(key, "object key")
             normalized[key] = _check(item, depth + 1)
         return normalized
 

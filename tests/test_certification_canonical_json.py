@@ -6,10 +6,12 @@ digest are all lowercase SHA-256 over these exact bytes. If canonicalization is
 not byte-stable across supported runtimes, every one of those identities is
 unstable and no stamp means anything.
 
-The plan requires Python 3.12 parity vectors. Python 3.12 is not installed on
-this host, so `CrossRuntimeParityTests` exercises the newest available ALTERNATE
-interpreter and records an explicit skip when a runtime is absent. A skip here is
-`unverifiable`, never a pass.
+The plan requires Python 3.12 parity vectors. `CrossRuntimeParityTests` exercises
+every alternate interpreter it can find and records an explicit skip when one is
+absent; a skip here is `unverifiable`, never a pass. The full pinned whole-source
+matrix - fixed vectors with literal expected bytes and literal expected digests,
+driven under BOTH interpreters - lives in
+`tests/test_certification_cross_interpreter.py`.
 """
 
 from pathlib import Path
@@ -112,6 +114,57 @@ class CanonicalTypeRejectionTests(unittest.TestCase):
         raw = canonical_bytes({"v": value})
         self.assertEqual(raw, f'{{"v":{value}}}'.encode("utf-8"))
         self.assertEqual(loads_strict(raw)["v"], value)
+
+
+class SurrogateRefusalTests(unittest.TestCase):
+    """An unpaired surrogate has no UTF-8 encoding, so it must be a typed refusal.
+
+    Before this was pinned, a lone surrogate escaped canonicalization as a raw
+    `UnicodeEncodeError` from `str.encode`. Callers guard the canonicalizer with
+    `except CanonicalJSONError`, so an untyped escape either crashed the runner or
+    - worse, in a broad `except Exception` - read as a clean early return. And
+    `loads_strict` accepted `"\\ud800"` happily, so a payload could be parsed,
+    stored, and then explode when re-serialized: a round-trip that is not a
+    round-trip. The refusal surface must be closed, and identical on every runtime.
+    """
+
+    def test_lone_high_surrogate_in_a_value_is_a_typed_refusal(self):
+        with self.assertRaises(CanonicalJSONError) as ctx:
+            canonical_bytes({"k": "\ud800"})
+        self.assertEqual(
+            str(ctx.exception),
+            "string value contains an unpaired surrogate at index 0; an unpaired "
+            "surrogate has no UTF-8 encoding, so it cannot be canonicalized",
+        )
+
+    def test_lone_low_surrogate_mid_string_reports_its_index(self):
+        with self.assertRaises(CanonicalJSONError) as ctx:
+            canonical_bytes({"k": "ab\udfffc"})
+        self.assertEqual(
+            str(ctx.exception),
+            "string value contains an unpaired surrogate at index 2; an unpaired "
+            "surrogate has no UTF-8 encoding, so it cannot be canonicalized",
+        )
+
+    def test_unpaired_surrogate_in_a_key_is_a_typed_refusal(self):
+        with self.assertRaises(CanonicalJSONError) as ctx:
+            canonical_bytes({"\ud800": 1})
+        self.assertEqual(
+            str(ctx.exception),
+            "object key contains an unpaired surrogate at index 0; an unpaired "
+            "surrogate has no UTF-8 encoding, so it cannot be canonicalized",
+        )
+
+    def test_escaped_surrogate_is_refused_at_parse_not_accepted_then_exploded(self):
+        with self.assertRaises(CanonicalJSONError):
+            loads_strict(b'{"k":"\\ud800"}')
+
+    def test_a_well_formed_surrogate_pair_is_accepted_as_one_astral_character(self):
+        # U+1D11E written as an escaped surrogate pair decodes to a single
+        # non-surrogate code point, so it is canonical, not a refusal.
+        parsed = loads_strict(b'{"k":"\\ud834\\udd1e"}')
+        self.assertEqual(parsed, {"k": "\U0001d11e"})
+        self.assertEqual(canonical_bytes(parsed), b'{"k":"\xf0\x9d\x84\x9e"}')
 
 
 class StrictParseTests(unittest.TestCase):
