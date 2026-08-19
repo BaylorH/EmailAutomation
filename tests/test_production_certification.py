@@ -1239,3 +1239,168 @@ class CertificationRunnerTests(unittest.TestCase):
         leak on any fault between the two."""
         _record, detail = self._run("cert-runner-order-0001")
         self.assertLess(detail["cleanup_allocated_seq"], detail["fixture_opened_seq"])
+
+
+class RunAuthorizationDigestTests(unittest.TestCase):
+    """The one-use authorization a run is bound to, and its digest.
+
+    The digest is what makes an authorization non-transferable. If a stored
+    record could be edited and still verify, a run could be re-pointed at a
+    different scenario, revision, image, or fixture secret after review -- and
+    the stamp would then certify something nobody approved.
+
+    So the rule is narrow and absolute: the digest is RECOMPUTED from the stored
+    scalars before every transition and compared. The stored digest is evidence
+    to check, never a value to trust.
+    """
+
+    VALID = {
+        "scenario_id": "campaign-one-property",
+        "run_id": "cert-auth-0001",
+        "source_revision": "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9",
+        "image_digest": "sha256:" + "b" * 64,
+        "certification_service": "process-user-certification",
+        "certification_revision": "process-user-certification-00001-abc",
+        "production_candidate_revision": "process-user-00042-xyz",
+        "caller_identity_digest": "c" * 64,
+        "fixture_config_secret_version": "7",
+        "fixture_config_digest": "d" * 64,
+        "scenario_registry_digest": "e" * 64,
+        "launch_class": "agent_safe",
+        "input_producer_kind": "backend_registry_v1",
+        "canonical_input_digest": "f" * 64,
+        "input_producer_artifact_digest": "0" * 64,
+        "authorization_expires_at": "2026-08-19T00:00:00Z",
+    }
+
+    def _auth(self, **overrides):
+        from email_automation.certification import models as m
+        return m.RunAuthorization.create(**{**self.VALID, **overrides})
+
+    # -- the digest itself -------------------------------------------------
+
+    def test_digest_is_lowercase_sha256_hex(self):
+        self.assertRegex(self._auth().authorization_digest, r"^[0-9a-f]{64}$")
+
+    def test_digest_recomputes_to_the_same_value(self):
+        auth = self._auth()
+        self.assertEqual(auth.compute_digest(), auth.authorization_digest)
+        auth.verify()
+
+    def test_the_digest_never_includes_itself(self):
+        """A self-including preimage cannot be computed, only faked."""
+        from email_automation.certification import models as m
+        self.assertNotIn("authorization_digest", self._auth().digest_preimage())
+        self.assertEqual(len(m.AUTHORIZATION_FIELDS), 16)
+
+    def test_mutating_any_single_field_changes_the_digest(self):
+        baseline = self._auth().authorization_digest
+        for field_name in self.VALID:
+            with self.subTest(field=field_name):
+                # Two fields are closed sets, so "append a character" would
+                # produce a refusal rather than a different digest.
+                if field_name == "authorization_expires_at":
+                    mutated = "2026-08-19T00:00:01Z"
+                elif field_name == "input_producer_kind":
+                    mutated = "frontend_functions_adapter_v1"
+                else:
+                    mutated = self.VALID[field_name] + "x"
+                self.assertNotEqual(
+                    self._auth(**{field_name: mutated}).authorization_digest,
+                    baseline,
+                    f"{field_name} does not enter the digest",
+                )
+
+    def test_a_tampered_stored_digest_is_refused(self):
+        from email_automation.certification import models as m
+        from dataclasses import replace
+        tampered = replace(self._auth(), authorization_digest="a" * 64)
+        with self.assertRaises(m.AuthorizationInvalid):
+            tampered.verify()
+
+    def test_a_stored_record_is_revalidated_not_trusted(self):
+        """from_stored recomputes. A record whose digest was edited to match an
+        edited field must still fail, because the recomputation disagrees."""
+        from email_automation.certification import models as m
+        auth = self._auth()
+        stored = auth.to_stored()
+        stored["scenario_id"] = "some-other-scenario"
+        with self.assertRaises(m.AuthorizationInvalid):
+            m.RunAuthorization.from_stored(stored)
+
+    def test_a_consistently_reforged_record_still_fails_on_request_mismatch(self):
+        """Recomputation alone is not enough: an attacker who edits a field AND
+        recomputes the digest produces a self-consistent record. It is the
+        binding to the actual request that refuses it."""
+        from email_automation.certification import models as m
+        forged = self._auth(scenario_id="some-other-scenario").to_stored()
+        reloaded = m.RunAuthorization.from_stored(forged)   # self-consistent
+        request = m.CertificationRequest(
+            scenario_id="campaign-one-property",
+            run_id="cert-auth-0001",
+            expected_revision=self.VALID["source_revision"],
+        )
+        with self.assertRaises(m.AuthorizationInvalid):
+            reloaded.assert_matches_request(request)
+
+    # -- expiry encoding ---------------------------------------------------
+
+    def test_expiry_must_be_exact_rfc3339_utc_without_fractional_seconds(self):
+        from email_automation.certification import models as m
+        for bad in ("2026-08-19T00:00:00.000Z",     # fractional seconds
+                    "2026-08-19T00:00:00+00:00",    # offset alias for Z
+                    "2026-08-19T00:00:00-04:00",    # non-UTC offset
+                    "2026-08-19T00:00:00",          # no zone at all
+                    "2026-08-19 00:00:00Z",         # space instead of T
+                    "2026-08-19t00:00:00z"):        # lowercase designators
+            with self.subTest(expiry=bad), self.assertRaises(m.AuthorizationInvalid):
+                self._auth(authorization_expires_at=bad)
+
+    # -- field hygiene -----------------------------------------------------
+
+    def test_missing_blank_or_padded_fields_are_refused(self):
+        from email_automation.certification import models as m
+        for value in ("", "   ", " campaign-one-property", "campaign-one-property "):
+            with self.subTest(value=repr(value)), self.assertRaises(m.AuthorizationInvalid):
+                self._auth(scenario_id=value)
+        incomplete = dict(self.VALID)
+        incomplete.pop("launch_class")
+        with self.assertRaises(m.AuthorizationInvalid) as caught:
+            m.RunAuthorization.create(**incomplete)
+        self.assertIn("launch_class", str(caught.exception))
+        with self.assertRaises(m.AuthorizationInvalid):
+            m.RunAuthorization.create(**{**self.VALID, "surprise": "x"})
+
+    def test_non_string_scalars_are_refused(self):
+        from email_automation.certification import models as m
+        for value in (7, None, True, ["7"], {"v": "7"}):
+            with self.subTest(value=repr(value)), self.assertRaises(m.AuthorizationInvalid):
+                self._auth(fixture_config_secret_version=value)
+
+    def test_only_the_two_approved_producer_kinds_are_allowed(self):
+        from email_automation.certification import models as m
+        for kind in ("backend_registry_v1", "frontend_functions_adapter_v1"):
+            with self.subTest(kind=kind):
+                self._auth(input_producer_kind=kind)
+        with self.assertRaises(m.AuthorizationInvalid):
+            self._auth(input_producer_kind="anything_else_v1")
+
+    # -- a fixed vector, so the algorithm itself is pinned ------------------
+
+    def test_fixed_digest_vector(self):
+        """Pins the preimage construction, not just its self-consistency.
+
+        A digest test that only compares recomputation to itself agrees with any
+        algorithm, including a wrong one.
+        """
+        self.assertEqual(
+            self._auth().authorization_digest,
+            _EXPECTED_AUTHORIZATION_DIGEST,
+        )
+
+
+# Filled from the implementation, then mutation-checked: changing any single
+# input field must move this value.
+_EXPECTED_AUTHORIZATION_DIGEST = (
+    "3833ab44ec5eb14b3b19154081aa0a4e4921efb3066fde16ea0751e37208beda"
+)
