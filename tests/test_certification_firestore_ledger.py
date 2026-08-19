@@ -174,6 +174,9 @@ class FakeFirestore:
         self.begins = 0
         self.rollbacks = 0
         self.aborts = 0
+        # Every commit conflicts, forever. Models a document under permanent
+        # contention, which is the only way to reach the end of the retry loop.
+        self.force_abort = False
         self._read_hook = None
         self._read_hook_after = 0
         self.history = []
@@ -184,6 +187,9 @@ class FakeFirestore:
         return self.versions.get(path, 0), self.docs.get(path)
 
     def commit(self, reads, writes):
+        if self.force_abort:
+            self.aborts += 1
+            raise gcp_exceptions.Aborted("this document is permanently contended")
         for path, version in reads.items():
             if self.versions.get(path, 0) != version:
                 self.aborts += 1
@@ -1231,6 +1237,102 @@ class TheTwoLedgersAgreeStepForStepTests(LedgerCase):
             ):
                 clean.add(name)
         self.assertEqual(clean, self.SCRIPTS_WITH_NO_REFUSAL)
+
+
+class DurableLocationsAndBoundsArePinnedTests(LedgerCase):
+    """Constants that are facts about a live database, not tuning knobs."""
+
+    def test_the_collection_names_are_the_ones_already_written_to(self):
+        """A durable ledger's collection name is a location on disk. Renaming
+        one does not migrate anything -- it starts a second, empty ledger while
+        every existing run row sits unreachable in the old one, and single-use
+        run ids stop being single-use the moment that happens."""
+        self.assertEqual(lg.DEFAULT_RUNS_COLLECTION, "certificationRuns")
+        self.assertEqual(
+            lg.DEFAULT_AUTHORIZATIONS_COLLECTION, "certificationRunAuthorizations"
+        )
+        self.assertNotEqual(
+            lg.DEFAULT_RUNS_COLLECTION,
+            lg.DEFAULT_AUTHORIZATIONS_COLLECTION,
+            "the permanent half and the consumed half must not share a location",
+        )
+
+    def test_the_default_deadline_and_attempt_bound_are_pinned(self):
+        self.assertEqual(lg.DEFAULT_LEDGER_DEADLINE_SECONDS, 20.0)
+        self.assertEqual(lg.DEFAULT_TRANSACTION_ATTEMPTS, 5)
+
+    def test_the_default_deadline_is_what_a_read_actually_carries(self):
+        """The constant is only worth pinning if it reaches the wire."""
+        seen = []
+        store = self.store
+        original = store.collection
+
+        def recording_collection(name):
+            reference = original(name)
+            inner = reference.document
+
+            def document(doc_id):
+                doc = inner(doc_id)
+                doc_get = doc.get
+
+                def get(transaction=None, timeout=None, **kwargs):
+                    seen.append(timeout)
+                    return doc_get(transaction=transaction, timeout=timeout, **kwargs)
+
+                doc.get = get
+                return doc
+
+            reference.document = document
+            return reference
+
+        store.collection = recording_collection
+        self.firestore_ledger().state("never-seen")
+        self.assertEqual(seen, [lg.DEFAULT_LEDGER_DEADLINE_SECONDS])
+
+    def test_an_unusable_attempt_bound_is_refused_at_construction(self):
+        for bad in (0, -1, None, "5", True, 1.5):
+            with self.subTest(max_attempts=bad):
+                with self.assertRaises(ValueError):
+                    self.firestore_ledger(max_attempts=bad)
+
+
+class TheRetryLoopIsBoundedTests(LedgerCase):
+    """A contended document must exhaust and raise, never spin.
+
+    This is the shape the landmine takes here: a retry loop with no bound plus a
+    read with no deadline is a hang, and a hang is the one failure the broad
+    ``except Exception`` around every call site cannot turn into an error.
+    """
+
+    def test_a_permanently_contended_claim_stops_after_the_attempt_bound(self):
+        ledger, request = self.firestore_ledger(max_attempts=3), self.request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+
+        self.store.force_abort = True
+        begins_before, commits_before = self.store.begins, self.store.commits
+        with self.assertRaises(ValueError):
+            ledger.claim(request, self.auth())
+
+        self.assertEqual(self.store.begins - begins_before, 3)
+        self.assertEqual(self.store.commits, commits_before)
+        self.store.force_abort = False
+        self.assertEqual(ledger.state(request.run_id), "PREPARED")
+        self.assertIsNotNone(ledger.peek_ephemeral(request.run_id))
+
+    def test_the_attempt_bound_is_the_configured_one_not_the_library_default(self):
+        for attempts in (1, 2, 4):
+            with self.subTest(max_attempts=attempts):
+                self.store = FakeFirestore()
+                ledger, request = (
+                    self.firestore_ledger(max_attempts=attempts),
+                    self.request(),
+                )
+                ledger.begin_preparing(request)
+                self.store.force_abort = True
+                with self.assertRaises(ValueError):
+                    ledger.mark_prepared(request, self.auth())
+                self.assertEqual(self.store.begins, 1 + attempts)
 
 
 if __name__ == "__main__":
