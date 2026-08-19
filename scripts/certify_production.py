@@ -109,15 +109,24 @@ def assert_agent_may_call(operation: str) -> None:
         raise CertifyRefused(f"unknown certification operation: {operation}")
 
 
+# ALLOWLIST, not a denylist. The first version of this check tested for the
+# string "user_runtime_launch_required", which appears nowhere in the registry --
+# the registry says "user_runtime" -- so all 91 capability scenarios sailed past
+# it to /run. A denylist is wrong here even when spelled correctly: it fails OPEN
+# for any launch class nobody thought of, and the thing on the other side of this
+# check is a real model-provider call with fixture prompts in it.
+AGENT_SAFE_LAUNCH_CLASS = "agent_safe"
+
+
 def agent_mode_precheck(scenario: Mapping[str, Any], *, run_id: str,
                         url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Stop BEFORE /run for a scenario that needs a real model call.
+    """Stop BEFORE /run for anything not explicitly agent-safe.
 
     The refusal has to precede the call rather than follow it: an agent must
     never submit fixture prompts to a model provider, and "we called it and then
     reported INSTRUMENT_BLOCKED" is not that.
     """
-    if scenario.get("launchClass") == "user_runtime_launch_required":
+    if scenario.get("launchClass") != AGENT_SAFE_LAUNCH_CLASS:
         command = (
             f"python3 scripts/certify_production.py --url {url} "
             f"--scenario {scenario['scenarioId']} --run-id {run_id} --user-runtime-launch"

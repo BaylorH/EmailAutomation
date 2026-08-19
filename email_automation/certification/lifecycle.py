@@ -39,6 +39,10 @@ Response = Tuple[Dict[str, Any], int]
 # a caller-chosen expiry is a caller-chosen security property.
 AUTHORIZATION_TTL_SECONDS = 3600
 
+# Only this launch class may be driven without a human launching the
+# product runtime. Anything else stops before any provider can be reached.
+AGENT_SAFE_LAUNCH_CLASS = "agent_safe"
+
 # Every one is a deployment fact. None may be defaulted -- a missing candidate
 # revision or fixture-secret version quietly filled in would produce an
 # authorization, and therefore a stamp, bound to something nobody deployed.
@@ -120,6 +124,13 @@ def prepare(body: Mapping[str, Any], *, caller_identity_digest: str,
         # Refused BEFORE the ledger is touched, so an unapproved scenario cannot
         # consume a run id.
         return _error("unknown_scenario", 404)
+
+    # Defence in depth, and not redundant: the CLI refuses this before calling,
+    # but the CLI is one caller of a route that executes real product code. A
+    # non-agent-safe scenario needs a human-launched runtime, so preparing one
+    # here would create an authorization nobody can legitimately spend.
+    if scenario.get("launchClass") != AGENT_SAFE_LAUNCH_CLASS:
+        return _error("user_runtime_launch_required", 409)
 
     request = CertificationRequest(
         scenario_id=body["scenarioId"],

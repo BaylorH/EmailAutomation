@@ -1926,6 +1926,43 @@ class CertificationCliTests(unittest.TestCase):
 
     # -- the agent's boundaries --------------------------------------------
 
+    def test_every_non_agent_safe_registry_scenario_is_refused(self):
+        """Driven from the REAL registry, which is how this was caught.
+
+        The first version of this guard tested for the string
+        "user_runtime_launch_required". The registry says "user_runtime". The
+        test built its own scenario dict carrying the guard's spelling, so it
+        passed while all 91 capability scenarios sailed through to /run.
+
+        A check whose test invents its own input is only testing itself.
+        """
+        from email_automation.certification import scenarios
+        cli = self._cli()
+        refused = allowed = 0
+        for scenario in scenarios.all_scenarios():
+            verdict, command = cli.agent_mode_precheck(
+                dict(scenario), run_id="r-1", url=self.URL)
+            if scenario["launchClass"] == "agent_safe":
+                self.assertIsNone(verdict, scenario["scenarioId"])
+                allowed += 1
+            else:
+                self.assertEqual(verdict,
+                                 "INSTRUMENT_BLOCKED:user_runtime_launch_required",
+                                 scenario["scenarioId"])
+                self.assertIn("r-1", command)
+                refused += 1
+        self.assertEqual((allowed, refused), (2, 91),
+                         "registry launch-class split changed; re-read the plan")
+
+    def test_an_unknown_launch_class_fails_closed(self):
+        """A denylist fails OPEN for anything nobody thought of, and the thing
+        on the other side of this check is a real provider call."""
+        cli = self._cli()
+        verdict, _ = cli.agent_mode_precheck(
+            {"scenarioId": "s", "launchClass": "something_invented_later"},
+            run_id="r-1", url=self.URL)
+        self.assertEqual(verdict, "INSTRUMENT_BLOCKED:user_runtime_launch_required")
+
     def test_agent_mode_refuses_a_scenario_requiring_a_user_runtime_launch(self):
         """A model scenario stops BEFORE /run and prints one exact command.
 
@@ -1934,7 +1971,7 @@ class CertificationCliTests(unittest.TestCase):
         """
         cli = self._cli()
         verdict, command = cli.agent_mode_precheck(
-            {"scenarioId": "s", "launchClass": "user_runtime_launch_required"},
+            {"scenarioId": "s", "launchClass": "user_runtime"},
             run_id="r-1", url=self.URL)
         self.assertEqual(verdict, "INSTRUMENT_BLOCKED:user_runtime_launch_required")
         self.assertIn("r-1", command)
