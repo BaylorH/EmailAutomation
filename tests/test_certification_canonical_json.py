@@ -250,12 +250,14 @@ class CrossRuntimeParityTests(unittest.TestCase):
 
     def test_canonical_digest_is_identical_across_available_interpreters(self):
         local = canonical_digest(self.VECTOR)
-        available = [name for name in PARITY_INTERPRETERS if shutil.which(name)]
-        alternates = [
-            name
-            for name in available
-            if Path(shutil.which(name)).resolve() != Path(sys.executable).resolve()
-        ]
+        # shutil.which returns None for a name that is not installed, so the
+        # lookup is done once and the None case is handled, never re-queried and
+        # assumed present the second time.
+        alternates = []
+        for name in PARITY_INTERPRETERS:
+            found = shutil.which(name)
+            if found and Path(found).resolve() != Path(sys.executable).resolve():
+                alternates.append(name)
         if not alternates:
             self.skipTest(
                 "unverifiable: no alternate interpreter available for parity; "
