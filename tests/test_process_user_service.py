@@ -667,19 +667,36 @@ class CertificationRevisionBindingTests(unittest.TestCase):
         service.app.config["TESTING"] = True
         self.client = service.app.test_client()
 
+    AUDIENCE = "https://process-user-certification-abc123-uc.a.run.app"
+    OPERATOR = "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
+    SUB = "104729384756102938475"
+
     def _env(self, **overrides):
         env = {
             "K_SERVICE": "process-user-certification",
             "SITESIFT_SOURCE_REVISION": self.REVISION,
             "SITESIFT_IMAGE_DIGEST": self.IMAGE,
+            "SITESIFT_CERTIFICATION_AUDIENCE": self.AUDIENCE,
+            "SITESIFT_CERTIFICATION_OPERATOR_EMAIL": self.OPERATOR,
+            "SITESIFT_CERTIFICATION_OPERATOR_SUB": self.SUB,
         }
         env.update(overrides)
         return patch.dict(os.environ, env, clear=False)
 
+    def _decoder(self):
+        return lambda token, audience: {
+            "iss": "https://accounts.google.com", "aud": self.AUDIENCE,
+            "email": self.OPERATOR, "email_verified": True,
+            "sub": self.SUB, "exp": 4102444800,
+        }
+
     def _post(self, operation="status", **body):
         payload = {"runId": "cert-route-0001", "expectedRevision": self.REVISION}
         payload.update(body)
-        return self.client.post(f"/certification/{operation}", json=payload)
+        with patch.object(service, "_caller_decoder", self._decoder()):
+            return self.client.post(
+                f"/certification/{operation}", json=payload,
+                headers={"Authorization": "Bearer valid-token"})
 
     def test_a_matching_revision_is_accepted(self):
         with self._env():
@@ -733,16 +750,29 @@ class CertificationRouteEndToEndTests(unittest.TestCase):
 
     REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
 
+    AUDIENCE = "https://process-user-certification-abc123-uc.a.run.app"
+    OPERATOR = "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
+    SUB = "104729384756102938475"
+
     ENV = {
         "K_SERVICE": "process-user-certification",
         "K_REVISION": "process-user-certification-00001-abc",
+        "SITESIFT_CERTIFICATION_AUDIENCE": AUDIENCE,
+        "SITESIFT_CERTIFICATION_OPERATOR_EMAIL": OPERATOR,
+        "SITESIFT_CERTIFICATION_OPERATOR_SUB": SUB,
         "SITESIFT_SOURCE_REVISION": REVISION,
         "SITESIFT_IMAGE_DIGEST": "sha256:" + "b" * 64,
         "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "process-user-00042-xyz",
         "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "7",
         "SITESIFT_FIXTURE_CONFIG_DIGEST": "d" * 64,
-        "SITESIFT_CALLER_IDENTITY_DIGEST": "c" * 64,
     }
+
+    def _accepting_decoder(self):
+        return lambda token, audience: {
+            "iss": "https://accounts.google.com", "aud": self.AUDIENCE,
+            "email": self.OPERATOR, "email_verified": True,
+            "sub": self.SUB, "exp": 4102444800,
+        }
 
     def setUp(self):
         service.app.config["TESTING"] = True
@@ -755,9 +785,12 @@ class CertificationRouteEndToEndTests(unittest.TestCase):
         self._ledger_patch.start()
         self.addCleanup(self._ledger_patch.stop)
 
-    def _post(self, operation, body):
-        with patch.dict(os.environ, self.ENV, clear=False):
-            return self.client.post(f"/certification/{operation}", json=body)
+    def _post(self, operation, body, token="valid-token"):
+        with patch.dict(os.environ, self.ENV, clear=False), \
+                patch.object(service, "_caller_decoder", self._accepting_decoder()):
+            return self.client.post(
+                f"/certification/{operation}", json=body,
+                headers={"Authorization": f"Bearer {token}"} if token else {})
 
     def test_prepare_then_run_produces_a_pass_over_http(self):
         run_id = "cert-http-0001"
@@ -821,3 +854,122 @@ class CertificationRouteEndToEndTests(unittest.TestCase):
             for op in ("prepare", "run", "status"))
         for forbidden in ("@", "broker", "Hi Pat", "100 Fixture Way", "cert-uid-0001"):
             self.assertNotIn(forbidden, blob, f"{forbidden!r} crossed the wire")
+
+
+class CertificationRouteAuthTests(unittest.TestCase):
+    """No token, no lifecycle. Checked before the body is parsed.
+
+    The twin executes real product code and writes terminal records, so "who is
+    this from" stops being theoretical the moment /run does work. IAM controls
+    who reaches the port; this controls whose identity gets bound into the stamp.
+    """
+
+    REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
+    AUDIENCE = "https://process-user-certification-abc123-uc.a.run.app"
+    OPERATOR = "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
+    SUB = "104729384756102938475"
+
+    ENV = {
+        "K_SERVICE": "process-user-certification",
+        "K_REVISION": "process-user-certification-00001-abc",
+        "SITESIFT_SOURCE_REVISION": REVISION,
+        "SITESIFT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+        "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "process-user-00042-xyz",
+        "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "7",
+        "SITESIFT_FIXTURE_CONFIG_DIGEST": "d" * 64,
+        "SITESIFT_CERTIFICATION_AUDIENCE": AUDIENCE,
+        "SITESIFT_CERTIFICATION_OPERATOR_EMAIL": OPERATOR,
+        "SITESIFT_CERTIFICATION_OPERATOR_SUB": SUB,
+    }
+
+    def setUp(self):
+        service.app.config["TESTING"] = True
+        self.client = service.app.test_client()
+
+    def _body(self):
+        return {"scenarioId": "campaign-one-property", "runId": "cert-auth-http-0001",
+                "expectedRevision": self.REVISION}
+
+    def _post(self, claims=None, headers=None, env=None, body=None):
+        decoder = (lambda token, audience: claims) if claims else None
+        with patch.dict(os.environ, env if env is not None else self.ENV, clear=False), \
+                patch.object(service, "_caller_decoder", decoder):
+            return self.client.post(
+                "/certification/prepare",
+                json=self._body() if body is None else body,
+                headers=headers if headers is not None else {})
+
+    def _claims(self, **overrides):
+        claims = {"iss": "https://accounts.google.com", "aud": self.AUDIENCE,
+                  "email": self.OPERATOR, "email_verified": True,
+                  "sub": self.SUB, "exp": 4102444800}
+        claims.update(overrides)
+        return claims
+
+    def test_no_authorization_header_is_rejected(self):
+        response = self._post(claims=self._claims())
+        self.assertEqual(response.status_code, 401)
+
+    def test_a_rejected_caller_never_reaches_the_lifecycle(self):
+        from email_automation.certification import lifecycle
+        with patch.object(lifecycle, "prepare") as prepared:
+            response = self._post(claims=self._claims(email="attacker@example.invalid"),
+                                  headers={"Authorization": "Bearer t"})
+        self.assertEqual(response.status_code, 401)
+        prepared.assert_not_called()
+
+    def test_authentication_happens_before_the_body_is_parsed(self):
+        """An unauthenticated caller's JSON is untrusted input; there is no
+        reason to process any of it. A malformed body must still be 401."""
+        response = self._post(claims=self._claims(), body={"garbage": True})
+        self.assertEqual(response.status_code, 401)
+
+    def test_every_rejection_reason_looks_identical(self):
+        """Distinguishable refusals let a caller enumerate which claim was
+        wrong, one request at a time."""
+        seen = set()
+        for override in ({"email": "attacker@example.invalid"},
+                         {"sub": "9" * 21},
+                         {"aud": "https://elsewhere.a.run.app"},
+                         {"iss": "https://accounts.evil.invalid"},
+                         {"email_verified": False},
+                         {"exp": 1}):
+            with self.subTest(**override):
+                response = self._post(claims=self._claims(**override),
+                                      headers={"Authorization": "Bearer t"})
+                self.assertEqual(response.status_code, 401)
+                seen.add(response.get_data(as_text=True))
+        self.assertEqual(len(seen), 1, f"refusals are distinguishable: {seen}")
+
+    def test_unconfigured_expected_operator_refuses_everyone(self):
+        env = dict(self.ENV)
+        env["SITESIFT_CERTIFICATION_OPERATOR_SUB"] = ""
+        response = self._post(claims=self._claims(),
+                              headers={"Authorization": "Bearer t"}, env=env)
+        self.assertEqual(response.status_code, 401)
+
+    def test_a_verified_operator_is_admitted(self):
+        """Guards against a check that passes by refusing everyone."""
+        response = self._post(claims=self._claims(),
+                              headers={"Authorization": "Bearer t"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["state"], "PREPARED")
+
+    def test_the_authorization_binds_the_VERIFIED_caller_not_a_configured_one(self):
+        """The whole point of verifying.
+
+        If the caller digest came from configuration, a deployment could assert
+        who called it -- and the stamp would name an operator who never made the
+        request. It has to come from the token that was actually presented.
+        """
+        from email_automation.certification import caller as caller_module
+        from email_automation.certification import ledger as lg, lifecycle
+        with patch.object(lifecycle, "_DEFAULT_LEDGER", lg.InMemoryRunLedger()):
+            response = self._post(claims=self._claims(),
+                                  headers={"Authorization": "Bearer t"})
+            self.assertEqual(response.status_code, 200)
+            stored = lifecycle.default_ledger().peek_ephemeral("cert-auth-http-0001")
+        self.assertEqual(
+            stored.caller_identity_digest,
+            caller_module.caller_digest(self.SUB, self.OPERATOR),
+        )

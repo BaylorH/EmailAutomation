@@ -99,6 +99,21 @@ spec:
               value: SOURCE_REVISION_PLACEHOLDER
             - name: SITESIFT_IMAGE_DIGEST
               value: sha256:IMAGE_DIGEST_PLACEHOLDER
+            # --- The exact operator this service will accept, and the exact
+            #     audience its tokens must carry. Verification is against ALL
+            #     THREE: an address can be reassigned to a new principal, so the
+            #     numeric subject is what actually pins the identity. Any one of
+            #     them absent makes the verifier refuse EVERYONE rather than
+            #     degrade into an open door. ---
+            - name: SITESIFT_CERTIFICATION_AUDIENCE
+              value: CERTIFICATION_SERVICE_URL_PLACEHOLDER
+            - name: SITESIFT_CERTIFICATION_OPERATOR_EMAIL
+              value: sitesift-certification-operator@PROJECT_ID_PLACEHOLDER.iam.gserviceaccount.com
+            - name: SITESIFT_CERTIFICATION_OPERATOR_SUB
+              value: CERTIFICATION_OPERATOR_NUMERIC_SUB_PLACEHOLDER
+            # --- The candidate revision this twin is the exact-image twin OF. ---
+            - name: SITESIFT_PRODUCTION_CANDIDATE_REVISION
+              value: PRODUCTION_CANDIDATE_REVISION_PLACEHOLDER
             # --- The immutable NUMERIC fixture-config secret version. Every
             #     concrete identity the run touches -- client, recipient, Sheet,
             #     Drive folder -- is resolved from this, never from a request.

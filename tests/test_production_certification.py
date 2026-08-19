@@ -1600,7 +1600,6 @@ class CertificationLifecycleTests(unittest.TestCase):
             "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "process-user-00042-xyz",
             "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "7",
             "SITESIFT_FIXTURE_CONFIG_DIGEST": "d" * 64,
-            "SITESIFT_CALLER_IDENTITY_DIGEST": "c" * 64,
         }
 
     def _fresh(self):
@@ -1613,6 +1612,7 @@ class CertificationLifecycleTests(unittest.TestCase):
         return lc.prepare(
             {"scenarioId": scenario_id, "runId": run_id,
              "expectedRevision": revision or self.REVISION},
+            caller_identity_digest="c" * 64,
             ledger=ledger, environ=env if env is not None else self._env())
 
     def _run(self, ledger, run_id="cert-life-0001", env=None):
@@ -1684,8 +1684,7 @@ class CertificationLifecycleTests(unittest.TestCase):
         """
         for key in ("K_REVISION", "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
                     "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
-                    "SITESIFT_FIXTURE_CONFIG_DIGEST",
-                    "SITESIFT_CALLER_IDENTITY_DIGEST"):
+                    "SITESIFT_FIXTURE_CONFIG_DIGEST"):
             with self.subTest(missing=key):
                 env = self._env()
                 env.pop(key)
@@ -1746,3 +1745,135 @@ class CertificationLifecycleTests(unittest.TestCase):
         blob = json.dumps(payloads, sort_keys=True, default=str)
         for forbidden in ("@", "broker", "Hi Pat", "100 Fixture Way", "cert-uid-0001"):
             self.assertNotIn(forbidden, blob, f"{forbidden!r} reached a route response")
+
+
+class CertificationCallerVerificationTests(unittest.TestCase):
+    """Who may ask this service to certify something.
+
+    The twin executes real product code and writes terminal records. Internal
+    ingress and IAM decide who can reach the port; this decides who the request
+    is actually FROM. They are different questions, and only the second one ends
+    up bound into the stamp.
+
+    Signature verification is injected so these run offline. That is not a
+    shortcut around the check -- the default decoder is Google's, and a RED
+    proves an unverifiable token is refused rather than trusted.
+    """
+
+    AUDIENCE = "https://process-user-certification-abc123-uc.a.run.app"
+    OPERATOR = "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
+    SUB = "104729384756102938475"
+
+    def _claims(self, **overrides):
+        claims = {
+            "iss": "https://accounts.google.com",
+            "aud": self.AUDIENCE,
+            "email": self.OPERATOR,
+            "email_verified": True,
+            "sub": self.SUB,
+            "exp": 4102444800,   # year 2100
+        }
+        claims.update(overrides)
+        return claims
+
+    def _verify(self, claims=None, **kwargs):
+        from email_automation.certification import caller as cl
+        payload = self._claims() if claims is None else claims
+        settings = {
+            "expected_audience": self.AUDIENCE,
+            "expected_email": self.OPERATOR,
+            "expected_sub": self.SUB,
+            "decoder": lambda token, audience: payload,
+            "now_epoch": 1755000000,
+        }
+        settings.update(kwargs)
+        return cl.verify_caller("any-token", **settings)
+
+    # -- the accepted case --------------------------------------------------
+
+    def test_the_exact_operator_is_accepted(self):
+        identity = self._verify()
+        self.assertRegex(identity.digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(identity.subject, self.SUB)
+
+    def test_the_digest_is_stable_and_carries_no_raw_address(self):
+        """Only the digest enters evidence. An operator address in a stamp is a
+        real identity persisted forever for no benefit."""
+        self.assertEqual(self._verify().digest, self._verify().digest)
+        self.assertNotIn("@", self._verify().digest)
+
+    def test_a_different_operator_yields_a_different_digest(self):
+        other = self._claims(email="someone-else@example.invalid", sub="1" * 21)
+        different = self._verify(
+            other, expected_email="someone-else@example.invalid", expected_sub="1" * 21)
+        self.assertNotEqual(different.digest, self._verify().digest)
+
+    # -- every rejection the plan names -------------------------------------
+
+    def test_wrong_email_is_refused(self):
+        from email_automation.certification import caller as cl
+        with self.assertRaises(cl.CallerRejected):
+            self._verify(self._claims(email="attacker@example.invalid"))
+
+    def test_wrong_subject_is_refused_even_with_the_right_email(self):
+        """An email can be reassigned to a new principal; the numeric subject
+        cannot. Checking only the address would accept a recreated account."""
+        from email_automation.certification import caller as cl
+        with self.assertRaises(cl.CallerRejected):
+            self._verify(self._claims(sub="9" * 21))
+
+    def test_wrong_audience_is_refused(self):
+        from email_automation.certification import caller as cl
+        with self.assertRaises(cl.CallerRejected):
+            self._verify(self._claims(aud="https://some-other-service.a.run.app"))
+
+    def test_wrong_issuer_is_refused(self):
+        from email_automation.certification import caller as cl
+        with self.assertRaises(cl.CallerRejected):
+            self._verify(self._claims(iss="https://accounts.evil.invalid"))
+
+    def test_unverified_email_is_refused(self):
+        from email_automation.certification import caller as cl
+        for value in (False, "false", None, "true", 1):
+            with self.subTest(value=repr(value)), self.assertRaises(cl.CallerRejected):
+                self._verify(self._claims(email_verified=value))
+
+    def test_missing_email_claim_is_refused(self):
+        from email_automation.certification import caller as cl
+        claims = self._claims()
+        del claims["email"]
+        with self.assertRaises(cl.CallerRejected):
+            self._verify(claims)
+
+    def test_an_expired_token_is_refused(self):
+        from email_automation.certification import caller as cl
+        with self.assertRaises(cl.CallerRejected):
+            self._verify(self._claims(exp=1754999999))
+
+    def test_a_token_the_decoder_cannot_verify_is_refused_not_trusted(self):
+        from email_automation.certification import caller as cl
+        def explode(token, audience):
+            raise ValueError("bad signature")
+        with self.assertRaises(cl.CallerRejected):
+            self._verify(decoder=explode)
+
+    # -- configuration fails closed ------------------------------------------
+
+    def test_absent_expected_identity_refuses_rather_than_accepting_anyone(self):
+        """An unconfigured verifier must not degrade into an open door."""
+        from email_automation.certification import caller as cl
+        for blanked in ("expected_audience", "expected_email", "expected_sub"):
+            with self.subTest(blanked=blanked), self.assertRaises(cl.CallerRejected):
+                self._verify(**{blanked: ""})
+
+    def test_the_rejection_never_echoes_the_presented_value(self):
+        """A refusal names the field. Echoing the value turns the log into a
+        record of whatever an attacker chose to send."""
+        from email_automation.certification import caller as cl
+        try:
+            self._verify(self._claims(email="attacker@example.invalid"))
+        except cl.CallerRejected as exc:
+            self.assertNotIn("attacker", str(exc))
+            self.assertIn("email", str(exc))
+        else:
+            self.fail("expected rejection")

@@ -95,6 +95,15 @@ class CertificationTwinServiceContractTests(unittest.TestCase):
         self.assertTrue(carried, "ordinary service carries none of them; the "
                                  "absence assertion above is vacuous")
 
+    def test_the_expected_operator_identity_is_configured(self):
+        """An unconfigured verifier refuses everyone, which is safe but useless.
+        The twin must actually name the operator it will accept."""
+        env = _env_names(self.doc)
+        for key in ("SITESIFT_CERTIFICATION_AUDIENCE",
+                    "SITESIFT_CERTIFICATION_OPERATOR_EMAIL",
+                    "SITESIFT_CERTIFICATION_OPERATOR_SUB"):
+            self.assertIn(key, env)
+
     def test_the_run_is_bound_to_an_exact_revision_and_image(self):
         env = _env_names(self.doc)
         self.assertIn("SITESIFT_SOURCE_REVISION", env)

@@ -50,8 +50,12 @@ REQUIRED_IDENTITY_ENV = (
     "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
     "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
     "SITESIFT_FIXTURE_CONFIG_DIGEST",
-    "SITESIFT_CALLER_IDENTITY_DIGEST",
 )
+
+# NOT an environment fact. The caller identity is whatever the VERIFIED token
+# said, passed in explicitly -- an env-configured caller digest would let a
+# deployment assert who called it, which is exactly what verification exists to
+# stop.
 
 _DEFAULT_LEDGER = ledger_module.InMemoryRunLedger()
 
@@ -101,8 +105,8 @@ def _canonical_input_for(scenario: Mapping[str, Any]) -> SealedInput:
     })
 
 
-def prepare(body: Mapping[str, Any], *, ledger=None,
-            environ: Optional[Mapping[str, str]] = None,
+def prepare(body: Mapping[str, Any], *, caller_identity_digest: str,
+            ledger=None, environ: Optional[Mapping[str, str]] = None,
             now_epoch: Optional[int] = None) -> Response:
     ledger = ledger if ledger is not None else default_ledger()
     environ = environ if environ is not None else os.environ
@@ -134,7 +138,7 @@ def prepare(body: Mapping[str, Any], *, ledger=None,
             certification_revision=identity["K_REVISION"],
             production_candidate_revision=identity[
                 "SITESIFT_PRODUCTION_CANDIDATE_REVISION"],
-            caller_identity_digest=identity["SITESIFT_CALLER_IDENTITY_DIGEST"],
+            caller_identity_digest=caller_identity_digest,
             fixture_config_secret_version=identity[
                 "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION"],
             fixture_config_digest=identity["SITESIFT_FIXTURE_CONFIG_DIGEST"],
@@ -171,8 +175,8 @@ def prepare(body: Mapping[str, Any], *, ledger=None,
     }, 200
 
 
-def run(body: Mapping[str, Any], *, ledger=None,
-        environ: Optional[Mapping[str, str]] = None) -> Response:
+def run(body: Mapping[str, Any], *, caller_identity_digest: str = "",
+        ledger=None, environ: Optional[Mapping[str, str]] = None) -> Response:
     from email_automation.certification import runner as runner_module
 
     ledger = ledger if ledger is not None else default_ledger()
@@ -227,8 +231,8 @@ def run(body: Mapping[str, Any], *, ledger=None,
     }, 200
 
 
-def status(body: Mapping[str, Any], *, ledger=None,
-           environ: Optional[Mapping[str, str]] = None) -> Response:
+def status(body: Mapping[str, Any], *, caller_identity_digest: str = "",
+           ledger=None, environ: Optional[Mapping[str, str]] = None) -> Response:
     ledger = ledger if ledger is not None else default_ledger()
     run_id = body["runId"]
     state = ledger.state(run_id)
@@ -238,8 +242,8 @@ def status(body: Mapping[str, Any], *, ledger=None,
             "verdict": ledger.verdict(run_id) or ""}, 200
 
 
-def abort(body: Mapping[str, Any], *, ledger=None,
-          environ: Optional[Mapping[str, str]] = None) -> Response:
+def abort(body: Mapping[str, Any], *, caller_identity_digest: str = "",
+          ledger=None, environ: Optional[Mapping[str, str]] = None) -> Response:
     """Terminalize a run proven not to have executed.
 
     Allowed only from PREPARING/PREPARED. A CLAIMED run may have run already, so

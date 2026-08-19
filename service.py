@@ -298,6 +298,45 @@ _CERTIFICATION_OPERATIONS = {
 
 # Operation -> lifecycle function. Absent means "not implemented yet", which is
 # deliberately distinct from "not a route" (404).
+
+# --- caller verification ----------------------------------------------------
+#
+# Internal ingress and IAM decide who can reach the port. This decides who the
+# request is FROM, and only that answer is bound into the stamp.
+#
+# Run BEFORE the body is parsed: an unauthenticated caller's JSON is untrusted
+# input, and there is no reason to process any of it.
+#
+# The decoder is a module attribute so tests can supply claims without a network
+# round trip to Google's certificate endpoint. The DEFAULT is Google's real
+# verifier; a decoder that raises is a rejection, never a pass.
+
+_EXPECTED_AUDIENCE_ENV = "SITESIFT_CERTIFICATION_AUDIENCE"
+_EXPECTED_OPERATOR_EMAIL_ENV = "SITESIFT_CERTIFICATION_OPERATOR_EMAIL"
+_EXPECTED_OPERATOR_SUB_ENV = "SITESIFT_CERTIFICATION_OPERATOR_SUB"
+
+_caller_decoder = None      # None -> the real Google verifier
+
+
+def _verify_certification_caller():
+    """(digest, None) when accepted, or (None, (payload, status)) when refused."""
+    from email_automation.certification import caller as caller_module
+
+    try:
+        identity = caller_module.verify_caller(
+            _extract_bearer() or "",
+            expected_audience=os.getenv(_EXPECTED_AUDIENCE_ENV, ""),
+            expected_email=os.getenv(_EXPECTED_OPERATOR_EMAIL_ENV, ""),
+            expected_sub=os.getenv(_EXPECTED_OPERATOR_SUB_ENV, ""),
+            decoder=_caller_decoder,
+        )
+    except caller_module.CallerRejected:
+        # One constant response for every rejection reason. Distinguishable
+        # refusals let a caller enumerate which claim was wrong.
+        return None, ({"status": "error", "reason": "unauthorized"}, 401)
+    return identity.digest, None
+
+
 _CERTIFICATION_HANDLERS = {
     "prepare": "prepare",
     "run": "run",
@@ -333,6 +372,11 @@ def certification_operation(operation: str):
                         "reason": "revision_binding_unavailable"}), 503
     source_revision, _image_digest = binding
 
+    caller_digest, refusal = _verify_certification_caller()
+    if refusal is not None:
+        payload, code = refusal
+        return jsonify(payload), code
+
     if operation == "review":
         body = request.get_json(silent=True)
         if not isinstance(body, dict) or set(body) != _CERTIFICATION_REVIEW_KEYS:
@@ -365,7 +409,8 @@ def certification_operation(operation: str):
     # import is still an import.
     from email_automation.certification import lifecycle
 
-    payload, status_code = getattr(lifecycle, handler)(body)
+    payload, status_code = getattr(lifecycle, handler)(
+        body, caller_identity_digest=caller_digest)
     return jsonify(payload), status_code
 
 
