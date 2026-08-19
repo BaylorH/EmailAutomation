@@ -20,11 +20,16 @@ scoping bug. Fix 1 and 2; 3 is how you *observe* that they worked.
 If a piece of work does not make one of those three true for a real user, it is
 not the work.
 
-### The failure that has happened five times
+### The failure that has happened eight times
 
-> An offline or self-owned proof goes green → the green is read as clearance →
-> first contact with the live path refutes it → a HOLD is re-imposed → **and a
-> LARGER proof apparatus is commissioned.**
+> A proof goes green → the green is read as clearance → something refutes it →
+> a HOLD is re-imposed → **and a LARGER proof apparatus is commissioned.**
+
+It has now happened **eight times between 2026-07-09 and 2026-08-19** — see
+`projects/email-automation/refutation-ledger.md` in the Brain for the table.
+Note the refutation is not always the live path: at least once a STRICTER
+OFFLINE INSTRUMENT killed a green that had already passed 96 suites and 782
+tests. Passing more tests is not the way out.
 
 The apparatus is the compounding error, not the fix. Two rules follow:
 
@@ -41,9 +46,16 @@ The apparatus is the compounding error, not the fix. Two rules follow:
 python3 scripts/drift_check.py          # product vs apparatus commit ratio
 ```
 
-Apparatus share by month: **June 3% → July 27% → August 46%.** August had 236
-commits and shipped nothing. If apparatus ≥ product over a window, the sixth
+Apparatus share by month: **June 7% → July 41% → August 62%.** August had 437
+commits and shipped nothing. If apparatus ≥ product over a window, the next
 failure is already forming.
+
+(An earlier version of this block printed 3/27/46 — the figures from BEFORE the
+classifier was widened to stop scoring apparatus commits as `other`. The prose
+was not updated in the same commit, so for a while the number read every turn
+under-reported drift by 16 points. Re-run the script rather than trusting any
+number written here; a stale figure in the file you read every turn is the same
+defect class as a green page whose evidence expired.)
 
 ### Where the real signal lives
 
