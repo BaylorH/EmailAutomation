@@ -423,8 +423,18 @@ def certification_operation(operation: str):
     # import is still an import.
     from email_automation.certification import lifecycle
 
+    # The DURABLE ledger, resolved here and passed explicitly. Resolved after
+    # the schema and revision checks so a malformed request is never reported as
+    # an unavailable instrument, and refused by name rather than downgraded to
+    # the process-scoped ledger: a single-process ledger that looked durable
+    # would answer "unknown run" for every record a restart lost.
+    ledger, refusal = lifecycle.resolved_ledger()
+    if refusal is not None:
+        payload, code = refusal
+        return jsonify(payload), code
+
     payload, status_code = getattr(lifecycle, handler)(
-        body, caller_identity_digest=caller_digest)
+        body, caller_identity_digest=caller_digest, ledger=ledger)
     return jsonify(payload), status_code
 
 

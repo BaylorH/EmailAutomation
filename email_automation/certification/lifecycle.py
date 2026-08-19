@@ -20,12 +20,14 @@ relaxes to accommodate it.
 worker vanished, and it NEVER EXECUTES: its whole body runs inside the execution
 fence below, and its call graph is approved by allowlist in the tests.
 
-One deliberate limitation, stated rather than hidden: the default ledger is
-in-memory and therefore process-scoped. It enforces the full state machine but
-does not survive a restart, so it is correct for a single-instance twin
-(containerConcurrency 1, maxScale 1) and is NOT yet the durable Firestore
-ledger the plan ultimately requires. The state machine lives in ledger.py so
-both implementations agree by construction.
+The default ledger is the DURABLE one, resolved lazily from an explicit client.
+It is never the process-scoped in-memory ledger: that one has no server-assigned
+commit timestamp and dies with the process it would be recovering, so defaulting
+to it would make ``recover`` permanently inert while looking wired. When no
+client can be resolved the answer is a named refusal, never a downgrade -- a
+silent downgrade would make a single-process ledger look durable, which is the
+exact property the durable ledger exists to provide. Tests inject their own
+ledger explicitly; every function here keeps that seam.
 """
 
 from __future__ import annotations
@@ -75,7 +77,19 @@ REQUIRED_IDENTITY_ENV = (
 # deployment assert who called it, which is exactly what verification exists to
 # stop.
 
-_DEFAULT_LEDGER = ledger_module.InMemoryRunLedger()
+# The process's run ledger. ``None`` until something asks for it, and then the
+# DURABLE one -- resolved once, under the lock below, from a client built at
+# call time. Never assigned at import: a module-level client construction runs
+# for every process that merely imports this module, including ordinary
+# production where these routes are inert, and that is a live bug class in this
+# repo (issue #91). A test installs its own ledger over this name.
+_DEFAULT_LEDGER = None
+_LEDGER_RESOLUTION_LOCK = threading.Lock()
+
+# The named refusal for "no durable ledger". Distinct from
+# ``instrument_unavailable`` (an incomplete deployment identity) because the two
+# send an operator to different places, and both are 503 rather than a verdict.
+LEDGER_UNAVAILABLE_REASON = "ledger_unavailable"
 
 # Transient, process-scoped, and never persisted. See input_handoff for why the
 # raw review text may not go anywhere else.
@@ -89,8 +103,79 @@ _DEFAULT_REVIEW_STORE = input_handoff.TransientReviewStore()
 UNSANITIZED_OPERATIONS = frozenset({"review-input"})
 
 
-def default_ledger() -> ledger_module.InMemoryRunLedger:
-    return _DEFAULT_LEDGER
+class LedgerUnavailable(RuntimeError):
+    """No durable run ledger could be resolved. Never a downgrade."""
+
+
+def _firestore_client() -> Any:
+    """The certification store's client, built HERE and only when called.
+
+    Imported inside the function for the same reason the construction is: the
+    import itself pulls in a client library that ordinary production has no
+    reason to load, and ``clients._fs`` is deliberately not reached for -- that
+    name is imported BY VALUE into ten modules which each patch their own copy,
+    so "the" ambient client is a fiction. The ledger takes an explicit one.
+    """
+    from google.cloud import firestore
+    return firestore.Client()
+
+
+def resolve_default_ledger() -> Any:
+    """Resolve the durable ledger once, or raise ``LedgerUnavailable``.
+
+    Cached under a lock: two concurrent requests must not each build a client,
+    and a failed resolution must cache NOTHING -- a store that was unreachable
+    for one request may be reachable for the next, and remembering the failure
+    would turn a transient outage into a permanently dead instrument.
+    """
+    global _DEFAULT_LEDGER
+    with _LEDGER_RESOLUTION_LOCK:
+        if _DEFAULT_LEDGER is not None:
+            return _DEFAULT_LEDGER
+        try:
+            client = _firestore_client()
+        except Exception as exc:      # noqa: BLE001 - any failure is unavailable
+            raise LedgerUnavailable(
+                "no Firestore client could be built for the run ledger") from exc
+        try:
+            # Raises on a None client rather than resolving one ambiently.
+            resolved = ledger_module.FirestoreRunLedger(client)
+        except ValueError as exc:
+            raise LedgerUnavailable(
+                "the run ledger refused the resolved client") from exc
+        _DEFAULT_LEDGER = resolved
+        return resolved
+
+
+def default_ledger() -> Any:
+    """The process's ledger, or a refusal. NEVER an in-memory substitute."""
+    ledger = _DEFAULT_LEDGER
+    if ledger is None:
+        raise LedgerUnavailable("no durable run ledger has been resolved")
+    return ledger
+
+
+def resolved_ledger() -> Tuple[Optional[Any], Optional["Response"]]:
+    """(ledger, None) or (None, refusal). The route's one resolution point."""
+    try:
+        return resolve_default_ledger(), None
+    except LedgerUnavailable:
+        return None, _error(LEDGER_UNAVAILABLE_REASON, 503)
+
+
+def _ledger_or_refusal(ledger: Any) -> Tuple[Optional[Any], Optional["Response"]]:
+    """The injected ledger, or the resolved default, or a named refusal.
+
+    The refusal is returned rather than raised because every caller of this is a
+    route handler: an escaping exception would be a 500, which is the one answer
+    that tells a caller nothing about whether to retry.
+    """
+    if ledger is not None:
+        return ledger, None
+    try:
+        return default_ledger(), None
+    except LedgerUnavailable:
+        return None, _error(LEDGER_UNAVAILABLE_REASON, 503)
 
 
 def default_review_store() -> input_handoff.TransientReviewStore:
@@ -141,7 +226,9 @@ def _canonical_input_for(scenario: Mapping[str, Any]) -> SealedInput:
 def prepare(body: Mapping[str, Any], *, caller_identity_digest: str,
             ledger=None, environ: Optional[Mapping[str, str]] = None,
             now_epoch: Optional[int] = None) -> Response:
-    ledger = ledger if ledger is not None else default_ledger()
+    ledger, refusal = _ledger_or_refusal(ledger)
+    if refusal is not None:
+        return refusal
     environ = environ if environ is not None else os.environ
     identity = _identity(environ)
     if identity is None:
@@ -252,7 +339,9 @@ def run(body: Mapping[str, Any], *, caller_identity_digest: str = "",
 
     from email_automation.certification import runner as runner_module
 
-    ledger = ledger if ledger is not None else default_ledger()
+    ledger, refusal = _ledger_or_refusal(ledger)
+    if refusal is not None:
+        return refusal
     environ = environ if environ is not None else os.environ
     identity = _identity(environ)
     if identity is None:
@@ -322,7 +411,9 @@ def run(body: Mapping[str, Any], *, caller_identity_digest: str = "",
 
 def status(body: Mapping[str, Any], *, caller_identity_digest: str = "",
            ledger=None, environ: Optional[Mapping[str, str]] = None) -> Response:
-    ledger = ledger if ledger is not None else default_ledger()
+    ledger, refusal = _ledger_or_refusal(ledger)
+    if refusal is not None:
+        return refusal
     run_id = body["runId"]
     state = ledger.state(run_id)
     if state is None:
@@ -347,7 +438,9 @@ def review_input(body: Mapping[str, Any], *, caller_identity_digest: str = "",
     before it builds a request, which is a capability the CLI does not have
     rather than a guard it chooses not to use.
     """
-    ledger = ledger if ledger is not None else default_ledger()
+    ledger, refusal = _ledger_or_refusal(ledger)
+    if refusal is not None:
+        return refusal
     store = store if store is not None else default_review_store()
     run_id = body["runId"]
 
@@ -375,7 +468,9 @@ def abort(body: Mapping[str, Any], *, caller_identity_digest: str = "",
     aborting it would record "did not execute" over an execution that happened;
     that case is recovery's, not abort's.
     """
-    ledger = ledger if ledger is not None else default_ledger()
+    ledger, refusal = _ledger_or_refusal(ledger)
+    if refusal is not None:
+        return refusal
     run_id = body["runId"]
     state = ledger.state(run_id)
     if state is None:
@@ -584,7 +679,9 @@ def _recover_under_fence(
         clock: Optional[Callable[[], float]] = None,
         sleeper: Optional[Callable[[float], None]] = None,
         cleaner: Optional[Callable[[str], Mapping[str, int]]] = None) -> Response:
-    ledger = ledger if ledger is not None else default_ledger()
+    ledger, refusal = _ledger_or_refusal(ledger)
+    if refusal is not None:
+        return refusal
     clock = clock if clock is not None else _now_float
     sleeper = sleeper if sleeper is not None else _sleep
     run_id = body["runId"]

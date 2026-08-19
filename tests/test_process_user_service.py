@@ -666,6 +666,15 @@ class CertificationRevisionBindingTests(unittest.TestCase):
     def setUp(self):
         service.app.config["TESTING"] = True
         self.client = service.app.test_client()
+        # The route's default ledger is the DURABLE one, resolved from a real
+        # client. A test that let it resolve would reach the real certification
+        # store over the network; these tests are about revision binding, so
+        # they install the reference ledger explicitly.
+        from email_automation.certification import ledger as lg, lifecycle
+        patcher = patch.object(lifecycle, "_DEFAULT_LEDGER",
+                               lg.InMemoryRunLedger())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     AUDIENCE = "https://process-user-certification-abc123-uc.a.run.app"
     OPERATOR = "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
@@ -885,6 +894,14 @@ class CertificationRouteAuthTests(unittest.TestCase):
     def setUp(self):
         service.app.config["TESTING"] = True
         self.client = service.app.test_client()
+        # A fresh reference ledger per test, for the same reason as above: the
+        # route's default is durable, and an admitted operator must not depend
+        # on a run id another test consumed.
+        from email_automation.certification import ledger as lg, lifecycle
+        patcher = patch.object(lifecycle, "_DEFAULT_LEDGER",
+                               lg.InMemoryRunLedger())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _body(self):
         return {"scenarioId": "campaign-one-property", "runId": "cert-auth-http-0001",

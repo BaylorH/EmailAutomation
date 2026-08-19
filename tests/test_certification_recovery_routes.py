@@ -563,6 +563,11 @@ class RecoverNeverExecutesTests(unittest.TestCase):
         "_error", "_observe", "_probe", "_bounded_read", "_coerce_observation",
         "_exact_int", "_quiesce", "_recovery_digest", "_recover_under_fence",
         "default_ledger", "execution_forbidden",
+        # Resolving WHICH ledger, and refusing by name when there is none.
+        # Deliberately not the RESOLUTION of a client: ``default_ledger``
+        # returns an already-resolved ledger or raises, so recovery can never
+        # reach ``resolve_default_ledger`` and never builds a Firestore client.
+        "_ledger_or_refusal", "LedgerUnavailable",
         # types and sanctioned digesting
         "ReadbackTimeout", "RecordObservation", "canonical_digest",
         # injected callables the caller owns

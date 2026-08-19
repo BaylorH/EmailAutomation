@@ -23,14 +23,17 @@ them, because a certification test may not make a provider call.
 
 from __future__ import annotations
 
+import ast
 import copy
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
+import service
 from email_automation.certification import evidence as ev
 from email_automation.certification import input_handoff
 from email_automation.certification import ledger as ledger_module
@@ -43,9 +46,16 @@ from email_automation.certification.models import (
     RunAuthorization,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LIFECYCLE_SOURCE = REPO_ROOT / "email_automation" / "certification" / "lifecycle.py"
+
 REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
 BOOTSTRAP = "campaign-one-property"
 REFUTATION = "campaign-one-property-impossible-oracle"
+
+OPERATOR = "sitesift-certification-operator@email-automation-cache.iam.gserviceaccount.com"
+SUB = "104729384756102938475"
+AUDIENCE = "https://process-user-certification-abc123-uc.a.run.app"
 
 TWIN_ENV = {
     "K_SERVICE": "process-user-certification",
@@ -700,6 +710,304 @@ class RecoveryCeilingConstantTests(unittest.TestCase):
         self.assertEqual(lifecycle.RECOVERY_MIN_RECORD_AGE_SECONDS,
                          ledger_module.WORKER_REQUEST_CEILING_SECONDS
                          + lifecycle.RECOVERY_AGE_MARGIN_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# The durable ledger is the DEFAULT, and nothing downgrades it
+# ---------------------------------------------------------------------------
+#
+# ``recover`` was implemented, driven, and INERT: the module default was
+# ``InMemoryRunLedger()``, which has no server-assigned commit timestamp, so
+# every real recovery refused ``record_age_unprovable``. Wiring the durable
+# ledger in is therefore not a tidy-up -- it is what makes the operation exist.
+#
+# The hazard of the swap is the opposite of the hazard of the route: a resolution
+# that FALLS BACK to the in-memory ledger when no client can be found would make
+# a single-process ledger look durable, which is the exact property the durable
+# ledger exists to provide. So the fallback is absent rather than guarded, and
+# these tests are what stop it being reintroduced as a kindness.
+
+
+def _lifecycle_tree():
+    return ast.parse(LIFECYCLE_SOURCE.read_text())
+
+
+def _calls_in(node):
+    return {
+        (child.func.attr if isinstance(child.func, ast.Attribute)
+         else getattr(child.func, "id", "<computed>"))
+        for child in ast.walk(node) if isinstance(child, ast.Call)
+    }
+
+
+class DurableLedgerDefaultTests(unittest.TestCase):
+    """Resolved lazily, from an explicit client, or refused by name."""
+
+    def setUp(self):
+        # Each test resolves from scratch: the resolution is cached in the same
+        # module global, and a value another test resolved would make "lazy"
+        # unfalsifiable here.
+        patcher = patch.object(lifecycle, "_DEFAULT_LEDGER", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_shipped_lifecycle_never_constructs_an_in_memory_ledger(self):
+        """MUTATION-PROOF. The downgrade is absent, not merely unused."""
+        source = LIFECYCLE_SOURCE.read_text()
+        self.assertNotIn("InMemoryRunLedger", source,
+                         "the process-scoped ledger is reachable from the "
+                         "lifecycle again; a fallback to it is a durable "
+                         "ledger in name only")
+
+    def test_nothing_is_constructed_at_import(self):
+        """Import-time client construction is this repo's live bug class (#91).
+
+        Read from the SHIPPED module body rather than by timing an import: a
+        module-level ``FirestoreRunLedger(firestore.Client())`` constructs a
+        client for every process that merely imports the lifecycle, including
+        ordinary production, where these routes are inert.
+        """
+        forbidden = {"Client", "FirestoreRunLedger", "InMemoryRunLedger",
+                     "resolve_default_ledger"}
+        for node in _lifecycle_tree().body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                continue
+            self.assertEqual(_calls_in(node) & forbidden, set(),
+                             f"line {getattr(node, 'lineno', '?')} constructs a "
+                             "ledger or a client at import time")
+
+    def test_the_client_is_resolved_only_when_it_is_first_needed(self):
+        calls = []
+
+        def factory():
+            calls.append(1)
+            return ClockedFirestore()
+
+        with patch.object(lifecycle, "_firestore_client", factory):
+            self.assertEqual(calls, [], "a client was built before anything asked")
+            first = lifecycle.resolve_default_ledger()
+            second = lifecycle.resolve_default_ledger()
+        self.assertEqual(len(calls), 1, "the client was rebuilt per call")
+        self.assertIs(first, second)
+
+    def test_concurrent_resolution_builds_exactly_one_ledger(self):
+        """Serialized, and observably so.
+
+        Two requests arriving on an unresolved process would otherwise each
+        build a client and a ledger. Two ledger instances over one store makes
+        "which instance observed the claim" a live question, and single-use run
+        ids are not written to answer it. The construction is counted because
+        the property is invisible to anyone reading the code.
+        """
+        import threading
+
+        built = []
+        gate = threading.Event()
+
+        def slow_factory():
+            # Widen the window a naive check-then-construct would race in.
+            gate.wait(1.0)
+            built.append(1)
+            return ClockedFirestore()
+
+        resolved = []
+        errors = []
+
+        def resolve():
+            try:
+                resolved.append(lifecycle.resolve_default_ledger())
+            except BaseException as exc:      # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        with patch.object(lifecycle, "_firestore_client", slow_factory):
+            threads = [threading.Thread(target=resolve) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            gate.set()
+            for thread in threads:
+                thread.join(10)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(built), 1, "the resolution raced and built two")
+        self.assertEqual(len(resolved), 8)
+        self.assertEqual({id(ledger) for ledger in resolved},
+                         {id(resolved[0])}, "callers got different ledgers")
+
+    def test_the_resolved_default_is_the_durable_ledger_over_that_client(self):
+        store = ClockedFirestore()
+        with patch.object(lifecycle, "_firestore_client", lambda: store):
+            resolved = lifecycle.resolve_default_ledger()
+        self.assertIsInstance(resolved, ledger_module.FirestoreRunLedger)
+        self.assertNotIsInstance(resolved, ledger_module.InMemoryRunLedger)
+        drive_to_claimed(resolved, "cert-wiring-resolved")
+        self.assertIn("certificationRuns/cert-wiring-resolved", store.docs)
+
+    def test_an_unresolvable_client_is_a_named_refusal_and_never_a_downgrade(self):
+        def exploding():
+            raise RuntimeError("no application default credentials")
+
+        for factory in (exploding, lambda: None):
+            with self.subTest(factory=factory):
+                with patch.object(lifecycle, "_firestore_client", factory):
+                    with self.assertRaises(lifecycle.LedgerUnavailable):
+                        lifecycle.resolve_default_ledger()
+                    ledger, refusal = lifecycle.resolved_ledger()
+                self.assertIsNone(ledger)
+                payload, code = refusal
+                self.assertEqual(code, 503)
+                self.assertEqual(payload["reason"],
+                                 lifecycle.LEDGER_UNAVAILABLE_REASON)
+                self.assertIsNone(lifecycle._DEFAULT_LEDGER,
+                                  "a failed resolution cached something")
+
+    def test_default_ledger_refuses_rather_than_handing_back_a_process_ledger(self):
+        with self.assertRaises(lifecycle.LedgerUnavailable):
+            lifecycle.default_ledger()
+
+    def test_the_refusal_reason_is_pinned(self):
+        """MUTATION. Edit the constant and the route's contract moves with it."""
+        self.assertEqual(lifecycle.LEDGER_UNAVAILABLE_REASON, "ledger_unavailable")
+
+    def test_an_explicitly_injected_ledger_still_wins(self):
+        """The seam every lifecycle function keeps, so tests need no store."""
+        injected = ledger_module.InMemoryRunLedger()
+        payload, code = lifecycle.prepare(
+            {"scenarioId": BOOTSTRAP, "runId": "cert-wiring-injected",
+             "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=injected, environ=TWIN_ENV)
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(injected.state("cert-wiring-injected"),
+                         ledger_module.PREPARED)
+
+
+ROUTE_ENV = dict(TWIN_ENV, **{
+    "SITESIFT_CERTIFICATION_AUDIENCE": AUDIENCE,
+    "SITESIFT_CERTIFICATION_OPERATOR_EMAIL": OPERATOR,
+    "SITESIFT_CERTIFICATION_OPERATOR_SUB": SUB,
+})
+
+
+class DurableLedgerRouteDriveTests(unittest.TestCase):
+    """prepare -> run -> status -> recover, over the REAL route, over the
+    durable ledger. This is the drive the swap exists for: every one of these
+    answers used to come from a process-scoped ledger, and ``recover``'s came
+    back ``record_age_unprovable`` no matter what had happened."""
+
+    def setUp(self):
+        service.app.config["TESTING"] = True
+        self.client = service.app.test_client()
+        self.store = ClockedFirestore()
+        self.ledger = durable_ledger(self.store)
+        for target, value in (("_DEFAULT_LEDGER", self.ledger),
+                              ("_DEFAULT_REVIEW_STORE",
+                               input_handoff.TransientReviewStore())):
+            patcher = patch.object(lifecycle, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # The 75s gate is proven against a fake clock in the recovery-route
+        # tests; here it is shortened so the HTTP surface can be exercised
+        # without waiting it out.
+        gate = patch.object(lifecycle, "QUIESCENCE_WAIT_SECONDS", 0)
+        gate.start()
+        self.addCleanup(gate.stop)
+
+    def _post(self, operation, body):
+        decoder = lambda token, audience: {
+            "iss": "https://accounts.google.com", "aud": AUDIENCE,
+            "email": OPERATOR, "email_verified": True, "sub": SUB,
+            "exp": 4102444800,
+        }
+        with patch.dict(os.environ, ROUTE_ENV, clear=False), \
+                patch.object(service, "_caller_decoder", decoder):
+            return self.client.post(
+                f"/certification/{operation}", json=body,
+                headers={"Authorization": "Bearer valid"})
+
+    def test_a_whole_run_is_served_from_the_durable_store(self):
+        run_id = "cert-wiring-route-durable"
+        body = {"scenarioId": BOOTSTRAP, "runId": run_id,
+                "expectedRevision": REVISION}
+
+        prepared = self._post("prepare", body)
+        self.assertEqual(prepared.status_code, 200, prepared.get_json())
+        self.assertEqual(prepared.get_json()["state"], "PREPARED")
+
+        executed = self._post("run", body)
+        self.assertEqual(executed.status_code, 200, executed.get_json())
+        result = executed.get_json()
+        self.assertEqual(result["verdict"], "PASS")
+        for name, want in (("captured_outreach", 1), ("fixture_audit", 1),
+                           ("fixture_followup", 1), ("fixture_thread_index", 1),
+                           ("replay_delta", 0), ("cleanup_residue", 0),
+                           ("graph_network", 0), ("nonfixture_write", 0),
+                           ("bcc", 0)):
+            self.assertEqual(result["counts"][name], want, name)
+
+        final = self._post("status", {"runId": run_id,
+                                      "expectedRevision": REVISION})
+        self.assertEqual(final.get_json()["state"], "TERMINAL")
+        self.assertEqual(final.get_json()["verdict"], "PASS")
+
+        # The row is in the STORE, not in this process's memory.
+        row = self.store.docs[f"certificationRuns/{run_id}"]
+        self.assertEqual(row["state"], "TERMINAL")
+        self.assertEqual(row["verdict"], "PASS")
+        self.assertNotIn(f"certificationRunAuthorizations/{run_id}",
+                         self.store.docs)
+
+    def test_recover_now_evaluates_its_gates_instead_of_refusing_unprovable(self):
+        """The whole point. Against the in-memory default this was 503
+        ``record_age_unprovable`` for every input; against the durable one the
+        age is measured server-side and the gates decide."""
+        drive_to_claimed(self.ledger, "cert-wiring-route-recover")
+        body = {"runId": "cert-wiring-route-recover",
+                "expectedRevision": REVISION}
+
+        young = self._post("recover", body)
+        self.assertEqual(young.status_code, 409, young.get_json())
+        self.assertEqual(young.get_json()["reason"], "record_too_recent")
+        self.assertNotEqual(young.get_json()["reason"], "record_age_unprovable")
+
+        self.store.advance(10_000)
+        recovered = self._post("recover", body)
+        self.assertEqual(recovered.status_code, 200, recovered.get_json())
+        payload = recovered.get_json()
+        self.assertEqual(payload["verdict"], "INSTRUMENT_BLOCKED")
+        self.assertEqual(payload["failureCode"], "recovered_after_interruption")
+        self.assertNotEqual(payload["verdict"], "NOT_TESTED")
+        self.assertFalse(payload["residueProven"],
+                         "the route proved a residue it cannot observe")
+        self.assertEqual(
+            self.store.docs["certificationRuns/cert-wiring-route-recover"][
+                "verdict"], "INSTRUMENT_BLOCKED")
+
+    def test_a_route_with_no_resolvable_ledger_refuses_by_name(self):
+        """Never a 404 from a fresh in-memory ledger, which is what a silent
+        downgrade would answer: "unknown run" reads as a fact about the run."""
+        def exploding():
+            raise RuntimeError("no application default credentials")
+
+        with patch.object(lifecycle, "_DEFAULT_LEDGER", None), \
+                patch.object(lifecycle, "_firestore_client", exploding):
+            response = self._post("status", {"runId": "cert-wiring-route-none",
+                                             "expectedRevision": REVISION})
+        self.assertEqual(response.status_code, 503, response.get_json())
+        self.assertEqual(response.get_json()["reason"],
+                         lifecycle.LEDGER_UNAVAILABLE_REASON)
+
+    def test_a_bad_request_is_still_a_bad_request(self):
+        """The ledger is resolved AFTER the schema and revision checks, so a
+        malformed request is never reported as an unavailable instrument."""
+        with patch.object(lifecycle, "_DEFAULT_LEDGER", None), \
+                patch.object(lifecycle, "_firestore_client",
+                             lambda: (_ for _ in ()).throw(RuntimeError("no adc"))):
+            malformed = self._post("status", {"runId": "r"})
+            mismatched = self._post("status", {"runId": "r",
+                                               "expectedRevision": "0" * 40})
+        self.assertEqual(malformed.status_code, 400)
+        self.assertEqual(malformed.get_json()["reason"], "invalid_request")
+        self.assertEqual(mismatched.status_code, 409)
+        self.assertEqual(mismatched.get_json()["reason"], "revision_mismatch")
 
 
 # ---------------------------------------------------------------------------
