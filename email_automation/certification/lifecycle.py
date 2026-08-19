@@ -249,7 +249,15 @@ def run(body: Mapping[str, Any], *, caller_identity_digest: str = "",
         return _error("instrument_unavailable", 503)
 
     run_id = body["runId"]
-    authorization = ledger.peek_ephemeral(run_id)
+    try:
+        authorization = ledger.peek_ephemeral(run_id)
+    except AuthorizationInvalid:
+        # A durable ledger raises here when a STORED authorization has been
+        # edited. That is a finding and gets its own reason: collapsing it into
+        # the ordinary 409 would hide a tamper, and letting it escape would
+        # return a 500 -- the one answer that tells a caller this run id hit a
+        # code path the others did not.
+        return _error("authorization_invalid", 409)
     if authorization is None:
         # Covers "never prepared" and "already claimed" alike, and deliberately
         # does not distinguish them to a caller: both mean this request may not

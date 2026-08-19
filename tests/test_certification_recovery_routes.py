@@ -1107,3 +1107,65 @@ class SanitizationContractTests(unittest.TestCase):
         blob = json.dumps(unsanitized, sort_keys=True)
         self.assertNotIn("real.person@example.com", blob)
         self.assertIn("reach me at", blob)
+
+
+# ---------------------------------------------------------------------------
+# A tampered authorization is a finding, not a 500 and not an absence
+# ---------------------------------------------------------------------------
+#
+# The in-memory ledger's `peek_ephemeral` only ever returns a value or None.
+# The durable one raises `AuthorizationInvalid` when a stored authorization has
+# been EDITED in the database -- deliberately, so a tamper and an absence do not
+# look alike. `run` must be ready for that before the swap, not after it.
+
+
+class TamperedAuthorizationTests(unittest.TestCase):
+    """The 409 for "no prepared run" is deliberately ambiguous between "never
+    prepared" and "already claimed", because telling those apart is a probe for
+    which run ids exist. A 500 breaks that ambiguity in the opposite direction:
+    it says this particular run id hit a path the others did not."""
+
+    ENV = dict(TWIN_ENV)
+
+    def _run(self, ledger, run_id):
+        return lifecycle.run(
+            {"scenarioId": "campaign-one-property", "runId": run_id,
+             "expectedRevision": REVISION},
+            caller_identity_digest="c" * 64, ledger=ledger, environ=self.ENV)
+
+    def test_an_absent_authorization_still_refuses_as_no_prepared_run(self):
+        ledger = ledger_module.InMemoryRunLedger()
+        payload, code = self._run(ledger, "cert-tamper-absent")
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "no_prepared_run")
+
+    def test_a_tampered_authorization_is_named_rather_than_crashing(self):
+        from email_automation.certification.models import AuthorizationInvalid
+
+        class TamperedLedger(ledger_module.InMemoryRunLedger):
+            def peek_ephemeral(self, run_id):
+                raise AuthorizationInvalid("stored authorization digest does not match")
+
+        ledger = TamperedLedger()
+        claimed_run(ledger, "cert-tamper-edited")
+        payload, code = self._run(ledger, "cert-tamper-edited")
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["reason"], "authorization_invalid")
+
+    def test_a_tamper_and_an_absence_are_distinguishable(self):
+        from email_automation.certification.models import AuthorizationInvalid
+
+        class TamperedLedger(ledger_module.InMemoryRunLedger):
+            def peek_ephemeral(self, run_id):
+                raise AuthorizationInvalid("stored authorization digest does not match")
+
+        tampered = TamperedLedger()
+        claimed_run(tampered, "cert-tamper-a")
+        tampered_payload, _ = self._run(tampered, "cert-tamper-a")
+        absent_payload, _ = self._run(ledger_module.InMemoryRunLedger(),
+                                      "cert-tamper-b")
+        self.assertNotEqual(tampered_payload["reason"], absent_payload["reason"])
+        # Neither answer names a run id, so neither is a probe for which exist.
+        for payload in (tampered_payload, absent_payload):
+            self.assertEqual(set(payload), {"status", "reason"})
+            self.assertNotIn("cert-tamper", json.dumps(payload))
