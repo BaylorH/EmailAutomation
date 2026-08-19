@@ -282,7 +282,7 @@ def stamp_entitlement(scenario: Mapping[str, Any]) -> int:
     return 1 if scenario.get("capabilityStamp") is True else 0
 
 
-def observe_capability_stamp(writes: Any, *, stamp_entitlement: int) -> int:
+def observe_capability_stamp(writes: Any, *, entitlement: int) -> int:
     """Capability stamps this run produced: entitlement plus stamp-shaped writes."""
     produced = 0
     for entry in writes:
@@ -293,7 +293,7 @@ def observe_capability_stamp(writes: Any, *, stamp_entitlement: int) -> int:
         text = f"{path} {payload}"
         if any(marker in text for marker in STAMP_MARKERS):
             produced += 1
-    return int(stamp_entitlement) + produced
+    return int(entitlement) + produced
 
 
 def _observe(runtime: Any, fixture: fx.PreparedFixture,
@@ -341,7 +341,7 @@ def _observe(runtime: Any, fixture: fx.PreparedFixture,
             1 for p in write_paths if "sendCounters" in p or "/counters/" in p
         ),
         "capability_stamp": observe_capability_stamp(
-            store.writes, stamp_entitlement=stamp_entitlement
+            store.writes, entitlement=stamp_entitlement
         ),
         "cleanup_residue": cleanup_residue,
         "replay_delta": replay_delta,
@@ -610,6 +610,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"run       {args.run_id}")
         print(f"outcome   {record.outcome.upper()}   (registry expects "
               f"{detail.get('expected_verdict')})")
+        if record.failure_code:
+            print(f"because   {record.failure_code}")
+        if detail.get("oracle_key"):
+            print(f"oracle    {detail['oracle_key']}")
         if detail.get("error"):
             print(f"error     {detail['error']}")
         print("\neffects observed:")
@@ -618,8 +622,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             want_forb = detail.get("forbidden", {}).get(name)
             want = want_req if want_req is not None else want_forb
             flag = "" if want is None or want == value else "   <-- MISMATCH"
-            print(f"  {name:24} {value:>4}   declared {want}{flag}")
-        for label in ("mismatches", "unmeasured", "scope_violations",
+            print(f"  {name:28} {value:>4}   declared {want}{flag}")
+        # A terminal that prints FAIL and no reason sends the reader to the
+        # source. ``oracle_contradictions`` says what was refuted;
+        # ``oracle_impossible`` says the expectation could never have been met,
+        # which is the difference between a designed refutation and a
+        # regression.
+        for label in ("mismatches", "oracle_contradictions", "oracle_impossible",
+                      "unmeasured", "scope_violations",
                       "ambient_reaches", "network_attempts"):
             rows = detail.get(label) or []
             if rows:

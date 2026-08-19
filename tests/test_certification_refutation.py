@@ -276,6 +276,29 @@ class PublicDrivePermissionObserverTests(unittest.TestCase):
             0,
         )
 
+    def test_the_grant_type_allowlist_bites_independently_of_the_address(self):
+        """The type gate must hold on its own, not lean on the address gate.
+
+        Found by mutation: widening PRIVATE_GRANT_TYPES to include "anyone" and
+        "domain" left every other test in this module green, because the public
+        grants they use carry no emailAddress and were still caught by the
+        address requirement. A public TYPE is public even when an address is
+        attached to it, and that has to be asserted directly or the type
+        allow-list is decoration.
+        """
+        for permission in (
+            {"type": "anyone", "role": "reader",
+             "emailAddress": "person@fixture.example.com"},
+            {"type": "domain", "role": "reader", "domain": "example.com",
+             "emailAddress": "person@fixture.example.com"},
+        ):
+            with self.subTest(permission=permission):
+                self.assertEqual(
+                    self._observe(_FakeDrivePublication([("file-1", permission)])), 1
+                )
+        self.assertNotIn("anyone", rn.PRIVATE_GRANT_TYPES)
+        self.assertNotIn("domain", rn.PRIVATE_GRANT_TYPES)
+
     def test_the_private_grant_allowlist_is_load_bearing(self):
         """Mutate the pin and confirm it bites.
 
@@ -325,22 +348,22 @@ class CapabilityStampObserverTests(unittest.TestCase):
             ("set", "capabilities/spreadsheet-admission",
              {"productionVerdict": "PASS"}, False),
         ]
-        self.assertEqual(rn.observe_capability_stamp(writes, stamp_entitlement=0), 1)
+        self.assertEqual(rn.observe_capability_stamp(writes, entitlement=0), 1)
 
     def test_an_ordinary_fixture_write_is_not_a_stamp(self):
         writes = [("set", "users/cert-uid-0001/actionAudit/audit-1", {"status": "sent"}, False)]
-        self.assertEqual(rn.observe_capability_stamp(writes, stamp_entitlement=0), 0)
+        self.assertEqual(rn.observe_capability_stamp(writes, entitlement=0), 0)
 
     def test_the_stamp_marker_pin_is_load_bearing(self):
         from unittest.mock import patch
         writes = [("set", "capabilities/x", {"productionVerdict": "PASS"}, False)]
-        self.assertEqual(rn.observe_capability_stamp(writes, stamp_entitlement=0), 1)
+        self.assertEqual(rn.observe_capability_stamp(writes, entitlement=0), 1)
         with patch.object(rn, "STAMP_MARKERS", ("somethingElseEntirely",)):
-            self.assertEqual(rn.observe_capability_stamp(writes, stamp_entitlement=0), 0)
+            self.assertEqual(rn.observe_capability_stamp(writes, entitlement=0), 0)
 
     def test_entitlement_and_observed_writes_both_reach_the_count(self):
         writes = [("set", "capabilities/x", {"productionVerdict": "PASS"}, False)]
-        self.assertEqual(rn.observe_capability_stamp(writes, stamp_entitlement=1), 2)
+        self.assertEqual(rn.observe_capability_stamp(writes, entitlement=1), 2)
 
 
 class ObserverCompletenessTests(unittest.TestCase):
@@ -370,6 +393,278 @@ class ObserverCompletenessTests(unittest.TestCase):
         declared = set(scenario["requiredEffects"]) | set(scenario["forbiddenEffects"])
         self.assertEqual(sorted(declared - set(detail["observed"])), [])
         self.assertEqual(detail["unmeasured"], [])
+
+
+class RefutationRunTests(unittest.TestCase):
+    """The whole point: a run that returns a real FAIL, and cleans up anyway.
+
+    A failing run that leaks a fixture is a worse bug than the failure it
+    reports - the failure is information, the leak is a production effect. So
+    every cleanup property the bootstrap run proves has to hold on this branch
+    too, and it is asserted here rather than assumed to carry over.
+    """
+
+    def _run(self, scenario_id, run_id):
+        return rn.run_scenario(scenario_id, run_id=run_id, revision=VALID_REVISION)
+
+    def test_the_refutation_scenario_returns_a_real_fail(self):
+        record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-fail-0001")
+        self.assertEqual(record.outcome, "fail", detail)
+        self.assertEqual(record.failure_code, "oracle_contradicted")
+        self.assertEqual(detail["error"], None,
+                         "the FAIL must come from the oracle, not from a crash")
+
+    def test_the_instrument_agrees_with_the_registry_expected_verdict(self):
+        """The instrument-level judgement, driven off the registry's own field.
+
+        The runner reports what it MEASURED. Whether that measurement agrees
+        with the approved expectation is a judgement about the instrument, and
+        it belongs here - putting it inside the runner would make the runner
+        grade itself against the answer key it is holding.
+        """
+        for scenario_id in (BOOTSTRAP_SCENARIO_ID, REFUTATION_SCENARIO_ID):
+            with self.subTest(scenario=scenario_id):
+                scenario = registry_scenario(scenario_id)
+                record, detail = self._run(scenario_id, f"cert-verdict-{scenario_id[:24]}")
+                self.assertEqual(
+                    OUTCOME_TO_VERDICT[record.outcome],
+                    scenario["expectedVerdict"],
+                    f"instrument disagreed with the registry: {detail.get('mismatches')} "
+                    f"{detail.get('oracle_contradictions')}",
+                )
+
+    def test_the_failure_is_designed_not_accidental(self):
+        """Every declared effect matched. The run failed on the ORACLE alone.
+
+        If the refutation scenario failed because some forbidden effect fired,
+        it would be reporting a real defect in the product rather than proving
+        the instrument can refuse an impossible expectation.
+        """
+        _record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-designed-0001")
+        self.assertEqual(detail["mismatches"], [])
+        self.assertEqual(detail["unmeasured"], [])
+        self.assertTrue(detail["oracle_contradictions"])
+        self.assertTrue(detail["oracle_impossible"],
+                        "the oracle was merely unmet, not impossible")
+        self.assertEqual(detail["observed"]["intentional_oracle_mismatch"], 1)
+
+    def test_a_failing_run_still_cleans_up_to_zero_residue(self):
+        _record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-cleanup-0001")
+        self.assertEqual(detail["observed"]["cleanup_residue"], 0)
+        self.assertEqual(detail["cleanup_residue_paths"], [])
+        self.assertEqual(detail["cleanup_failures"], [])
+
+    def test_a_failing_run_never_deletes_the_global_policy_document(self):
+        _record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-policy-0001")
+        self.assertIn(fx.CAMPAIGN_AUTHORITY_PATH, detail["surviving_global_paths"])
+
+    def test_cleanup_is_allocated_before_the_fixture_on_the_failing_branch(self):
+        """Ordering is the property. A fixture opened before its cleanup handle
+        exists can leak on any fault between the two - and the failing branch is
+        exactly where a fault is expected."""
+        _record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-order-0001")
+        self.assertLess(detail["cleanup_allocated_seq"], detail["fixture_opened_seq"])
+
+    def test_the_failing_run_reaches_no_provider(self):
+        _record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-quiet-0001")
+        self.assertEqual(detail["network_attempts"], [])
+        self.assertEqual(detail["ambient_reaches"], [])
+        self.assertEqual(detail["scope_violations"], [])
+        self.assertEqual(detail["observed"]["graph_network"], 0)
+        self.assertEqual(detail["observed"]["nonfixture_write"], 0)
+        self.assertEqual(detail["observed"]["public_drive_permission"], 0)
+        self.assertEqual(detail["observed"]["capability_stamp"], 0)
+
+    def test_the_bootstrap_scenario_still_passes_with_its_pinned_counts(self):
+        """The control run. If the refutation work moved a bootstrap count, the
+        FAIL would be a regression wearing the costume of a new capability."""
+        record, detail = self._run(BOOTSTRAP_SCENARIO_ID, "cert-boot-control-0001")
+        self.assertEqual(record.outcome, "pass", detail.get("mismatches"))
+        for name, want in (("captured_outreach", 1), ("fixture_audit", 1),
+                           ("fixture_followup", 1), ("fixture_thread_index", 1),
+                           ("replay_delta", 0), ("cleanup_residue", 0),
+                           ("graph_network", 0), ("nonfixture_write", 0), ("bcc", 0)):
+            with self.subTest(count=name):
+                self.assertEqual(detail["observed"][name], want)
+        self.assertEqual(detail["observed"]["intentional_oracle_mismatch"], 0)
+
+    def test_fail_and_instrument_blocked_stay_distinct(self):
+        """"Never exercised" must never read as "exercised and clean".
+
+        A scenario whose lane this runner cannot drive reports
+        instrument_blocked; the refutation scenario, which IS driven and IS
+        refuted, reports fail. Collapsing the two would make an unbuilt half of
+        the instrument indistinguishable from a proven defect.
+        """
+        unwired = [
+            scenario for scenario in scenarios.all_scenarios()
+            if rn.LANES.get(scenario["logicalFixtureKey"]) != rn.BOOTSTRAP_LANE
+        ]
+        self.assertTrue(unwired)
+        blocked, _detail = self._run(unwired[0]["scenarioId"], "cert-unwired-0001")
+        failed, _detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-distinct-0001")
+        self.assertEqual(blocked.outcome, "instrument_blocked")
+        self.assertEqual(failed.outcome, "fail")
+        self.assertNotEqual(blocked.outcome, failed.outcome)
+        self.assertIn("instrument_blocked", ev.ALLOWED_OUTCOMES)
+        self.assertIn("fail", ev.ALLOWED_OUTCOMES)
+
+    def test_the_failing_evidence_record_is_projectable_and_stable(self):
+        """Evidence from a FAIL is exported like any other, so it goes through
+        the same allow-list. A failure code that leaked a fixture path or an
+        exception string would be a disclosure carried by a red build."""
+        record, _detail = self._run(REFUTATION_SCENARIO_ID, "cert-refute-evidence-0001")
+        payload = record.to_dict()
+        self.assertEqual(payload["outcome"], "fail")
+        self.assertEqual(payload["failureCode"], "oracle_contradicted")
+        self.assertEqual(payload["phase"], "readback")
+        self.assertRegex(record.canonical_digest(), r"^[0-9a-f]{64}$")
+        rendered = repr(payload)
+        for forbidden in (fx.FIXTURE_RECIPIENT, fx.FIXTURE_SENDER, fx.FIXTURE_PREFIX):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_the_cli_exit_status_reports_the_failure(self):
+        """A FAIL that exits 0 is a green build over a red run."""
+        import io
+        import contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            status = rn.main([REFUTATION_SCENARIO_ID, "--run-id", "cert-refute-cli-0001",
+                              "--revision", VALID_REVISION])
+        self.assertEqual(status, 1)
+        self.assertIn("FAIL", buffer.getvalue())
+
+    def test_the_operator_output_says_why_the_run_failed(self):
+        """A terminal that prints FAIL and no reason sends the reader to the
+        source. The oracle that was refuted, and the fixture bound that made it
+        impossible, both belong on screen."""
+        import io
+        import contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rn.main([REFUTATION_SCENARIO_ID, "--run-id", "cert-refute-why-0001",
+                     "--revision", VALID_REVISION])
+        rendered = buffer.getvalue()
+        self.assertIn("oracle_contradicted", rendered)
+        self.assertIn("oracle_contradictions", rendered)
+        self.assertIn("oracle_impossible", rendered)
+        self.assertIn("captured_outreach", rendered)
+        # the operator view is a terminal convenience, not evidence, but it is
+        # still printed from a fixture-bearing detail dict
+        for forbidden in (fx.FIXTURE_RECIPIENT, fx.FIXTURE_SENDER):
+            self.assertNotIn(forbidden, rendered)
+
+
+class OraclePinMutationTests(unittest.TestCase):
+    """Every new pin, mutated, with the bite confirmed.
+
+    A pinning test that only agrees with itself proves nothing. Each test here
+    changes the shipped value and asserts the verdict moves - which is the only
+    way to know the constant is consulted rather than decorative.
+    """
+
+    def _run(self, scenario_id, run_id):
+        return rn.run_scenario(scenario_id, run_id=run_id, revision=VALID_REVISION)
+
+    def test_a_satisfiable_refutation_oracle_changes_why_the_run_fails(self):
+        """Mutate the oracle table and confirm the pin bites.
+
+        Softening the impossible expectation to one the fixture CAN satisfy does
+        not turn the scenario green, and that is the stronger result: the run is
+        pinned twice over. The oracle stops being contradicted, so
+        intentional_oracle_mismatch drops to 0, and the registry's declared
+        requirement of 1 then fails it as an effect mismatch instead.
+
+        A softened oracle that produced a PASS would mean the registry's
+        required effect was decorative.
+        """
+        from unittest.mock import patch
+        refutation = registry_scenario(REFUTATION_SCENARIO_ID)
+        satisfiable = fx.OracleProjection(
+            key=refutation["oracleProjectionKey"],
+            expectations={"captured_outreach": 1},
+        )
+        mutated = dict(fx.ORACLES)
+        mutated[refutation["oracleProjectionKey"]] = satisfiable
+        with patch.dict(fx.ORACLES, mutated, clear=True):
+            record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-mutate-oracle-0001")
+        self.assertEqual(detail["oracle_contradictions"], [])
+        self.assertEqual(detail["observed"]["intentional_oracle_mismatch"], 0)
+        self.assertEqual(record.failure_code, "effect_count_mismatch")
+        self.assertIn("required intentional_oracle_mismatch: want 1, observed 0",
+                      detail["mismatches"])
+
+        # Unmutated, the SAME run fails for the oracle instead, so the constant
+        # is what moved the verdict rather than anything ambient.
+        record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-mutate-oracle-0002")
+        self.assertEqual(record.failure_code, "oracle_contradicted")
+        self.assertEqual(detail["mismatches"], [])
+
+    def test_dropping_the_shipped_oracle_blocks_the_instrument_rather_than_passing(self):
+        from unittest.mock import patch
+        with patch.dict(fx.ORACLES, {}, clear=True):
+            record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-mutate-drop-0001")
+        self.assertEqual(record.outcome, "instrument_blocked")
+        self.assertEqual(record.failure_code, "oracle_not_registered")
+        self.assertEqual(detail["reason"], "oracle_not_registered")
+
+    def test_a_stamp_entitlement_would_violate_the_refutation_contract(self):
+        """Mutate the registry fact the entitlement is read from.
+
+        If the refutation scenario ever acquired the right to stamp a
+        capability, capability_stamp would be 1 against a declared 0 and the run
+        would fail as an effect mismatch - not slip through as a clean FAIL.
+        """
+        from unittest.mock import patch
+        stamping = dict(registry_scenario(REFUTATION_SCENARIO_ID))
+        stamping["capabilityStamp"] = True
+        with patch.object(rn.scenarios, "get", return_value=stamping):
+            _record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-mutate-stamp-0001")
+        self.assertEqual(detail["observed"]["capability_stamp"], 1)
+        self.assertIn("forbidden capability_stamp: want 0, observed 1", detail["mismatches"])
+
+    def test_an_unobservable_drive_transport_blocks_rather_than_scoring_zero(self):
+        """Mutate the observer's measurability, not its answer.
+
+        With the transport unenumerable, public_drive_permission must vanish
+        from the observation entirely and the run must report instrument_blocked
+        - never a FAIL that implicitly claims the Drive surface was clean.
+        """
+        from unittest.mock import patch
+        with patch.object(rn, "observe_public_drive_permission", return_value=None):
+            record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-mutate-drive-0001")
+        self.assertNotIn("public_drive_permission", detail["observed"])
+        self.assertIn("forbidden public_drive_permission (no observer)", detail["unmeasured"])
+        self.assertEqual(record.outcome, "instrument_blocked")
+        self.assertEqual(record.failure_code, "observer_not_wired")
+
+    def test_a_public_grant_during_the_run_turns_the_fail_into_a_mismatch(self):
+        """The forbidden effect actually firing must be visible, not absorbed.
+
+        The refutation scenario already fails, so the danger is that a REAL
+        public Drive permission would hide inside a verdict that was going to be
+        FAIL anyway. It must surface as a declared-effect mismatch.
+        """
+        from unittest.mock import patch
+        with patch.object(rn, "observe_public_drive_permission", return_value=1):
+            record, detail = self._run(REFUTATION_SCENARIO_ID, "cert-mutate-public-0001")
+        self.assertEqual(record.outcome, "fail")
+        self.assertEqual(record.failure_code, "effect_count_mismatch")
+        self.assertIn("forbidden public_drive_permission: want 0, observed 1",
+                      detail["mismatches"])
+
+    def test_the_oracles_digest_moves_when_the_table_moves(self):
+        from unittest.mock import patch
+        baseline = fx.oracles_digest()
+        self.assertRegex(baseline, r"^[0-9a-f]{64}$")
+        mutated = dict(fx.ORACLES)
+        mutated["oracle/certification-integrity/impossible"] = fx.OracleProjection(
+            key="oracle/certification-integrity/impossible",
+            expectations={"captured_outreach": 3},
+        )
+        with patch.dict(fx.ORACLES, mutated, clear=True):
+            self.assertNotEqual(fx.oracles_digest(), baseline)
+        self.assertEqual(fx.oracles_digest(), baseline)
 
 
 if __name__ == "__main__":
