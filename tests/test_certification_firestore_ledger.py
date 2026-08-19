@@ -174,6 +174,7 @@ class FakeFirestore:
         self.rollbacks = 0
         self.aborts = 0
         self._read_hook = None
+        self._read_hook_after = 0
         self.history = []
 
     # -- store ------------------------------------------------------------
@@ -197,13 +198,25 @@ class FakeFirestore:
 
     # -- hooks used to interleave two callers -----------------------------
 
-    def on_transactional_read(self, hook):
+    def arm_after_reads(self, hook, after=1):
+        """Fire ``hook`` once, after the ``after``-th transactional read.
+
+        Where the hook fires decides WHICH refusal a losing caller hits, and
+        both matter: fire between the two reads and the loser finds the
+        authorization already consumed; fire after both and the loser's commit
+        aborts on a moved read set and the retry finds the run already CLAIMED.
+        """
         self._read_hook = hook
+        self._read_hook_after = after
 
     def fire_read_hook(self, path):
+        if self._read_hook is None:
+            return
+        self._read_hook_after -= 1
+        if self._read_hook_after > 0:
+            return
         hook, self._read_hook = self._read_hook, None
-        if hook is not None:
-            hook(path)
+        hook(path)
 
     # -- client surface ---------------------------------------------------
 
@@ -623,6 +636,180 @@ class CleanupEvidenceAppendsTests(LedgerCase):
         ledger.begin_preparing(request)
         with self.assertRaises(lg.LedgerStateError):
             ledger.append_cleanup_result(request.run_id, "e" * 64, {"residue": 0})
+
+
+class _LeakyClaimLedger(lg.FirestoreRunLedger):
+    """The bug the atomic claim exists to prevent, written out on purpose.
+
+    Advances to CLAIMED in one transaction and consumes the authorization in a
+    second. It is a NEGATIVE CONTROL: the window test below must fail against
+    this and pass against the real one, otherwise the test is agreeing with
+    itself rather than constraining anything.
+    """
+
+    def claim(self, request, authorization):
+        def advance(transaction):
+            row = self._read_row(request.run_id, transaction)
+            prepared = self._read_authorization(request.run_id, transaction)
+            claimed = self._apply_claim(row, request, authorization, prepared)
+            self._write_row(transaction, request.run_id, row)
+            return claimed
+
+        claimed = self._in_transaction(advance)
+
+        def consume(transaction):
+            transaction.delete(self._authorization_ref(request.run_id))
+
+        self._in_transaction(consume)
+        return claimed
+
+
+class TheClaimConsumesTheAuthorizationInOneTransactionTests(LedgerCase):
+    """The property the plan names: no consumed-without-claim window.
+
+    In memory the advance and the delete happen inside one lock. Over a store
+    they have to happen inside one COMMIT. If there is any moment where the
+    claim is already visible and the one-use records are still there, a second
+    caller can spend the same authorization -- and the whole point of a one-use
+    authorization is that it covers exactly one execution.
+    """
+
+    RUN_PATH = f"{lg.DEFAULT_RUNS_COLLECTION}/cert-auth-0001"
+    AUTH_PATH = f"{lg.DEFAULT_AUTHORIZATIONS_COLLECTION}/cert-auth-0001"
+
+    def _prepared(self, ledger, request):
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self.auth())
+
+    def _observable_states(self):
+        """Every state an outside reader could have seen, in order.
+
+        The double makes uncommitted writes invisible, so the sequence of
+        post-commit snapshots IS the sequence of observable states.
+        """
+        return [
+            ((docs.get(self.RUN_PATH) or {}).get("state"), self.AUTH_PATH in docs)
+            for docs in self.store.history
+        ]
+
+    def test_the_claim_is_exactly_one_commit(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        self._prepared(ledger, request)
+        commits_before = self.store.commits
+        ledger.claim(request, self.auth())
+        self.assertEqual(self.store.commits, commits_before + 1)
+
+    def test_no_observable_state_shows_a_claim_beside_a_spendable_authorization(self):
+        ledger, request = self.firestore_ledger(), self.request()
+        self._prepared(ledger, request)
+        ledger.claim(request, self.auth())
+        self.assertIn(("PREPARED", True), self._observable_states())
+        self.assertIn(("CLAIMED", False), self._observable_states())
+        self.assertNotIn(("CLAIMED", True), self._observable_states())
+
+    def test_the_window_test_fails_against_a_claim_split_across_transactions(self):
+        """Negative control. Splitting the delete out opens exactly the window,
+        which proves the assertion above is constraining the implementation and
+        not merely agreeing with it."""
+        ledger, request = _LeakyClaimLedger(self.store), self.request()
+        self._prepared(ledger, request)
+        ledger.claim(request, self.auth())
+        self.assertIn(("CLAIMED", True), self._observable_states())
+
+    def test_a_second_caller_can_spend_the_authorization_through_that_window(self):
+        """And the window is not cosmetic: while it is open, a second caller
+        holding the same authorization reads it straight back out."""
+        leaky, request = _LeakyClaimLedger(self.store), self.request()
+        honest = self.firestore_ledger()
+        self._prepared(leaky, request)
+
+        seen = {}
+
+        def peek_between_the_two_transactions(_path):
+            seen["authorization"] = honest.peek_ephemeral(request.run_id)
+            seen["state"] = honest.state(request.run_id)
+
+        # Fires after the leaky claim's first transaction has committed, which
+        # is the only moment that exists at all in the atomic implementation.
+        original_in_transaction = leaky._in_transaction
+        calls = []
+
+        def counting_in_transaction(body):
+            result = original_in_transaction(body)
+            calls.append(body)
+            if len(calls) == 1:
+                peek_between_the_two_transactions(None)
+            return result
+
+        leaky._in_transaction = counting_in_transaction
+        leaky.claim(request, self.auth())
+
+        self.assertEqual(seen["state"], "CLAIMED")
+        self.assertIsNotNone(
+            seen["authorization"],
+            "the split claim left a spendable authorization beside a visible claim",
+        )
+
+    def test_two_callers_racing_a_claim_between_the_reads_produce_one_winner(self):
+        """The competitor commits while the loser is mid-transaction, before the
+        loser has read the authorization. The loser finds it already consumed."""
+        loser, winner = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        self._prepared(loser, request)
+
+        outcome = {}
+
+        def competing_claim(_path):
+            outcome["winner"] = winner.claim(request, self.auth())
+
+        self.store.arm_after_reads(competing_claim, after=1)
+        with self.assertRaises(lg.LedgerStateError):
+            loser.claim(request, self.auth())
+
+        self.assertIsNotNone(outcome["winner"])
+        self.assertEqual(loser.state(request.run_id), "CLAIMED")
+        self.assertIsNone(loser.peek_ephemeral(request.run_id))
+        self.assertNotIn(("CLAIMED", True), self._observable_states())
+
+    def test_two_callers_racing_a_claim_after_the_reads_produce_one_winner(self):
+        """The competitor commits after the loser has read BOTH documents, so
+        the loser's own reads looked consistent. Its commit aborts on the moved
+        read set, the driver retries, and the retry re-reads CLAIMED and
+        refuses -- rather than overwriting the winner with a stale row."""
+        loser, winner = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+        self._prepared(loser, request)
+
+        outcome = {}
+
+        def competing_claim(_path):
+            outcome["winner"] = winner.claim(request, self.auth())
+
+        self.store.arm_after_reads(competing_claim, after=2)
+        aborts_before = self.store.aborts
+        with self.assertRaises(lg.LedgerStateError):
+            loser.claim(request, self.auth())
+
+        self.assertIsNotNone(outcome["winner"])
+        self.assertGreater(
+            self.store.aborts, aborts_before, "the losing commit did not abort"
+        )
+        self.assertEqual(loser.state(request.run_id), "CLAIMED")
+        self.assertNotIn(("CLAIMED", True), self._observable_states())
+
+    def test_two_callers_racing_begin_preparing_produce_one_winner(self):
+        """Single-use has to survive the race too, or two callers both believe
+        they own a fresh run id."""
+        loser, winner = self.firestore_ledger(), self.firestore_ledger()
+        request = self.request()
+
+        def competing_prepare(_path):
+            winner.begin_preparing(request)
+
+        self.store.arm_after_reads(competing_prepare, after=1)
+        with self.assertRaises(lg.LedgerStateError):
+            loser.begin_preparing(request)
+        self.assertEqual(loser.state(request.run_id), "PREPARING")
 
 
 if __name__ == "__main__":
