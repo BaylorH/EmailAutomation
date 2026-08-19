@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Tuple
 
+from email_automation.certification.canonical_json import canonical_digest
+
 # -- bound fixture identities ------------------------------------------------
 #
 # Synthetic throughout. The recipient domain is ``.example.com`` (RFC 2606), so
@@ -39,6 +41,10 @@ CAMPAIGN_AUTHORITY_PATH = "systemConfig/campaignAccess"
 
 class FixtureError(RuntimeError):
     """No fixture is registered for the scenario's logical key."""
+
+
+class OracleNotRegistered(RuntimeError):
+    """The scenario names an oracle projection this image does not ship."""
 
 
 class AmbientClientReached(RuntimeError):
@@ -385,3 +391,139 @@ def prepare(logical_key: str) -> PreparedFixture:
         # campaign authority is a genuinely global decision: readable, never writable
         readable_paths=(CAMPAIGN_AUTHORITY_PATH,),
     )
+
+
+# -- oracle projections ------------------------------------------------------
+#
+# An oracle is the expectation a run is judged against. It ships IN THE IMAGE,
+# alongside the seeds, and is reached ONLY through the logical
+# ``oracleProjectionKey`` the in-image scenario registry declares. There is
+# deliberately no parameter anywhere on the run path that could carry one: a
+# caller who could supply the oracle could declare any run a pass, which would
+# make the refutation scenario an elaborate way of grading its own exam.
+#
+# The refutation scenario exists to prove that stays true even when the approved
+# expectation is one the fixture provably cannot satisfy. Same product, same
+# lane, same fixture as the bootstrap scenario - only the oracle key differs.
+
+
+@dataclass(frozen=True)
+class OracleProjection:
+    """One shipped expectation, addressed by its logical key."""
+
+    key: str
+    expectations: Mapping[str, int]
+
+    def contradictions(self, observed: Mapping[str, int]) -> List[str]:
+        """Expectations the readback PROVABLY refutes.
+
+        Only counters that were actually observed are judged. An expectation
+        naming a counter nothing measured is not a contradiction - it is an
+        unwired observer, and reporting it as a contradiction would let a gap in
+        the instrument masquerade as a finding about the product.
+        """
+        rows: List[str] = []
+        for name in sorted(self.expectations):
+            if name not in observed:
+                continue
+            want = self.expectations[name]
+            got = observed[name]
+            if got != want:
+                rows.append(f"{name}: oracle expects {want}, readback observed {got}")
+        return rows
+
+    def unmeasured(self, observed: Mapping[str, int]) -> List[str]:
+        """Expectations no observer measured. Distinct from a contradiction."""
+        return [
+            f"oracle {name} (no observer)"
+            for name in sorted(self.expectations)
+            if name not in observed
+        ]
+
+    def exceeds_fixture_ceiling(self, ceilings: Mapping[str, int]) -> List[str]:
+        """Expectations the seeded fixture cannot reach even in principle.
+
+        This is what separates "impossible" from "merely unmet". A run may fail
+        an oracle because the product regressed; the refutation scenario has to
+        fail because the expectation itself is unsatisfiable by construction.
+        """
+        return [
+            f"{name}: oracle expects {self.expectations[name]}, "
+            f"the fixture can produce at most {ceilings[name]}"
+            for name in sorted(self.expectations)
+            if name in ceilings and self.expectations[name] > ceilings[name]
+        ]
+
+
+ORACLES: Dict[str, OracleProjection] = {
+    # What the bootstrap fixture genuinely produces: one queued outbox item,
+    # sent once, audited once, indexed once, with one follow-up scheduled.
+    "oracle/certification-integrity/campaign-one-property": OracleProjection(
+        key="oracle/certification-integrity/campaign-one-property",
+        expectations={
+            "captured_outreach": 1,
+            "fixture_audit": 1,
+            "fixture_followup": 1,
+            "fixture_thread_index": 1,
+        },
+    ),
+    # The approved impossible expectation. TWO captured outreaches from a
+    # fixture that seeds ONE outbox item addressed to ONE recipient: no product
+    # behaviour, correct or incorrect, can satisfy it.
+    "oracle/certification-integrity/impossible": OracleProjection(
+        key="oracle/certification-integrity/impossible",
+        expectations={"captured_outreach": 2},
+    ),
+}
+
+
+def oracles_digest() -> str:
+    """Identity of the shipped oracle table, so a silent edit is detectable."""
+    return canonical_digest({
+        key: {name: int(value) for name, value in sorted(projection.expectations.items())}
+        for key, projection in sorted(ORACLES.items())
+    })
+
+
+def oracle_for(scenario: Mapping[str, Any]) -> OracleProjection:
+    """The shipped oracle a scenario names. Allow-list, never improvisation.
+
+    ``scenario`` is the entry as the in-image registry ships it. ONLY its
+    ``oracleProjectionKey`` is read: an oracle body smuggled into the mapping
+    under any other name is ignored, so a caller that reached the registry entry
+    still cannot influence what the run is graded against.
+
+    An unregistered key raises. Returning an empty expectation would mean every
+    unrecognised scenario passes its oracle trivially, which is the exact shape
+    of the bug this instrument exists to detect.
+    """
+    key = scenario.get("oracleProjectionKey") if isinstance(scenario, Mapping) else None
+    if not isinstance(key, str) or not key.strip():
+        raise OracleNotRegistered("scenario declares no oracle projection key")
+    projection = ORACLES.get(key)
+    if projection is None:
+        raise OracleNotRegistered(f"no oracle projection is shipped for {key}")
+    return projection
+
+
+def fixture_ceilings(fixture: PreparedFixture) -> Dict[str, int]:
+    """Structural upper bounds MEASURED from the seeded fixture.
+
+    Deliberately narrow. ``captured_outreach`` has an airtight ceiling - one
+    captured outreach per (outbox item, assigned recipient) pair, because an
+    outbox item is deleted once sent - and a bound that is merely plausible
+    would let a wrong "impossible" claim slip through. Counters whose ceiling is
+    not provable are simply absent, and an oracle naming one is then judged by
+    contradiction alone.
+
+    Must be called BEFORE the run executes: the lane deletes the outbox item it
+    sends, so a ceiling read afterwards would be zero.
+    """
+    outbox_prefix = f"{fixture.prefix}/outbox/"
+    recipients = 0
+    for path, data in fixture.firestore.data.items():
+        if not path.startswith(outbox_prefix):
+            continue
+        assigned = data.get("assignedEmails") if isinstance(data, Mapping) else None
+        recipients += len(assigned) if isinstance(assigned, (list, tuple)) else 0
+    return {"captured_outreach": recipients}
