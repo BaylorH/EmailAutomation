@@ -356,6 +356,75 @@ def _observe(runtime: Any, fixture: fx.PreparedFixture,
 UNWIRED: Tuple[str, ...] = ()
 
 
+# -- the human-review pack ---------------------------------------------------
+#
+# ``/certification/review-input`` serves the one unsanitized payload in the
+# instrument, and until this existed nothing produced its input: the captured
+# envelopes died with the runtime at the end of a run, so the route refused
+# every real call with ``no_review_pending``. A route that is structurally
+# correct and never exercised proves nothing.
+#
+# The deposit is DEPOSIT-ONLY. Nothing here decides what is safe to show: the
+# projection redacts, re-checks with the real evidence sanitizer, bounds, orders
+# and refuses. This maps the product's delivery kind onto the review kind and
+# hands over subject and body.
+
+# ALLOWLIST, keyed by the product's own ``DeliveryKind`` values. A delivery kind
+# nobody mapped produces a review kind the projection refuses, which loses the
+# pack -- the correct direction, because a kind nobody anticipated is a lane
+# nobody wrote a review rubric for.
+REVIEW_KIND_BY_DELIVERY_KIND: Dict[str, str] = {
+    "new": "outreach",
+    "reply": "reply",
+    "reply_all": "reply",
+}
+
+
+def _review_rows(runtime: Any) -> List[Dict[str, str]]:
+    """The captured envelopes, in capture order, as review rows."""
+    rows: List[Dict[str, str]] = []
+    for draft in list(getattr(runtime.outbound, "captured", ())):
+        raw = draft.kind.value if hasattr(draft.kind, "value") else draft.kind
+        rows.append({
+            # ``.get(raw, raw)`` rather than a default: an unmapped kind travels
+            # through unchanged and the projection's own allowlist refuses it,
+            # so there is exactly one place that decides which kinds are
+            # reviewable.
+            "kind": REVIEW_KIND_BY_DELIVERY_KIND.get(str(raw), str(raw)),
+            "subject": draft.subject or "",
+            "body": draft.body or "",
+        })
+    return rows
+
+
+def _deposit_review_pack(runtime: Any, *, run_id: str) -> str:
+    """Deposit the ordered pack. Returns "" on success, or the refusal.
+
+    The ONLY exception swallowed here is ``ReviewProjectionRefused``, which is
+    the projection saying "this pack may not be served" -- a refused review
+    artifact is not a verdict about the product, and must not turn a PASS into a
+    crash. Everything else propagates: in this codebase a name a module does not
+    own fails as SILENCE, because nearly every call site downstream is wrapped
+    in a broad ``except Exception``, and a swallowed ``NameError`` here would be
+    indistinguishable from a run that captured nothing.
+    """
+    from email_automation.certification import input_handoff
+    from email_automation.certification import lifecycle
+
+    # Resolved from the lifecycle, never from a parameter. ``run_scenario``
+    # takes no store and no clock: the review store is the one place in the
+    # instrument where raw captured prose lives, and a caller that could name a
+    # different destination for it would be choosing where the fixture's words
+    # go.
+    store = lifecycle.default_review_store()
+    try:
+        store.deposit(run_id, _review_rows(runtime),
+                      now_epoch=lifecycle._now_epoch())
+    except input_handoff.ReviewProjectionRefused as refusal:
+        return str(refusal)
+    return ""
+
+
 def _compare(scenario: Mapping[str, Any],
              observed: Mapping[str, int]) -> Tuple[List[str], List[str]]:
     """Return (mismatches, unmeasured) against the registry's declared counts."""
@@ -483,6 +552,13 @@ def run_scenario(scenario_id: str, *, run_id: str,
     # must not fail merely because two expectations were refuted instead of one.
     observed["intentional_oracle_mismatch"] = 1 if oracle_contradictions else 0
 
+    # The human-review pack, deposited HERE and for the same reason the readback
+    # is here: replay re-executes the lane and cleanup is a stream of DELETEs
+    # against the fixture, so a pack captured after either describes a fixture
+    # that has been re-run or dismantled rather than the one the product wrote
+    # to. Measure the product, then dismantle the fixture.
+    review_deposit = _deposit_review_pack(runtime, run_id=run_id)
+
     # Replay BEFORE cleanup: replaying a torn-down fixture proves only that a
     # missing fixture does nothing.
     phase = "replay"
@@ -536,6 +612,10 @@ def run_scenario(scenario_id: str, *, run_id: str,
         "surviving_global_paths": surviving_global,
         "cleanup_allocated_seq": cleanup.allocated_seq,
         "fixture_opened_seq": fixture_opened_seq,
+        # "" on a deposited pack; otherwise the refusal, so a run that produced
+        # no reviewable pack says so instead of looking like a run that captured
+        # nothing.
+        "review_deposit": review_deposit,
     }
 
     if error is not None:
