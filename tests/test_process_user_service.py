@@ -649,3 +649,74 @@ class BidirectionalServiceFenceTests(unittest.TestCase):
         self.assertEqual(ordinary.status_code, 404)
         self.assertEqual(certification.status_code, 404)
         pipeline.assert_not_called()
+
+
+class CertificationRevisionBindingTests(unittest.TestCase):
+    """A certification route may only answer for the revision it is running.
+
+    A stamp binds a verdict to an exact source and image. If a route would serve
+    a request naming some other revision, the resulting stamp would certify code
+    that never executed -- which is worse than no stamp, because it reads as
+    proof.
+    """
+
+    REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
+    IMAGE = "sha256:" + "b" * 64
+
+    def setUp(self):
+        service.app.config["TESTING"] = True
+        self.client = service.app.test_client()
+
+    def _env(self, **overrides):
+        env = {
+            "K_SERVICE": "process-user-certification",
+            "SITESIFT_SOURCE_REVISION": self.REVISION,
+            "SITESIFT_IMAGE_DIGEST": self.IMAGE,
+        }
+        env.update(overrides)
+        return patch.dict(os.environ, env, clear=False)
+
+    def _post(self, operation="status", **body):
+        payload = {"runId": "cert-route-0001", "expectedRevision": self.REVISION}
+        payload.update(body)
+        return self.client.post(f"/certification/{operation}", json=payload)
+
+    def test_a_matching_revision_is_accepted(self):
+        with self._env():
+            response = self._post()
+        self.assertNotIn(response.status_code, (400, 409, 503))
+
+    def test_a_mismatched_expected_revision_is_refused(self):
+        """A stamp may only bind the revision it actually executed against."""
+        with self._env():
+            response = self._post(expectedRevision="0" * 40)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["reason"], "revision_mismatch")
+
+    def test_a_missing_source_revision_fails_closed(self):
+        with self._env(SITESIFT_SOURCE_REVISION=""):
+            response = self._post()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["reason"], "revision_binding_unavailable")
+
+    def test_a_missing_image_digest_fails_closed(self):
+        with self._env(SITESIFT_IMAGE_DIGEST=""):
+            response = self._post()
+        self.assertEqual(response.status_code, 503)
+
+    def test_a_non_canonical_revision_or_digest_is_refused(self):
+        """Forged or truncated values reject rather than degrade."""
+        for override in ({"SITESIFT_SOURCE_REVISION": "1a20ba44"},          # abbreviated
+                         {"SITESIFT_SOURCE_REVISION": self.REVISION.upper()},
+                         {"SITESIFT_IMAGE_DIGEST": "b" * 64},               # no algorithm
+                         {"SITESIFT_IMAGE_DIGEST": "sha256:xyz"}):
+            with self.subTest(**override), self._env(**override):
+                response = self._post()
+            self.assertEqual(response.status_code, 503, override)
+
+    def test_the_binding_is_checked_before_the_body_schema(self):
+        """An unavailable binding must not be reported as a bad request; the two
+        are different failures and a caller has to be able to tell them apart."""
+        with self._env(SITESIFT_SOURCE_REVISION=""):
+            response = self.client.post("/certification/status", json={"nonsense": True})
+        self.assertEqual(response.status_code, 503)

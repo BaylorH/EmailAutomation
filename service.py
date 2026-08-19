@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 
 from flask import Flask, jsonify, request
 
@@ -256,6 +257,32 @@ def process_outbox():
 # it is never mistaken for a verdict, because a verdict can only come from the
 # runner's terminal record.
 
+
+# --- revision binding ------------------------------------------------------
+#
+# A stamp binds a verdict to an exact source revision and image digest. If a
+# route answered a request naming some other revision, the stamp would certify
+# code that never executed -- worse than no stamp, because it reads as proof.
+#
+# Both values are injected by the deployment manifest and must be present,
+# canonical, and equal on candidate and twin. Absent or malformed is 503
+# (the instrument is unavailable), NOT 400 (the caller is wrong): a caller has
+# to be able to tell "my request was bad" from "this service cannot certify
+# anything right now", because only one of those is worth retrying.
+
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _revision_binding():
+    """(source_revision, image_digest) or None when either is unusable."""
+    revision = (os.getenv("SITESIFT_SOURCE_REVISION") or "").strip()
+    image = (os.getenv("SITESIFT_IMAGE_DIGEST") or "").strip()
+    if not _FULL_SHA.match(revision) or not _IMAGE_DIGEST.match(image):
+        return None
+    return revision, image
+
+
 _CERTIFICATION_RUN_KEYS = frozenset({"scenarioId", "runId", "expectedRevision"})
 _CERTIFICATION_RUN_SCOPED_KEYS = frozenset({"runId", "expectedRevision"})
 
@@ -289,6 +316,14 @@ def _certification_schema_error(body, allowed_keys) -> str | None:
 
 @app.post("/certification/<operation>")
 def certification_operation(operation: str):
+    binding = _revision_binding()
+    if binding is None:
+        # Checked BEFORE the body: an unavailable binding is not a bad request,
+        # and reporting it as one would send a caller to fix the wrong thing.
+        return jsonify({"status": "error",
+                        "reason": "revision_binding_unavailable"}), 503
+    source_revision, _image_digest = binding
+
     if operation == "review":
         body = request.get_json(silent=True)
         if not isinstance(body, dict) or set(body) != _CERTIFICATION_REVIEW_KEYS:
@@ -301,9 +336,13 @@ def certification_operation(operation: str):
     if allowed is None:
         return jsonify({"status": "error", "reason": "route_not_available"}), 404
 
-    reason = _certification_schema_error(request.get_json(silent=True), allowed)
+    body = request.get_json(silent=True)
+    reason = _certification_schema_error(body, allowed)
     if reason:
         return jsonify({"status": "error", "reason": reason}), 400
+
+    if not hmac.compare_digest(body["expectedRevision"], source_revision):
+        return jsonify({"status": "error", "reason": "revision_mismatch"}), 409
 
     return jsonify({"status": "error", "reason": "not_implemented"}), 501
 
