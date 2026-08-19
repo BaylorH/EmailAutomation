@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Mapping, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Tuple
 
 from .utils import strip_email_quotes, strip_html_tags
 
