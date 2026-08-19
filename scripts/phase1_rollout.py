@@ -1067,14 +1067,38 @@ class Phase1Rollout:
             return False
         return True
 
+    def _held_lock(self, lock: RolloutLock | None) -> RolloutLock:
+        """The held lock, or a refusal.
+
+        Everything below exists to provide one property: this step happened
+        while the rollout lock was held. A ``None`` lock would make that
+        property VACUOUS rather than violated -- ``assert_lock`` would never
+        run, the step would proceed, and nothing would error. Vacuous is the
+        harder failure to notice, so the invariant is stated here rather than
+        inferred from the fact that every caller happens to sit downstream of
+        ``acquire_lock``.
+
+        ``apply`` currently guarantees this by coupling: ``lock`` is ``None``
+        only before ``acquire_lock`` returns, and ``pause_attempted`` -- the
+        flag that admits anything to the cleanup path -- is set only after it
+        does. That coupling is real but it lives in two distant assignments,
+        and it is not the kind of thing that should have to be reconstructed by
+        a reader of the under-lock slice.
+        """
+        if lock is None:
+            raise RolloutLockLost("rollout step attempted without a held lock")
+        return lock
+
     def _locked_mutation(
-        self, lock: RolloutLock, operation: Callable[[], None]
+        self, lock: RolloutLock | None, operation: Callable[[], None]
     ) -> None:
+        lock = self._held_lock(lock)
         self.ops.assert_lock(lock)
         operation()
         self.ops.assert_lock(lock)
 
-    def _validate_locked_pre_promotion(self, lock: RolloutLock) -> None:
+    def _validate_locked_pre_promotion(self, lock: RolloutLock | None) -> None:
+        lock = self._held_lock(lock)
         self.ops.assert_lock(lock)
         image = self.ops.artifact_image()
         if not isinstance(image, str) or not image.startswith(IMAGE_REPOSITORY + "@"):
@@ -1126,10 +1150,16 @@ class Phase1Rollout:
         pause_attempted: bool,
         tag_attempted: bool,
         traffic_attempted: bool,
-        lock: RolloutLock,
+        lock: RolloutLock | None,
     ) -> bool:
         if not pause_attempted:
+            # Nothing was mutated, so there is nothing to undo -- and this is
+            # the ONLY branch on which a caller may still be holding no lock.
             return True
+        # Past this point every step goes through _locked_mutation, which
+        # refuses a None lock by name. Restating that requirement here would
+        # read as a second control while being unable to fail independently of
+        # the first, and a check that cannot be killed is decoration.
         cleanup_ok = True
         try:
             self._locked_mutation(lock, self.ops.pause_queue)

@@ -1333,6 +1333,76 @@ class StateMachineTests(unittest.TestCase):
         )
         return rollout, sleeps
 
+    # -- the under-lock invariant, stated rather than inferred ---------------
+    #
+    # Every step below exists to provide one property: it happened while the
+    # rollout lock was held. A None lock makes that property VACUOUS rather
+    # than violated -- assert_lock never runs, the step proceeds, and nothing
+    # errors. `apply` does guarantee a lock by coupling `pause_attempted` to
+    # `acquire_lock`, but that coupling lives in two distant assignments and
+    # nothing asserted it, so a refactor could have dissolved it silently.
+
+    def test_a_mutation_without_a_held_lock_refuses_and_never_runs(self):
+        """Refuse, don't proceed. The operation must not be called at all --
+        a mutation that happened and then reported a lock problem has already
+        had the effect the lock exists to gate."""
+        ops = FakeOps()
+        rollout, _ = self.make_rollout(ops)
+        ran = []
+        with self.assertRaises(phase1_rollout.RolloutLockLost) as caught:
+            rollout._locked_mutation(None, lambda: ran.append("mutated"))
+        self.assertEqual(
+            str(caught.exception), "rollout step attempted without a held lock"
+        )
+        self.assertEqual(ran, [])
+
+    def test_pre_promotion_validation_without_a_held_lock_refuses(self):
+        ops = FakeOps()
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaises(phase1_rollout.RolloutLockLost):
+            rollout._validate_locked_pre_promotion(None)
+
+    def test_cleanup_without_a_held_lock_refuses_once_anything_was_mutated(self):
+        """The one branch that may legitimately hold no lock is the one where
+        nothing was mutated. Every other path requires it."""
+        ops = FakeOps()
+        rollout, _ = self.make_rollout(ops)
+        self.assertTrue(
+            rollout._cleanup_failure(
+                pause_attempted=False,
+                tag_attempted=False,
+                traffic_attempted=False,
+                lock=None,
+            )
+        )
+        for tag_attempted, traffic_attempted in ((False, False), (True, False),
+                                                 (True, True)):
+            with self.subTest(tag=tag_attempted, traffic=traffic_attempted):
+                with self.assertRaises(phase1_rollout.RolloutLockLost):
+                    rollout._cleanup_failure(
+                        pause_attempted=True,
+                        tag_attempted=tag_attempted,
+                        traffic_attempted=traffic_attempted,
+                        lock=None,
+                    )
+
+    def test_the_lockless_refusal_is_the_kind_apply_escalates(self):
+        """The refusal must be a RolloutLockLost specifically.
+
+        ``apply`` and ``_cleanup_failure`` both re-raise that type straight to
+        MANUAL_RECOVERY, while a plain RolloutError is caught by the broad
+        ``except BaseException`` handlers around each cleanup step and becomes
+        ``cleanup_ok = False`` -- a tidier-looking outcome than a lockless
+        mutation deserves. The type is the escalation path, so it is pinned.
+        """
+        self.assertTrue(
+            issubclass(phase1_rollout.RolloutLockLost, phase1_rollout.RolloutError)
+        )
+        ops = FakeOps()
+        rollout, _ = self.make_rollout(ops)
+        with self.assertRaises(phase1_rollout.RolloutLockLost):
+            rollout._locked_mutation(None, lambda: None)
+
     def test_happy_path_orders_pause_tag_health_remove_promote_resume(self):
         ops = FakeOps()
         rollout, sleeps = self.make_rollout(ops)
