@@ -2594,18 +2594,42 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         return {"sent": False, "error": error_msg}
 
 
-def get_contact_email_count(user_id: str, recipient_email: str, runtime=None) -> int:
+def get_contact_email_count(user_id: str, recipient_email: str, runtime=None,
+                            client_id: Optional[str] = None) -> int:
     """
-    Count how many outbound emails have been sent to this contact.
-    Used to determine whether to use primary or secondary script.
+    Count outbound emails already sent to this contact WITHIN one campaign.
+    Used to determine whether to use the primary or a later script.
+
+    LIVE break (2026-08-06 production campaign), recorded as one of eight
+    defects: "cross-contact copy leaked the wrong property ordinal". This query
+    had no campaign filter and no time bound, so it counted every thread under
+    the user in which the address had ever appeared -- and the caller uses that
+    count as the SCRIPT INDEX. A contact ordinal was being spent as a property
+    ordinal, so a broker carried over from any earlier campaign received a
+    later script for their FIRST property in a new one, together with the
+    "I'm sending separate emails for each of your properties" note.
+
+    The scripts are authored per campaign, so the count that indexes them is
+    only meaningful per campaign. `client_id` is therefore required in practice;
+    it stays optional in the signature so an unscoped legacy caller degrades to
+    the previous behaviour LOUDLY (see the warning) rather than silently, and
+    any such caller is a bug to fix rather than a mode to support.
     """
     fs = _fs_for(runtime)
 
     threads_ref = fs.collection("users").document(user_id).collection("threads")
 
-    # Query threads where this email was a recipient
-    # The 'email' field is an array of recipient emails
+    # Query threads where this email was a recipient.
+    # The 'email' field is an array of recipient emails.
     query = threads_ref.where("email", "array_contains", recipient_email.lower().strip())
+
+    scope = (client_id or "").strip()
+    if scope:
+        query = query.where("clientId", "==", scope)
+    else:
+        print("⚠️ get_contact_email_count called with no clientId; the script "
+              "ordinal will count contacts across ALL campaigns")
+
     results = list(query.stream())
 
     return len(results)
@@ -2699,7 +2723,8 @@ def _personalize_name_placeholders(script: Optional[str], contact_name: Optional
 
 
 def _select_script_for_recipient(user_id: str, recipient_email: str,
-                                  scripts: List[str], contact_name: str = None, runtime=None) -> str:
+                                  scripts: List[str], contact_name: str = None, runtime=None,
+                                  client_id: Optional[str] = None) -> str:
     """
     Select appropriate script based on contact history.
 
@@ -2715,7 +2740,9 @@ def _select_script_for_recipient(user_id: str, recipient_email: str,
     if not scripts or len(scripts) == 0:
         return ""
 
-    email_count = get_contact_email_count(user_id, recipient_email, runtime=runtime)
+    email_count = get_contact_email_count(
+        user_id, recipient_email, runtime=runtime, client_id=client_id
+    )
     print(f"📊 Contact history for {recipient_email}: {email_count} previous email(s)")
 
     # Primary script for first contact
@@ -5490,7 +5517,7 @@ def _send_single_outbox_item(
             else:
                 selected_script = _select_script_for_recipient(
                     user_id, recipient_email, email_scripts, contact_name=recipient_contact_name,
-                    runtime=runtime,
+                    runtime=runtime, client_id=clientId,
                 )
 
             if _dead_letter_unresolved_name_placeholder_if_needed(
