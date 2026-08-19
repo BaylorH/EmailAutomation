@@ -1404,3 +1404,177 @@ class RunAuthorizationDigestTests(unittest.TestCase):
 _EXPECTED_AUTHORIZATION_DIGEST = (
     "3833ab44ec5eb14b3b19154081aa0a4e4921efb3066fde16ea0751e37208beda"
 )
+
+
+class CertificationRunLedgerTests(unittest.TestCase):
+    """The permanent sanitized ledger: PREPARING → PREPARED → CLAIMED → … → terminal.
+
+    This is the only thing standing between "a run happened" and "a run happened
+    exactly once, under an authorization somebody approved". Everything else in
+    the program can be retried; the ledger is what makes retrying safe.
+    """
+
+    AUTH = RunAuthorizationDigestTests.VALID
+
+    def _ledger(self):
+        from email_automation.certification import ledger as lg
+        return lg.InMemoryRunLedger()
+
+    def _request(self, run_id="cert-auth-0001", scenario_id="campaign-one-property"):
+        from email_automation.certification import models as m
+        return m.CertificationRequest(
+            scenario_id=scenario_id, run_id=run_id,
+            expected_revision=self.AUTH["source_revision"])
+
+    def _auth(self, **overrides):
+        from email_automation.certification import models as m
+        return m.RunAuthorization.create(**{**self.AUTH, **overrides})
+
+    # -- monotonic lifecycle ------------------------------------------------
+
+    def test_the_happy_path_walks_the_whole_machine(self):
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        self.assertEqual(ledger.state(request.run_id), "PREPARING")
+        ledger.mark_prepared(request, self._auth())
+        self.assertEqual(ledger.state(request.run_id), "PREPARED")
+        ledger.claim(request, self._auth())
+        self.assertEqual(ledger.state(request.run_id), "CLAIMED")
+        for phase in ("fixture_open", "seed", "execute", "replay", "cleanup"):
+            ledger.mark_running(request.run_id, phase)
+        self.assertTrue(ledger.record_terminal(request.run_id, "PASS", "d" * 64))
+        self.assertEqual(ledger.state(request.run_id), "TERMINAL")
+
+    def test_state_never_moves_backwards(self):
+        from email_automation.certification import ledger as lg
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        ledger.claim(request, self._auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.mark_prepared(request, self._auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.begin_preparing(request)
+
+    def test_a_run_cannot_be_claimed_before_it_is_prepared(self):
+        from email_automation.certification import ledger as lg
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.claim(request, self._auth())
+
+    # -- single use ---------------------------------------------------------
+
+    def test_a_run_id_is_never_reusable(self):
+        from email_automation.certification import ledger as lg
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        ledger.claim(request, self._auth())
+        ledger.record_terminal(request.run_id, "PASS", "d" * 64)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.begin_preparing(self._request())
+
+    def test_claiming_twice_is_refused(self):
+        from email_automation.certification import ledger as lg
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        ledger.claim(request, self._auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.claim(request, self._auth())
+
+    def test_claiming_consumes_the_one_use_records(self):
+        """The authorization and sealed input are ephemeral. If they outlived
+        the claim there would be a window where a second caller could use
+        them."""
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        self.assertIsNotNone(ledger.peek_ephemeral(request.run_id))
+        ledger.claim(request, self._auth())
+        self.assertIsNone(ledger.peek_ephemeral(request.run_id))
+
+    # -- the authorization is revalidated at the boundary -------------------
+
+    def test_a_claim_whose_authorization_mismatches_the_request_is_refused(self):
+        """The authorization grants ONE scenario. A request for another is
+        refused even though the authorization is internally valid."""
+        from email_automation.certification import models as m
+        ledger = self._ledger()
+        request = self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        with self.assertRaises(m.AuthorizationInvalid):
+            ledger.claim(request, self._auth(scenario_id="some-other-scenario"))
+
+    def test_a_wholesale_substituted_pair_is_caught_by_the_prepared_binding(self):
+        """Swapping BOTH request and authorization keeps them consistent with
+        each other, so the request binding cannot see it. What refuses it is
+        that the run was PREPARED under a different authorization -- two
+        independent checks, and this case needs the second one."""
+        from email_automation.certification import ledger as lg
+        ledger = self._ledger()
+        request = self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.claim(self._request(scenario_id="some-other-scenario"),
+                         self._auth(scenario_id="some-other-scenario"))
+
+    def test_a_claim_against_a_different_authorization_than_prepared_is_refused(self):
+        from email_automation.certification import ledger as lg
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.claim(request, self._auth(fixture_config_secret_version="8"))
+
+    # -- terminal recording -------------------------------------------------
+
+    def test_terminal_recording_is_idempotent_and_never_rewrites_the_verdict(self):
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        ledger.claim(request, self._auth())
+        self.assertTrue(ledger.record_terminal(request.run_id, "FAIL", "d" * 64))
+        # A repeat is accepted (a retried write must converge) but changes
+        # nothing -- and an attempt to record a DIFFERENT verdict is refused.
+        self.assertFalse(ledger.record_terminal(request.run_id, "FAIL", "d" * 64))
+        from email_automation.certification import ledger as lg
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.record_terminal(request.run_id, "PASS", "d" * 64)
+        self.assertEqual(ledger.verdict(request.run_id), "FAIL")
+
+    def test_cleanup_evidence_appends_without_changing_the_verdict(self):
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        ledger.claim(request, self._auth())
+        ledger.record_terminal(request.run_id, "FAIL", "d" * 64)
+        self.assertTrue(ledger.append_cleanup_result(request.run_id, "e" * 64, {"residue": 0}))
+        self.assertEqual(ledger.verdict(request.run_id), "FAIL")
+
+    def test_cleanup_evidence_is_refused_before_the_run_is_terminal(self):
+        from email_automation.certification import ledger as lg
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        with self.assertRaises(lg.LedgerStateError):
+            ledger.append_cleanup_result(request.run_id, "e" * 64, {"residue": 0})
+
+    # -- the ledger stays sanitized ----------------------------------------
+
+    def test_the_ledger_holds_no_fixture_value_or_raw_text(self):
+        """Durable state is digests, states, phases and counts. A recipient or
+        a message body in here would outlive the fixture it belongs to."""
+        ledger, request = self._ledger(), self._request()
+        ledger.begin_preparing(request)
+        ledger.mark_prepared(request, self._auth())
+        ledger.claim(request, self._auth())
+        ledger.record_terminal(request.run_id, "PASS", "d" * 64)
+        blob = json.dumps(ledger.export(), sort_keys=True)
+        for forbidden in ("@", "broker", "Hi Pat", "100 Fixture Way"):
+            self.assertNotIn(forbidden, blob, f"{forbidden!r} reached the ledger")
+
+    def test_an_unknown_run_has_no_state_rather_than_a_guessed_one(self):
+        self.assertIsNone(self._ledger().state("never-seen"))
