@@ -17,8 +17,11 @@ until now: it was caught only incidentally, by the generic post-normalization
 residual comparison, and only when the two sides happened to disagree.
 """
 
+import copy
 import inspect
 import os
+import re
+import shlex
 import unittest
 from pathlib import Path
 
@@ -163,10 +166,215 @@ UNREADABLE_TWIN_SHARE_REFUSAL = (
 RESIDUAL_MARKER = "unpaired difference after normalization"
 
 
+# -- the twin-only classifications, against the twin the script really ships --
+#
+# ``TWIN_ONLY`` named three fields while
+# ``scripts/deploy_certification_twin.sh`` set eight. The other five came back
+# as "exists only on the twin and is unclassified", so the comparator refused
+# EVERY twin the deploy script produced -- failing closed, and blocking.
+#
+# Widening that list is exactly the edit that must not happen quietly, so the
+# classifications and these tests land together. Each of the five is asserted in
+# BOTH directions -- required on the twin, forbidden on the candidate -- because
+# an entry that only said "ignore this key" would be a hole with a label on it.
+#
+# Every expected value below is RESOLVED FROM THE SHIPPED SCRIPT rather than
+# retyped here. A test that restates a value it should be reading is only
+# testing itself.
+
+DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_certification_twin.sh"
+
+_DEFAULTED = re.compile(r"\$\{(\w+):-([^}]*)\}")
+_BRACED = re.compile(r"\$\{(\w+)\}")
+_BARE = re.compile(r"\$(\w+)")
+_UNRESOLVED = re.compile(r"\$\{[^}]*\}")
+
+
+def _expand(token, values):
+    """``${VAR:-default}`` resolves to the default, which is what an operator
+    running the script with a clean environment actually gets."""
+    token = _DEFAULTED.sub(lambda m: values.get(m.group(1), m.group(2)), token)
+    token = _BRACED.sub(lambda m: values.get(m.group(1), m.group(0)), token)
+    return _BARE.sub(lambda m: values.get(m.group(1), m.group(0)), token)
+
+
+def _script_constants(source):
+    values = dict(re.findall(r'^([A-Z_]+)="([^"]*)"$', source, re.M))
+    for _ in range(len(values) + 1):        # resolve chained references
+        values = {name: _expand(value, values) for name, value in values.items()}
+    return values
+
+
+def _deploy_tokens(source, array_name):
+    match = re.search(rf"^{re.escape(array_name)}=\(\n(.*?)^\)$", source, re.S | re.M)
+    if match is None:                        # pragma: no cover -- vacuity guarded below
+        raise AssertionError(f"{array_name} array not found in the deploy script")
+    values = _script_constants(source)
+    return [_expand(token, values)
+            for token in shlex.split(match.group(1), comments=True)]
+
+
+def _flag_value(tokens, flag):
+    return tokens[tokens.index(flag) + 1]
+
+
+DEPLOY_SOURCE = DEPLOY_SCRIPT.read_text()
+DEPLOY_CONSTANTS = _script_constants(DEPLOY_SOURCE)
+DEPLOY_TOKENS = _deploy_tokens(DEPLOY_SOURCE, "deploy_command")
+
+# The regexes the script itself enforces on the operator's inputs, read off the
+# script. The contract must not be laxer than the artifact it describes.
+SCRIPT_GUARDS = dict(re.findall(r'\[\[ "\$(\w+)" =~ (\S+) \]\]', DEPLOY_SOURCE))
+
+# The only values an operator supplies at deploy time. Everything else in the
+# fixture below comes from the script. Each of these is checked against the
+# script's OWN guard before it is used, so the fixture cannot smuggle in a value
+# the script would have refused.
+OPERATOR_INPUTS = {
+    "SOURCE_REVISION": "1" * 40,
+    "TESTED_IMAGE_DIGEST##*@": "sha256:" + "a" * 64,
+    "PRODUCTION_CANDIDATE_REVISION": "email-automation-process-user-00042-abc",
+    "FIXTURE_CONFIG_SECRET_VERSION": "7",
+    "CERTIFICATION_OPERATOR_SUB": "104729384756019283746",
+}
+
+PRODUCTION_SERVICE = _load(ORDINARY_MANIFEST)["metadata"]["name"]
+PRODUCTION_CREDENTIALS = sorted(
+    _env_names(_load(ORDINARY_MANIFEST)) & set(tc.FORBIDDEN_ON_TWIN))
+CANDIDATE_IMAGE = ("region-docker.pkg.dev/p/r/email-automation@"
+                   + OPERATOR_INPUTS["TESTED_IMAGE_DIGEST##*@"])
+
+
+def _fill(token):
+    return _UNRESOLVED.sub(lambda m: OPERATOR_INPUTS.get(m.group(0)[2:-1], m.group(0)),
+                           token)
+
+
+def _deployed_twin_env():
+    """The twin's environment exactly as ``--set-env-vars`` and
+    ``--set-secrets`` spell it in the shipped script."""
+    env = {}
+    for pair in _flag_value(DEPLOY_TOKENS, "--set-env-vars").split(","):
+        name, _, value = pair.partition("=")
+        env[name] = _fill(value)
+    name, _, value = _flag_value(DEPLOY_TOKENS, "--set-secrets").partition("=")
+    env[name] = _fill(value)
+    return env
+
+
+def _deployed_twin(**overrides):
+    spec = {
+        "image": CANDIDATE_IMAGE,
+        "serviceName": DEPLOY_CONSTANTS["SERVICE"],
+        "serviceAccount": DEPLOY_CONSTANTS["RUNTIME_SA"],
+        "trafficPercent": 0,
+        "env": _deployed_twin_env(),
+        "containerConcurrency": int(_flag_value(DEPLOY_TOKENS, "--concurrency")),
+        "timeoutSeconds": int(_flag_value(DEPLOY_TOKENS, "--timeout")),
+    }
+    spec.update(overrides)
+    return spec
+
+
+def _deployed_candidate(**overrides):
+    """The production candidate the twin is a twin OF.
+
+    Its environment is the twin's, minus every classified twin-only field, plus
+    the credentials the shipped ordinary manifest really carries -- so the
+    symmetric half of the comparison is built from the same source as the twin
+    rather than typed out beside it.
+    """
+    env = {name: value for name, value in _deployed_twin_env().items()
+           if name not in tc.TWIN_ONLY}
+    for name in PRODUCTION_CREDENTIALS:
+        env[name] = f"secret://{name.lower().replace('_', '-')}/latest"
+    spec = {
+        "image": CANDIDATE_IMAGE,
+        "serviceName": PRODUCTION_SERVICE,
+        "serviceAccount": "123-compute@developer.gserviceaccount.com",
+        "trafficPercent": 0,
+        "env": env,
+        "containerConcurrency": int(_flag_value(DEPLOY_TOKENS, "--concurrency")),
+        "timeoutSeconds": int(_flag_value(DEPLOY_TOKENS, "--timeout")),
+    }
+    spec.update(overrides)
+    return spec
+
+
+def _without(spec, name):
+    spec = copy.deepcopy(spec)
+    del spec["env"][name]
+    return spec
+
+
+def _with_env(spec, **env):
+    spec = copy.deepcopy(spec)
+    spec["env"].update(env)
+    return spec
+
+
+# The EXACT sentences the new rules emit, restated here rather than imported.
+# Importing them would pin nothing: the assertion would follow the source
+# wherever it went. The generic residual produces a DIFFERENT sentence for the
+# same input, and matching a substring of either is how two rules in this very
+# comparator went decorative.
+MISSING_FROM_TWIN = "{0} is missing from the twin"
+PRESENT_ON_CANDIDATE = "{0} must not appear on the candidate"
+
+SECRET_VERSION_SHAPE_REFUSAL = (
+    "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION must pin a positive decimal "
+    "version; an alias, zero, or a zero-padded spelling is not one"
+)
+SECRET_VERSION_DISAGREEMENT_REFUSAL = (
+    "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION and CERTIFICATION_FIXTURE_CONFIG "
+    "pin different fixture versions; one deployment may not carry two "
+    "spellings of the fixture it ran"
+)
+OPERATOR_EMAIL_REFUSAL = (
+    "SITESIFT_CERTIFICATION_OPERATOR_EMAIL is not the certification operator "
+    "service account; the twin would accept an identity nobody approved"
+)
+OPERATOR_SUB_REFUSAL = (
+    "SITESIFT_CERTIFICATION_OPERATOR_SUB is not a numeric uniqueId; an address "
+    "can be reassigned, so a non-numeric subject pins nothing"
+)
+AUDIENCE_REFUSAL = (
+    "SITESIFT_CERTIFICATION_AUDIENCE is not the twin's own URL; an audience "
+    "naming another service is a confused deputy"
+)
+REVISION_SHAPE_REFUSAL = (
+    "SITESIFT_PRODUCTION_CANDIDATE_REVISION is not a Cloud Run revision name"
+)
+REVISION_IS_THE_TWIN_REFUSAL = (
+    "SITESIFT_PRODUCTION_CANDIDATE_REVISION names the twin's own service; a "
+    "twin that certifies itself certifies nothing"
+)
+REVISION_FOREIGN_REFUSAL = (
+    "SITESIFT_PRODUCTION_CANDIDATE_REVISION is not a revision of the candidate "
+    "service under certification"
+)
+
+NEWLY_CLASSIFIED = (
+    "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
+    "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
+    "SITESIFT_CERTIFICATION_AUDIENCE",
+    "SITESIFT_CERTIFICATION_OPERATOR_EMAIL",
+    "SITESIFT_CERTIFICATION_OPERATOR_SUB",
+)
+
+
 def _candidate(**overrides):
+    """The traffic-rule fixture pair.
+
+    Its service name is read off the shipped ordinary manifest rather than
+    typed here, because the comparator now derives the expected shape of
+    ``SITESIFT_PRODUCTION_CANDIDATE_REVISION`` from the candidate's own service
+    name -- a fixture naming a service nobody deploys would be proving a rule
+    against itself.
+    """
     spec = {
         "image": "region-docker.pkg.dev/p/r/email-automation@sha256:" + "a" * 64,
-        "serviceName": "process-user",
+        "serviceName": PRODUCTION_SERVICE,
         "serviceAccount": "123-compute@developer.gserviceaccount.com",
         "trafficPercent": 0,
         "env": {
@@ -203,6 +411,15 @@ def _twin(**overrides):
         "containerConcurrency": 1,
         "timeoutSeconds": 540,
     }
+    # The operator binding, the fixture-version pin, and the candidate-revision
+    # pin, taken from the shipped deploy script rather than restated. They were
+    # absent from this fixture while the comparator classified only three
+    # twin-only fields; now that all eight are classified, a twin missing them
+    # is refused -- correctly -- and a fixture that kept omitting them would be
+    # describing a twin that could not be deployed.
+    spec["env"].update({name: value
+                        for name, value in _deployed_twin_env().items()
+                        if name in NEWLY_CLASSIFIED})
     spec.update(overrides)
     return spec
 
@@ -520,6 +737,354 @@ class TwinTrafficIsReadOnTheSameAllowlistTests(unittest.TestCase):
             "both the candidate and the twin gate must read through "
             f"_traffic_share:\n{source}")
 
+
+class TheFixtureIsTheShippedScriptTests(unittest.TestCase):
+    """Vacuity guards for everything below.
+
+    If the parse silently produced an empty or half-resolved spec, every
+    assertion in the classes that follow would pass while proving nothing about
+    the twin the script actually deploys.
+    """
+
+    def test_the_parsed_command_is_the_real_deploy_command(self):
+        self.assertEqual(DEPLOY_TOKENS[:4],
+                         ["gcloud", "run", "deploy", "process-user-certification"])
+        self.assertGreater(len(DEPLOY_TOKENS), 10, DEPLOY_TOKENS)
+
+    def test_the_script_sets_every_field_the_contract_classifies_as_twin_only(self):
+        """The list that was too short is compared against its source of truth.
+        If the script grows a ninth variable, this is what says so."""
+        symmetric = {"SITESIFT_SOURCE_REVISION", "SITESIFT_IMAGE_DIGEST"}
+        self.assertEqual(sorted(_deployed_twin_env()),
+                         sorted(set(tc.TWIN_ONLY) | symmetric))
+
+    def test_no_placeholder_survives_into_the_fixture(self):
+        """A literal ``${VAR}`` left in a value would be a string the contract
+        might happen to accept, and the fixture would be certifying a spec no
+        deployment ever produces."""
+        for name, value in _deployed_twin()["env"].items():
+            with self.subTest(field=name):
+                self.assertNotRegex(value, r"\$\{|\$[A-Z]")
+
+    def test_the_operator_inputs_satisfy_the_scripts_own_guards(self):
+        """The fixture may not smuggle in a value the script would refuse."""
+        for variable, pattern in (("SOURCE_REVISION", None),
+                                  ("FIXTURE_CONFIG_SECRET_VERSION", None),
+                                  ("CERTIFICATION_OPERATOR_SUB", None)):
+            pattern = SCRIPT_GUARDS[variable]
+            with self.subTest(variable=variable):
+                self.assertRegex(OPERATOR_INPUTS[variable], pattern)
+
+    def test_the_candidate_carries_credentials_the_twin_does_not(self):
+        """If the ordinary manifest carried none of them, the forbidden-on-twin
+        half of the comparison would be vacuous here."""
+        self.assertTrue(PRODUCTION_CREDENTIALS)
+        for name in PRODUCTION_CREDENTIALS:
+            with self.subTest(credential=name):
+                self.assertNotIn(name, _deployed_twin()["env"])
+
+
+class TheDeployedTwinComparesCleanTests(unittest.TestCase):
+    """The blocker, cleared: a real twin is now ACCEPTED.
+
+    Before the five classifications each of them came back as ``... exists only
+    on the twin and is unclassified``, so no twin the deploy script could
+    produce was comparable at all.
+    """
+
+    def test_a_twin_built_from_the_shipped_script_compares_clean(self):
+        self.assertEqual(tc.compare(_deployed_candidate(), _deployed_twin()), [])
+
+    def test_the_five_previously_unclassified_fields_are_really_present(self):
+        """Proof the clean comparison above is not clean because the fields are
+        missing. Deleting the classifications would have to be caught."""
+        env = _deployed_twin()["env"]
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                self.assertIn(name, env)
+
+    def test_no_unclassified_residue_is_reported_for_any_of_them(self):
+        differences = tc.compare(_deployed_candidate(), _deployed_twin())
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                self.assertNotIn(f"{name} exists only on the twin and is "
+                                 "unclassified", differences)
+
+
+class EachTwinOnlyFieldIsPairedInBothDirectionsTests(unittest.TestCase):
+    """Approved differences are PAIRED, never excused.
+
+    A classification that only said "skip this key" would refuse nothing: a twin
+    silently missing its operator binding, or a candidate that had grown one,
+    would both compare clean. So each field is required on the twin AND
+    forbidden on the candidate, and both refusals name the field.
+    """
+
+    def test_removing_the_field_from_the_twin_is_refused_by_name(self):
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                self.assertIn(MISSING_FROM_TWIN.format(name),
+                              tc.compare(_deployed_candidate(),
+                                         _without(_deployed_twin(), name)))
+
+    def test_adding_the_field_to_the_candidate_is_refused_by_name(self):
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                candidate = _with_env(_deployed_candidate(),
+                                      **{name: _deployed_twin()["env"][name]})
+                self.assertIn(PRESENT_ON_CANDIDATE.format(name),
+                              tc.compare(candidate, _deployed_twin()))
+
+    def test_both_refusals_fire_during_validation(self):
+        """Order is the contract. A rule that only held after normalization
+        would be one edit away from holding nowhere."""
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                self.assertIn(
+                    MISSING_FROM_TWIN.format(name),
+                    tc._validate(_deployed_candidate(),
+                                 _without(_deployed_twin(), name)))
+                candidate = _with_env(_deployed_candidate(),
+                                      **{name: _deployed_twin()["env"][name]})
+                self.assertIn(PRESENT_ON_CANDIDATE.format(name),
+                              tc._validate(candidate, _deployed_twin()))
+
+    def test_the_residual_comparison_is_blind_to_every_one_of_these_inputs(self):
+        """Proof rather than assertion, and the reason the pairing has to be
+        specified here.
+
+        ``normalize`` writes the same sentinel over every ``TWIN_ONLY`` name on
+        BOTH sides, so a field missing from the twin -- or grown on the
+        candidate -- leaves two byte-identical specs behind it. There is no
+        residual line to lean on. These inputs are caught by the named rules or
+        by nothing at all.
+        """
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                left, right = tc.normalize(_deployed_candidate(),
+                                           _without(_deployed_twin(), name))
+                self.assertEqual(left, right)
+                candidate = _with_env(_deployed_candidate(),
+                                      **{name: _deployed_twin()["env"][name]})
+                left, right = tc.normalize(candidate, _deployed_twin())
+                self.assertEqual(left, right)
+
+    def test_neither_refusal_fires_on_the_shipped_twin(self):
+        """Vacuity guard: a rule that always fires pins nothing."""
+        problems = tc._validate(_deployed_candidate(), _deployed_twin())
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                self.assertNotIn(MISSING_FROM_TWIN.format(name), problems)
+                self.assertNotIn(PRESENT_ON_CANDIDATE.format(name), problems)
+
+
+class TheClassifiedValuesAreConstrainedNotMerelyNamedTests(unittest.TestCase):
+    """A classification that accepts any value is barely a classification.
+
+    Each rule below is asserted on its EXACT sentence at the ``_validate``
+    stage, where normalization cannot reach it, and each is paired with a
+    vacuity guard proving it is silent on the value the deploy script produces.
+    """
+
+    def _problems(self, **env):
+        return tc._validate(_deployed_candidate(), _with_env(_deployed_twin(), **env))
+
+    # -- SITESIFT_FIXTURE_CONFIG_SECRET_VERSION ----------------------------
+
+    def test_a_non_canonical_fixture_version_is_refused(self):
+        """``latest`` is an alias that can be repointed after review, ``0`` is
+        not a version, and ``07`` is a second spelling of the same number."""
+        for spelling in ("latest", "0", "07", "", "7 ", "v7", "-7", "7.0"):
+            with self.subTest(version=spelling):
+                self.assertIn(SECRET_VERSION_SHAPE_REFUSAL, self._problems(
+                    SITESIFT_FIXTURE_CONFIG_SECRET_VERSION=spelling,
+                    CERTIFICATION_FIXTURE_CONFIG=f"{tc.FIXTURE_CONFIG_SECRET}:{spelling}"))
+
+    def test_the_two_spellings_of_the_fixture_version_must_agree(self):
+        """The script sets both from ONE variable. Disagreement means the run
+        cannot say which fixture it executed against."""
+        self.assertIn(SECRET_VERSION_DISAGREEMENT_REFUSAL,
+                      self._problems(SITESIFT_FIXTURE_CONFIG_SECRET_VERSION="8"))
+
+    def test_the_fixture_version_rules_are_silent_on_the_shipped_twin(self):
+        problems = tc._validate(_deployed_candidate(), _deployed_twin())
+        self.assertNotIn(SECRET_VERSION_SHAPE_REFUSAL, problems)
+        self.assertNotIn(SECRET_VERSION_DISAGREEMENT_REFUSAL, problems)
+
+    def test_the_version_rule_reuses_the_secret_version_regex(self):
+        """Two regexes for one fact is how the two spellings drift apart."""
+        self.assertEqual(1, inspect.getsource(tc).count("_SECRET_VERSION = re.compile"))
+        self.assertEqual(2, inspect.getsource(tc._validate).count("_SECRET_VERSION.match"))
+
+    # -- SITESIFT_CERTIFICATION_OPERATOR_EMAIL ------------------------------
+
+    def test_an_operator_that_is_not_the_certification_operator_is_refused(self):
+        """Not an arbitrary address, and not a human's account: the stamp binds
+        whoever invoked the run."""
+        for address in ("baylor@gmail.com",
+                        "baylor@example.com",
+                        "attacker@evil.iam.gserviceaccount.com",
+                        DEPLOY_CONSTANTS["RUNTIME_SA"],
+                        "sitesift-certification-operator@gmail.com",
+                        "sitesift-certification-operator",
+                        "",
+                        "x sitesift-certification-operator@p.iam.gserviceaccount.com"):
+            with self.subTest(operator=address):
+                self.assertIn(OPERATOR_EMAIL_REFUSAL, self._problems(
+                    SITESIFT_CERTIFICATION_OPERATOR_EMAIL=address))
+
+    def test_the_operator_rule_accepts_the_account_the_script_deploys(self):
+        """Vacuity guard, and the tie to the shipped artifact: the account the
+        script really binds as sole invoker must be the one the contract
+        accepts, or the contract describes a service nobody deploys."""
+        self.assertNotIn(OPERATOR_EMAIL_REFUSAL,
+                         tc._validate(_deployed_candidate(), _deployed_twin()))
+        self.assertEqual(
+            DEPLOY_CONSTANTS["OPERATOR_SA"],
+            _deployed_twin()["env"]["SITESIFT_CERTIFICATION_OPERATOR_EMAIL"])
+
+    # -- SITESIFT_CERTIFICATION_OPERATOR_SUB --------------------------------
+
+    def test_a_non_numeric_operator_subject_is_refused(self):
+        for subject in ("", "not-a-number", "104729384756019283746 ",
+                        "0x1f", "1,2", "operator@example.com", "+1"):
+            with self.subTest(sub=subject):
+                self.assertIn(OPERATOR_SUB_REFUSAL,
+                              self._problems(SITESIFT_CERTIFICATION_OPERATOR_SUB=subject))
+
+    def test_the_subject_rule_is_silent_on_the_shipped_twin(self):
+        self.assertNotIn(OPERATOR_SUB_REFUSAL,
+                         tc._validate(_deployed_candidate(), _deployed_twin()))
+
+    def test_the_subject_rule_is_exactly_the_scripts_own_guard(self):
+        """The contract may not be laxer than the artifact it describes."""
+        self.assertEqual(SCRIPT_GUARDS["CERTIFICATION_OPERATOR_SUB"],
+                         tc._OPERATOR_SUB.pattern)
+
+    # -- SITESIFT_CERTIFICATION_AUDIENCE ------------------------------------
+
+    def test_an_audience_naming_another_service_is_refused(self):
+        """The confused-deputy shape audience verification exists to stop: a
+        token minted for the twin would be replayable against whatever the
+        audience really named."""
+        for audience in (
+                f"https://{PRODUCTION_SERVICE}-abc123-uc.a.run.app",
+                "https://process-user-abc123-uc.a.run.app",
+                "https://process-user-certification-abc.attacker.example.com",
+                "http://process-user-certification-abc-uc.a.run.app",
+                "https://evil-process-user-certification-abc-uc.a.run.app",
+                "process-user-certification-abc-uc.a.run.app",
+                "https://process-user-certification.a.run.app",
+                ""):
+            with self.subTest(audience=audience):
+                self.assertIn(AUDIENCE_REFUSAL,
+                              self._problems(SITESIFT_CERTIFICATION_AUDIENCE=audience))
+
+    def test_the_audience_rule_accepts_the_url_the_script_builds(self):
+        """Vacuity guard tied to the artifact: the contract has to accept the
+        twin URL the shipped script assembles, and it has to be THIS service's
+        own name inside it."""
+        self.assertNotIn(AUDIENCE_REFUSAL,
+                         tc._validate(_deployed_candidate(), _deployed_twin()))
+        self.assertEqual(DEPLOY_CONSTANTS["SERVICE_URL"],
+                         _deployed_twin()["env"]["SITESIFT_CERTIFICATION_AUDIENCE"])
+        self.assertIn(DEPLOY_CONSTANTS["SERVICE"], DEPLOY_CONSTANTS["SERVICE_URL"])
+
+    # -- SITESIFT_PRODUCTION_CANDIDATE_REVISION -----------------------------
+
+    def test_a_revision_naming_the_twins_own_service_is_refused(self):
+        """A twin that certifies itself certifies nothing, and the twin's name
+        has the candidate service's name as a prefix -- so this is the case an
+        ordinary prefix check reads the wrong way."""
+        service = DEPLOY_CONSTANTS["SERVICE"]
+        for revision in (f"{service}-00042-abc", f"{service}-00001-xyz"):
+            with self.subTest(revision=revision):
+                self.assertIn(REVISION_IS_THE_TWIN_REFUSAL, self._problems(
+                    SITESIFT_PRODUCTION_CANDIDATE_REVISION=revision))
+
+    def test_a_revision_of_some_other_service_is_refused(self):
+        for revision in ("some-other-service-00042-abc", "email-automation-00001-a",
+                         PRODUCTION_SERVICE, DEPLOY_CONSTANTS["SERVICE"]):
+            with self.subTest(revision=revision):
+                self.assertIn(REVISION_FOREIGN_REFUSAL, self._problems(
+                    SITESIFT_PRODUCTION_CANDIDATE_REVISION=revision))
+
+    def test_a_value_that_is_not_a_revision_name_at_all_is_refused(self):
+        for revision in ("", "Email-Automation-Process-User-00042",
+                         "email automation-00042", "-leading-hyphen",
+                         "trailing-hyphen-", "9-starts-with-a-digit",
+                         "a" * 64, "email-automation-process-user-00042/abc"):
+            with self.subTest(revision=revision):
+                self.assertIn(REVISION_SHAPE_REFUSAL, self._problems(
+                    SITESIFT_PRODUCTION_CANDIDATE_REVISION=revision))
+
+    def test_the_revision_rules_are_silent_on_the_shipped_twin(self):
+        problems = tc._validate(_deployed_candidate(), _deployed_twin())
+        for refusal in (REVISION_SHAPE_REFUSAL, REVISION_IS_THE_TWIN_REFUSAL,
+                        REVISION_FOREIGN_REFUSAL):
+            with self.subTest(refusal=refusal):
+                self.assertNotIn(refusal, problems)
+
+    def test_the_three_revision_refusals_are_distinct_sentences(self):
+        """Three different facts. Collapsing them would let a fix to one look
+        like a fix to another."""
+        self.assertEqual(3, len({REVISION_SHAPE_REFUSAL,
+                                 REVISION_IS_THE_TWIN_REFUSAL,
+                                 REVISION_FOREIGN_REFUSAL}))
+
+
+class NoneOfTheNewRefusalsAreTheGenericResidualTests(unittest.TestCase):
+    """The mistake that made two adjacent rules decorative, not repeated.
+
+    Every sentence below is compared for EQUALITY against a difference the
+    comparator actually emitted, and each is checked to be something the generic
+    ``<key>: unpaired difference after normalization`` residual cannot supply.
+    """
+
+    def test_every_new_refusal_is_a_named_sentence_and_not_a_residual(self):
+        cases = {
+            SECRET_VERSION_SHAPE_REFUSAL: {
+                "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "latest",
+                "CERTIFICATION_FIXTURE_CONFIG": f"{tc.FIXTURE_CONFIG_SECRET}:latest"},
+            SECRET_VERSION_DISAGREEMENT_REFUSAL: {
+                "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "8"},
+            OPERATOR_EMAIL_REFUSAL: {
+                "SITESIFT_CERTIFICATION_OPERATOR_EMAIL": "baylor@gmail.com"},
+            OPERATOR_SUB_REFUSAL: {
+                "SITESIFT_CERTIFICATION_OPERATOR_SUB": "not-a-number"},
+            AUDIENCE_REFUSAL: {
+                "SITESIFT_CERTIFICATION_AUDIENCE": "https://elsewhere.example.com"},
+            REVISION_SHAPE_REFUSAL: {
+                "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "Not A Revision"},
+            REVISION_IS_THE_TWIN_REFUSAL: {
+                "SITESIFT_PRODUCTION_CANDIDATE_REVISION":
+                    f"{DEPLOY_CONSTANTS['SERVICE']}-00042-abc"},
+            REVISION_FOREIGN_REFUSAL: {
+                "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "elsewhere-00042-abc"},
+        }
+        for refusal, env in cases.items():
+            with self.subTest(refusal=refusal):
+                differences = tc.compare(_deployed_candidate(),
+                                         _with_env(_deployed_twin(), **env))
+                self.assertTrue(
+                    any(RESIDUAL_MARKER not in d and d == refusal
+                        for d in differences),
+                    f"only the generic residual reported it: {differences}")
+
+    def test_the_residual_comparison_sees_none_of_those_inputs(self):
+        """Proof of the sentence above. Every one of those fields is paired by
+        ``normalize`` on both sides, so a wrong value leaves two identical specs
+        and the residual loop has nothing to report."""
+        for name in NEWLY_CLASSIFIED:
+            with self.subTest(field=name):
+                left, right = tc.normalize(
+                    _deployed_candidate(),
+                    _with_env(_deployed_twin(), **{name: "wrong"}))
+                self.assertEqual(left, right)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

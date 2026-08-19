@@ -48,7 +48,31 @@ FORBIDDEN_ON_TWIN = (
 )
 
 # Must exist ONLY on the twin, with exactly these shapes.
-TWIN_ONLY = ("K_SERVICE", "FIRESTORE_DATABASE", "CERTIFICATION_FIXTURE_CONFIG")
+#
+# Every name here is set by scripts/deploy_certification_twin.sh. Classifying
+# one is not the same as excusing it: each entry is REQUIRED on the twin and
+# FORBIDDEN on the candidate, both directions refused BY NAME, and -- wherever
+# the value is knowable -- validated against the exact shape the deploy script
+# produces. An entry that only said "ignore this key" would be a hole with a
+# label on it, and a hole is what an unapproved difference would hide in.
+TWIN_ONLY = (
+    "K_SERVICE",
+    "FIRESTORE_DATABASE",
+    "CERTIFICATION_FIXTURE_CONFIG",
+    # The candidate revision this twin is the exact-image twin OF. A twin that
+    # named its own service here would be certifying itself.
+    "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
+    # The numeric fixture-config version, in its second spelling. The deploy
+    # script sets this and the secret reference from ONE variable, so the two
+    # must agree or the run cannot say which fixture it executed against.
+    "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
+    # The operator binding. All three together are what the twin verifies an
+    # incoming token against; any one of them wrong points the twin at an
+    # identity nobody approved.
+    "SITESIFT_CERTIFICATION_AUDIENCE",
+    "SITESIFT_CERTIFICATION_OPERATOR_EMAIL",
+    "SITESIFT_CERTIFICATION_OPERATOR_SUB",
+)
 
 EXPECTED_CERTIFICATION_DATABASE = "sitesift-certification"
 EXPECTED_TWIN_SERVICE = "process-user-certification"
@@ -57,10 +81,40 @@ FIXTURE_CONFIG_SECRET = "sitesift-certification-fixture-config"
 # A positive decimal with no leading zero. `latest` is an alias that can be
 # repointed, `0` is not a version, and `07` is a different string for the same
 # number -- which would give one deployment two spellings of its own identity.
+#
+# Shared by the secret REFERENCE and the standalone version variable on
+# purpose: they are two spellings of one fact, and two regexes for one fact is
+# how the two spellings drift apart.
 _SECRET_VERSION = re.compile(r"^[1-9][0-9]*$")
 
 _TWIN_RUNTIME_SA = re.compile(r"^sitesift-certification-runtime@[^@]+$")
 _IMAGE_BY_DIGEST = re.compile(r"^[^\s]+@sha256:[0-9a-f]{64}$")
+
+# The ONE principal the twin accepts, and it must be a SERVICE ACCOUNT: the
+# stamp binds whoever invoked the run, and a human's own account -- gmail.com,
+# a workspace domain, anything outside `.iam.gserviceaccount.com` -- would bind
+# the wrong one. `sitesift-certification-runtime@...` is a different identity
+# again and is deliberately not accepted here.
+_CERTIFICATION_OPERATOR_SA = re.compile(
+    r"^sitesift-certification-operator@[a-z0-9-]+\.iam\.gserviceaccount\.com$")
+
+# The twin's OWN url. An OIDC audience naming some other service is precisely
+# the confused-deputy shape audience verification exists to stop: a token
+# minted for the twin would be replayable against whatever the audience really
+# named. Cloud Run mints `https://<service>-<suffix>.<zone>.run.app`, and the
+# service component has to be THIS service.
+_CERTIFICATION_AUDIENCE = re.compile(
+    r"^https://" + re.escape(EXPECTED_TWIN_SERVICE)
+    + r"-[A-Za-z0-9][A-Za-z0-9-]*\.[A-Za-z0-9-]+\.run\.app$")
+
+# The operator service account's numeric uniqueId, spelled exactly as
+# scripts/deploy_certification_twin.sh demands. An address can be reassigned to
+# a new principal; the numeric subject is what actually pins the identity, so a
+# non-numeric one pins nothing.
+_OPERATOR_SUB = re.compile(r"^[0-9]+$")
+
+# A Cloud Run revision name: an RFC1035 label, at most 63 characters.
+_REVISION_NAME = re.compile(r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
 
 # A canonical non-negative decimal. `007` and ` 0 ` are other spellings of a
 # number the comparator was never handed, and a share it has to guess at is not
@@ -184,6 +238,73 @@ def _validate(candidate: Mapping[str, Any],
                 "CERTIFICATION_FIXTURE_CONFIG must pin a positive decimal version; "
                 f"{version!r} is an alias, zero, or non-canonical"
             )
+
+    # -- the twin-only values the deploy script can be held to ------------
+    #
+    # A classification that accepts ANY value is barely a classification. Each
+    # rule below fires only when the field is PRESENT -- its absence is already
+    # a refusal from the TWIN_ONLY loop above, and reporting one broken field
+    # twice would let a fix to one look like a fix to both.
+    #
+    # None of these can be left to the residual comparison at the bottom of
+    # this function. `normalize` pairs every TWIN_ONLY name on BOTH sides, so
+    # after normalization there is nothing about them left to differ: a wrong
+    # value here is caught by the named rule or by nothing at all.
+
+    # The second spelling of the fixture version. The deploy script sets this
+    # and the secret reference from one variable, so disagreement means the run
+    # cannot say which fixture it executed against.
+    secret_version = twin_env.get("SITESIFT_FIXTURE_CONFIG_SECRET_VERSION")
+    if secret_version is not None:
+        if not _SECRET_VERSION.match(secret_version):
+            problems.append(
+                "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION must pin a positive "
+                "decimal version; an alias, zero, or a zero-padded spelling is "
+                "not one")
+        elif reference is not None and secret_version != reference.partition(":")[2]:
+            problems.append(
+                "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION and "
+                "CERTIFICATION_FIXTURE_CONFIG pin different fixture versions; "
+                "one deployment may not carry two spellings of the fixture it ran")
+
+    operator_email = twin_env.get("SITESIFT_CERTIFICATION_OPERATOR_EMAIL")
+    if operator_email is not None and not _CERTIFICATION_OPERATOR_SA.match(operator_email):
+        problems.append(
+            "SITESIFT_CERTIFICATION_OPERATOR_EMAIL is not the certification "
+            "operator service account; the twin would accept an identity "
+            "nobody approved")
+
+    operator_sub = twin_env.get("SITESIFT_CERTIFICATION_OPERATOR_SUB")
+    if operator_sub is not None and not _OPERATOR_SUB.match(operator_sub):
+        problems.append(
+            "SITESIFT_CERTIFICATION_OPERATOR_SUB is not a numeric uniqueId; an "
+            "address can be reassigned, so a non-numeric subject pins nothing")
+
+    audience = twin_env.get("SITESIFT_CERTIFICATION_AUDIENCE")
+    if audience is not None and not _CERTIFICATION_AUDIENCE.match(audience):
+        problems.append(
+            "SITESIFT_CERTIFICATION_AUDIENCE is not the twin's own URL; an "
+            "audience naming another service is a confused deputy")
+
+    # The revision this twin is the exact-image twin OF. The twin's own service
+    # is checked FIRST because its name has the candidate service's name as a
+    # prefix -- `process-user-certification-00001-abc` is a revision of the
+    # TWIN, and reading it as a candidate revision is the whole mistake.
+    revision = twin_env.get("SITESIFT_PRODUCTION_CANDIDATE_REVISION")
+    if revision is not None:
+        candidate_service = str(candidate.get("serviceName") or "")
+        if not _REVISION_NAME.match(revision):
+            problems.append(
+                "SITESIFT_PRODUCTION_CANDIDATE_REVISION is not a Cloud Run "
+                "revision name")
+        elif revision.startswith(f"{EXPECTED_TWIN_SERVICE}-"):
+            problems.append(
+                "SITESIFT_PRODUCTION_CANDIDATE_REVISION names the twin's own "
+                "service; a twin that certifies itself certifies nothing")
+        elif not (candidate_service and revision.startswith(f"{candidate_service}-")):
+            problems.append(
+                "SITESIFT_PRODUCTION_CANDIDATE_REVISION is not a revision of "
+                "the candidate service under certification")
 
     # -- identities that must differ, with exact expected values ---------
     if twin.get("serviceName") != EXPECTED_TWIN_SERVICE:
