@@ -132,11 +132,24 @@ what turns "unlikely" into "measured".
 - Both global campaign switches false.
 - Service currently has one sole 100% revision with the single `release-a` mapping.
 
+**This script no longer builds, as of the overnight session.** It used to call
+`gcloud builds submit --tag` itself, which meant staging produced a *different
+digest* from the one the twin certifies — the certification chain was broken at
+its root, because a rebuild from an identical commit yields a different digest and
+therefore a different artifact. It now takes the already-built digest as input and
+refuses without one.
+
 **Command — dry run FIRST, it executes zero gcloud commands:**
 
 ```bash
+export TESTED_IMAGE_DIGEST='us-central1-docker.pkg.dev/email-automation-cache/cloud-run-source-deploy/process-user@sha256:...'   # from step 1
+
 scripts/deploy_process_user.sh --dry-run
 ```
+
+It refuses unless `TESTED_IMAGE_DIGEST` is `repository@sha256:<64 lowercase hex>`
+— never a tag or alias — names the one expected repository, and is already
+present in the registry.
 
 Read the deterministic `process-user-stage-<12-char-HEAD>` revision identity it
 reports. Only if that is what you expect:
@@ -234,6 +247,52 @@ that changed underneath you cannot be silently reviewed.
 
 **Rollback:** none — a review is a recorded human judgement, not a mutation of
 production. If a verdict is wrong, that is a new review, not an undo.
+
+---
+
+---
+
+## Known blocker between steps 4 and 5 — your call, ~30 seconds
+
+**The twin contract comparator will currently refuse every twin that
+`deploy_certification_twin.sh` produces.**
+
+`twin_contract.TWIN_ONLY` classifies exactly three twin-only environment
+variables:
+
+```python
+TWIN_ONLY = ("K_SERVICE", "FIRESTORE_DATABASE", "CERTIFICATION_FIXTURE_CONFIG")
+```
+
+The twin deploy script sets **five more** that the comparator does not classify:
+
+- `SITESIFT_PRODUCTION_CANDIDATE_REVISION`
+- `SITESIFT_FIXTURE_CONFIG_SECRET_VERSION`
+- `SITESIFT_CERTIFICATION_AUDIENCE`
+- `SITESIFT_CERTIFICATION_OPERATOR_EMAIL`
+- `SITESIFT_CERTIFICATION_OPERATOR_SUB`
+
+Each will be reported as *"exists only on the twin and is unclassified"*.
+
+**This fails CLOSED and names every field, which is the correct behaviour** — an
+unreviewed asymmetric difference should refuse, not be waved through. It is
+blocking, not dangerous.
+
+It was deliberately **not** fixed overnight. Widening an allowlist is exactly the
+change the plan requires to happen in a reviewed successor, together with its
+hostile tests — "approved differences get PAIRED, never deleted", and an
+allowlist quietly widened at 4am by an agent is the opposite of that. The locked
+matrix does contemplate a certification route/audience, so this reads as a
+matrix/implementation gap rather than a bug in either file.
+
+**Your decision:** classify those five in `TWIN_ONLY` (with paired hostile tests
+asserting each must be present on the twin and absent on the candidate), or amend
+the matrix. Either way it is a reviewed change, not a silent one.
+
+Related and smaller: `deploy/README.md` around lines 301–305 still describes the
+staging script as building (*"It then builds and resolves an immutable image
+digest"*). That is now false — see step 3. The runbook tests over that README
+still pass, so nothing is red; the prose is just stale.
 
 ---
 
