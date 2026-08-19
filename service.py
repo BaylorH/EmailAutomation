@@ -296,6 +296,15 @@ _CERTIFICATION_OPERATIONS = {
     "cleanup": _CERTIFICATION_RUN_SCOPED_KEYS,
 }
 
+# Operation -> lifecycle function. Absent means "not implemented yet", which is
+# deliberately distinct from "not a route" (404).
+_CERTIFICATION_HANDLERS = {
+    "prepare": "prepare",
+    "run": "run",
+    "status": "status",
+    "abort": "abort",
+}
+
 _CERTIFICATION_REVIEW_KEYS = frozenset(
     {"runId", "expectedRevision", "reviewSetDigest", "rubricVersion", "reviews"}
 )
@@ -344,7 +353,20 @@ def certification_operation(operation: str):
     if not hmac.compare_digest(body["expectedRevision"], source_revision):
         return jsonify({"status": "error", "reason": "revision_mismatch"}), 409
 
-    return jsonify({"status": "error", "reason": "not_implemented"}), 501
+    handler = _CERTIFICATION_HANDLERS.get(operation)
+    if handler is None:
+        # review-input and recover are real operations with real contracts that
+        # are not built yet. 501 says so; it is never a verdict, because a
+        # verdict can only come from the ledger's terminal record.
+        return jsonify({"status": "error", "reason": "not_implemented"}), 501
+
+    # Imported lazily so ordinary production never loads the certification
+    # lifecycle -- on that service these routes are already inert, and an unused
+    # import is still an import.
+    from email_automation.certification import lifecycle
+
+    payload, status_code = getattr(lifecycle, handler)(body)
+    return jsonify(payload), status_code
 
 
 if __name__ == "__main__":

@@ -1578,3 +1578,171 @@ class CertificationRunLedgerTests(unittest.TestCase):
 
     def test_an_unknown_run_has_no_state_rather_than_a_guessed_one(self):
         self.assertIsNone(self._ledger().state("never-seen"))
+
+
+class CertificationLifecycleTests(unittest.TestCase):
+    """prepare → run → status, driven through the ledger, without Flask.
+
+    The lifecycle is the part a route is only a thin shell around. Keeping it
+    testable without a request context is what lets the hostile cases -- reused
+    run ids, a run claimed twice, a missing deployment identity -- be exercised
+    directly rather than through HTTP status codes that flatten them.
+    """
+
+    REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
+
+    def _env(self):
+        return {
+            "SITESIFT_SOURCE_REVISION": self.REVISION,
+            "SITESIFT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+            "K_SERVICE": "process-user-certification",
+            "K_REVISION": "process-user-certification-00001-abc",
+            "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "process-user-00042-xyz",
+            "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "7",
+            "SITESIFT_FIXTURE_CONFIG_DIGEST": "d" * 64,
+            "SITESIFT_CALLER_IDENTITY_DIGEST": "c" * 64,
+        }
+
+    def _fresh(self):
+        from email_automation.certification import ledger as lg
+        return lg.InMemoryRunLedger()
+
+    def _prepare(self, ledger, run_id="cert-life-0001",
+                 scenario_id=BOOTSTRAP_SCENARIO_ID, env=None, revision=None):
+        from email_automation.certification import lifecycle as lc
+        return lc.prepare(
+            {"scenarioId": scenario_id, "runId": run_id,
+             "expectedRevision": revision or self.REVISION},
+            ledger=ledger, environ=env if env is not None else self._env())
+
+    def _run(self, ledger, run_id="cert-life-0001", env=None):
+        from email_automation.certification import lifecycle as lc
+        return lc.run(
+            {"runId": run_id, "expectedRevision": self.REVISION},
+            ledger=ledger, environ=env if env is not None else self._env())
+
+    # -- happy path ---------------------------------------------------------
+
+    def test_prepare_moves_the_ledger_to_prepared_and_returns_safe_digests(self):
+        ledger = self._fresh()
+        payload, code = self._prepare(ledger)
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["state"], "PREPARED")
+        self.assertEqual(ledger.state("cert-life-0001"), "PREPARED")
+        self.assertRegex(payload["authorizationDigest"], r"^[0-9a-f]{64}$")
+
+    def test_run_claims_executes_and_terminalizes(self):
+        ledger = self._fresh()
+        self._prepare(ledger)
+        payload, code = self._run(ledger)
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["verdict"], "PASS")
+        self.assertEqual(ledger.state("cert-life-0001"), "TERMINAL")
+        self.assertEqual(ledger.verdict("cert-life-0001"), "PASS")
+
+    def test_status_reports_state_without_changing_it(self):
+        from email_automation.certification import lifecycle as lc
+        ledger = self._fresh()
+        self._prepare(ledger)
+        payload, code = lc.status({"runId": "cert-life-0001",
+                                   "expectedRevision": self.REVISION},
+                                  ledger=ledger, environ=self._env())
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["state"], "PREPARED")
+        self.assertEqual(ledger.state("cert-life-0001"), "PREPARED")
+
+    # -- single use ---------------------------------------------------------
+
+    def test_a_run_id_cannot_be_prepared_twice(self):
+        ledger = self._fresh()
+        self._prepare(ledger)
+        _payload, code = self._prepare(ledger)
+        self.assertEqual(code, 409)
+
+    def test_a_run_cannot_be_executed_twice(self):
+        ledger = self._fresh()
+        self._prepare(ledger)
+        self._run(ledger)
+        _payload, code = self._run(ledger)
+        self.assertEqual(code, 409)
+
+    def test_run_without_prepare_is_refused_and_never_executes(self):
+        ledger = self._fresh()
+        payload, code = self._run(ledger)
+        self.assertEqual(code, 409)
+        self.assertIsNone(ledger.state("cert-life-0001"))
+        self.assertNotIn("verdict", payload)
+
+    # -- fail closed on identity --------------------------------------------
+
+    def test_every_deployment_identity_field_is_required(self):
+        """Absent identity is instrument_unavailable, never a default.
+
+        A missing candidate revision or fixture-secret version silently defaulted
+        would produce an authorization -- and therefore a stamp -- bound to
+        something nobody deployed.
+        """
+        for key in ("K_REVISION", "SITESIFT_PRODUCTION_CANDIDATE_REVISION",
+                    "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION",
+                    "SITESIFT_FIXTURE_CONFIG_DIGEST",
+                    "SITESIFT_CALLER_IDENTITY_DIGEST"):
+            with self.subTest(missing=key):
+                env = self._env()
+                env.pop(key)
+                _payload, code = self._prepare(self._fresh(), env=env)
+                self.assertEqual(code, 503, f"{key} was defaulted instead of required")
+
+    def test_an_unknown_scenario_is_refused_before_the_ledger_is_touched(self):
+        ledger = self._fresh()
+        _payload, code = self._prepare(ledger, scenario_id="not-a-real-scenario")
+        self.assertEqual(code, 404)
+        self.assertIsNone(ledger.state("cert-life-0001"))
+
+    # -- the authorization actually binds -----------------------------------
+
+    def test_the_prepared_authorization_binds_the_registry_digest(self):
+        """The scenario set is part of what a stamp certifies. If the registry
+        changed, the stamp is about a different set of scenarios."""
+        from email_automation.certification import scenarios
+        ledger = self._fresh()
+        self._prepare(ledger)
+        stored = ledger.peek_ephemeral("cert-life-0001")
+        self.assertEqual(stored.scenario_registry_digest, scenarios.registry_digest())
+
+    def test_claiming_consumes_the_authorization_so_a_replay_finds_nothing(self):
+        ledger = self._fresh()
+        self._prepare(ledger)
+        self.assertIsNotNone(ledger.peek_ephemeral("cert-life-0001"))
+        self._run(ledger)
+        self.assertIsNone(ledger.peek_ephemeral("cert-life-0001"))
+
+    def test_running_under_a_different_scenario_than_prepared_is_refused(self):
+        """The run body names a scenario, and it must be the prepared one.
+
+        If run() defaulted to the scenario on file, the caller's scenarioId
+        would be decorative and the binding check would compare a value to
+        itself.
+        """
+        from email_automation.certification import lifecycle as lc
+        ledger = self._fresh()
+        self._prepare(ledger)
+        payload, code = lc.run(
+            {"scenarioId": "certification-transport-refutation",
+             "runId": "cert-life-0001", "expectedRevision": self.REVISION},
+            ledger=ledger, environ=self._env())
+        self.assertEqual(code, 409)
+        self.assertNotIn("verdict", payload)
+        self.assertEqual(ledger.state("cert-life-0001"), "PREPARED")
+
+    # -- responses stay sanitized -------------------------------------------
+
+    def test_no_response_carries_a_fixture_value(self):
+        from email_automation.certification import lifecycle as lc
+        ledger = self._fresh()
+        payloads = [self._prepare(ledger)[0], self._run(ledger)[0],
+                    lc.status({"runId": "cert-life-0001",
+                               "expectedRevision": self.REVISION},
+                              ledger=ledger, environ=self._env())[0]]
+        blob = json.dumps(payloads, sort_keys=True, default=str)
+        for forbidden in ("@", "broker", "Hi Pat", "100 Fixture Way", "cert-uid-0001"):
+            self.assertNotIn(forbidden, blob, f"{forbidden!r} reached a route response")

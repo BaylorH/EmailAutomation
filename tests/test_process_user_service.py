@@ -720,3 +720,104 @@ class CertificationRevisionBindingTests(unittest.TestCase):
         with self._env(SITESIFT_SOURCE_REVISION=""):
             response = self.client.post("/certification/status", json={"nonsense": True})
         self.assertEqual(response.status_code, 503)
+
+
+class CertificationRouteEndToEndTests(unittest.TestCase):
+    """A whole certification run, driven the way the twin will actually be called.
+
+    Every layer below this has its own tests. This one exists because they can
+    all be individually correct and still not compose -- and "the twin serves a
+    certification run over HTTP" is the claim Phase E depends on, not "the parts
+    work in isolation".
+    """
+
+    REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
+
+    ENV = {
+        "K_SERVICE": "process-user-certification",
+        "K_REVISION": "process-user-certification-00001-abc",
+        "SITESIFT_SOURCE_REVISION": REVISION,
+        "SITESIFT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+        "SITESIFT_PRODUCTION_CANDIDATE_REVISION": "process-user-00042-xyz",
+        "SITESIFT_FIXTURE_CONFIG_SECRET_VERSION": "7",
+        "SITESIFT_FIXTURE_CONFIG_DIGEST": "d" * 64,
+        "SITESIFT_CALLER_IDENTITY_DIGEST": "c" * 64,
+    }
+
+    def setUp(self):
+        service.app.config["TESTING"] = True
+        self.client = service.app.test_client()
+        # A fresh ledger per test: the module default is process-scoped, and a
+        # run id consumed by one test would otherwise fail the next.
+        from email_automation.certification import ledger as lg, lifecycle
+        self._ledger_patch = patch.object(lifecycle, "_DEFAULT_LEDGER",
+                                          lg.InMemoryRunLedger())
+        self._ledger_patch.start()
+        self.addCleanup(self._ledger_patch.stop)
+
+    def _post(self, operation, body):
+        with patch.dict(os.environ, self.ENV, clear=False):
+            return self.client.post(f"/certification/{operation}", json=body)
+
+    def test_prepare_then_run_produces_a_pass_over_http(self):
+        run_id = "cert-http-0001"
+        body = {"scenarioId": "campaign-one-property", "runId": run_id,
+                "expectedRevision": self.REVISION}
+
+        prepared = self._post("prepare", body)
+        self.assertEqual(prepared.status_code, 200, prepared.get_json())
+        self.assertEqual(prepared.get_json()["state"], "PREPARED")
+
+        executed = self._post("run", body)
+        self.assertEqual(executed.status_code, 200, executed.get_json())
+        result = executed.get_json()
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["counts"]["captured_outreach"], 1)
+        self.assertEqual(result["counts"]["graph_network"], 0)
+        self.assertEqual(result["counts"]["replay_delta"], 0)
+        self.assertEqual(result["counts"]["cleanup_residue"], 0)
+        self.assertRegex(result["evidenceDigest"], r"^[0-9a-f]{64}$")
+
+        final = self._post("status", {"runId": run_id,
+                                      "expectedRevision": self.REVISION})
+        self.assertEqual(final.get_json()["state"], "TERMINAL")
+        self.assertEqual(final.get_json()["verdict"], "PASS")
+
+    def test_the_same_run_id_cannot_be_replayed_over_http(self):
+        run_id = "cert-http-0002"
+        body = {"scenarioId": "campaign-one-property", "runId": run_id,
+                "expectedRevision": self.REVISION}
+        self._post("prepare", body)
+        self._post("run", body)
+        self.assertEqual(self._post("run", body).status_code, 409)
+        self.assertEqual(self._post("prepare", body).status_code, 409)
+
+    def test_run_without_prepare_is_refused_over_http(self):
+        response = self._post("run", {"scenarioId": "campaign-one-property",
+                                      "runId": "cert-http-never-prepared",
+                                      "expectedRevision": self.REVISION})
+        self.assertEqual(response.status_code, 409)
+
+    def test_abort_terminalizes_a_prepared_run_as_not_tested(self):
+        run_id = "cert-http-0003"
+        body = {"scenarioId": "campaign-one-property", "runId": run_id,
+                "expectedRevision": self.REVISION}
+        self._post("prepare", body)
+        aborted = self._post("abort", {"runId": run_id,
+                                       "expectedRevision": self.REVISION})
+        self.assertEqual(aborted.status_code, 200)
+        self.assertEqual(aborted.get_json()["verdict"], "NOT_TESTED")
+        # An aborted run may never then execute.
+        self.assertEqual(self._post("run", body).status_code, 409)
+
+    def test_a_certification_run_carries_no_fixture_value_over_the_wire(self):
+        run_id = "cert-http-0004"
+        body = {"scenarioId": "campaign-one-property", "runId": run_id,
+                "expectedRevision": self.REVISION}
+        blob = "".join(
+            self._post(op, body if op in ("prepare", "run") else
+                       {"runId": run_id, "expectedRevision": self.REVISION})
+            .get_data(as_text=True)
+            for op in ("prepare", "run", "status"))
+        for forbidden in ("@", "broker", "Hi Pat", "100 Fixture Way", "cert-uid-0001"):
+            self.assertNotIn(forbidden, blob, f"{forbidden!r} crossed the wire")
