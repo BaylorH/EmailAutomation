@@ -290,6 +290,14 @@ def run(body: Mapping[str, Any], *, caller_identity_digest: str = "",
     except AuthorizationInvalid:
         return _error("authorization_invalid", 409)
 
+    # Announce the phase BEFORE the work it names, and durably. This is the
+    # ``CLAIMED → RUNNING(phase)`` step the state machine has always enforced
+    # and nothing ever took: without it, a worker that vanishes mid-execution
+    # leaves a row indistinguishable from one that vanished before executing,
+    # and recovery has no way to tell "may have caused an effect" from "provably
+    # did not". Written first, so the row is never behind reality.
+    ledger.mark_running(run_id, "execute")
+
     record, _detail = runner_module.run_scenario(
         claimed.scenario_id, run_id=run_id, revision=claimed.source_revision
     )
@@ -400,7 +408,11 @@ def abort(body: Mapping[str, Any], *, caller_identity_digest: str = "",
 
 # 540s Cloud Run request timeout. A record younger than this may still have an
 # execution in flight, because the execution itself has not yet been killed.
-SERVICE_TIMEOUT_SECONDS = 540
+#
+# READ from the ledger rather than restated here. The same number is what makes
+# a lease provably dead inside ``recovery_observation``, and a second copy of it
+# would agree with the first only until somebody edited one of them.
+SERVICE_TIMEOUT_SECONDS = ledger_module.WORKER_REQUEST_CEILING_SECONDS
 RECOVERY_AGE_MARGIN_SECONDS = 180
 RECOVERY_MIN_RECORD_AGE_SECONDS = SERVICE_TIMEOUT_SECONDS + RECOVERY_AGE_MARGIN_SECONDS
 

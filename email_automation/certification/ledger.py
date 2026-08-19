@@ -71,6 +71,15 @@ _ALLOWED_TRANSITIONS: Mapping[str, frozenset] = {
 
 ALLOWED_VERDICTS = ("PASS", "FAIL", "INSTRUMENT_BLOCKED", "NOT_TESTED")
 
+# Cloud Run's hard request ceiling. Declared HERE, once, and read by
+# ``lifecycle.SERVICE_TIMEOUT_SECONDS``, because it is simultaneously the
+# recovery age threshold and the only thing that makes a lease provably dead: a
+# request is killed at this age whether or not it was finished, so a record
+# whose last SERVER-ASSIGNED write is older than this cannot still be held by
+# the worker that claimed it. Two copies of that number would agree only until
+# somebody edited one.
+WORKER_REQUEST_CEILING_SECONDS = 540
+
 # Every key a durable row may carry, and nothing else. States, phases, counts
 # and digests. A row key outside this set is how a recipient, a subject, a sheet
 # id, a fixture alias, or an exception string reaches permanent storage - where
@@ -275,6 +284,78 @@ class _RunLedgerStateMachine:
         row["residue"] = {str(k): int(v) for k, v in dict(residue).items()}
         return row
 
+    # -- the recovery observation -------------------------------------------
+    #
+    # ``lifecycle.recover`` gates a PERMANENT terminal record on these five
+    # values, so every one of them is decided here, from facts the STORE
+    # supplied, and never from anything a caller sent. A caller-supplied age
+    # would let a caller declare its own run recoverable.
+    #
+    # ``None`` means UNPROVABLE and nothing else. Not zero, not "expired", not
+    # "probably fine". Recovery refuses on every ``None``, which is the correct
+    # outcome for a gate nothing measured -- the alternative is a terminal
+    # record written over a run that may still be executing.
+
+    def _recovery_facts(self, run_id: str) -> Optional[Any]:
+        """(row, elapsed_seconds) from storage, or None when there is no record.
+
+        A backend supplies raw facts and nothing else. ``elapsed_seconds`` is
+        ``None`` when the store cannot vouch for how long the record has sat
+        there. Every judgement made from these lives in
+        ``_decide_recovery_observation`` so the two backends cannot disagree.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def _decide_recovery_observation(
+        cls, row: Mapping[str, Any], elapsed_seconds: Optional[float]
+    ) -> Dict[str, Any]:
+        """The five gates, judged once, for every backend."""
+        state = row.get("state")
+        phases = row.get("phases") or []
+
+        age: Optional[int] = None
+        lease_expired: Optional[bool] = None
+        in_flight: Optional[int] = None
+        if elapsed_seconds is not None:
+            age = int(elapsed_seconds)
+            lease_expired = elapsed_seconds >= WORKER_REQUEST_CEILING_SECONDS
+            # Zero ONLY once the platform has certainly killed every request
+            # that could still write to this record. Younger than that, a
+            # request may still be alive and the count is unknown -- which is a
+            # refusal, not a zero.
+            in_flight = 0 if lease_expired else None
+
+        # An operation is ambiguous when the record proves it BEGAN and does not
+        # prove how it ended: its effect may have committed at the provider
+        # after the worker died. ``mark_running`` writes the phase before the
+        # work it names, so an empty phase list on a non-terminal row is proof
+        # that nothing was announced, not merely an absence of evidence.
+        ambiguous = 1 if (phases and state != TERMINAL) else 0
+
+        return {
+            "state": state if isinstance(state, str) and state else None,
+            "recordAgeSeconds": age,
+            "leaseExpired": lease_expired,
+            "inFlight": in_flight,
+            "ambiguous": ambiguous,
+        }
+
+    def recovery_observation(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """What this ledger can PROVE about an interrupted run, or None.
+
+        ``None`` here means the record could not be observed at all, which is a
+        different fact from an observation carrying a missing field, and
+        recovery answers the two differently.
+        """
+        facts = self._recovery_facts(run_id)
+        if facts is None:
+            return None
+        row, elapsed_seconds = facts
+        if row is None:
+            return None
+        return self._decide_recovery_observation(row, elapsed_seconds)
+
 
 class InMemoryRunLedger(_RunLedgerStateMachine):
     """Reference ledger. Same transitions a transactional store must enforce.
@@ -310,6 +391,23 @@ class InMemoryRunLedger(_RunLedgerStateMachine):
         """The durable rows, as they would be persisted."""
         with self._lock:
             return {run_id: dict(row) for run_id, row in self._rows.items()}
+
+    def _recovery_facts(self, run_id: str) -> Optional[Any]:
+        """The row, and NO elapsed time.
+
+        This process has no server-assigned commit timestamp to measure from.
+        Reading a wall clock here would produce this process's own opinion of
+        how old the record is -- and this process is the one asking to
+        terminalize it. Worse, the store dies with the process, so a row that
+        is present is a row this instance wrote; it cannot describe the crashed
+        worker recovery exists for. ``None`` is the honest answer, and recovery
+        refuses on it.
+        """
+        with self._lock:
+            row = self._rows.get(run_id)
+            if row is None:
+                return None
+            return dict(row), None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -403,6 +501,27 @@ DEFAULT_LEDGER_DEADLINE_SECONDS = 20.0
 # set moved; the driver retries it, and each retry re-reads, so a retry that
 # arrives after a competing claim sees CLAIMED and refuses instead of racing.
 DEFAULT_TRANSACTION_ATTEMPTS = 5
+
+
+def _server_elapsed_seconds(snapshot: Any) -> Optional[float]:
+    """How long the store says this record has sat unchanged, or None.
+
+    Both timestamps come from the STORE. ``None`` on anything that cannot be
+    measured exactly -- a missing stamp, a pair that will not subtract, or a
+    negative result from a store whose clock moved backwards. A store that
+    cannot say how old a record is has not said it is new.
+    """
+    update_time = getattr(snapshot, "update_time", None)
+    read_time = getattr(snapshot, "read_time", None)
+    if update_time is None or read_time is None:
+        return None
+    try:
+        elapsed = (read_time - update_time).total_seconds()
+    except (AttributeError, TypeError):
+        return None
+    if elapsed < 0:
+        return None
+    return float(elapsed)
 
 
 class FirestoreRunLedger(_RunLedgerStateMachine):
@@ -514,6 +633,27 @@ class FirestoreRunLedger(_RunLedgerStateMachine):
             timeout=self._deadline
         )
         return {snapshot.id: dict(snapshot.to_dict() or {}) for snapshot in stream}
+
+    def _recovery_facts(self, run_id: str) -> Optional[Any]:
+        """The row, plus the elapsed time BETWEEN TWO SERVER TIMESTAMPS.
+
+        ``update_time`` is the commit timestamp the store assigned; ``read_time``
+        is the timestamp the store assigned to this read. Neither is reachable
+        from a request body, and neither is this process's clock, so a caller
+        cannot make its own run look old enough to recover -- which is the whole
+        point of measuring the age server-side.
+
+        The read carries the ledger's explicit deadline, like every other read
+        here: a Firestore read with no deadline HANGS rather than raising, and
+        the broad ``except Exception`` around recovery's probe cannot catch a
+        hang.
+        """
+        snapshot = self._run_ref(run_id).get(
+            transaction=None, timeout=self._deadline
+        )
+        if not snapshot.exists:
+            return None
+        return dict(snapshot.to_dict() or {}), _server_elapsed_seconds(snapshot)
 
     # -- transactions -------------------------------------------------------
 

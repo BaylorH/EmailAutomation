@@ -226,11 +226,19 @@ class RecoverGateTests(unittest.TestCase):
         self.assertEqual(ledger.state("cert-recover-leased"), ledger_module.CLAIMED)
 
     def test_a_ledger_that_cannot_be_observed_refuses_rather_than_proceeds(self):
-        """The REAL default in-memory ledger cannot answer any of these gates.
+        """The REAL default in-memory ledger cannot answer these gates.
 
-        It is process-scoped, so it has no server-side record age, no lease, and
-        no in-flight registrations. Recovery against it must refuse -- not
-        proceed on the assumption that unmeasured means safe.
+        It is process-scoped, so it has no SERVER-ASSIGNED record age and
+        therefore no provable lease or in-flight count. Recovery against it must
+        refuse -- not proceed on the assumption that unmeasured means safe.
+
+        The refusal names the missing FACT rather than a missing answer. The
+        in-memory ledger now implements ``recovery_observation`` (shared with
+        the durable one, so the two cannot drift), and what it reports is a real
+        observation carrying ``None`` where it can prove nothing. "The store
+        answered and had no age" and "there was no answer at all" need different
+        operator responses; ``test_an_unanswerable_observation_refuses_rather_``
+        ``than_proceeds`` below still pins the second.
         """
         ledger = ledger_module.InMemoryRunLedger()
         claimed_run(ledger, "cert-recover-blind")
@@ -238,8 +246,12 @@ class RecoverGateTests(unittest.TestCase):
             {"runId": "cert-recover-blind", "expectedRevision": REVISION},
             caller_identity_digest="c" * 64, ledger=ledger)
         self.assertEqual(code, 503)
-        self.assertEqual(payload["reason"], "record_observation_unavailable")
+        self.assertEqual(payload["reason"], "record_age_unprovable")
         self.assertEqual(ledger.state("cert-recover-blind"), ledger_module.CLAIMED)
+        # None means UNPROVABLE, never zero and never "old enough".
+        observed = ledger.recovery_observation("cert-recover-blind")
+        for gate in ("recordAgeSeconds", "leaseExpired", "inFlight"):
+            self.assertIsNone(observed[gate], gate)
 
     def test_a_hanging_readback_is_bounded_rather_than_waited_on(self):
         """A Firestore read with no deadline hangs, and no `except` catches it."""
