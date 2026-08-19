@@ -2,6 +2,26 @@
 
 Only the OpenAI response is faked.  ``propose_sheet_updates`` and every
 deterministic reconciliation guard are the same code used by the inbound worker.
+
+STATUS 2026-08-19: red, pre-existing, and NOT caused by the parallel
+certification build. Measured identically at commit 0a656fa (the base all four
+tracks branched from) and at the tip after Track D's commits:
+
+    Ran 21 tests in 0.013s
+    FAILED (failures=45, errors=20)
+
+The two runs were compared in a separate detached worktree rather than with
+`git stash`, because a bare stash in this checkout would have taken three other
+agents' uncommitted work with it. Static confirmation agrees with the
+measurement: this module imports only email_automation.ai_processing, and no
+commit in the Track D range touches that module.
+
+20 distinct test methods are red across the drive-in evidence state machine
+(target provenance, terminal-vs-review classification, correction recency,
+evidence locality). That is a semantic gap in the reconciliation rules, not a
+mechanical breakage, and nobody should read a fix for it into a triage pass.
+Anyone diffing a sweep should treat 45/20 as the baseline for this module and
+investigate only a change from it.
 """
 
 import json
