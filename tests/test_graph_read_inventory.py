@@ -65,9 +65,11 @@ def _load_tool():
 BLIND_SPOT_SITES = (
     (
         "email_automation/processing.py",
-        6365,
+        6498,
         "_resolve_current_mailbox_email",
-        "bare /me identity endpoint; the substring '/me/' does not occur in it",
+        "bare /me identity endpoint; the substring '/me/' does not occur in it. "
+        "Now routed through the read boundary, which the URL-literal scan cannot "
+        "see either - a read does not stop being a read by being converged",
     ),
     (
         "app.py",
@@ -155,13 +157,16 @@ class InventoryToolTests(unittest.TestCase):
         different mailbox folders. If the resolver were module-flat, both sites
         would report the same folder and one of them would be a lie.
         """
-        by_line = {
-            op["line"]: op["url"]
+        by_operation = {
+            op["operation"]: op["url"]
             for op in self.report["operations"]
             if op["module"] == "email_automation/processing.py"
         }
-        self.assertIn("/me/mailFolders/Inbox/messages", by_line.get(8774, ""))
-        self.assertIn("/me/mailFolders/SentItems/messages", by_line.get(9331, ""))
+        # Keyed by operation rather than by line: a line number is a fact about
+        # today's file, and pinning one turns every unrelated edit above it into
+        # a spurious failure that teaches people to re-pin without reading.
+        self.assertIn("/me/mailFolders/Inbox/messages", by_operation["inbox_message_page"])
+        self.assertIn("/me/mailFolders/SentItems/messages", by_operation["sent_items_page"])
 
     def test_an_http_call_the_tool_cannot_classify_is_reported_not_dropped(self):
         """Allowlist, never denylist: silence is the failure mode being avoided.
@@ -202,11 +207,38 @@ class ReconciliationTests(unittest.TestCase):
         cls.tool = _load_tool()
         cls.report = cls.tool.build_report(REPO_ROOT)
 
-    def test_scope_a_reproduces_the_nineteen_read_figure(self):
-        """Scope A: unconverged product-module reads, as the URL-literal scan sees them."""
+    def test_scope_a_is_what_the_url_literal_scan_still_sees(self):
+        """Scope A measured **19** before ``processing.py`` converged. It now measures 9.
+
+        The figure moved because the CODE moved, and the drop is fully accounted
+        for: eleven of ``processing.py``'s twelve reads were visible to this scan
+        and are now routed through the read boundary, so it no longer sees them
+        as direct calls. The twelfth - the bare ``/me`` identity endpoint - was
+        never in the 19 at all.
+
+        19 - 11 = 8, and the scan reports 9, because converging the module handed
+        it a brand new PHANTOM: the boundary's own ``requests.get(url, **kwargs)``
+        takes its URL from a parameter, and the module-flat binding table fills
+        that gap with an unrelated assignment from elsewhere in the file. The
+        scan's habit of inventing a read where it cannot resolve one is asserted
+        directly in ``test_the_url_literal_scan_also_reports_reads_that_do_not_exist``.
+        """
         scope_a = self.report["scopeA"]
-        self.assertEqual(scope_a["readCount"], 19, scope_a["byModule"])
+        self.assertEqual(scope_a["readCount"], 9, scope_a["byModule"])
         self.assertEqual(len(scope_a["byModule"]), 6, scope_a["byModule"])
+
+    def test_the_only_read_scope_a_still_sees_in_processing_is_a_phantom(self):
+        """So the 9 is not mistaken for 'one direct read left to converge'."""
+        phantoms = {
+            (entry["module"], entry["line"])
+            for entry in self.report["reconciliation"]["urlLiteralPhantomReads"]
+        }
+        remaining = [
+            op for op in self.report["urlLiteralOperations"]
+            if op["module"] == "email_automation/processing.py" and op["classification"] == "read"
+        ]
+        self.assertEqual(len(remaining), 1, remaining)
+        self.assertIn(("email_automation/processing.py", remaining[0]["line"]), phantoms)
 
     def test_the_reconciliation_names_the_six_scope_a_modules_exactly(self):
         self.assertEqual(
@@ -235,6 +267,27 @@ class ReconciliationTests(unittest.TestCase):
             with self.subTest(module=added):
                 self.assertIn(added, scope_b["byModule"])
 
+    def test_convergence_conserved_the_total_read_count(self):
+        """The property that makes the inventory trustworthy across a refactor.
+
+        Routing a read through a boundary must MOVE it between the direct and
+        boundary columns and leave the total alone. If converging a module made
+        the total fall, the instrument would be going blind to precisely the
+        reads someone had just finished making observable - and every future
+        convergence would be rewarded with a smaller number.
+        """
+        scope_b = self.report["scopeB"]
+        self.assertEqual(scope_b["readCount"], 36)
+        self.assertEqual(scope_b["readRoutes"], {"direct": 24, "boundary": 12})
+
+    def test_every_boundary_routed_read_is_in_the_converged_module(self):
+        """One module has converged so far. Say which, rather than implying more."""
+        routed = {
+            op["module"] for op in self.report["operations"]
+            if op["classification"] == "read" and op["route"] == "boundary"
+        }
+        self.assertEqual(routed, {"email_automation/processing.py"})
+
     def test_the_two_undercounted_modules_are_pinned_at_their_true_counts(self):
         """The corrections the 33 figure was right to make, and one it got wrong.
 
@@ -261,9 +314,24 @@ class ReconciliationTests(unittest.TestCase):
         two numbers that disagree.
         """
         delta = self.report["reconciliation"]["scopeBOnly"]
+        self.assertEqual(len(delta), 28, [f"{e['module']}:{e['line']}" for e in delta])
+
+        # Scope A's raw count includes reads that do not exist, so the books only
+        # balance once those are taken back out. That is the reconciliation's
+        # sharpest result: the smaller figure was not simply a subset of the
+        # larger one, and no adjustment to the TOTAL could have reconciled them -
+        # it overcounts in one place and undercounts in another at the same time.
+        scope_a_modules = set(self.report["scopeA"]["byModule"])
+        phantoms_inside_scope_a = [
+            entry for entry in self.report["reconciliation"]["urlLiteralPhantomReads"]
+            if entry["module"] in scope_a_modules
+        ]
+        scope_a_real = self.report["scopeA"]["readCount"] - len(phantoms_inside_scope_a)
         self.assertEqual(
-            self.report["scopeA"]["readCount"] + len(delta),
+            scope_a_real + len(delta),
             self.report["scopeB"]["readCount"],
+            f"scopeA={self.report['scopeA']['readCount']} "
+            f"phantoms={len(phantoms_inside_scope_a)} delta={len(delta)}",
         )
         for entry in delta:
             with self.subTest(site=f"{entry['module']}:{entry['line']}"):
@@ -327,6 +395,392 @@ class ReconciliationTests(unittest.TestCase):
             op for op in self.report["operations"] if op["classification"] == "destructive"
         ]
         self.assertIn("app.py", {op["module"] for op in destructive})
+
+
+# ---------------------------------------------------------------------------
+# The converged module
+# ---------------------------------------------------------------------------
+#
+# ``processing.py`` holds the largest concentration of mailbox reads - twelve of
+# the thirty-six on the deployed surface - so it converges first, mirroring how
+# delivery converged onto ``message_transport``.
+#
+# The property under test is NOT "the reads call a helper". It is that the
+# helper is the ONLY way to reach the mailbox from this module. A convergence
+# with a surviving alternate path is worse than no convergence, because the
+# certification runtime would fence one route and report a clean run while the
+# other route ran unobserved. That is the entire bug class.
+
+
+PROCESSING = "email_automation/processing.py"
+
+
+def _processing_module():
+    from email_automation import processing
+    return processing
+
+
+class ProcessingReadConvergenceTests(unittest.TestCase):
+    """Structural half: one call site, one allowlist, no second route."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tool = _load_tool()
+        cls.report = cls.tool.build_report(REPO_ROOT)
+        cls.source = (REPO_ROOT / PROCESSING).read_text()
+        cls.tree = ast.parse(cls.source)
+
+    def _processing_ops(self):
+        return [op for op in self.report["operations"] if op["module"] == PROCESSING]
+
+    def test_processing_still_holds_all_twelve_of_its_mailbox_reads(self):
+        """Convergence MOVES reads; it must never appear to remove them.
+
+        If the inventory stopped counting a read the moment it was routed
+        through a boundary, converging a module would look like the reads
+        vanished - and the instrument would be rewarding the refactor by going
+        blind to it.
+        """
+        reads = [op for op in self._processing_ops() if op["classification"] == "read"]
+        self.assertEqual(len(reads), 12, [f"{o['line']}:{o['function']}" for o in reads])
+
+    def test_all_twelve_are_routed_and_none_is_a_direct_provider_call(self):
+        reads = [op for op in self._processing_ops() if op["classification"] == "read"]
+        direct = [op for op in reads if op["route"] != "boundary"]
+        self.assertEqual(
+            direct, [],
+            "a mailbox read in processing.py still reaches the provider directly",
+        )
+
+    def test_the_boundarys_own_provider_call_is_reported_not_hidden(self):
+        """The one call the resolver cannot follow must still be visible.
+
+        Its URL arrives as a parameter, so no static scan can resolve it. That
+        is fine - what is not fine is dropping it. It belongs in the unresolved
+        list, where a reviewer can see that the module's single remaining direct
+        call is the boundary and satisfy themselves it is the right one.
+        """
+        unresolved = [
+            entry for entry in self.report["unresolvedHttpCallSites"]
+            if entry["module"] == PROCESSING
+        ]
+        self.assertEqual(len(unresolved), 1, unresolved)
+        self.assertEqual(unresolved[0]["function"], "read")
+
+    def test_no_http_verb_reaches_the_mailbox_outside_the_boundary(self):
+        """Asserted over the AST rather than over the tool, deliberately.
+
+        The tool and the product could drift in the same direction - a URL shape
+        the resolver stops recognising would make an escaped call site invisible
+        to both the inventory and this test. So this one walks the module
+        directly and asks a blunter question: which functions contain a call to
+        an HTTP verb at all?
+        """
+        offenders = []
+        for node in ast.walk(self.tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call) or not isinstance(child.func, ast.Attribute):
+                    continue
+                if child.func.attr not in ("get", "post", "patch", "put", "delete"):
+                    continue
+                receiver = child.func.value
+                name = receiver.id if isinstance(receiver, ast.Name) else ""
+                if name == "requests":
+                    offenders.append((node.name, child.lineno))
+        self.assertEqual(
+            offenders, [("read", offenders[0][1] if offenders else 0)],
+            f"a requests.* call survives outside the read boundary: {offenders}",
+        )
+
+    def test_the_allowlist_names_every_routed_operation_and_nothing_more(self):
+        """A dead allowlist entry is a hole, and an unlisted name is a refusal.
+
+        Both directions matter. An operation name in the allowlist that no call
+        site uses is a door left open for the next caller; a call site whose name
+        is absent would refuse at runtime, on a path a passing test may never
+        walk.
+        """
+        processing = _processing_module()
+        used = set()
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "read" or not node.args:
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                used.add(first.value)
+        self.assertEqual(used, set(processing.GRAPH_MAILBOX_READ_OPERATIONS))
+        self.assertEqual(len(used), 12, sorted(used))
+
+    def test_nothing_imports_the_fence_binding_by_value(self):
+        """The hazard that has bitten this project twice, checked for a third shape.
+
+        Ten modules import ``clients._fs`` BY VALUE and each patches its own
+        copy, so patching one canonical global leaves the other nine live. A
+        read fence has exactly the same failure mode: if another module bound
+        the resolver or the context variable at import time, fencing
+        ``processing``'s copy would leave that module's copy pointing at the
+        real provider.
+        """
+        bound_names = {"_mailbox_reader", "_MAILBOX_READER", "graph_mailbox_reader_scope"}
+        offenders = {}
+        for path in sorted(REPO_ROOT.rglob("*.py")):
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative == PROCESSING or "__pycache__" in relative:
+                continue
+            if relative.startswith("tests/"):
+                continue
+            try:
+                tree = ast.parse(path.read_text(errors="ignore"))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or not node.module:
+                    continue
+                if not node.module.endswith("processing"):
+                    continue
+                taken = {alias.name for alias in node.names} & bound_names
+                if taken:
+                    offenders.setdefault(relative, set()).update(taken)
+        self.assertEqual(offenders, {})
+
+
+class ProcessingReadFenceDrivenTests(unittest.TestCase):
+    """Driven half. Structural proof is not driven proof.
+
+    Three phases of this project proved properties by test and the first ACTUAL
+    run immediately found a real ordering bug. So these tests EXECUTE the
+    converged functions with the provider primed to explode: any surviving
+    direct call site raises rather than being quietly absent from a count.
+    """
+
+    def setUp(self):
+        self.processing = _processing_module()
+
+    class _Recorder:
+        """Stands in for a certification reader: observes, and calls nothing."""
+
+        def __init__(self, payloads=None):
+            self.reads = []
+            self.payloads = payloads or {}
+
+        def read(self, operation, url, **kwargs):
+            self.reads.append({"operation": operation, "url": url, "kwargs": kwargs})
+            return _FakeResponse(self.payloads.get(operation, {}))
+
+    def _exploding_provider(self):
+        def explode(*args, **kwargs):
+            raise AssertionError(
+                "a mailbox read escaped the boundary and reached the provider"
+            )
+        return explode
+
+    def test_a_fenced_reader_sees_the_reads_and_the_provider_is_never_touched(self):
+        from unittest.mock import patch
+        processing = self.processing
+        recorder = self._Recorder(payloads={
+            "mailbox_identity": {"mail": "operator@example.com"},
+            "message_envelope_by_id": {"id": "abc", "subject": "s"},
+        })
+        with patch.object(processing.requests, "get", self._exploding_provider()), \
+                processing.graph_mailbox_reader_scope(recorder):
+            processing._fetch_graph_message_by_id({"Authorization": "x"}, "abc")
+            resolved = processing._resolve_current_mailbox_email({"Authorization": "x"})
+
+        self.assertEqual(resolved, "operator@example.com")
+        self.assertEqual(
+            [entry["operation"] for entry in recorder.reads],
+            ["message_envelope_by_id", "mailbox_identity"],
+        )
+
+    def test_a_read_the_fence_refuses_stops_the_lane_rather_than_falling_through(self):
+        """Refuse, don't sanitize - and refuse LOUDLY.
+
+        Code reaching for a name it does not own fails as SILENCE in this
+        codebase: a broad ``except Exception`` turns a NameError into a clean
+        early return. So the refusal is asserted to propagate out of a function
+        that has no try/except around its read, proving the fence is not being
+        swallowed into a plausible-looking empty result.
+        """
+        from unittest.mock import patch
+
+        class _Refusing:
+            def read(self, operation, url, **kwargs):
+                raise self.Refused(operation)
+
+            class Refused(RuntimeError):
+                pass
+
+        processing = self.processing
+        refusing = _Refusing()
+        with patch.object(processing.requests, "get", self._exploding_provider()), \
+                processing.graph_mailbox_reader_scope(refusing):
+            with self.assertRaises(_Refusing.Refused):
+                processing._fetch_graph_message_by_id({"Authorization": "x"}, "abc")
+
+    def test_the_boundary_refuses_an_operation_outside_the_allowlist(self):
+        from unittest.mock import patch
+        processing = self.processing
+        reader = processing.GraphMailboxReader()
+        with patch.object(processing.requests, "get", self._exploding_provider()):
+            with self.assertRaises(processing.GraphMailboxReadRefused):
+                reader.read(
+                    "delete_everything",
+                    "https://graph.microsoft.com/v1.0/me/messages",
+                    headers={},
+                )
+
+    def test_the_allowlist_is_checked_before_the_provider_is_reached(self):
+        """Ordering, not politeness. A check after the call has already leaked."""
+        from unittest.mock import patch
+        processing = self.processing
+        reader = processing.GraphMailboxReader()
+        calls = []
+        with patch.object(processing.requests, "get", lambda *a, **k: calls.append(a)):
+            with self.assertRaises(processing.GraphMailboxReadRefused):
+                reader.read("not_an_operation", "https://graph.microsoft.com/v1.0/me", headers={})
+        self.assertEqual(calls, [])
+
+    def test_the_default_reader_uses_the_modules_own_requests_binding(self):
+        """The ambient-fallback rule, driven rather than asserted structurally.
+
+        Every existing test in this suite fences ``processing`` by patching
+        ``processing.requests``. If the boundary reached for a freshly imported
+        ``requests`` instead, all of them would keep passing while fencing
+        nothing - the exact shape of the ``clients._fs`` defect. So drive a real
+        read through the default reader and require the module's own binding to
+        intercept it.
+        """
+        from unittest.mock import patch
+        processing = self.processing
+        seen = {}
+
+        def capture(url, **kwargs):
+            seen["url"] = url
+            return _FakeResponse({"id": "abc"})
+
+        with patch.object(processing.requests, "get", capture):
+            result = processing._fetch_graph_message_by_id({"Authorization": "x"}, "abc")
+        self.assertEqual(result, {"id": "abc"})
+        self.assertIn("/me/messages/abc", seen["url"])
+
+    def test_the_fence_is_restored_when_its_scope_exits(self):
+        """A fence that leaks past its scope would silence production reads."""
+        processing = self.processing
+        recorder = self._Recorder()
+        with processing.graph_mailbox_reader_scope(recorder):
+            self.assertIs(processing._mailbox_reader(), recorder)
+        self.assertIsNot(processing._mailbox_reader(), recorder)
+
+    def test_an_explicit_runtime_reader_outranks_the_ambient_one(self):
+        """Delivery resolves runtime.outbound first; reads must resolve the same way."""
+        import types
+        processing = self.processing
+        ambient, injected = self._Recorder(), self._Recorder()
+        runtime = types.SimpleNamespace(mailbox_reader=injected)
+        with processing.graph_mailbox_reader_scope(ambient):
+            self.assertIs(processing._mailbox_reader(runtime), injected)
+
+
+class RemainingWorkTests(unittest.TestCase):
+    """What is left, pinned so the next session starts from a list.
+
+    The list itself is EMITTED by the tool - ``--remaining`` - rather than
+    written down, because a hand-written remaining-work list is stale the moment
+    anything moves and a stale list is worse than none: it gets trusted. What is
+    pinned here is the SHAPE of the remaining job, so that finishing a module
+    shows up as a test to update rather than as a silent drift.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tool = _load_tool()
+        cls.report = cls.tool.build_report(REPO_ROOT)
+
+    def _direct_reads_by_module(self):
+        counts = {}
+        for op in self.report["operations"]:
+            if op["classification"] == "read" and op["route"] == "direct":
+                counts[op["module"]] = counts.get(op["module"], 0) + 1
+        return counts
+
+    def test_processing_is_the_only_converged_module_so_far(self):
+        self.assertNotIn(PROCESSING, self._direct_reads_by_module())
+
+    def test_the_remaining_application_reads_are_pinned_module_by_module(self):
+        """Twenty-four direct reads remain on the application surface.
+
+        Ordered by size, the next candidates are ``service_providers`` (5, but
+        it is the raw provider - converging it means deciding whether the
+        provider or the lanes own the boundary), ``app.py`` (4 reads AND a
+        mailbox DELETE, on an operator surface no scheduler lane touches),
+        ``email.py`` (4 reads and a DELETE, and the module whose delivery is
+        already converged so the seam exists), and ``sent_mail_guard`` (3, all
+        paginating and all currently invisible to the URL-literal scan).
+        """
+        counts = self._direct_reads_by_module()
+        application = {
+            module: count for module, count in counts.items()
+            if self.tool._is_application_module(module)
+        }
+        self.assertEqual(
+            application,
+            {
+                "app.py": 4,
+                "email_automation/email.py": 4,
+                "email_automation/email_operations.py": 4,
+                "email_automation/file_handling.py": 1,
+                "email_automation/followup.py": 1,
+                "email_automation/messaging.py": 1,
+                "email_automation/operator_replay.py": 1,
+                "email_automation/sent_mail_guard.py": 3,
+                "email_automation/service_providers.py": 5,
+            },
+        )
+        self.assertEqual(sum(application.values()), 24)
+
+    def test_the_destructive_calls_are_named_rather_than_left_to_be_rediscovered(self):
+        """A fixture teardown IS a DELETE, and three of them are still direct.
+
+        Recorded here because a read-convergence task is exactly the context in
+        which a destructive call gets overlooked - it is not a read, so it falls
+        outside the thing being worked on, which is how app.py's DELETE survived
+        a whole send-focused inventory.
+        """
+        destructive = {
+            (op["module"], op["function"])
+            for op in self.report["operations"]
+            if op["classification"] == "destructive"
+        }
+        self.assertEqual(
+            destructive,
+            {
+                ("app.py", "delete_matching_emails"),
+                ("email_automation/email.py", "_delete_graph_reply_draft"),
+                ("email_automation/message_transport.py", "delete_draft"),
+            },
+        )
+
+    def test_the_remaining_list_renders(self):
+        """The operator-facing output is exercised, not just the data behind it."""
+        rendered = self.tool._render_remaining(self.report)
+        self.assertIn("ALREADY CONVERGED: " + PROCESSING, rendered)
+        self.assertIn("email_automation/service_providers.py", rendered)
+
+
+class _FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
 
 
 if __name__ == "__main__":

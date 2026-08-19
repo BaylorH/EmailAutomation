@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 import logging
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 import os
@@ -165,6 +166,134 @@ class ReplySendOutcome:
 
 
 _REPLY_SEND_OUTCOME = ContextVar("reply_send_outcome", default=ReplySendOutcome())
+
+
+# ---------------------------------------------------------------------------
+# the shared mailbox READ boundary
+# ---------------------------------------------------------------------------
+#
+# Delivery converged first: four independent send call sites across three
+# modules became one, and the absence of an alternate send path is proven.
+# READS did not converge with it. This module held the largest remaining
+# concentration - twelve Graph mailbox reads across nine functions - so it
+# converges here, mirroring the delivery boundary's shape.
+#
+# The load-bearing property is NOT that the reads share a helper. It is that
+# the helper is the ONLY route from this module to the mailbox. A convergence
+# with a surviving alternate path is worse than none, because a certification
+# runtime would fence the boundary, observe nothing on the other route, and
+# report a clean run. That is the whole bug class.
+#
+# Three deliberate decisions:
+#
+# **The operation name is an ALLOWLIST, and an unknown one is REFUSED.** Not
+# sanitized, not defaulted, not logged-and-continued. A read this module does
+# not already perform is a new mailbox effect, and a new mailbox effect must
+# fail loudly at the point it is introduced rather than appear in production
+# traffic.
+#
+# **The reader carries no policy.** Retry, timeout, field selection and error
+# handling all stay at the call site, exactly as ``message_transport`` leaves
+# rendering and safety with the caller. Pulling them in here would make one
+# object decide what nine functions are each allowed to decide for themselves,
+# which is the coupling this refactor exists to remove rather than create.
+#
+# **The default reader uses THIS MODULE'S ``requests`` binding.** It resolves
+# the module global at call time rather than importing its own. Ten modules in
+# this codebase import ``clients._fs`` by value and each patches its own copy,
+# so fencing one canonical global leaves the others live; that defect has bitten
+# twice. A boundary that reached for a fresh ``requests`` would reproduce it
+# precisely - every existing test fences this module by patching
+# ``processing.requests``, and all of them would keep passing while fencing
+# nothing at all.
+
+
+class GraphMailboxReadRefused(RuntimeError):
+    """A mailbox read was requested that this module does not perform.
+
+    Deliberately its own type. A caller distinguishing "the instrument refused"
+    from "the product failed" cannot do so against a bare RuntimeError, and
+    collapsing the two would make a never-exercised lane read as an exercised
+    and broken one.
+    """
+
+
+# Every mailbox read this module performs, named by PURPOSE rather than by URL.
+# Naming by purpose is what lets the allowlist be reviewed: "sent_items_page" is
+# a claim someone can agree or disagree with, where a URL is only a fact about
+# spelling. A name here that no call site uses is a door left open, and a call
+# site whose name is missing refuses at runtime - the paired test asserts this
+# set matches the call sites exactly, in both directions.
+GRAPH_MAILBOX_READ_OPERATIONS = frozenset({
+    "sent_items_for_conversation",      # reconcile a just-sent reply
+    "message_envelope_by_id",           # exact-message identity readback
+    "reply_target_metadata",            # recipients of the message being replied to
+    "reply_conversation_id",            # conversation of the message being replied to
+    "mailbox_identity",                 # who this mailbox is (/me)
+    "sent_items_identity_probe",        # fallback identity when /me omits mail
+    "inbox_message_body",               # full body of one scanned inbox message
+    "inbox_message_headers",            # internet headers of one scanned message
+    "inbox_message_page",               # one page of the inbox scan
+    "thread_match_headers",             # headers used to match a message to a thread
+    "thread_message_body",              # full body when saving a message to a thread
+    "sent_items_page",                  # one page of the manual-reply sent scan
+})
+
+
+class GraphMailboxReader:
+    """THE Graph mailbox read call site for this module.
+
+    Kept as one named method so the verb sweep has exactly one site to find, and
+    so a future read cannot converge "almost" here.
+    """
+
+    def read(self, operation: str, url: str, **kwargs):
+        if operation not in GRAPH_MAILBOX_READ_OPERATIONS:
+            # Refused BEFORE the provider is reached. A check that runs after
+            # the call has already caused the effect it was meant to prevent.
+            raise GraphMailboxReadRefused(
+                f"{operation!r} is not an allowed Graph mailbox read for this module"
+            )
+        return requests.get(url, **kwargs)
+
+
+_DEFAULT_GRAPH_MAILBOX_READER = GraphMailboxReader()
+
+# Request-scoped rather than a module global, following ``_REPLY_SEND_OUTCOME``
+# above. A certification run and an ordinary production run can be in flight in
+# the same process at the same moment; a plain global would let one fence the
+# other's reads.
+_MAILBOX_READER: ContextVar = ContextVar("graph_mailbox_reader", default=None)
+
+
+def _mailbox_reader(runtime=None):
+    """Resolve the mailbox read boundary for this call.
+
+    Resolution order mirrors ``_reply_delivery_transport_for``: an explicitly
+    passed runtime wins, then the ambient fence, then ordinary production. Most
+    of the converged functions carry no runtime - they are reached from the
+    scheduler, not from a request - which is exactly why the ambient seam has to
+    exist rather than every signature growing a parameter.
+    """
+    if runtime is not None:
+        injected = getattr(runtime, "mailbox_reader", None)
+        if injected is not None:
+            return injected
+    return _MAILBOX_READER.get() or _DEFAULT_GRAPH_MAILBOX_READER
+
+
+@contextmanager
+def graph_mailbox_reader_scope(reader):
+    """Install a mailbox read fence for the duration of the block.
+
+    The token is reset in a ``finally``: a fence that leaked past its scope
+    would silence ordinary production reads in the same process.
+    """
+    token = _MAILBOX_READER.set(reader)
+    try:
+        yield reader
+    finally:
+        _MAILBOX_READER.reset(token)
 
 
 DEFAULT_AUTOMATIC_INBOX_REPLY_ALLOWLIST = {
@@ -695,7 +824,8 @@ def _find_recent_sent_message_for_conversation(
     for attempt in range(attempts):
         try:
             sent_resp = exponential_backoff_request(
-                lambda: requests.get(
+                lambda: _mailbox_reader().read(
+                    "sent_items_for_conversation",
                     f"{base}/me/mailFolders/SentItems/messages",
                     headers=headers,
                     params=params,
@@ -1809,7 +1939,8 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
 def _fetch_graph_message_by_id(headers: Dict[str, str], message_id: str) -> Dict[str, Any]:
     encoded_id = quote(str(message_id or ""), safe="")
     response = exponential_backoff_request(
-        lambda: requests.get(
+        lambda: _mailbox_reader().read(
+            "message_envelope_by_id",
             f"https://graph.microsoft.com/v1.0/me/messages/{encoded_id}",
             headers=headers,
             params={
@@ -5773,7 +5904,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
         try:
             current_meta_resp = exponential_backoff_request(
-                lambda: requests.get(
+                lambda: _mailbox_reader(runtime).read(
+                    "reply_target_metadata",
                     f"{base}/me/messages/{current_msg_id}",
                     headers=headers,
                     params={
@@ -5982,7 +6114,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             # Fetch the most recent message from SentItems for this conversation
             # Get conversationId from the current message
             current_msg_resp = exponential_backoff_request(
-                lambda: requests.get(
+                lambda: _mailbox_reader(runtime).read(
+                    "reply_conversation_id",
                     f"{base}/me/messages/{current_msg_id}",
                     headers=headers,
                     params={"$select": "conversationId"},
@@ -6362,7 +6495,8 @@ def _resolve_current_mailbox_email(headers: Dict[str, str]) -> Optional[str]:
     my_email = None
     resolution_failures = []
     try:
-        my_email_resp = requests.get(
+        my_email_resp = _mailbox_reader().read(
+            "mailbox_identity",
             "https://graph.microsoft.com/v1.0/me",
             headers=headers,
             params={"$select": "mail,userPrincipalName"},
@@ -6380,7 +6514,8 @@ def _resolve_current_mailbox_email(headers: Dict[str, str]) -> Optional[str]:
 
     if not my_email:
         try:
-            sent_resp = requests.get(
+            sent_resp = _mailbox_reader().read(
+                "sent_items_identity_probe",
                 "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
                 headers=headers,
                 params={"$top": "1", "$select": "from"},
@@ -6500,7 +6635,8 @@ def process_inbox_message(
     # NEW: fetch full message body and normalize to plain text
     try:
         full_msg = exponential_backoff_request(
-            lambda: requests.get(
+            lambda: _mailbox_reader().read(
+                "inbox_message_body",
                 f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
                 headers=headers,
                 params={"$select": "body,hasAttachments,sender,replyTo,ccRecipients"},
@@ -6530,7 +6666,8 @@ def process_inbox_message(
     if not internet_message_headers:
         try:
             response = exponential_backoff_request(
-                lambda: requests.get(
+                lambda: _mailbox_reader().read(
+                    "inbox_message_headers",
                     f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
                     headers=headers,
                     params={"$select": "internetMessageHeaders"},
@@ -8771,7 +8908,9 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
 
         while url:
             response = exponential_backoff_request(
-                lambda: requests.get(url, headers=headers, params=params, timeout=30)
+                lambda: _mailbox_reader().read(
+                    "inbox_message_page", url, headers=headers, params=params, timeout=30
+                )
             )
             data = response.json()
             messages = data.get("value", [])
@@ -9072,7 +9211,8 @@ def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional
     if not internet_message_headers:
         try:
             response = exponential_backoff_request(
-                lambda: requests.get(
+                lambda: _mailbox_reader().read(
+                    "thread_match_headers",
                     f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
                     headers=headers,
                     params={"$select": "internetMessageHeaders"},
@@ -9150,7 +9290,8 @@ def _save_message_to_thread(
     # Fetch full body
     try:
         full_msg = exponential_backoff_request(
-            lambda: requests.get(
+            lambda: _mailbox_reader().read(
+                "thread_message_body",
                 f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
                 headers=headers,
                 params={
@@ -9328,7 +9469,9 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
             
             while url:
                 response = exponential_backoff_request(
-                    lambda: requests.get(url, headers=headers, params=params, timeout=30)
+                    lambda: _mailbox_reader().read(
+                        "sent_items_page", url, headers=headers, params=params, timeout=30
+                    )
                 )
                 data = response.json()
                 messages = data.get("value", [])

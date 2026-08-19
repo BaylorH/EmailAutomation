@@ -66,6 +66,11 @@ SEND_SUFFIXES = ("/send", "/sendMail", "/reply", "/replyAll")
 # tool's OWN blind spot, so anything outside it is reported rather than skipped.
 HTTP_RECEIVERS = frozenset({"requests", "http", "session", "_request", "_http"})
 
+# A read routed through a named boundary is spelled ``reader.read(operation, url)``
+# rather than ``requests.get(url)``. Both are mailbox reads and both are counted;
+# they differ only in the ``route`` field.
+BOUNDARY_METHOD = "read"
+
 SKIP_PARTS = {".git", "tests", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
 
 # A resolved URL template names the mailbox when the ``/me`` segment sits
@@ -297,7 +302,14 @@ class _ModuleScanner:
 
     def _scan_call(self, node: ast.Call, env: Dict[str, str], scope: str) -> None:
         func = node.func
-        if not isinstance(func, ast.Attribute) or func.attr not in HTTP_VERBS:
+        if not isinstance(func, ast.Attribute):
+            return
+
+        if func.attr == BOUNDARY_METHOD:
+            self._scan_boundary_call(node, env, scope)
+            return
+
+        if func.attr not in HTTP_VERBS:
             return
 
         keywords = {kw.arg for kw in node.keywords if kw.arg}
@@ -346,6 +358,36 @@ class _ModuleScanner:
             "method": func.attr,
             "classification": _classify(func.attr, url),
             "url": url,
+            "route": "direct",
+            "operation": None,
+        })
+
+    def _scan_boundary_call(self, node: ast.Call, env: Dict[str, str], scope: str) -> None:
+        """``reader.read("operation_name", url, ...)`` - a read through a boundary.
+
+        Counted as a mailbox read, because it IS one. A converged read is still
+        a read; what convergence changes is its ROUTE, and an inventory that
+        stopped counting reads once they were routed would make every
+        convergence look like the reads had disappeared. The instrument would
+        then be rewarding the refactor by going blind to it.
+        """
+        if len(node.args) < 2:
+            return
+        name_node, url_node = node.args[0], node.args[1]
+        if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
+            return
+        url = _resolve(url_node, env)
+        if url is None or not MAILBOX_PATH_RE.search(url):
+            return
+        self.operations.append({
+            "module": self.module,
+            "line": node.lineno,
+            "function": scope,
+            "method": "get",
+            "classification": "read",
+            "url": url,
+            "route": "boundary",
+            "operation": name_node.value,
         })
 
 
@@ -407,6 +449,8 @@ def url_literal_scan(module: str, tree: ast.Module) -> List[Dict[str, Any]]:
             "method": func.attr,
             "classification": _classify(func.attr, url),
             "url": url,
+            "route": "direct",
+            "operation": None,
         })
     return found
 
@@ -469,12 +513,26 @@ def build_report(root: Path = REPO_ROOT) -> Dict[str, Any]:
 
     scope_b_by_module: Dict[str, int] = {}
     scope_c_by_module: Dict[str, int] = {}
+    # Direct vs boundary is the CONSERVATION LAW convergence has to satisfy.
+    # Routing a read through a boundary must move it between these two columns
+    # and leave the total alone; a total that fell would mean the inventory had
+    # gone blind to exactly the reads someone just finished making observable.
+    routes: Dict[str, Dict[str, int]] = {}
     for op in operations:
         if op["classification"] != "read":
             continue
         scope_c_by_module[op["module"]] = scope_c_by_module.get(op["module"], 0) + 1
         if _is_application_module(op["module"]):
             scope_b_by_module[op["module"]] = scope_b_by_module.get(op["module"], 0) + 1
+        bucket = routes.setdefault(op["module"], {"direct": 0, "boundary": 0})
+        bucket[op["route"]] += 1
+
+    def _route_totals(modules) -> Dict[str, int]:
+        totals = {"direct": 0, "boundary": 0}
+        for module in modules:
+            for key, value in routes.get(module, {}).items():
+                totals[key] += value
+        return totals
 
     # --- B minus A: what the narrower figure does not count, itemised --------
     scope_b_only = []
@@ -566,6 +624,7 @@ def build_report(root: Path = REPO_ROOT) -> Dict[str, Any]:
             ),
             "byModule": scope_b_by_module,
             "readCount": sum(scope_b_by_module.values()),
+            "readRoutes": _route_totals(scope_b_by_module),
         },
         "scopeC": {
             "definition": (
@@ -574,6 +633,7 @@ def build_report(root: Path = REPO_ROOT) -> Dict[str, Any]:
             ),
             "byModule": scope_c_by_module,
             "readCount": sum(scope_c_by_module.values()),
+            "readRoutes": _route_totals(scope_c_by_module),
         },
         "reconciliation": {
             "why": (
@@ -666,18 +726,72 @@ def _render_reconciliation(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_remaining(report: Dict[str, Any]) -> str:
+    """What is still unconverged, module by module, with line numbers.
+
+    Emitted by the tool rather than written down, so the next session starts
+    from a list that is true when it is read instead of one that was true when
+    it was typed. A hand-written remaining-work list is stale the moment
+    anything moves, and a stale list is worse than none: it gets trusted.
+    """
+    remaining: Dict[str, List[Dict[str, Any]]] = {}
+    for op in report["operations"]:
+        if op["route"] == "boundary":
+            continue
+        remaining.setdefault(op["module"], []).append(op)
+
+    lines = [
+        "UNCONVERGED GRAPH MAILBOX OPERATIONS - every call site still reaching the",
+        "provider directly, grouped by module and ordered by size of the job.",
+        "",
+    ]
+    for module in sorted(remaining, key=lambda m: (-len(remaining[m]), m)):
+        ops = remaining[module]
+        counts: Dict[str, int] = {}
+        for op in ops:
+            counts[op["classification"]] = counts.get(op["classification"], 0) + 1
+        summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+        # message_transport is excluded from scope B because it is the delivery
+        # convergence TARGET, not a lane. Labelling it "script/tooling" here
+        # would be actively wrong, so the label is derived separately.
+        if module in SCOPE_B_EXCLUDED:
+            surface = "shared delivery boundary - already converged, by design"
+        elif _is_application_module(module):
+            surface = "application"
+        else:
+            surface = "script/tooling"
+        lines.append(f"{module}  ({summary})  [{surface}]")
+        for op in ops:
+            lines.append(
+                f"    {op['line']:>6d}  {op['classification']:<11s} {op['method']:<6s} "
+                f"{op['function']:<45s} {op['url']}"
+            )
+        lines.append("")
+
+    converged = sorted({
+        op["module"] for op in report["operations"] if op["route"] == "boundary"
+    })
+    lines.append("ALREADY CONVERGED: " + (", ".join(converged) or "none"))
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=str(REPO_ROOT))
     parser.add_argument("--format", choices=("table", "json", "sites"), default="table")
     parser.add_argument("--reconcile", action="store_true",
                         help="explain the 19-vs-33 read figures as two scopes")
+    parser.add_argument("--remaining", action="store_true",
+                        help="list every call site still reaching the provider directly")
     args = parser.parse_args(argv)
 
     report = build_report(Path(args.root).resolve())
 
     if args.reconcile:
         print(_render_reconciliation(report))
+        return 0
+    if args.remaining:
+        print(_render_remaining(report))
         return 0
     if args.format == "json":
         print(json.dumps(report, indent=2, sort_keys=True))
