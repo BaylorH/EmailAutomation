@@ -3,56 +3,75 @@
 # would bake credentials and dev cruft from the working checkout into the
 # pushed image. Pinned by tests/test_ws_b_dockerignore_contract.py — keep the
 # two in sync.
+#
+# ANCHORING — read this before adding a pattern.
+#
+# Docker matches these patterns against the path relative to the BUILD CONTEXT
+# ROOT. `venv/` therefore excludes a top-level `venv` and nothing else; it
+# never matched auth_service/venv, which shipped 190 MB and 2763 files in
+# every image while a green contract test confirmed the line was present.
+# A pattern that must apply at any depth has to say `**/` explicitly. Bare
+# names do NOT behave like .gitignore here.
+#
+# So: anything that is dangerous or worthless wherever it appears is written
+# `**/…`. The few patterns deliberately left root-anchored are the top-level
+# project layout (tests/, docs/, scripts/, deploy/, test_pdfs/, env/, ENV/) —
+# generalising those to any depth would also exclude directories with those
+# very common names inside third-party packages.
 
-# --- Credentials / secrets (must never enter an image layer) ---
-service-account*.json
-*credentials*.json
-.env*
-*.pem
-*.key
-run_production.sh
+# --- Credentials / secrets (must never enter an image layer, at any depth) ---
+**/service-account*.json
+**/*credentials*.json
+**/.env*
+**/*.pem
+**/*.key
+**/run_production.sh
 
-# --- Local token caches (per-user MSAL/OAuth state) ---
-msal_token_cache.bin
-token_cache.bin
+# --- Local token caches (per-user MSAL/OAuth state, at any depth) ---
+**/msal_token_cache.bin
+**/token_cache.bin
 
-# --- VCS / CI ---
-.git
-.github
-.gitignore
+# --- VCS / CI (vendored checkouts carry their own .git) ---
+**/.git
+**/.github
+**/.gitignore
 
 # --- Tests and test data (not needed at runtime) ---
+# Root-anchored on purpose: the project's own suites live at the top level.
 tests/
 test_pdfs/
-E2E_TEST_PLAN.md
-E2E_TEST_RUN_SHEET.md
-test_results.json
+**/E2E_TEST_PLAN.md
+**/E2E_TEST_RUN_SHEET.md
+**/test_results.json
 
 # --- Dev/deploy scaffolding (image is built FROM these, never contains them) ---
-Dockerfile
-.dockerignore
+**/Dockerfile
+**/.dockerignore
 deploy/
 docs/
 scripts/
-AGENTS.md
-CLAUDE.md
-AI_IMPROVEMENTS_TODO.md
-*.md
+**/AGENTS.md
+**/CLAUDE.md
+**/AI_IMPROVEMENTS_TODO.md
+**/*.md
 
 # --- Python / editor / OS cruft ---
-__pycache__
-*.py[cod]
-*.egg-info/
-venv/
-.venv/
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info/
+# Committed virtualenvs. `**/` is load-bearing: auth_service/venv is the one
+# that actually exists, and it is not at the context root.
+**/venv/
+**/.venv/
+# Root-anchored: `env` is too common a package directory name to exclude at depth.
 env/
 ENV/
-.idea/
-.vscode/
-.DS_Store
-*.log
-logs/
+**/.idea/
+**/.vscode/
+**/.DS_Store
+**/*.log
+**/logs/
 
 # --- Local data artifacts ---
-*.xlsx
-sig.png
+**/*.xlsx
+**/sig.png

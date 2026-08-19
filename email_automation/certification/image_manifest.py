@@ -16,7 +16,7 @@ cannot show you.
 
 from __future__ import annotations
 
-import fnmatch
+import functools
 import hashlib
 import json
 import re
@@ -71,29 +71,83 @@ def load_dockerignore(path: Path) -> List[Rule]:
     return rules
 
 
+def _compile(pattern: str) -> "re.Pattern[str]":
+    """Compile one .dockerignore pattern the way Docker compiles it.
+
+    This is NOT .gitignore. Docker matches every pattern against the path
+    relative to the build context ROOT, so a bare ``venv`` matches a top-level
+    ``venv`` and nothing else -- there is no "a bare name matches at any depth"
+    rule. ``**`` is the only way to say "at any depth", and it spans zero or
+    more directories, so ``**/venv`` covers both ``venv`` and
+    ``auth_service/venv``. Mirrors moby/patternmatcher's compile().
+
+    Getting this wrong is not a cosmetic difference. The image side of the
+    manifest is produced by walking /app AFTER ``COPY . .``, i.e. by real
+    Docker semantics. Any rule this function reads more loosely than Docker
+    does makes the checkout side omit files the image really contains, and the
+    gate reports a mismatch that is entirely an artifact of the mismatch in the
+    two matchers.
+    """
+    # Docker cleans the pattern first: a trailing slash carries no meaning
+    # beyond "directory", and directories are matched as path prefixes below.
+    cleaned = pattern.replace("\\", "/").strip("/")
+    regex = "^"
+    index, length = 0, len(cleaned)
+    while index < length:
+        char = cleaned[index]
+        if char == "*":
+            if index + 1 < length and cleaned[index + 1] == "*":
+                index += 2
+                if index < length and cleaned[index] == "/":
+                    index += 1  # "**/" is eaten whole, as Docker does
+                if index >= length:
+                    regex += ".*"  # trailing "**" accepts everything below
+                else:
+                    regex += "((.*/)|([^/]*))"
+                continue
+            regex += "[^/]*"
+        elif char == "?":
+            regex += "[^/]"
+        elif char == "[":
+            close = cleaned.find("]", index + 1)
+            if close == -1:
+                regex += r"\["
+            else:
+                klass = cleaned[index:close + 1]
+                if klass.startswith("[!"):
+                    klass = "[^" + klass[2:]
+                regex += klass
+                index = close + 1
+                continue
+        else:
+            regex += re.escape(char)
+        index += 1
+    return re.compile(regex + "$")
+
+
+@functools.lru_cache(maxsize=None)
+def _matcher(pattern: str) -> "re.Pattern[str]":
+    return _compile(pattern)
+
+
 def _rule_matches(relative_path: str, pattern: str) -> bool:
-    # A trailing slash means "this directory and everything under it".
-    if pattern.endswith("/"):
-        prefix = pattern.rstrip("/")
-        return relative_path == prefix or relative_path.startswith(prefix + "/")
-    if fnmatch.fnmatch(relative_path, pattern):
-        return True
-    # A bare name matches at any depth, and also as a directory prefix --
-    # ".git" must exclude ".git/config", not merely a file called ".git".
-    if "/" not in pattern:
-        parts = relative_path.split("/")
-        if any(fnmatch.fnmatch(part, pattern) for part in parts[:-1]):
-            return True
-        if fnmatch.fnmatch(parts[-1], pattern):
-            return True
-    return False
+    """Does this exact path match this pattern? Ancestors are is_excluded's job."""
+    return bool(_matcher(pattern).match(relative_path))
+
+
+def _ancestors(relative_path: str) -> List[str]:
+    """The path and every directory above it: a/b/c.py -> a, a/b, a/b/c.py."""
+    parts = relative_path.split("/")
+    return ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
 
 
 def is_excluded(relative_path: str, rules: Sequence[Rule]) -> bool:
-    """Docker semantics: last matching rule decides."""
+    """Docker semantics: last matching rule decides, and a matched parent
+    directory takes everything under it (MatchesOrParentMatches)."""
     excluded = False
+    candidates = _ancestors(relative_path)
     for rule in rules:
-        if _rule_matches(relative_path, rule.pattern):
+        if any(_rule_matches(candidate, rule.pattern) for candidate in candidates):
             excluded = not rule.negated
     return excluded
 
