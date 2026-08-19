@@ -205,18 +205,119 @@ def _replay(runtime: Any, fixture: "fx.PreparedFixture",
 
 
 # -- observation -------------------------------------------------------------
+#
+# Two of the effects below are the least reversible things this system can do,
+# and both were previously UNOBSERVED. An unobserved forbidden effect is not a
+# zero; it is an absence, and a run that scores it as a zero is claiming to have
+# checked something nothing looked at.
+
+# Permission grants that are provably NOT a public publication. An ALLOW-LIST:
+# a captured permission counts as clean only if it names one concrete
+# addressable subject. Anything else - including a grant shape this instrument
+# does not recognise - is scored as the irreversible effect, because a deny-list
+# of ("anyone",) would score a novel public grant type as clean.
+PRIVATE_GRANT_TYPES: Tuple[str, ...] = ("user", "group")
+
+# Field names that make a write a durable claim about a capability's production
+# status. A stamp is not an irreversible external effect - it is a record - so
+# this is a detector, not the guard. The guard is ``stamp_entitlement``, which
+# is read from the registry, plus the fixture prefix fence behind
+# ``nonfixture_write``.
+STAMP_MARKERS: Tuple[str, ...] = (
+    "productionVerdict",
+    "capabilityStamp",
+    "certificationStamp",
+)
+
+
+def _is_private_grant(permission: Any) -> bool:
+    """True only for a grant that names one concrete addressable subject."""
+    if not isinstance(permission, Mapping):
+        return False
+    if permission.get("type") not in PRIVATE_GRANT_TYPES:
+        return False
+    return bool(str(permission.get("emailAddress") or "").strip())
+
+
+def observe_public_drive_permission(runtime: Any) -> Optional[int]:
+    """Public Drive permissions this run caused, or ``None`` if unmeasurable.
+
+    Resolved through the PRODUCT's own ``drive_publication_for`` rather than by
+    reading ``runtime.drive_publication`` directly, so what is measured is the
+    surface the product would actually have published through. Reading the
+    attribute would agree with itself even if resolution had drifted.
+
+    ``None`` is deliberate and is NOT zero. ``ProviderBackedDrivePublication``
+    and ``AmbientDrivePublication`` cannot be asked what they published, so a
+    run holding one cannot support a claim of zero - it has to report the gap
+    and land on ``instrument_blocked``.
+    """
+    from email_automation import automation_runtime as ar
+
+    transport = ar.drive_publication_for(runtime, None)
+    real = getattr(transport, "real_permission_calls", None)
+    captured = getattr(transport, "captured", None)
+    if isinstance(real, bool) or not isinstance(real, int) or captured is None:
+        return None
+    public = 0
+    for entry in captured:
+        try:
+            _file_id, permission = entry
+        except (TypeError, ValueError):
+            # An entry this instrument cannot read is not a clean entry.
+            public += 1
+            continue
+        if not _is_private_grant(permission):
+            public += 1
+    return int(real) + public
+
+
+def stamp_entitlement(scenario: Mapping[str, Any]) -> int:
+    """Whether this scenario is permitted to stamp a capability at all.
+
+    Read from the in-image registry entry, so a scenario whose ``capabilityStamp``
+    flag were flipped would immediately violate the refutation scenario's
+    ``capability_stamp: 0`` instead of quietly acquiring the right to certify.
+    """
+    return 1 if scenario.get("capabilityStamp") is True else 0
+
+
+def observe_capability_stamp(writes: Any, *, stamp_entitlement: int) -> int:
+    """Capability stamps this run produced: entitlement plus stamp-shaped writes."""
+    produced = 0
+    for entry in writes:
+        try:
+            _kind, path, payload, _merge = entry
+        except (TypeError, ValueError):
+            continue
+        text = f"{path} {payload}"
+        if any(marker in text for marker in STAMP_MARKERS):
+            produced += 1
+    return int(stamp_entitlement) + produced
 
 
 def _observe(runtime: Any, fixture: fx.PreparedFixture,
              sentinel: NetworkSentinel, *,
-             replay_delta: int, cleanup_residue: int) -> Dict[str, int]:
-    """Measure what the run actually did. No scenario knowledge here."""
+             replay_delta: int, cleanup_residue: int,
+             stamp_entitlement: int) -> Dict[str, int]:
+    """Measure what the run actually did.
+
+    No scenario knowledge is looked up here. ``stamp_entitlement`` arrives as a
+    scalar the caller already read from the registry, the same way
+    ``replay_delta`` and ``cleanup_residue`` arrive as scalars the caller
+    already measured.
+
+    A counter that cannot be measured is OMITTED rather than defaulted to zero.
+    ``_compare`` then reports it as "no observer", which lands the run on
+    ``instrument_blocked`` - the honest answer for a forbidden effect nothing
+    looked at.
+    """
     store = fixture.firestore
     prefix = fixture.prefix
     write_paths = [path for _kind, path, _payload, _merge in store.writes]
     captured = list(getattr(runtime.outbound, "captured", ()))
 
-    return {
+    observed: Dict[str, int] = {
         # required-effect surfaces
         "captured_outreach": len(captured),
         "fixture_audit": sum(
@@ -239,9 +340,17 @@ def _observe(runtime: Any, fixture: fx.PreparedFixture,
         "global_counter_effect": sum(
             1 for p in write_paths if "sendCounters" in p or "/counters/" in p
         ),
+        "capability_stamp": observe_capability_stamp(
+            store.writes, stamp_entitlement=stamp_entitlement
+        ),
         "cleanup_residue": cleanup_residue,
         "replay_delta": replay_delta,
     }
+
+    public_drive = observe_public_drive_permission(runtime)
+    if public_drive is not None:
+        observed["public_drive_permission"] = public_drive
+    return observed
 
 
 UNWIRED: Tuple[str, ...] = ()
@@ -297,6 +406,32 @@ def run_scenario(scenario_id: str, *, run_id: str,
         )
         return record, {"reason": "lane_not_wired", "logical_key": logical_key}
 
+    # The oracle is resolved HERE: from the IN-IMAGE projection table, keyed by
+    # the registry entry's oracleProjectionKey, before anything is opened and
+    # OUTSIDE every try block. Two reasons, both load bearing.
+    #
+    # There is no oracle parameter on this function and no oracle field in a
+    # certification request, so the expectation a run is graded against cannot
+    # come from the caller - which is the entire claim the refutation scenario
+    # exists to prove.
+    #
+    # And a name this module does not own fails as SILENCE in this codebase:
+    # nearly every call site downstream is wrapped in a broad ``except
+    # Exception``, so a NameError inside the run would become a tidy-looking
+    # early return. Resolving before the try region means a missing name is a
+    # loud crash instead of a clean verdict nobody earned.
+    try:
+        oracle = fx.oracle_for(scenario)
+    except fx.OracleNotRegistered:
+        record = ev.instrument_blocked(
+            run_id=run_id, scenario_id=scenario_id, revision=revision,
+            phase="prepare", reason_code="oracle_not_registered",
+        )
+        return record, {"reason": "oracle_not_registered", "logical_key": logical_key,
+                        "oracle_key": scenario.get("oracleProjectionKey")}
+
+    entitlement = stamp_entitlement(scenario)
+
     # Cleanup is allocated BEFORE the fixture is opened. Between these two
     # statements there is nothing to leak; after them there always is.
     sequence = itertools.count(1)
@@ -304,6 +439,10 @@ def run_scenario(scenario_id: str, *, run_id: str,
 
     fixture = fx.prepare(logical_key)
     fixture_opened_seq = next(sequence)
+    # Measured from the SEEDED fixture, before the lane consumes it: the lane
+    # deletes each outbox item it sends, so a ceiling read after the run would
+    # be zero and would make every oracle look impossible.
+    ceilings = fx.fixture_ceilings(fixture)
     sentinel = NetworkSentinel()
     runtime = ar.certification_runtime(
         run_id=run_id,
@@ -331,7 +470,18 @@ def run_scenario(scenario_id: str, *, run_id: str,
     phase = "readback"
     violations = [str(v) for v in getattr(runtime.effect_scope, "violations", ())]
     observed = _observe(runtime, fixture, sentinel,
-                        replay_delta=0, cleanup_residue=0)
+                        replay_delta=0, cleanup_residue=0,
+                        stamp_entitlement=entitlement)
+
+    # The oracle comparison, against the READBACK - the state of the world
+    # before replay re-executes anything and before cleanup dismantles it.
+    oracle_contradictions = oracle.contradictions(observed)
+    oracle_unmeasured = oracle.unmeasured(observed)
+    oracle_impossible = oracle.exceeds_fixture_ceiling(ceilings)
+    # One counted fact, not a tally: "the readback provably contradicts the
+    # declared oracle" is true or it is not, and a scenario declaring it at 1
+    # must not fail merely because two expectations were refuted instead of one.
+    observed["intentional_oracle_mismatch"] = 1 if oracle_contradictions else 0
 
     # Replay BEFORE cleanup: replaying a torn-down fixture proves only that a
     # missing fixture does nothing.
@@ -357,9 +507,16 @@ def run_scenario(scenario_id: str, *, run_id: str,
     observed["nonfixture_write"] += len(violations)
 
     mismatches, unmeasured = _compare(scenario, observed)
+    unmeasured = unmeasured + oracle_unmeasured
 
     detail: Dict[str, Any] = {
         "logical_key": logical_key,
+        "oracle_key": oracle.key,
+        "oracle_expectations": dict(oracle.expectations),
+        "oracle_contradictions": oracle_contradictions,
+        "oracle_impossible": oracle_impossible,
+        "fixture_ceilings": ceilings,
+        "stamp_entitlement": entitlement,
         "observed": observed,
         "required": dict(scenario.get("requiredEffects") or {}),
         "forbidden": dict(scenario.get("forbiddenEffects") or {}),
@@ -398,9 +555,32 @@ def run_scenario(scenario_id: str, *, run_id: str,
             summary=f"{len(mismatches)} declared effect count(s) did not match observation",
         )
     elif unmeasured:
+        # BEFORE the oracle verdict, on purpose. A FAIL is only meaningful from
+        # a complete instrument: reporting "the oracle was refuted" while some
+        # forbidden effect went unobserved would dress an incomplete instrument
+        # up as a finding about the product.
         record = ev.instrument_blocked(
             run_id=run_id, scenario_id=scenario_id, revision=revision,
             phase=phase, reason_code="observer_not_wired",
+        )
+    elif oracle_contradictions:
+        # Every declared effect matched AND every observer was wired, and the
+        # run still contradicted the expectation it was graded against. That is
+        # a FAIL by definition, and for the refutation scenario it is the point:
+        # the approved expectation was impossible, and the harness refused it
+        # without ever having accepted an oracle from the caller.
+        #
+        # ``readback`` rather than ``cleanup``: the contradiction is a fact
+        # about the state the product left behind, measured before replay and
+        # before teardown. Cleanup still runs - it ran above - because a failing
+        # run that leaks a fixture is worse than the failure it reports.
+        record = ev.project_evidence(
+            run_id=run_id, scenario_id=scenario_id, revision=revision,
+            outcome="fail", phase="readback",
+            counts=observed,
+            failure_code="oracle_contradicted",
+            summary=f"{len(oracle_contradictions)} declared oracle expectation(s) "
+                    "were refuted by the readback",
         )
     else:
         record = ev.project_evidence(
