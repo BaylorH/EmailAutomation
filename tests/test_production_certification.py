@@ -1877,3 +1877,123 @@ class CertificationCallerVerificationTests(unittest.TestCase):
             self.assertIn("email", str(exc))
         else:
             self.fail("expected rejection")
+
+
+class CertificationCliTests(unittest.TestCase):
+    """The CLI that drives a run against the deployed twin.
+
+    It is the agent-facing half of the instrument, so most of its behaviour is
+    refusals. The plan makes the agent's boundaries explicit -- no public push,
+    no production traffic, no model call, no raw captured text -- and a CLI that
+    could do any of those would be the single easiest way to cross them by
+    accident.
+    """
+
+    REVISION = "1a20ba44a46e0aeed7620a6408856c0aacf6c7d9"
+    URL = "https://process-user-certification-abc123-uc.a.run.app"
+
+    def _cli(self):
+        import importlib.util
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / "scripts" / "certify_production.py"
+        spec = importlib.util.spec_from_file_location("certify_production", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    # -- source-state refusals ---------------------------------------------
+
+    def test_a_dirty_checkout_is_refused(self):
+        """A stamp names a revision. If the tree has uncommitted changes, the
+        revision it names is not the code that ran."""
+        cli = self._cli()
+        with self.assertRaises(cli.CertifyRefused) as caught:
+            cli.assert_source_state(dirty=True, local_sha=self.REVISION,
+                                    upstream_sha=self.REVISION)
+        self.assertIn("dirty", str(caught.exception))
+
+    def test_an_unpushed_commit_is_refused(self):
+        """Nobody else can review, rebuild, or reproduce a local-only SHA."""
+        cli = self._cli()
+        with self.assertRaises(cli.CertifyRefused):
+            cli.assert_source_state(dirty=False, local_sha="a" * 40,
+                                    upstream_sha="b" * 40)
+
+    def test_a_clean_pushed_checkout_is_accepted(self):
+        cli = self._cli()
+        cli.assert_source_state(dirty=False, local_sha=self.REVISION,
+                                upstream_sha=self.REVISION)
+
+    # -- the agent's boundaries --------------------------------------------
+
+    def test_agent_mode_refuses_a_scenario_requiring_a_user_runtime_launch(self):
+        """A model scenario stops BEFORE /run and prints one exact command.
+
+        Not a soft warning: an agent must never submit fixture prompts to a
+        model provider, so the refusal has to precede the call, not follow it.
+        """
+        cli = self._cli()
+        verdict, command = cli.agent_mode_precheck(
+            {"scenarioId": "s", "launchClass": "user_runtime_launch_required"},
+            run_id="r-1", url=self.URL)
+        self.assertEqual(verdict, "INSTRUMENT_BLOCKED:user_runtime_launch_required")
+        self.assertIn("r-1", command)
+
+    def test_agent_mode_allows_an_agent_safe_scenario(self):
+        cli = self._cli()
+        verdict, command = cli.agent_mode_precheck(
+            {"scenarioId": "s", "launchClass": "agent_safe"},
+            run_id="r-1", url=self.URL)
+        self.assertIsNone(verdict)
+        self.assertIsNone(command)
+
+    def test_agent_mode_refuses_review_input_outright(self):
+        """Raw captured text is Baylor's to read locally, never the agent's."""
+        cli = self._cli()
+        with self.assertRaises(cli.CertifyRefused):
+            cli.assert_agent_may_call("review-input")
+        with self.assertRaises(cli.CertifyRefused):
+            cli.assert_agent_may_call("review")
+        for allowed in ("prepare", "run", "status", "abort"):
+            with self.subTest(operation=allowed):
+                cli.assert_agent_may_call(allowed)
+
+    def test_the_cli_never_contains_a_push_deploy_or_traffic_command(self):
+        """Read the source, not the behaviour: the guarantee is that these verbs
+        are ABSENT, and a test that called them to prove they fail would be
+        exercising the thing it forbids."""
+        from pathlib import Path
+        source = (Path(__file__).resolve().parents[1]
+                  / "scripts" / "certify_production.py").read_text()
+        for forbidden in ("git push", "gcloud run services update-traffic",
+                          "gcloud run deploy", "firebase deploy",
+                          "gcloud builds submit"):
+            self.assertNotIn(forbidden, source, f"CLI contains {forbidden!r}")
+
+    # -- evidence handling --------------------------------------------------
+
+    def test_a_verdict_without_a_replay_and_cleanup_is_refused(self):
+        cli = self._cli()
+        for missing in ("replay_delta", "cleanup_residue"):
+            counts = {"captured_outreach": 1, "replay_delta": 0, "cleanup_residue": 0}
+            counts.pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(cli.CertifyRefused):
+                cli.assert_verdict_is_supported({"verdict": "PASS", "counts": counts})
+
+    def test_a_pass_with_a_nonzero_forbidden_effect_is_refused(self):
+        cli = self._cli()
+        with self.assertRaises(cli.CertifyRefused):
+            cli.assert_verdict_is_supported({"verdict": "PASS", "counts": {
+                "captured_outreach": 1, "replay_delta": 0,
+                "cleanup_residue": 0, "graph_network": 1}})
+
+    def test_a_supported_pass_is_accepted(self):
+        cli = self._cli()
+        cli.assert_verdict_is_supported({"verdict": "PASS", "counts": {
+            "captured_outreach": 1, "replay_delta": 0, "cleanup_residue": 0,
+            "graph_network": 0, "nonfixture_write": 0}})
+
+    def test_run_ids_are_unique_per_invocation(self):
+        cli = self._cli()
+        self.assertNotEqual(cli.new_run_id("campaign-one-property", nonce="a"),
+                            cli.new_run_id("campaign-one-property", nonce="b"))
