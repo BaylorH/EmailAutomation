@@ -4,6 +4,64 @@
 
 ---
 
+## ⛔ READ THIS BEFORE PLANNING ANYTHING
+
+**The goal is three capabilities, proven in production:**
+
+1. **Proper event handling** — the right thing happens to the right property / thread / contact
+2. **Proper extraction** — the facts taken from replies and documents are correct
+3. **Natural English** — it reads like a person wrote it
+
+**Naturalness is DOWNSTREAM of the other two.** The worst reputational failure on
+record ("It really pissed off the listing broker") was not a writing problem — it
+was the system re-asking answered questions. You cannot write your way out of a
+scoping bug. Fix 1 and 2; 3 is how you *observe* that they worked.
+
+If a piece of work does not make one of those three true for a real user, it is
+not the work.
+
+### The failure that has happened five times
+
+> An offline or self-owned proof goes green → the green is read as clearance →
+> first contact with the live path refutes it → a HOLD is re-imposed → **and a
+> LARGER proof apparatus is commissioned.**
+
+The apparatus is the compounding error, not the fix. Two rules follow:
+
+- **Clearance is computed from live evidence, never asserted.** A registry entry
+  saying `GO` is not a gate — its evidence expires, and the record's own words are
+  *"a named registry entry is not an executable gate."* Check the evidence dates
+  before believing any green page. **This was violated again on 2026-08-19.**
+- **After a refutation, the next commit is a PRODUCT fix.** Not a scenario, not a
+  registry, not a harness.
+
+### The tripwire — run it, don't trust your judgement
+
+```bash
+python3 scripts/drift_check.py          # product vs apparatus commit ratio
+```
+
+Apparatus share by month: **June 3% → July 27% → August 46%.** August had 236
+commits and shipped nothing. If apparatus ≥ product over a window, the sixth
+failure is already forming.
+
+### Where the real signal lives
+
+`docs/release-safety/` and offline suites are NOT evidence the product works —
+the manifest itself declares `existingTestsAreRegressionEvidenceNotProductionStamps: true`.
+
+The only real production signal in four months is the **2026-08-06 campaign,
+which reproduced eight defects.** They were invisible for 13 days because nobody
+filed them. Three are now fixed (1, 3, 6). Five remain. Do not close any of them
+without a production re-run.
+
+**Current top 3, in order:**
+1. Mint a real property identity (`PropertyRef`) — closes production defects 5 and 7, and stops 1 and 3 recurring elsewhere
+2. Carry `proposal["updates"]` into the alternate-property notification — defect 5; facts are currently discarded twice and stored nowhere
+3. Re-run the 2026-08-06 size-3 campaign shape in production — the promotion condition the record set and never met
+
+---
+
 ## ⚠️ CRITICAL: Testing Account Information
 
 **DO NOT FORGET THIS. EVER.**
