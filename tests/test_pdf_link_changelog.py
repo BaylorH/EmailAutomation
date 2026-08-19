@@ -3,8 +3,15 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json")
+# setdefault, never a hard assignment: email_automation.clients builds a real
+# firestore.Client() at import time, so this module is unimportable unless the
+# credential the caller supplied survives. Assigning clobbered it with a path to
+# a real service account that is gitignored and absent from every checkout,
+# which is why this was the only one of the 166 unittest modules here that could
+# not be imported at all. The 165 others already use setdefault.
+os.environ.setdefault(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 from email_automation import processing
