@@ -5801,6 +5801,12 @@ def _augment_proposal_with_deterministic_extractions(
     return proposal
 
 
+_GROSS_BASIS_OPEX_REASON = (
+    "Deterministic definitive-none: the broker stated the quote is gross / all-in "
+    "with no separate operating expenses, so the pass-through is recorded as zero "
+    "rather than left blank."
+)
+
 # Broker states there is NO separate opex figure (gross / all-in / no pass-through).
 _NO_SEPARATE_OPEX_RE = re.compile(
     r"\bno\s+(?:separate\s+)?(?:opex|op\s*ex|operating\s+expenses?|cam)\b"
@@ -5869,6 +5875,19 @@ _DOCK_COUNT_RE = re.compile(
     r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)",
     re.IGNORECASE,
 )
+# Broker STATES there are no drive-in / grade-level doors (LIVE break: reask_none).
+# "There's no existing drive-in" is an answer, and treating it as silence is what
+# made the system ask a real broker for it thirty seconds after he had answered.
+# Scoped to the drive-in keyword family on purpose: "there are no loading docks" is
+# a statement about docks and must never write a drive-in zero.
+_NO_DRIVE_IN_RE = re.compile(
+    r"\b(?:no|none|zero|without\s+any|does\s+not\s+have\s+(?:any|a)?|"
+    r"there\s+(?:is|are)\s+no|has\s+no|lacks?)\b"
+    r"[^.!?\n]{0,40}?"
+    r"(?:drive[-\s]?ins?|grade[-\s]?level)\b"
+    r"(?:\s*(?:doors?|ramps?|access))?",
+    re.IGNORECASE,
+)
 _DIMENSIONED_SINGULAR_DRIVE_IN_RE = re.compile(
     r"\b(?:a|one)\s+(?:\d{1,2}\s*[x×]\s*\d{1,2}\s*)"
     r"(?:ft\.?\s*)?(?:drive[-\s]?in|grade[-\s]?level)\s+(?:door|ramp)\b",
@@ -5929,15 +5948,38 @@ def _augment_proposal_opex_basis(
     text = _fresh_inbound_text(conversation) or ""
     current = str(opex_update.get("value") or "").strip()
 
-    # FABRICATION guard — drop a fabricated zero/blank opex on a gross/all-in quote.
-    if _NO_SEPARATE_OPEX_RE.search(text):
-        try:
-            is_zeroish = current == "" or float(current) == 0.0
-        except ValueError:
-            is_zeroish = False
-        if is_zeroish:
+    # DEFINITIVE-NONE / FABRICATION guard.
+    #
+    # LIVE break (a real client's broker thread): the broker wrote "$18 gross, no
+    # opex", and this branch DELETED the opex update because the value was zeroish
+    # -- on the strength of him having said so. The cell stayed empty, an empty cell
+    # reads as missing, and forty-five seconds later the system asked him for the
+    # operating expenses he had just given. He replied "Are you using Ai or something
+    # to email me. This is ridiculous. I have answered these questions." and the
+    # client forwarded the thread to us.
+    #
+    # The original intent was right and the condition was backwards: it fired on the
+    # one case where the zero is a STATED FACT rather than an invention. Provenance is
+    # the whole distinction, so it is now split three ways.
+    try:
+        is_zeroish = current == "" or float(current) == 0.0
+    except ValueError:
+        is_zeroish = False
+
+    if is_zeroish:
+        if _NO_SEPARATE_OPEX_RE.search(text):
+            # He said there is none. That is an answer -- record it so the row can
+            # close and the question stops being asked.
+            opex_update["value"] = "0"
+            opex_update["reason"] = _GROSS_BASIS_OPEX_REASON
+            opex_update["confidence"] = 1.0
+            return proposal
+        if _ops_ex_winner(text) is None:
+            # He said nothing about opex at all, so a zero is the model inventing a
+            # number. Drop it; the field stays open and is legitimately asked for.
             proposal["updates"] = [u for u in updates if u is not opex_update]
             return proposal
+        # He stated a figure that happens to be zero -- leave his number alone.
 
     # BASIS guard — use the same accepted evidence winner as extraction. Rewrite
     # only the raw monthly value; an annualized, unrelated, or unsupported model
@@ -5969,11 +6011,23 @@ def _parse_feature_count(raw: str) -> Optional[str]:
 
 
 def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
-    """Explicit drive-in / grade-level door count, or None (never guesses)."""
+    """Explicit drive-in / grade-level door count, or None (never guesses).
+
+    A count the broker states wins. An ABSENCE he states records zero -- "there's no
+    existing drive-in" is an answer, and reading it as silence left the column empty,
+    which reads as missing, which is why a real broker was asked for it seconds after
+    he had answered it. Saying nothing about drive-ins still records nothing.
+    """
     if not text:
         return None
     m = _DRIVE_IN_COUNT_RE.search(text)
-    return _parse_feature_count(m.group(1)) if m else None
+    if m:
+        parsed = _parse_feature_count(m.group(1))
+        if parsed is not None:
+            return parsed
+    if _NO_DRIVE_IN_RE.search(text):
+        return "0"
+    return None
 
 
 def _extract_dimensioned_singular_drive_in_count(text: str) -> Optional[str]:

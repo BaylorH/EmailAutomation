@@ -223,8 +223,21 @@ class Bug6PhoneDigitsNotRent(unittest.TestCase):
 
 
 # ===========================================================================
-# BUG 7 — gross lease basis: broker stated NO separate opex figure; a
-# fabricated Ops Ex = 0 must be stripped, rent kept.
+# BUG 7 — gross lease basis. REVISED 2026-08-20 after a live customer escalation.
+#
+# This originally asserted that a zero Ops Ex on a gross quote must be STRIPPED,
+# on the reasoning that the model had invented a number the broker never gave.
+# The consequence was not foreseen: a stripped update leaves the cell empty, an
+# empty cell reads as missing, and a missing field is re-asked. A real client's
+# broker wrote "$18 gross, no opex" and was asked for the operating expenses
+# forty-five seconds later; he replied "Are you using Ai or something to email
+# me. This is ridiculous. I have answered these questions." and the client
+# forwarded the thread to us.
+#
+# The anti-fabrication intent is kept and made precise by PROVENANCE, which is
+# the distinction the original condition missed: a zero the broker STATED is
+# recorded, a zero he never mentioned is still stripped. See
+# tests/test_definitive_none_answers.py for the full contract.
 # ===========================================================================
 class Bug7GrossBasisFabricatedOpex(unittest.TestCase):
     TEXT = "This one is quoted at $15/SF gross - all in, no separate opex pass-through. 35,000 SF."
@@ -232,15 +245,32 @@ class Bug7GrossBasisFabricatedOpex(unittest.TestCase):
     ROWVALS = ["9 Depot Rd", "", ""]
     CONFIG = {"mappings": {"rent_sf_yr": "Rent/SF /Yr", "ops_ex_sf": "Ops Ex /SF"}}
 
-    def test_fabricated_zero_opex_stripped_rent_kept(self):
+    def test_stated_gross_basis_records_the_zero_and_keeps_rent(self):
         proposal = {"updates": [
             {"column": "Rent/SF /Yr", "value": "15", "confidence": 0.9},
             {"column": "Ops Ex /SF", "value": "0", "confidence": 0.8},
         ]}
         proposal = augment_opex(proposal, self.ROWVALS, self.HEADER, self.CONFIG, _inbound(self.TEXT))
         cols = [u["column"] for u in proposal["updates"]]
-        self.assertNotIn("Ops Ex /SF", cols, "fabricated gross-basis opex must be stripped")
+        self.assertIn("Ops Ex /SF", cols,
+                      "he stated there is no separate pass-through; recording that is "
+                      "what stops the row asking him again")
         self.assertIn("Rent/SF /Yr", cols, "rent must be preserved")
+        opex = next(u for u in proposal["updates"] if u["column"] == "Ops Ex /SF")
+        self.assertEqual(str(opex["value"]), "0")
+
+    def test_zero_opex_with_no_stated_basis_is_still_stripped(self):
+        # The original anti-fabrication intent, kept and made precise. Nothing in
+        # this text says anything about operating expenses, so a zero is invented.
+        text = "The building is 35,000 SF and available from October."
+        proposal = {"updates": [
+            {"column": "Rent/SF /Yr", "value": "15", "confidence": 0.9},
+            {"column": "Ops Ex /SF", "value": "0", "confidence": 0.8},
+        ]}
+        proposal = augment_opex(proposal, self.ROWVALS, self.HEADER, self.CONFIG, _inbound(text))
+        cols = [u["column"] for u in proposal["updates"]]
+        self.assertNotIn("Ops Ex /SF", cols, "an invented zero must still be stripped")
+        self.assertIn("Rent/SF /Yr", cols)
 
     def test_real_opex_not_stripped(self):
         # NEGATIVE CONTROL — a stated opex figure survives.
