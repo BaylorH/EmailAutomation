@@ -683,6 +683,33 @@ _CALL_REQUEST_RE = re.compile(
 )
 
 
+# Content that means a message is a REAL reply rather than a bare auto-responder:
+# a figure, a question, or an explicit ask. An auto-reply carries none of these.
+_SUBSTANTIVE_CONTENT_RE = re.compile(
+    r"\$\s*\d|\d[\d,]*\s*(?:sf|sq\.?\s*ft|square\s+feet)\b"
+    r"|\b\d+(?:\.\d+)?\s*/\s*sf\b"
+    r"|\bnnn\b|\bopex\b|\bops\s*ex\b|\bclear\s+height\b|\bamps?\b"
+    r"|\b(?:is|are|remains?)\s+available\b|\bno\s+longer\s+available\b"
+    r"|\?"
+    r"|\bcall\b|\btour\b|\bwalk[-\s]?through\b",
+    re.IGNORECASE,
+)
+
+
+def _is_bare_auto_reply(text: str) -> bool:
+    """True only for a message that IS an auto-responder, not one that mentions being away.
+
+    The out-of-office guard used to short-circuit the whole deterministic classifier on
+    any OOO-ish phrase. A real broker apologising for a slow reply -- "was on vacation
+    last week, sorry for the delay! It is available, 7000 SF, $0.90/SF NNN" -- says
+    exactly those words, and skipping the rest of the classifier for that message
+    silently swallowed call requests and defeated the deferral silence guard.
+    """
+    if not _looks_like_out_of_office(text):
+        return False
+    return not _SUBSTANTIVE_CONTENT_RE.search(text or "")
+
+
 def _looks_like_call_request(text: str) -> bool:
     return bool(text and _CALL_REQUEST_RE.search(text))
 
@@ -1584,7 +1611,15 @@ def _augment_events_with_deterministic_signals(
                 and classify_tour_intent(latest_text_raw) == TOUR_INTENT_COURTESY
             )
         ]
-        return proposal
+        events = proposal["events"]
+        # The stripping above always applies. The SHORT CIRCUIT does not: it is only
+        # right for a message that really is just an auto-responder. A real broker
+        # apologising for a slow reply says the same words and means none of it, and
+        # returning here for him skipped every check below -- so a call he asked for
+        # in the same sentence was silently swallowed, and a deferral he stated could
+        # not silence the re-ask. Found in real customer traffic.
+        if _is_bare_auto_reply(latest_text_raw):
+            return proposal
 
     # Engaged-alternative guard (LIVE break B9): a scoped "not interested in that
     # suite, but show me what else you have" is an active lead, not an opt-out.
