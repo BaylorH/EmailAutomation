@@ -686,6 +686,83 @@ _CALL_REQUEST_RE = re.compile(
 def _looks_like_call_request(text: str) -> bool:
     return bool(text and _CALL_REQUEST_RE.search(text))
 
+# A broker saying a field is COMING (LIVE break: deferred_reask). Live 2026-08-12 he
+# wrote "Operating expenses are still pending" twice and "I will send operating
+# expenses next" once; each drew a byte-identical re-ask for that same field, three
+# in fourteen minutes, the last twenty-five seconds after he promised it. The
+# existing no-re-ask guard only covers fields the system already HAS -- a field it
+# is still MISSING, and has been promised, is the opposite case and needs its own.
+_FIELD_DEFERRAL_RE = re.compile(
+    r"\b(?:still|currently)\s+(?:pending|outstanding|unavailable|waiting)\b"
+    r"|\b(?:is|are|remains?)\s+(?:still\s+)?(?:pending|outstanding)\b"
+    r"|\bi'?ll\s+(?:send|get|forward|share|pull|chase|follow\s+up\s+with)\b"
+    r"|\bi\s+will\s+(?:send|get|forward|share|pull|chase)\b"
+    r"|\bwill\s+(?:send|forward|share)\s+(?:them|it|those|that|these)\b"
+    r"|\b(?:sending|getting)\s+(?:them|it|those|that)\s+(?:over|to\s+you)\b"
+    r"|\bwaiting\s+(?:on|for)\b"
+    r"|\bdon'?t\s+have\s+(?:that|those|it|them)\s+(?:yet|handy|on\s+hand)\b"
+    r"|\b(?:coming|available)\s+(?:shortly|soon|next|later)\b"
+    r"|\bonce\s+i\s+(?:have|get|hear\s+back)\b",
+    re.IGNORECASE,
+)
+
+# Sentence shapes that are ONLY a request for information.
+_INFO_REQUEST_RE = re.compile(
+    r"\b(?:could|can|would)\s+you\s+(?:please\s+)?(?:provide|send|share|confirm|"
+    r"forward|let\s+me\s+know|advise)\b"
+    r"|\bwould\s+you\s+be\s+able\s+to\b"
+    r"|\bplease\s+(?:provide|send|share|confirm|forward|let\s+me\s+know|advise)\b"
+    r"|\bto\s+complete\s+the\s+(?:property\s+)?details\b"
+    r"|\bwhat\s+(?:are|is|'s)\s+the\b"
+    r"|\bdo\s+you\s+have\s+(?:the|a|an|any)\b"
+    r"|\bany\s+update\s+on\b"
+    r"|\blooking\s+for\s+the\s+following\b",
+    re.IGNORECASE,
+)
+# Openers, sign-offs and pleasantries that carry no content of their own.
+_COURTESY_LINE_RE = re.compile(
+    r"^(?:hi|hello|hey|dear|good\s+(?:morning|afternoon|evening))\b.{0,40}$"
+    r"|^(?:thanks?|thank\s+you|many\s+thanks|appreciate\s+it|got\s+it|understood|"
+    r"perfect|great|noted|sounds\s+good|no\s+problem)\b.{0,60}$"
+    r"|^(?:best|regards|sincerely|cheers)\b.{0,30}$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_field_deferral(text: str) -> bool:
+    """The broker has said a value is coming, so asking again is repeating ourselves."""
+    return bool(text and _FIELD_DEFERRAL_RE.search(text))
+
+
+def _asks_us_a_question(text: str) -> bool:
+    """Did the broker put a question back to us? Then we owe him a reply."""
+    return "?" in (text or "")
+
+
+def _is_bare_information_request(body: str) -> bool:
+    """True when a drafted reply is NOTHING but a request for information.
+
+    Greetings, sign-offs, pleasantries and the bulleted field list are stripped;
+    every sentence that survives must be a request. A reply carrying any real
+    content of its own is never a bare request, so it can never be suppressed.
+    """
+    if not (body or "").strip():
+        return False
+    fragments: List[str] = []
+    for line in str(body).splitlines():
+        line = line.strip()
+        if not line or line.startswith(("-", "*", "•")):
+            continue  # the field list itself
+        if _COURTESY_LINE_RE.match(line):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", line):
+            sentence = sentence.strip()
+            if sentence and not _COURTESY_LINE_RE.match(sentence):
+                fragments.append(sentence)
+    if not fragments:
+        return False
+    return all(_INFO_REQUEST_RE.search(f) for f in fragments)
+
 _OUT_OF_OFFICE_RE = re.compile(
     r"\bout\s+of\s+(?:the\s+)?office\b"
     r"|\booo\b"
@@ -1546,6 +1623,19 @@ def _augment_events_with_deterministic_signals(
         if not any((e or {}).get("type") == "call_requested" for e in events):
             events.append({"type": "call_requested", "reason": "call_request_phrase"})
     if any((e or {}).get("type") == "call_requested" for e in events):
+        proposal["response_email"] = None
+
+    # Deferral → stay silent (LIVE break: deferred_reask). When the broker has said
+    # the value is coming, asks us nothing, and the only thing we drafted is the same
+    # request again, the correct behaviour is to say nothing. The follow-up scheduler
+    # already owns the later nudge, so silence costs no field and no thread. Narrow on
+    # purpose: a question of his, or any reply with content of its own, is untouched.
+    if (
+        proposal.get("response_email")
+        and _looks_like_field_deferral(latest_text_raw)
+        and not _asks_us_a_question(latest_text_raw)
+        and _is_bare_information_request(proposal.get("response_email"))
+    ):
         proposal["response_email"] = None
 
     # HEAD retention/terminal layer reasons over the FULL latest inbound plus its

@@ -431,9 +431,112 @@ MIXED_INFO_AND_QUESTION = MultiTurnScenario(
 )
 
 
+# ---------------------------------------------------------------------------
+# Scenario 4: Deferred Field And Call Request
+#
+# Built from the 2026-08-11 live thread on 12870 W Indian School Rd, which
+# reproduced two failures that no existing scenario covers:
+#
+#   * The broker said "Let's hop on a quick call before we continue." The system
+#     replied "Understood." and kept asking for operating expenses. No call
+#     notification ever reached the operator, and the broker's "before we
+#     continue" was ignored.
+#
+#   * The broker then said operating expenses were still pending and that he
+#     would send them next. The system sent a BYTE-IDENTICAL request for
+#     operating expenses three times in fourteen minutes, the third one one
+#     minute after he said he would send them.
+#
+# Neither is in PROD-0806-1..8. Both are priority 1 (event handling) and
+# priority 3 (it reads like a person wrote it).
+# ---------------------------------------------------------------------------
+
+DEFERRED_FIELD_AND_CALL_REQUEST = MultiTurnScenario(
+    name="deferred_field_and_call_request",
+    description=(
+        "Broker requests a call mid-thread, then defers one field. The call must "
+        "reach the operator, and a deferral must not be answered by re-sending "
+        "the same request."
+    ),
+    property_address="9250 Baymeadows Rd",
+    city="Jacksonville",
+    contact_name="Mike Torres",
+    contact_email="bp21harrison@gmail.com",
+    outreach_subject="Inquiry - 9250 Baymeadows Rd, Jacksonville",
+    outreach_body=(
+        "Hi Mike,\n\n"
+        "I'm reaching out on behalf of a client looking for industrial space "
+        "in the Jacksonville area. Could you provide details on the property "
+        "at 9250 Baymeadows Rd?\n\n"
+        "Specifically, we'd like to know:\n"
+        "- Total square footage\n"
+        "- Rent per SF per year\n"
+        "- Operating expenses per SF\n\n"
+        "Thank you,\n"
+        "Jill"
+    ),
+    turns=[
+        # Turn 1: a plain partial answer. Baseline - this part already works.
+        TurnSpec(
+            action=TurnAction.BROKER_REPLY,
+            description="Broker provides square footage only",
+            body=(
+                "Hi Jill,\n\n"
+                "Happy to help. The building is 22,500 SF.\n\n"
+                "Best,\nMike"
+            ),
+            expected_sheet_values={"Total SF": "22500"},
+            expected_notification_kinds=["sheet_update"],
+            expected_response_type="missing_fields",
+            expect_auto_reply=True,
+        ),
+        # Turn 2: THE CALL REQUEST. A call is an operator action, and the broker
+        # gated the rest of the conversation on it ("before we continue").
+        TurnSpec(
+            action=TurnAction.BROKER_REPLY,
+            description="Broker gives rent and asks for a call before continuing",
+            body=(
+                "Hi Jill,\n\n"
+                "Rent is $15.40/SF/year. Let's hop on a quick call before we "
+                "continue.\n\n"
+                "Best,\nMike"
+            ),
+            expected_sheet_values={"Rent/SF/Yr": "15.40"},
+            # The rent still gets written; what must ALSO happen is the call
+            # reaching a human. Live, it did not.
+            expected_notification_kinds=["action_needed"],
+            expected_escalation_reason="call",
+        ),
+        # Turn 3: THE DEFERRAL. The broker has said the number is coming.
+        # A person waits. The system re-sent the identical request.
+        TurnSpec(
+            action=TurnAction.BROKER_REPLY,
+            description="Broker defers the last field and promises to send it",
+            body=(
+                "Hi Jill,\n\n"
+                "Operating expenses are still pending. I will send them next.\n\n"
+                "Best,\nMike"
+            ),
+            # No new fact -> nothing to write.
+            expected_sheet_values={},
+            # Silence is the correct behaviour here. Enforced now.
+            expect_auto_reply=False,
+            expected_status=PropertyStatus.IN_PROGRESS,
+        ),
+    ],
+    final_sheet_values={
+        "Total SF": "22500",
+        "Rent/SF/Yr": "15.40",
+    },
+    # The row is deliberately NOT complete: operating expenses never arrived.
+    final_status=PropertyStatus.IN_PROGRESS,
+)
+
+
 # All scenarios
 ALL_SCENARIOS = {
     "gradual_info_gathering": GRADUAL_INFO_GATHERING,
     "escalation_and_resume": ESCALATION_AND_RESUME,
     "mixed_info_and_question": MIXED_INFO_AND_QUESTION,
+    "deferred_field_and_call_request": DEFERRED_FIELD_AND_CALL_REQUEST,
 }

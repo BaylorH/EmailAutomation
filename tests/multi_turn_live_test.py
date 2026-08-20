@@ -452,6 +452,42 @@ class MultiTurnTestRunner:
                 count += 1
         return count
 
+    def _outbound_bodies_for_thread(self, thread_id: str) -> List[str]:
+        """Normalized outbound bodies, chronological.
+
+        Used to catch the system sending the SAME paragraph twice. A repeated
+        identical request is invisible to a count-based duplicate check --
+        one reply per broker turn is exactly what the count expects -- but it
+        is the single most visible way this product reads as a machine. Live
+        2026-08-11 on 12870 W Indian School Rd it sent a byte-identical
+        "could you please provide: - Ops Ex / SF" three times in 14 minutes,
+        the third one right after the broker said he would send it next.
+        """
+        bodies = []
+        for m in self._get_thread_messages(thread_id):
+            data = m.to_dict() if hasattr(m, "to_dict") else (m.get("data") or m)
+            if data.get("direction") != "outbound":
+                continue
+            body = data.get("body") or {}
+            text = ""
+            if isinstance(body, dict):
+                text = body.get("content") or body.get("preview") or ""
+            elif isinstance(body, str):
+                text = body
+            text = text or data.get("content") or ""
+            # Collapse whitespace so a reflow is not mistaken for new wording.
+            bodies.append(" ".join(str(text).split()).lower())
+        return bodies
+
+    @staticmethod
+    def _strip_signature(body: str) -> str:
+        """Drop the fixed signature block; only the authored part is compared."""
+        for marker in ("best,", "thanks,", "thank you,", "regards,"):
+            idx = body.find(marker)
+            if idx > 0:
+                return body[:idx].strip()
+        return body.strip()
+
     # ------------------------------------------------------------------
     # Sheet verification & row management
     # ------------------------------------------------------------------
@@ -941,6 +977,30 @@ class MultiTurnTestRunner:
                         f"    WARNING: Expected auto-reply not sent "
                         f"(outbound count: {outbound_count}, may be delayed)"
                     )
+
+                # An UNWANTED reply is a real failure, not a missing warning.
+                # Nothing enforced this before: `expect_auto_reply=False` was
+                # declared by scenarios and then never checked, so a turn where
+                # the right behaviour is to say nothing could never fail.
+                if not turn.expect_auto_reply and result.auto_reply_sent:
+                    result.errors.append(
+                        "Sent an auto-reply on a turn where silence was the "
+                        f"correct behaviour ({turn.description})"
+                    )
+
+                # The same paragraph twice reads as a machine, and a per-turn
+                # count can never see it.
+                bodies = [
+                    self._strip_signature(b)
+                    for b in self._outbound_bodies_for_thread(updated_thread_id)
+                ]
+                for i in range(1, len(bodies)):
+                    if bodies[i] and bodies[i] == bodies[i - 1]:
+                        result.errors.append(
+                            "Sent a byte-identical outbound message twice in a row: "
+                            f"{bodies[i][:120]!r}"
+                        )
+                        break
 
             # -- Duplicate check --
             # Only flag as error if significantly more outbound than expected

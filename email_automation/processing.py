@@ -39,6 +39,7 @@ from .ai_processing import (
     _attachment_property_verdict,
     _append_ai_meta,
     _detect_target_terminal_reason,
+    _looks_like_field_deferral,
     _looks_like_requirements_mismatch_nonviable,
     _normalize_safe_broker_flyer_url,
     _property_clause_spans,
@@ -4836,6 +4837,25 @@ def _complete_response_requests_more_information(response_body: Optional[str]) -
     return "?" in scan or bool(_COMPLETE_RESPONSE_OUTWARD_REQUEST_RE.search(scan))
 
 
+def _deferral_holds_missing_fields_reply(full_text: str) -> bool:
+    """Has the broker just promised the values we are still missing?
+
+    LIVE break (2026-08-12): three byte-identical missing-field requests in fourteen
+    minutes, the last twenty-five seconds after "I will send operating expenses next".
+    They were identical because Scenario 3 composes the request DETERMINISTICALLY from
+    the missing-field list -- suppressing the model's draft cannot reach it, so the
+    send decision itself has to hold.
+
+    Reasons only over the FRESH message: a deferral quoted from earlier in the thread
+    is history, and must never silence a reply. A deferral that also puts a question
+    to us is a reply we owe him, so it does not hold either.
+    """
+    fresh, _ = _split_fresh_and_quoted(full_text or "")
+    if not fresh or not _looks_like_field_deferral(fresh):
+        return False
+    return "?" not in fresh
+
+
 def _select_automatic_response_body(
     scenario: str,
     llm_response_email: Optional[str],
@@ -8831,7 +8851,20 @@ Could you please provide your phone number so I can give you a call?"""
                         
                         missing_fields = check_missing_required_fields(current_row, header, column_config)
                         
-                        if missing_fields:
+                        if missing_fields and _deferral_holds_missing_fields_reply(_full_text):
+                            # He has said the numbers are coming and asked us nothing.
+                            # A person waits. Re-arm the follow-up so the thread still
+                            # gets its later nudge, and send nothing now.
+                            print(
+                                "🤐 Broker deferred the outstanding field(s) - staying "
+                                "silent instead of repeating the request"
+                            )
+                            try:
+                                from .followup import schedule_followup_after_auto_response
+                                schedule_followup_after_auto_response(user_id, thread_id)
+                            except Exception as e:
+                                print(f"⚠️ Failed to re-arm follow-up after deferral silence: {e}")
+                        elif missing_fields:
                             # Scenario 3: Thank you + request missing fields
                             response_body = _select_automatic_response_body(
                                 "missing_fields",
