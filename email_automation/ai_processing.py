@@ -1632,6 +1632,32 @@ def _augment_events_with_deterministic_signals(
             proposal["events"] = kept
             events = proposal["events"]
 
+    # A deficiency the broker offers to FIX is not a dead property (LIVE break:
+    # remediable_mismatch). He wrote "No drive in door. 1 loading dock. The loading
+    # dock can be ramped for drive in" -- which is a broker saying the requirement
+    # CAN be met. The row was terminalized as a requirements mismatch and he was told
+    # the property was no longer available; he replied "The property IS available" and
+    # the client had to phone him and repair the sheet by hand.
+    #
+    # The remediation offer was already detected -- it is used to protect the drive-in
+    # column value -- but nothing stopped the terminal EVENT, so a lead the broker was
+    # actively trying to keep alive was closed anyway.
+    #
+    # Scoped to requirements_mismatch: a genuinely dead property stays dead however
+    # convertible its dock is, and an explicitly REFUSED remedy ("cannot be ramped")
+    # is not a remediation offer, which _looks_like_access_remediation already handles.
+    if _looks_like_access_remediation(latest_text_raw):
+        kept = [
+            e for e in events
+            if not (
+                (e or {}).get("type") == "property_unavailable"
+                and str((e or {}).get("reason") or "").strip().lower() == "requirements_mismatch"
+            )
+        ]
+        if len(kept) != len(events):
+            proposal["events"] = kept
+            events = proposal["events"]
+
     # Colleague/third-party redirect → force wrong_contact + escalate (no auto-reply).
     # Runs BEFORE the property_unavailable early-return so it survives a multi-intent
     # reply ("just leased, but try 4400 Referral Way, and loop in my colleague Dana").
