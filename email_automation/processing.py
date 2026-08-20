@@ -1,3 +1,4 @@
+import html as html_module
 import re
 import requests
 import hashlib
@@ -4837,6 +4838,79 @@ def _complete_response_requests_more_information(response_body: Optional[str]) -
     return "?" in scan or bool(_COMPLETE_RESPONSE_OUTWARD_REQUEST_RE.search(scan))
 
 
+_OUTBOUND_REPEAT_LOOKBACK = 3
+
+_SIGNATURE_CUT_RE = re.compile(
+    r"\b(?:best|thanks|thank\s+you|regards|sincerely|cheers)\s*,",
+    re.IGNORECASE,
+)
+_QUOTE_CUT_RE = re.compile(r"\nOn\s.{0,120}?wrote:|\nFrom:\s", re.IGNORECASE)
+
+
+def _authored_core(body: str) -> str:
+    """The part of a message we actually WROTE, normalised for comparison.
+
+    Strips markup, the quoted thread history and the fixed signature, then
+    collapses whitespace and case. Two messages with the same authored core are
+    the same message to the person receiving them, whatever the footer or the
+    reflow does.
+    """
+    text = html_module.unescape(re.sub(r"<[^>]+>", " ", re.sub(
+        r"(?i)<br\s*/?>|</(?:p|div|tr|table)>", "\n", body or "")))
+    text = _QUOTE_CUT_RE.split(text)[0]
+    match = _SIGNATURE_CUT_RE.search(text)
+    if match and match.start() > 0:
+        text = text[:match.start()]
+    return " ".join(text.split()).lower()
+
+
+def _repeats_recent_outbound(candidate: str, previous_bodies, lookback: int = _OUTBOUND_REPEAT_LOOKBACK) -> bool:
+    """Would sending this repeat something we already said?
+
+    LIVE break (two separate real-customer threads): the same missing-field
+    request went out three times in fourteen minutes in one, and four times over
+    three days in the other. Both brokers said so, bluntly, and in the second the
+    client's own broker apologised for the automation and switched it off by hand.
+
+    Every individual cause is worth fixing and several have been -- but the list of
+    causes is open-ended and the symptom is not, so the symptom gets a backstop.
+    The lookback is deliberate: in the second thread an unrelated follow-up landed
+    between two of the identical requests, so comparing only with the immediately
+    previous outbound would have let it through.
+    """
+    core = _authored_core(candidate)
+    if not core:
+        return False
+    recent = list(previous_bodies or [])[-lookback:] if lookback else list(previous_bodies or [])
+    return any(_authored_core(previous) == core for previous in recent)
+
+
+def _recent_outbound_bodies(user_id: str, thread_id: str, limit: int = _OUTBOUND_REPEAT_LOOKBACK):
+    """Chronological authored bodies of the last few outbound messages in a thread."""
+    try:
+        docs = (
+            _fs.collection("users").document(user_id)
+            .collection("threads").document(thread_id)
+            .collection("messages").stream()
+        )
+        rows = []
+        for doc in docs:
+            data = doc.to_dict() or {}
+            if (data.get("direction") or "").lower() != "outbound":
+                continue
+            body = data.get("body")
+            content = (body.get("content") if isinstance(body, dict) else body) or data.get("content") or ""
+            stamp = str(data.get("sentDateTime") or data.get("receivedDateTime")
+                        or data.get("timestamp") or "")
+            rows.append((stamp, content))
+        rows.sort(key=lambda row: row[0])
+        return [content for _stamp, content in rows[-limit:]]
+    except Exception as exc:
+        # Never let a history read stop a legitimate reply going out.
+        print(f"⚠️ Could not read recent outbound history for repeat check: {exc}")
+        return []
+
+
 def _deferral_holds_missing_fields_reply(full_text: str) -> bool:
     """Has the broker just promised the values we are still missing?
 
@@ -8875,8 +8949,25 @@ Could you please provide your phone number so I can give you a call?"""
                             )
                             if llm_response_email:
                                 print("ℹ️ Using deterministic authoritative missing-fields response")
-                            
-                            sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
+
+                            if _repeats_recent_outbound(
+                                response_body,
+                                _recent_outbound_bodies(user_id, thread_id),
+                            ):
+                                # We already said exactly this. Saying it again is the
+                                # single most visible way this product reads as a machine.
+                                print(
+                                    "🛑 This is word-for-word what we last sent - staying "
+                                    "silent rather than repeating ourselves"
+                                )
+                                try:
+                                    from .followup import schedule_followup_after_auto_response
+                                    schedule_followup_after_auto_response(user_id, thread_id)
+                                except Exception as e:
+                                    print(f"⚠️ Failed to re-arm follow-up after repeat suppression: {e}")
+                                sent = None
+                            else:
+                                sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent thank you + missing fields request to: {to_addr_lower}")
                                 try:
@@ -8884,6 +8975,11 @@ Could you please provide your phone number so I can give you a call?"""
                                     schedule_followup_after_auto_response(user_id, thread_id)
                                 except Exception as e:
                                     print(f"⚠️ Failed to reschedule follow-up after missing-fields response: {e}")
+                            elif sent is None:
+                                # Suppressed on purpose. NOT a send failure: routing it
+                                # through the failure path would queue a retry and post
+                                # the duplicate a few minutes later.
+                                pass
                             else:
                                 response_sent = _handle_auto_response_send_failure(
                                     user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
