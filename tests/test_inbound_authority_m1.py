@@ -17,6 +17,21 @@ os.environ.setdefault(
 from email_automation import followup, processing
 
 
+# The canonical inbound markers. followUpConfig.brokerHasReplied joined them
+# with FDR-061: it is an inbound FACT -- monotonic, never cleared -- and not
+# scheduling state. hasInboundReply cannot carry it because the resume path
+# resets that flag every cycle, so it means "replied since the last resume".
+# These tests assert the exact key set precisely so a terminal or archived
+# thread still records the facts and still does not have its follow-up
+# scheduling rewritten.
+INBOUND_MARKER_KEYS = {
+    "hasInboundReply",
+    "lastInboundAt",
+    "updatedAt",
+    "followUpConfig.brokerHasReplied",
+}
+
+
 class _ThreadSnapshot:
     def __init__(self, data=None, *, exists=True):
         self._data = deepcopy(data or {})
@@ -194,7 +209,7 @@ class CanonicalInboundMarkerTests(unittest.TestCase):
         self.assertEqual(1, len(fake_fs.updates))
         update = fake_fs.updates[0]
         self.assertEqual(
-            {"hasInboundReply", "lastInboundAt", "updatedAt"},
+            INBOUND_MARKER_KEYS,
             set(update),
         )
         self.assertEqual("completed", fake_fs.data["status"])
@@ -212,7 +227,7 @@ class CanonicalInboundMarkerTests(unittest.TestCase):
         self.assertEqual(1, len(fake_fs.updates))
         update = fake_fs.updates[0]
         self.assertEqual(
-            {"hasInboundReply", "lastInboundAt", "updatedAt"},
+            INBOUND_MARKER_KEYS,
             set(update),
         )
         self.assertEqual("archived", fake_fs.data["status"])
@@ -256,7 +271,7 @@ class CanonicalInboundMarkerTests(unittest.TestCase):
 
                 self.assertEqual(1, len(fake_fs.updates))
                 self.assertEqual(
-                    {"hasInboundReply", "lastInboundAt", "updatedAt"},
+                    INBOUND_MARKER_KEYS,
                     set(fake_fs.updates[0]),
                 )
                 self.assertEqual(
@@ -312,7 +327,7 @@ class CanonicalInboundMarkerTests(unittest.TestCase):
                 self.assertTrue(fake_fs.data["hasInboundReply"])
                 self.assertIn("lastInboundAt", fake_fs.data)
                 self.assertEqual(
-                    {"hasInboundReply", "lastInboundAt", "updatedAt"},
+                    INBOUND_MARKER_KEYS,
                     set(fake_fs.updates[-1]),
                 )
 

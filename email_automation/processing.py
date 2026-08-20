@@ -3997,11 +3997,22 @@ def _late_reply_after_followup_exhaustion_patch(
         or (_is_no_new_reply_text(message_text) and not has_attachments)
     ):
         return None
+    # This patch is applied with set(merge=True) AND copied over the in-memory
+    # thread_data, so the engaged marker is carried as a whole followUpConfig
+    # map built from the existing one. A dotted key would be written as a
+    # literal field name by set(), and a bare nested map would blank the rest
+    # of the config in memory for the remainder of this request.
+    from .followup import FOLLOWUP_BROKER_REPLIED_FIELD
+
+    existing_config = data.get("followUpConfig")
+    followup_config = dict(existing_config) if isinstance(existing_config, dict) else {}
+    followup_config[FOLLOWUP_BROKER_REPLIED_FIELD] = True
     return {
         "status": THREAD_STATUS["active"],
         "statusReason": "late_reply_after_max_followups",
         "followUpStatus": "max_reached",
         "hasInboundReply": True,
+        "followUpConfig": followup_config,
         "lastInboundAt": SERVER_TIMESTAMP,
         "updatedAt": SERVER_TIMESTAMP,
     }

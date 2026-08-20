@@ -433,6 +433,30 @@ def _followup_durable_config(
     }
 
 
+FOLLOWUP_BROKER_REPLIED_FIELD = "brokerHasReplied"
+
+
+def _followup_broker_has_replied(followup_config: Any) -> bool:
+    """Return whether this broker has EVER replied on the thread.
+
+    The marker is durable follow-up config, deliberately, and not a thread
+    field. It has to be readable at all three call sites of
+    ``_resolve_followup_message`` -- and one of those three is the sealed send
+    envelope, which never sees the live thread document and can only decode the
+    durable config back out of the send identity. It also has to survive a
+    reply that lands mid-send: the reconciliation paths tolerate a durable
+    CONFIG change under a preservation outcome, and tolerate no thread-field
+    change at all, so a thread-level marker would refuse the bookkeeping for an
+    email Graph had already accepted.
+
+    Stored config is client-writable and therefore untrusted: only an exact
+    ``True`` counts, so no truthy string or number can flip the copy.
+    """
+    if not isinstance(followup_config, dict):
+        return False
+    return followup_config.get(FOLLOWUP_BROKER_REPLIED_FIELD) is True
+
+
 def _followup_config_fingerprint(followup_config: Dict[str, Any]) -> str:
     """Fingerprint durable scheduling inputs while excluding runtime claim fields."""
     durable_config = _followup_durable_config(followup_config)
@@ -497,7 +521,10 @@ def _resolve_followup_message(
     """Resolve the exact final body from durable follow-up inputs."""
     message = (
         _followup_raw_message(followup_config, followup_index)
-        or _get_default_followup_message(followup_index)
+        or _get_default_followup_message(
+            followup_index,
+            engaged=_followup_broker_has_replied(followup_config),
+        )
     )
     safe_contact_name = _safe_followup_contact_name(contact_name)
     first_name = (
@@ -2997,7 +3024,10 @@ def _send_followup_email(
         followup_message = followup.get("message", "")
 
         if not followup_message:
-            followup_message = _get_default_followup_message(followup_index)
+            followup_message = _get_default_followup_message(
+                followup_index,
+                engaged=_followup_broker_has_replied(followup_config),
+            )
 
         contract_error = _followup_column_contract_error(
             followup_message,
@@ -3966,6 +3996,9 @@ def schedule_followup_after_auto_response(user_id: str, thread_id: str) -> bool:
             "followUpConfig.nextFollowUpAt": next_followup_at,
             "followUpConfig.pausedAt": None,
             "hasInboundReply": False,
+            # An automatic mid-thread reply only happens because the broker
+            # wrote to us, so this resume is engagement evidence too.
+            f"followUpConfig.{FOLLOWUP_BROKER_REPLIED_FIELD}": True,
             "lastOutboundAt": SERVER_TIMESTAMP,
             "updatedAt": SERVER_TIMESTAMP,
         })
@@ -4077,7 +4110,25 @@ def schedule_followup_for_thread(
         "lastFollowUpSentAt": None
     }
 
-    fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
+    # This write replaces the whole config on purpose, so that a rejected or
+    # stale one leaves nothing behind. That would also erase the engagement
+    # marker, and a thread SURVIVES a property replacement: a broker who
+    # answered about the previous property would be told he had never written.
+    # The marker is a fact about the counterparty, not about the sequence, so
+    # it is carried across. The read is deliberately not wrapped -- the update
+    # below is not either, and both belong to the same outbound boundary.
+    thread_ref = (
+        fs.collection("users").document(user_id)
+        .collection("threads").document(thread_id)
+    )
+    existing = thread_ref.get()
+    existing_config = ((existing.to_dict() or {}) if existing.exists else {}).get(
+        "followUpConfig"
+    )
+    if _followup_broker_has_replied(existing_config):
+        thread_followup_config[FOLLOWUP_BROKER_REPLIED_FIELD] = True
+
+    thread_ref.update({
         "followUpConfig": thread_followup_config,
         "followUpStatus": "waiting",
         "hasInboundReply": False,
@@ -4120,6 +4171,11 @@ def cancel_followup_on_response(user_id: str, thread_id: str):
             "hasInboundReply": True,
             "lastInboundAt": SERVER_TIMESTAMP,
             "updatedAt": SERVER_TIMESTAMP,
+            # Monotonic and never cleared. hasInboundReply cannot carry this:
+            # the resume path resets it to false every cycle, which is what
+            # lets the scheduler resume at all, so it means "replied since the
+            # last resume" rather than "has ever replied".
+            f"followUpConfig.{FOLLOWUP_BROKER_REPLIED_FIELD}": True,
         }
 
         thread_blocks_pause = current_thread_status in {
@@ -4214,6 +4270,11 @@ def resume_followup_if_silent(user_id: str, thread_id: str, silence_threshold_da
             "followUpStatus": "waiting",
             "followUpConfig.nextFollowUpAt": next_followup_at,
             "hasInboundReply": False,  # Reset for next check
+            # This path cannot run without a lastInboundAt, so reaching here is
+            # itself proof the broker replied. Marking it here is what covers
+            # threads whose reply predates this field -- and this is the exact
+            # path that produced all ten nudges measured in FDR-061.
+            f"followUpConfig.{FOLLOWUP_BROKER_REPLIED_FIELD}": True,
             "updatedAt": SERVER_TIMESTAMP
         })
 
@@ -4225,8 +4286,23 @@ def resume_followup_if_silent(user_id: str, thread_id: str, silence_threshold_da
         return False
 
 
-def _get_default_followup_message(index: int) -> str:
-    """Return default follow-up message based on sequence position."""
+def _get_default_followup_message(index: int, engaged: bool = False) -> str:
+    """Return the default follow-up body for a sequence position.
+
+    ``engaged`` selects the copy for a broker who has ALREADY replied on this
+    thread. The silent copy tells him he never answered -- and the final silent
+    nudge tells him we have concluded the property is not a fit -- which is the
+    defect measured in FDR-061 on ten real threads, two of them brokers who had
+    replied seven and five times.
+
+    The engaged copy asks for the outstanding details in general terms rather
+    than naming them: this resolver is reproduced byte-for-byte by two outbound
+    integrity checks from durable config plus index alone, so the body may not
+    depend on anything that is not durable, and the specific outstanding fields
+    are not.
+    """
+    if engaged:
+        return _get_engaged_followup_message(index)
     messages = [
         # Follow-up 1: Friendly reminder
         """Hi [NAME],
@@ -4250,6 +4326,42 @@ Thank you!""",
         """Hi [NAME],
 
 This will be my final follow-up regarding the property above. I'll assume this one isn't a fit for my client's needs, but if you'd like to discuss, I'm happy to connect.
+
+If anything else comes available in the area that might work, please keep me in mind.
+
+Thanks again for your time!"""
+    ]
+
+    if index < len(messages):
+        return messages[index]
+    return messages[-1]
+
+
+def _get_engaged_followup_message(index: int) -> str:
+    """Return the default follow-up body for a broker who has already replied."""
+    messages = [
+        # Follow-up 1: acknowledge the exchange, ask for what is still missing
+        """Hi [NAME],
+
+Thanks for getting back to me on the property above. I'm still short a few details before I can put this in front of my client.
+
+If you could share the remaining key specs (SF, asking rent, NNN, clear height, doors, power), that would be very helpful.
+
+Thanks again!""",
+
+        # Follow-up 2: still engaged, still short of details
+        """Hi [NAME],
+
+Circling back on our exchange about the property above. Whenever you have a moment, any of the outstanding details would help me move this along.
+
+If the property is no longer available or not a good fit, please let me know and I'll update my records.
+
+Thank you!""",
+
+        # Follow-up 3: last note, and NO presumption of disinterest
+        """Hi [NAME],
+
+Thanks again for your replies on the property above. I don't want to keep filling your inbox, so this will be my last note on it for now. If the remaining details come together, I'd be glad to pick this back up whenever it suits you.
 
 If anything else comes available in the area that might work, please keep me in mind.
 

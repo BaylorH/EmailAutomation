@@ -65,7 +65,7 @@ def _load_tool():
 BLIND_SPOT_SITES = (
     (
         "email_automation/processing.py",
-        6667,
+        6678,
         "_resolve_current_mailbox_email",
         "bare /me identity endpoint; the substring '/me/' does not occur in it. "
         "Now routed through the read boundary, which the URL-literal scan cannot "
