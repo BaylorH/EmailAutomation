@@ -61,11 +61,20 @@ def _load_tool():
 # count that drifts tells you nothing about WHICH site moved. Each of these was
 # read out of the source by hand before the tool existed; the tool has to find
 # them, not define them.
+#
+# The site is IDENTIFIED by (module, function) and the line is carried only so a
+# reader can go and look. It used to be asserted, and it drifted twice in a
+# single session for edits hundreds of lines above it that had nothing to do
+# with any Graph read -- a failure that says "the method scan missed this site"
+# when the site is exactly where it always was. A pin that cries wolf gets
+# repinned by rote, which is how a real miss would get waved through. The
+# property under test is that the scan FINDS the site a URL-literal scan cannot
+# see, and that property has nothing to do with what line it sits on.
 
 BLIND_SPOT_SITES = (
     (
         "email_automation/processing.py",
-        6678,
+        6682,
         "_resolve_current_mailbox_email",
         "bare /me identity endpoint; the substring '/me/' does not occur in it. "
         "Now routed through the read boundary, which the URL-literal scan cannot "
@@ -123,16 +132,16 @@ class InventoryToolTests(unittest.TestCase):
                     self.assertEqual(op["classification"], "read")
 
     def test_the_method_scan_finds_every_site_the_url_scan_is_blind_to(self):
-        found = {
-            (op["module"], op["line"])
-            for op in self.report["operations"]
-        }
+        found = {}
+        for op in self.report["operations"]:
+            found.setdefault((op["module"], op["function"]), []).append(op["line"])
         for module, line, function, why in BLIND_SPOT_SITES:
-            with self.subTest(module=module, line=line):
+            with self.subTest(module=module, function=function):
                 self.assertIn(
-                    (module, line),
+                    (module, function),
                     found,
-                    f"method scan missed {module}:{line} ({function}) - {why}",
+                    f"method scan missed {module}:{function} "
+                    f"(recorded near line {line}) - {why}",
                 )
 
     def test_the_url_literal_scan_really_is_blind_to_them(self):

@@ -27,7 +27,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Tuple
+import html as html_lib
+import re
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
 
 from .utils import strip_email_quotes, strip_html_tags
 
@@ -154,6 +156,141 @@ def normalize_graph_body(body: Mapping[str, Any]) -> str:
     raw_content = body.get("content", "") or ""
     content_type = (body.get("contentType") or "Text").upper()
     return strip_html_tags(raw_content) if content_type == "HTML" else raw_content
+
+
+# A broker's flyer is very often a HYPERLINK rather than a typed-out address, and
+# ``normalize_graph_body`` above destroys it: ``strip_html_tags`` deletes the whole
+# <a> element and keeps only its text, so the target is gone before the inbound
+# path's ``https?://`` harvest ever runs, and the linked-asset code that exists to
+# judge broker links is handed an empty list. Its own comments say a dropped link
+# is indistinguishable from "no assets" and lets a message be marked processed with
+# the broker's payload lost -- and none of that judgement gets to run.
+#
+# ``normalize_graph_body`` is NOT changed to fix this. It is the single body
+# pipeline the certification lane and production must agree on byte-for-byte, and
+# putting URLs into it would change what the extraction model reads on every
+# message. Recovery is a separate, additive read of the same raw body.
+
+# The anchor text stops at the next <a> or </a> and the closing tag is optional,
+# rather than the obvious ``(?P<text>.*?)</a>``. Mail HTML is not reliably
+# well-formed, and with that form an unclosed anchor swallows everything up to
+# the NEXT close tag -- so a flyer link followed by a disclosure link would take
+# the disclosure's words as its own anchor text and be suppressed as boilerplate.
+# The failure would be silent and in the direction of losing the flyer, which is
+# the very thing being fixed.
+_HREF_PATTERN = re.compile(
+    r"""<a\b[^>]*?\bhref\s*=\s*(?P<quote>["']?)(?P<url>[^"'>\s]+)(?P=quote)[^>]*>"""
+    r"""(?P<text>(?:(?!<\s*/?a\b).)*)""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Recovered links are LOWER TRUST than a URL a broker typed as visible text: the
+# same recovery surfaces the regulatory and mail-system links a human reader never
+# treats as message content. These families were READ OUT OF the stored corpus --
+# every one of them appears in the 29 messages that announce a link in prose while
+# the converted text holds no URL -- rather than imagined.
+#
+# The filter only ever SUPPRESSES a recovered link. A wrong entry here leaves a
+# case exactly as broken as it is today; a missing one would put brokerage
+# disclosure boilerplate in a client's flyer column, where a false value in a
+# filled cell reads exactly like a true one. Only one of those is recoverable, so
+# an unrecognised link is KEPT.
+_BOILERPLATE_ANCHOR_TEXT = re.compile(
+    r"(information about brokerage services|brokerage services?\s*$|\biabs\b|"
+    r"report this email|report as spam|unsubscribe|manage (your )?preferences|"
+    r"view (this )?(email|message) in (your )?browser|email preferences|"
+    r"privacy (policy|notice)|please click here|click here to (report|update|"
+    r"manage|unsubscribe)|all available inventory|available inventory|"
+    r"terms of use|do not sell)",
+    re.IGNORECASE,
+)
+_BOILERPLATE_HOSTS = re.compile(
+    r"(^|\.)(linkedin\.com|twitter\.com|x\.com|facebook\.com|instagram\.com|"
+    r"youtube\.com|trec\.texas\.gov|trec\.state\.tx\.us|proofpoint\.com|"
+    r"constantcontact\.com|"
+    r"list-manage\.com|mailchimp\.com)$",
+    re.IGNORECASE,
+)
+
+# The inbound path already hands at most three URLs to the linked-asset lane.
+# Recovery does not widen that budget; it only stops a real flyer being invisible.
+ASSET_LINK_CANDIDATE_CAP = 3
+
+
+def _anchor_text(raw: str) -> str:
+    """Visible text of an anchor, with any nested markup removed."""
+    return " ".join(
+        html_lib.unescape(re.sub(r"<[^>]+>", " ", raw or "")).split()
+    )
+
+
+def recover_html_link_targets(body: Optional[Mapping[str, Any]]) -> List[Tuple[str, str]]:
+    """Return ``(url, anchor_text)`` for each http(s) hyperlink, in document order.
+
+    Only HTML bodies carry hyperlinks; a Text body is returned as-is by
+    ``normalize_graph_body`` and its URLs are already visible, so it yields
+    nothing here rather than being parsed twice. ``mailto:``, ``tel:``, ``cid:``,
+    fragments and ``javascript:`` are not links to fetch. A target repeated in
+    the message is returned once, at its first position.
+    """
+    body = body if isinstance(body, Mapping) else {}
+    if (body.get("contentType") or "Text").upper() != "HTML":
+        return []
+    content = body.get("content") or ""
+    if not isinstance(content, str) or not content:
+        return []
+
+    recovered: List[Tuple[str, str]] = []
+    seen = set()
+    for match in _HREF_PATTERN.finditer(content):
+        url = html_lib.unescape(match.group("url") or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        recovered.append((url, _anchor_text(match.group("text"))))
+    return recovered
+
+
+def is_boilerplate_broker_link(url: str, anchor_text: str = "") -> bool:
+    """Is this recovered link footer furniture rather than broker payload?"""
+    if _BOILERPLATE_ANCHOR_TEXT.search(anchor_text or ""):
+        return True
+    host = ""
+    match = re.match(r"https?://([^/?#]+)", str(url or ""), re.IGNORECASE)
+    if match:
+        host = match.group(1).lower().split("@")[-1].split(":")[0]
+        if host.startswith("www."):
+            host = host[4:]
+    return bool(host) and bool(_BOILERPLATE_HOSTS.search(host))
+
+
+def asset_link_candidates(
+    visible_urls: Optional[Any],
+    body: Optional[Mapping[str, Any]],
+    cap: int = ASSET_LINK_CANDIDATE_CAP,
+) -> List[str]:
+    """Links to offer the linked-asset lane: what is typed, then what is hidden.
+
+    A URL the broker typed as visible text keeps its position and is never
+    touched by the boilerplate filter, so nothing that works today can be
+    displaced or suppressed by this. Recovered hyperlinks are appended after
+    them, filtered, and the existing three-link budget still applies.
+    """
+    ordered: List[str] = []
+    seen = set()
+    for url in visible_urls or []:
+        url = str(url or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            ordered.append(url)
+    for url, anchor_text in recover_html_link_targets(body):
+        if url in seen or is_boilerplate_broker_link(url, anchor_text):
+            continue
+        seen.add(url)
+        ordered.append(url)
+    return ordered[:cap]
 
 
 def merge_readback(summary: Mapping[str, Any], readback: Mapping[str, Any]) -> dict:

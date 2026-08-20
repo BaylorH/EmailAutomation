@@ -95,7 +95,11 @@ from .email import (
     _kill_switch_suppressed,
     resolve_outbound_mode,
 )
-from .message_transport import merge_readback, normalize_graph_body
+from .message_transport import (
+    asset_link_candidates,
+    merge_readback,
+    normalize_graph_body,
+)
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff,
@@ -6813,6 +6817,11 @@ def process_inbox_message(
     
     full_msg = {}
     # NEW: fetch full message body and normalize to plain text
+    # Held across the whole function: the raw Graph body is the only place a
+    # broker's hyperlinked flyer still exists once normalize_graph_body has
+    # converted the message to text. Bound before the try so the failure path
+    # cannot leave it undefined further down.
+    full_body_resp = {}
     try:
         full_msg = exponential_backoff_request(
             lambda: _mailbox_reader().read(
@@ -7284,8 +7293,14 @@ def process_inbox_message(
             if fetched_text:
                 url_texts.append({"url": clean, "text": fetched_text})
 
+        # The page-fetch above keeps exactly today's inputs -- only URLs the
+        # broker typed as visible text are fetched and read into the extraction
+        # prompt. The linked-asset lane additionally gets the hyperlinks that
+        # normalize_graph_body destroyed, because that lane binds a candidate to
+        # the target property and refuses what it cannot verify, and because a
+        # hyperlinked flyer currently never reaches the code written to judge it.
         linked_asset_manifest = fetch_and_process_linked_assets(
-            clean_urls,
+            asset_link_candidates(clean_urls, full_body_resp),
             target_property_hint=native_target_property_hint,
         )
         if linked_asset_manifest:

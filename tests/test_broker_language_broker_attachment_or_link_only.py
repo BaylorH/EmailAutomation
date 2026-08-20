@@ -43,13 +43,31 @@ from email_automation import property_images as pi
 from email_automation import processing as proc
 from email_automation.campaign_safety import CampaignAutomationDecision
 from email_automation import sheets as sh
+from email_automation.message_transport import (
+    asset_link_candidates,
+    normalize_graph_body,
+)
 from email_automation.utils import _sanitize_url
 
 
-def urls_in(message_text):
-    """Replicate processing.py's inline URL discovery + sanitize step."""
+def urls_in(message_text, html=None):
+    """Drive production's real URL composition rather than a copy of it.
+
+    This used to reproduce processing.py's inline discovery by hand, and a hand
+    copy is a thing that drifts. Production now also recovers the hyperlink
+    targets that the HTML-to-text conversion destroys, so a replica that only
+    scanned the converted text would keep passing while production changed
+    underneath it -- which is the exact failure the certification boundary
+    exists to prevent.
+    """
     found = re.findall(SOURCE_URL_PATTERN, message_text)
-    return [_sanitize_url(u) for u in found[:3]]
+    visible = [_sanitize_url(u) for u in found[:3]]
+    body = (
+        {"contentType": "HTML", "content": html}
+        if html is not None
+        else {"contentType": "Text", "content": message_text}
+    )
+    return asset_link_candidates(visible, body)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +129,70 @@ BLOCKED_LISTING_PHRASINGS = [
     ("costar", "Here's the listing: https://www.costar.com/property/12345"),
     ("loopnet", "See the LoopNet page https://www.loopnet.com/Listing/999/"),
 ]
+
+
+# The same payloads a broker actually sends, written the way mail clients
+# actually write them: the URL exists ONLY as a hyperlink target. Before the
+# recovery, the HTML-to-text conversion deleted the whole <a> element and the
+# broker's payload never reached build_download_candidate at all.
+HYPERLINKED_LINK_PHRASINGS = [
+    ("hyperlinked_dropbox",
+     '<p>All details are in <a href="https://www.dropbox.com/s/ab12/flyer.pdf?dl=0">'
+     'this Dropbox link</a>.</p>'),
+    ("hyperlinked_drive",
+     '<div>Flyer is <a href="https://drive.google.com/file/d/1A2B3C4D5E/view">here</a></div>'),
+    ("hyperlinked_direct_pdf",
+     'Floor plan: <a href="https://cdn.brokersite.com/assets/suite-200-floorplan.pdf">'
+     'Suite 200 floor plan</a>'),
+    ("hyperlinked_below_a_disclosure",
+     '<p><a href="https://www.dropbox.com/s/oo/om.pdf?dl=0">Marketing package</a></p>'
+     '<p><a href="https://www.trec.texas.gov/forms/iabs.pdf">'
+     'Information About Brokerage Services</a></p>'),
+]
+
+
+class TestHyperlinkedPayloadReachesTheGuards(unittest.TestCase):
+    """A hyperlinked flyer must reach the code written to judge broker links.
+
+    The linked-asset path's own reasoning is that a dropped link is
+    indistinguishable from "no assets" and lets a message be marked processed
+    with the broker's payload lost. That reasoning never got to run for a
+    hyperlink, because the target was destroyed upstream of it.
+    """
+
+    def test_the_converted_text_really_does_lose_the_target(self):
+        for label, html in HYPERLINKED_LINK_PHRASINGS:
+            with self.subTest(label=label):
+                text = normalize_graph_body({"contentType": "HTML", "content": html})
+                self.assertNotIn("http", text)
+
+    def test_hyperlinked_phrasings_build_candidate(self):
+        misses = []
+        for label, html in HYPERLINKED_LINK_PHRASINGS:
+            text = normalize_graph_body({"contentType": "HTML", "content": html})
+            urls = urls_in(text, html=html)
+            candidate = None
+            for u in urls:
+                candidate = pi.build_download_candidate(u, "")
+                if candidate:
+                    break
+            if not candidate:
+                misses.append((label, urls))
+        self.assertEqual(
+            [], misses,
+            "a hyperlinked broker payload produced no download candidate: "
+            f"{misses}",
+        )
+
+    def test_a_brokerage_disclosure_link_is_not_taken_as_the_flyer(self):
+        label, html = HYPERLINKED_LINK_PHRASINGS[-1]
+        text = normalize_graph_body({"contentType": "HTML", "content": html})
+        urls = urls_in(text, html=html)
+        self.assertIn("dropbox.com", " ".join(urls))
+        self.assertNotIn(
+            "trec.texas.gov", " ".join(urls),
+            "regulatory disclosure boilerplate must not become a row's flyer",
+        )
 
 
 class TestLinkDetectionFires(unittest.TestCase):
