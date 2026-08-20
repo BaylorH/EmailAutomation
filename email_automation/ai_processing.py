@@ -6099,6 +6099,15 @@ def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
     existing drive-in" is an answer, and reading it as silence left the column empty,
     which reads as missing, which is why a real broker was asked for it seconds after
     he had answered it. Saying nothing about drive-ins still records nothing.
+
+    PROPERTY-BLIND BY DESIGN -- the caller must pass a TARGET-BOUND SEGMENT, never a
+    whole message. Both current callers do (`current_segment` is cut at the alternate-
+    property boundary, and the other reads target-bound clause segments), which is
+    what keeps a multi-property reply honest. Run against a whole message, a real
+    corpus reply reading "17146 ... has no drive-in loading. A better alternative is
+    18002 ... with one drive-in door" returns 1 -- the ALTERNATIVE's count applied to
+    the target row. That is not a defect in this function; it is the contract. A new
+    caller that skips the grounding inherits the bug.
     """
     if not text:
         return None
