@@ -92,6 +92,55 @@ class DeferralDetectionTests(unittest.TestCase):
                 self.assertFalse(_looks_like_field_deferral(body))
 
 
+class CorpusFalsePositiveTests(unittest.TestCase):
+    """Real messages the first cut of this guard would have wrongly silenced.
+
+    Found by replaying all 797 stored inbound messages through the guard rather
+    than by inventing cases. Two brokers wrote that TOURS were "available next
+    week" -- an offer, not a deferred figure -- and the pattern read "available
+    next" as a promise to send something later. A third match landed on our OWN
+    words quoted back inside the broker's reply.
+
+    A guard that silences a reply is exactly the guard whose false positives are
+    invisible: nothing is sent, so nothing looks wrong.
+    """
+
+    def test_a_tour_offered_for_next_week_is_not_a_deferral(self):
+        for text in [
+            "Just confirming again that tours are available next week for the suite.",
+            "It has 480V 3-phase power. I can share a flyer/floor plan, and tours "
+            "are available next week.",
+        ]:
+            with self.subTest(text=text[:46]):
+                self.assertFalse(_looks_like_field_deferral(text))
+
+    def test_space_available_soon_is_not_a_deferral(self):
+        self.assertFalse(_looks_like_field_deferral("We will have this space available soon."))
+
+    def test_our_own_words_quoted_back_are_not_his_deferral(self):
+        """'I'd appreciate you sending them over' is us asking, not him promising."""
+        self.assertFalse(
+            _looks_like_field_deferral(
+                "If you have 3-phase power, one drive-in door, and 14'+ clear, "
+                "I'd appreciate you sending them over."
+            )
+        )
+
+    def test_the_genuine_corpus_deferrals_still_hold(self):
+        """Every real deferral the replay found must keep working."""
+        for text in [
+            "I am still confirming operating expenses and will send that figure shortly.",
+            "I need to confirm the ceiling height and power and will send those shortly.",
+            "I am still confirming the clear height and electrical power and will send "
+            "those once I have them.",
+            "I will send you more details on our site later today.",
+            "Received, thank you. I will get something back to you asap.",
+            "I'm checking the remaining details and will send them shortly.",
+        ]:
+            with self.subTest(text=text[:46]):
+                self.assertTrue(_looks_like_field_deferral(text))
+
+
 class DeferralSilenceGuardTests(unittest.TestCase):
     def test_repeated_reask_is_suppressed_on_every_live_deferral(self):
         """The live break: identical re-ask after an explicit deferral."""

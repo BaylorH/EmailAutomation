@@ -725,10 +725,21 @@ _FIELD_DEFERRAL_RE = re.compile(
     r"|\bi'?ll\s+(?:send|get|forward|share|pull|chase|follow\s+up\s+with)\b"
     r"|\bi\s+will\s+(?:send|get|forward|share|pull|chase)\b"
     r"|\bwill\s+(?:send|forward|share)\s+(?:them|it|those|that|these)\b"
-    r"|\b(?:sending|getting)\s+(?:them|it|those|that)\s+(?:over|to\s+you)\b"
+    # First person only. Replaying the corpus turned up this pattern matching OUR
+    # own words quoted back inside the broker's reply -- "I'd appreciate you sending
+    # them over" is us asking, not him promising.
+    r"|\bi\s*(?:'?m|am)?\s*(?:sending|getting)\s+(?:them|it|those|that)\s+(?:over|to\s+you)\b"
     r"|\bwaiting\s+(?:on|for)\b"
     r"|\bdon'?t\s+have\s+(?:that|those|it|them)\s+(?:yet|handy|on\s+hand)\b"
-    r"|\b(?:coming|available)\s+(?:shortly|soon|next|later)\b"
+    # "coming/available shortly|soon|next" is deliberately NOT here. Two real brokers
+    # wrote that TOURS were "available next week" and a third that space would be
+    # "available soon" -- offers about the property, not promises to send a figure --
+    # and reading them as deferrals silences a reply that was owed. Every genuine
+    # deferral in the corpus is carried by the promise and pending clauses above.
+    # "<information> is coming shortly" is a deferral; "tours are available next
+    # week" is not. The subject has to be the INFORMATION, never the space.
+    r"|\b(?:figure|number|numbers|details?|info(?:rmation)?|breakdown|quote|specs?|"
+    r"docs?|documents?|packet|flyer)\b[^.!?\n]{0,24}?\bcoming\s+(?:shortly|soon|next)\b"
     r"|\bonce\s+i\s+(?:have|get|hear\s+back)\b",
     re.IGNORECASE,
 )
