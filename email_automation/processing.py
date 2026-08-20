@@ -2766,6 +2766,14 @@ def _maybe_mark_client_completed(
             "completedAt": SERVER_TIMESTAMP,
             "statusUpdatedAt": SERVER_TIMESTAMP,
             "updatedAt": SERVER_TIMESTAMP,
+            # The field the DASHBOARD reads. `getUserData` resolves the
+            # operator-visible timestamp as `data.lastUpdated?.toDate?.() ||
+            # createdAt`, and nothing on this side had ever written
+            # `lastUpdated` -- so every campaign displayed its creation time for
+            # its whole life, including after it completed. That is PROD-0806-8,
+            # and it is a name mismatch across the boundary rather than a stuck
+            # clock: `updatedAt` is written faithfully and simply read by nobody.
+            "lastUpdated": SERVER_TIMESTAMP,
             "completionSummary": {
                 "terminalThreads": len(terminal_threads),
                 "activeThreads": len(active_threads),

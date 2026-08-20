@@ -155,7 +155,10 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
                 {
                     "notificationsUnread": unread_count,
                     "newUpdateCount": new_update_count,
-                    "notifCounts": notif_counts
+                    "notifCounts": notif_counts,
+                    # A notification the operator has to act on is the clearest
+                    # evidence the campaign has moved since launch.
+                    "lastUpdated": SERVER_TIMESTAMP,
                 },
                 merge=True
             )
@@ -234,6 +237,11 @@ def add_client_notifications(
             client_ref.set({
                 "lastNotificationSummary": summary,
                 "lastNotificationAt": SERVER_TIMESTAMP,
+                # Applied sheet updates are what a live campaign mostly DOES.
+                # Stamping only at completion would leave the dashboard showing
+                # launch for the entire working life of the campaign, which is
+                # the stretch the operator actually watches.
+                "lastUpdated": SERVER_TIMESTAMP,
             }, merge=True)
 
             print(f"📢 Created {len(applied_updates)} sheet_update notifications for client {client_id}")
