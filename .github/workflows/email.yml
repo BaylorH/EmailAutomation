@@ -14,7 +14,36 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        
+        with:
+          # Explicit, because the default is "whatever the default branch is" and
+          # that is exactly how this job spent five weeks running stale code
+          # without anyone being able to see it from a run page.
+          ref: main
+
+      - name: Report the revision this run is actually using
+        run: |
+          SHA="$(git rev-parse --short HEAD)"
+          SUBJECT="$(git log -1 --format=%s)"
+          COMMITTED="$(git log -1 --format=%cI)"
+          AGE_DAYS=$(( ( $(date -u +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "Running $SHA, committed $COMMITTED (${AGE_DAYS} days old)"
+          echo "  $SUBJECT"
+          {
+            echo "### Production revision"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`$SHA\` |"
+            echo "| committed | $COMMITTED |"
+            echo "| age | ${AGE_DAYS} days |"
+            echo "| subject | $SUBJECT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$AGE_DAYS" -ge 14 ]; then
+            echo "::warning title=Stale production code::This run is on code ${AGE_DAYS} days old. Fixes merged after $COMMITTED are NOT live."
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "> **Stale:** this run is on code ${AGE_DAYS} days old. Anything merged after $COMMITTED is not live." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
