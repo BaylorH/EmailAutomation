@@ -5952,10 +5952,20 @@ _DOCK_COUNT_RE = re.compile(
 # made the system ask a real broker for it thirty seconds after he had answered.
 # Scoped to the drive-in keyword family on purpose: "there are no loading docks" is
 # a statement about docks and must never write a drive-in zero.
+# The negation has to belong to the DRIVE-IN, not to something else in the sentence.
+# Corpus replay caught "No rail. No separate loading docks beyond the drive-ins" --
+# which says drive-ins EXIST -- being read as zero drive-ins. Writing that zero is
+# the same silent corruption as putting rent in the operating-expense column: the
+# cell reads as answered and the number is false.
+#
+# So the span between the negation and the drive-in term is tempered: it may not
+# cross another door/dock/rail noun, nor "beyond"/"besides"/"other than", which all
+# mark the drive-ins as the thing that DOES exist.
 _NO_DRIVE_IN_RE = re.compile(
     r"\b(?:no|none|zero|without\s+any|does\s+not\s+have\s+(?:any|a)?|"
     r"there\s+(?:is|are)\s+no|has\s+no|lacks?)\b"
-    r"[^.!?\n]{0,40}?"
+    r"(?:(?!\b(?:dock|docks|loading|rail|beyond|besides|other\s+than|apart\s+from|"
+    r"but|however|although)\b)[^.!?\n]){0,40}?"
     r"(?:drive[-\s]?ins?|grade[-\s]?level)\b"
     r"(?:\s*(?:doors?|ramps?|access))?",
     re.IGNORECASE,
