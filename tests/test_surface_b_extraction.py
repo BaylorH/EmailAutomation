@@ -259,9 +259,13 @@ class Bug7GrossBasisFabricatedOpex(unittest.TestCase):
         opex = next(u for u in proposal["updates"] if u["column"] == "Ops Ex /SF")
         self.assertEqual(str(opex["value"]), "0")
 
-    def test_zero_opex_with_no_stated_basis_is_still_stripped(self):
-        # The original anti-fabrication intent, kept and made precise. Nothing in
-        # this text says anything about operating expenses, so a zero is invented.
+    def test_zero_opex_with_no_stated_basis_is_left_untouched(self):
+        # REVISED with the guard itself: this hook only sees the CONVERSATION, but a
+        # zero opex may legitimately have been extracted from a flyer or linked
+        # document earlier in the same pass. Stripping it here because the email does
+        # not repeat it would blank an answered field, and a blank field reads as
+        # missing and gets asked for again -- the exact defect the guard exists to
+        # fix. Fabricated values belong to the extraction layer, where the evidence is.
         text = "The building is 35,000 SF and available from October."
         proposal = {"updates": [
             {"column": "Rent/SF /Yr", "value": "15", "confidence": 0.9},
@@ -269,7 +273,7 @@ class Bug7GrossBasisFabricatedOpex(unittest.TestCase):
         ]}
         proposal = augment_opex(proposal, self.ROWVALS, self.HEADER, self.CONFIG, _inbound(text))
         cols = [u["column"] for u in proposal["updates"]]
-        self.assertNotIn("Ops Ex /SF", cols, "an invented zero must still be stripped")
+        self.assertIn("Ops Ex /SF", cols, "an untouched update must survive this guard")
         self.assertIn("Rent/SF /Yr", cols)
 
     def test_real_opex_not_stripped(self):

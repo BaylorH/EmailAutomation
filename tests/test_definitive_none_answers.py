@@ -101,14 +101,27 @@ class GrossQuoteRecordsOpsExTests(unittest.TestCase):
         update = next(u for u in out["updates"] if u.get("column") == "Ops Ex / SF")
         self.assertEqual(str(update.get("value")), "3.75")
 
-    def test_a_zero_the_broker_never_stated_is_still_dropped(self):
-        """Provenance is the whole distinction: no stated basis, no recorded zero."""
+    def test_a_zero_with_no_stated_basis_is_left_exactly_as_it_was(self):
+        """This guard narrows to the stated case and touches nothing else.
+
+        The tempting extra step is to strip a zeroish opex the broker never
+        mentioned, as an anti-fabrication rule. This function only sees the
+        CONVERSATION, but the value may legitimately have come from a flyer or a
+        linked document earlier in the same pass -- so stripping it here because the
+        email does not repeat it would blank an answered field, and a blank field
+        reads as missing and gets asked for again. That is the defect this whole
+        change exists to fix, so the guard must not reintroduce it.
+        """
         out = A._augment_proposal_opex_basis(
             _opex_proposal("0"), [""] * len(HEADER), HEADER, CONFIG,
             _conv("The space is 22,000 SF and available now."),
         )
-        cols = [u.get("column") for u in out.get("updates") or []]
-        self.assertNotIn("Ops Ex / SF", cols)
+        update = next(
+            (u for u in out.get("updates") or [] if u.get("column") == "Ops Ex / SF"),
+            None,
+        )
+        self.assertIsNotNone(update, "an untouched update must survive this guard")
+        self.assertEqual(str(update.get("value")), "0")
 
 
 if __name__ == "__main__":

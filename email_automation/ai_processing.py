@@ -6048,20 +6048,23 @@ def _augment_proposal_opex_basis(
     except ValueError:
         is_zeroish = False
 
-    if is_zeroish:
-        if _NO_SEPARATE_OPEX_RE.search(text):
-            # He said there is none. That is an answer -- record it so the row can
-            # close and the question stops being asked.
-            opex_update["value"] = "0"
-            opex_update["reason"] = _GROSS_BASIS_OPEX_REASON
-            opex_update["confidence"] = 1.0
-            return proposal
-        if _ops_ex_winner(text) is None:
-            # He said nothing about opex at all, so a zero is the model inventing a
-            # number. Drop it; the field stays open and is legitimately asked for.
-            proposal["updates"] = [u for u in updates if u is not opex_update]
-            return proposal
-        # He stated a figure that happens to be zero -- leave his number alone.
+    if is_zeroish and _NO_SEPARATE_OPEX_RE.search(text):
+        # He said there is none. That is an answer -- record it so the row can close
+        # and the question stops being asked.
+        opex_update["value"] = "0"
+        opex_update["reason"] = _GROSS_BASIS_OPEX_REASON
+        opex_update["confidence"] = 1.0
+        return proposal
+
+    # NOTHING ELSE IS STRIPPED HERE, and that is deliberate. The tempting extra step
+    # is to also drop a zeroish opex the broker never mentioned, as an anti-fabrication
+    # rule -- this function's own docstring used to promise that. But this function
+    # only sees the CONVERSATION, while the opex value may legitimately have been
+    # extracted from a flyer or a linked document earlier in the same pass. Stripping
+    # it here because the email text does not repeat it would blank a field that was
+    # actually answered, and a blank field reads as missing and gets asked for again,
+    # which is precisely the defect this change exists to fix. Fabricated values are
+    # the extraction layer's problem, where the evidence actually lives.
 
     # BASIS guard — use the same accepted evidence winner as extraction. Rewrite
     # only the raw monthly value; an annualized, unrelated, or unsupported model
