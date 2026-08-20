@@ -1045,9 +1045,20 @@ def api_accept_new_property():
             except Exception as e:
                 print(f"⚠️ Could not apply PDF links to new row: {e}")
 
-        # If we have PDF manifest with extracted text, run AI extraction to pre-fill columns
+        # The facts the broker stated about THIS property, carried on the
+        # notification the operator just accepted. Read from the notification
+        # document, never from the request body: the body is untrusted here by
+        # the same rule that made sheetId come from the notification.
+        carried_updates = notif_meta.get("updates")
+        if not isinstance(carried_updates, list):
+            carried_updates = []
+
+        # Pre-fill the new row from what the broker said, and from the flyer for
+        # whatever he did not say. Before PROD-0806-5 was traced this ran only
+        # `if pdf_manifest`, so a broker who stated the numbers in plain text and
+        # attached nothing produced an empty row.
         extracted_updates = []
-        if pdf_manifest and new_rownum:
+        if new_rownum and (pdf_manifest or carried_updates):
             try:
                 from email_automation.ai_processing import propose_sheet_updates, apply_proposal_to_sheet
                 from email_automation.sheets import _read_row
@@ -1073,24 +1084,33 @@ def api_accept_new_property():
                     "timestamp": "now"
                 }]
 
-                # Call AI to extract data from PDFs
-                proposal = propose_sheet_updates(
-                    uid=uid,
-                    client_id=client_id,
-                    email=broker_email,
-                    sheet_id=sheet_id,
-                    header=header,
-                    rownum=new_rownum,
-                    rowvals=rowvals,
-                    thread_id=f"new_property_{notification_id}",  # Synthetic thread ID
-                    pdf_manifest=pdf_manifest,
-                    conversation=conversation,
-                    column_config=column_config,
-                    dry_run=True  # Don't log to Firestore
-                )
+                # Call AI to extract data from PDFs. The conversation below is a
+                # SYNTHETIC stub -- the broker's actual words are not in it, which
+                # is precisely why anything he stated in the body and not in the
+                # flyer used to be lost here.
+                flyer_updates = []
+                if pdf_manifest:
+                    proposal = propose_sheet_updates(
+                        uid=uid,
+                        client_id=client_id,
+                        email=broker_email,
+                        sheet_id=sheet_id,
+                        header=header,
+                        rownum=new_rownum,
+                        rowvals=rowvals,
+                        thread_id=f"new_property_{notification_id}",  # Synthetic thread ID
+                        pdf_manifest=pdf_manifest,
+                        conversation=conversation,
+                        column_config=column_config,
+                        dry_run=True  # Don't log to Firestore
+                    )
+                    flyer_updates = (proposal or {}).get("updates") or []
 
-                if proposal and proposal.get("updates"):
-                    # Apply the extracted updates to the sheet
+                merged_updates = _merge_carried_updates_over_extraction(
+                    carried_updates, flyer_updates,
+                )
+                if merged_updates:
+                    # Apply the stated facts, and the flyer for the rest
                     result = apply_proposal_to_sheet(
                         uid,
                         client_id,
@@ -1098,16 +1118,19 @@ def api_accept_new_property():
                         header,
                         new_rownum,
                         rowvals,
-                        proposal,
+                        {"updates": merged_updates},
                         column_config=column_config,
                     )
                     extracted_updates = result.get("applied", [])
-                    print(f"🤖 AI extracted {len(extracted_updates)} field(s) from PDF for new property")
+                    print(
+                        f"🤖 Applied {len(extracted_updates)} field(s) to the new property row "
+                        f"({len(carried_updates)} stated by the broker, {len(flyer_updates)} from PDF)"
+                    )
                     for upd in extracted_updates:
                         print(f"   • {upd.get('column')}: {upd.get('newValue')}")
 
             except Exception as e:
-                print(f"⚠️ Could not run AI extraction on PDFs: {e}")
+                print(f"⚠️ Could not pre-fill the new property row: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -1124,6 +1147,37 @@ def api_accept_new_property():
         import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": "Failed to accept new property"}), 500
+
+
+def _normalize_update_column(column) -> str:
+    """Fold a column name for comparison. Header spelling drifts; identity does not."""
+    return " ".join(str(column or "").strip().lower().split())
+
+
+def _merge_carried_updates_over_extraction(carried_updates, extracted_updates):
+    """A fact the broker STATED outranks the same fact re-read from a flyer.
+
+    PROD-0806-5: the alternate-property notification used to carry no updates at
+    all, so accepting it re-extracted everything from the PDF against a
+    synthetic conversation stub ("Here is information about {address}."). The
+    broker's own words were not in that stub, so anything he stated in the email
+    body and did not repeat in the flyer was simply gone -- and a suggestion with
+    no flyer at all applied nothing whatsoever, because the extractor was the
+    accept path's only writer.
+
+    Carried updates therefore win on any column they cover, and flyer extraction
+    keeps every column they do not. A flyer is marketing collateral that may be
+    months stale; the reply is the broker answering the question just asked.
+    """
+    carried = [u for u in (carried_updates or []) if isinstance(u, dict) and str(u.get("column") or "").strip()]
+    extracted = [u for u in (extracted_updates or []) if isinstance(u, dict)]
+    if not carried:
+        return extracted
+    owned = {_normalize_update_column(u.get("column")) for u in carried}
+    return carried + [
+        u for u in extracted
+        if _normalize_update_column(u.get("column")) not in owned
+    ]
 
 
 def _resolve_current_highlight_row(uid, client_id, thread_data):

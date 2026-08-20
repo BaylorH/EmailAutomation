@@ -30,6 +30,7 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
 from .property_ref import resolve_property_ref
 from .logging import write_message_order_test
 from .ai_processing import (
+    ALTERNATE_PROPERTY_UPDATES_KEY,
     _ANCILLARY_SUBJECT_RE,
     _UNAVAILABLE_PATTERNS,
     _VIABILITY_NEGATOR_LINK_WORDS,
@@ -1416,6 +1417,30 @@ def _source_message_envelope(msg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             envelope[address_key] = addresses
 
     return envelope
+
+
+def _alternate_property_updates_meta(proposal: dict) -> List[dict]:
+    """The alternate-property facts, reduced to what the accept path applies.
+
+    Only column/value/reason/confidence travel: that is exactly the shape
+    `apply_proposal_to_sheet` consumes, and a notification document is not the
+    place to park anything wider than the operator is being asked to approve.
+    """
+    carried = (proposal or {}).get(ALTERNATE_PROPERTY_UPDATES_KEY) or []
+    meta = []
+    for update in carried:
+        if not isinstance(update, dict):
+            continue
+        column = str(update.get("column") or "").strip()
+        if not column:
+            continue
+        meta.append({
+            "column": column,
+            "value": "" if update.get("value") is None else str(update.get("value")),
+            "reason": str(update.get("reason") or ""),
+            "confidence": update.get("confidence"),
+        })
+    return meta
 
 
 def _source_message_identity_meta(
@@ -8073,6 +8098,14 @@ def process_inbox_message(
                                 "city": city,
                                 "link": link,
                                 "notes": notes,
+                                # The facts the broker STATED about this
+                                # property, carried from the proposal the veto
+                                # took them out of. Without them the accept path
+                                # has only the flyer, re-read against a synthetic
+                                # stub, and PROD-0806-5 is what that costs: a
+                                # fact deleted twice and stored nowhere, until
+                                # the broker is asked to repeat himself.
+                                "updates": _alternate_property_updates_meta(proposal),
                                 "leasingCompany": leasing_company,
                                 "leasingContact": leasing_contact,
                                 "brokerEmail": new_property_email,  # Email for the new property contact

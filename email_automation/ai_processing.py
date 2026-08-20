@@ -4280,24 +4280,57 @@ def _target_bound_source_segments(
     return segments
 
 
+ALTERNATE_PROPERTY_UPDATES_KEY = "alternate_property_updates"
+
+
 def _suppress_cross_property_current_row_updates(
     proposal: dict,
     conversation: List[dict],
     target_anchor: str,
 ) -> dict:
-    """Keep alternate-property facts from being applied to the current row."""
+    """Keep alternate-property facts from being applied to the current row.
+
+    Removing them from the current row is correct and stays correct. What was
+    wrong was DROPPING them: the 2026-08-06 campaign reproduced PROD-0806-5,
+    "first alternate-property reply facts discarded until the broker repeats
+    them", and this is where the discard happened. The facts were extracted
+    correctly, once, and then deleted here -- while the notification that asks
+    the operator to accept the alternate property carried address, city, link
+    and notes but no updates, so accept re-extracted from the flyer against a
+    synthetic stub. Anything the broker stated in the email BODY and not in the
+    flyer existed nowhere, and the only recovery was asking him again.
+
+    So whatever is taken off the current row is now handed on under
+    ``ALTERNATE_PROPERTY_UPDATES_KEY`` -- but only when a ``new_property`` event
+    gives it somewhere to go. With no alternate property there is nothing to
+    carry to, and carrying anyway would be the same defect pointed the other
+    way: the current property's numbers written onto a row they do not describe.
+    """
     if not proposal:
         return proposal
 
     events = proposal.get("events") or []
     event_types = {(event or {}).get("type") for event in events}
+    original_updates = list(proposal.get("updates") or [])
+
+    def _apply(kept: List[dict]) -> dict:
+        proposal["updates"] = kept
+        if "new_property" in event_types:
+            kept_ids = {id(update) for update in kept}
+            carried = [u for u in original_updates if id(u) not in kept_ids]
+            if carried:
+                proposal[ALTERNATE_PROPERTY_UPDATES_KEY] = carried
+        return proposal
+
     if "property_unavailable" in event_types:
-        proposal["updates"] = [
-            update for update in (proposal.get("updates") or [])
+        # The compound shape production actually reproduced: the original goes
+        # non-viable in the same reply that names the replacement. This early
+        # return is where the live facts died, so it carries too.
+        return _apply([
+            update for update in original_updates
             if str((update or {}).get("value") or "").strip() == "0"
             and (update or {}).get("reason") == _TARGET_ZERO_UPDATE_REASON
-        ]
-        return proposal
+        ])
     if "new_property" not in event_types:
         return proposal
 
@@ -4314,8 +4347,7 @@ def _suppress_cross_property_current_row_updates(
         ) if position is not None
     ]
     if not boundary_candidates:
-        proposal["updates"] = []
-        return proposal
+        return _apply([])
 
     current_segment = fresh_text[:min(boundary_candidates)]
     explicitly_names_target = _source_mentions_target_property(
@@ -4326,14 +4358,12 @@ def _suppress_cross_property_current_row_updates(
         and _CURRENT_PROPERTY_AFFIRMATION_RE.search(current_segment)
     )
     if not explicitly_names_target and not has_transitioned_current_affirmation:
-        proposal["updates"] = []
-        return proposal
+        return _apply([])
 
-    proposal["updates"] = [
-        update for update in (proposal.get("updates") or [])
+    return _apply([
+        update for update in original_updates
         if _update_supported_in_current_segment(update, current_segment)
-    ]
-    return proposal
+    ])
 
 
 _ROUTE_ADDRESS_RE = re.compile(
