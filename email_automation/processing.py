@@ -1,5 +1,6 @@
 import html as html_module
 import re
+from datetime import datetime as _dt, timezone as _tz
 import requests
 import hashlib
 import json
@@ -4885,6 +4886,48 @@ def _repeats_recent_outbound(candidate: str, previous_bodies, lookback: int = _O
     return any(_authored_core(previous) == core for previous in recent)
 
 
+_FRACTIONAL_SECONDS_RE = re.compile(r"\.(\d{6})\d+")
+
+
+def _message_time_key(data) -> float:
+    """A sortable instant for a stored message, robust to MIXED timestamp shapes.
+
+    The stores in this system do not agree on a format: some records carry an ISO
+    string with a "T" separator, some a datetime whose text form uses a space. A
+    space sorts before "T", so sorting these as STRINGS puts every space-formatted
+    record before every "T"-formatted one whatever the real order was. That exact
+    mistake produced five separate false-positive analyses in one session; here the
+    cost would be higher, because picking the wrong "recent" messages makes the
+    repeat guard compare against the wrong history and it could then suppress a
+    reply that was never a duplicate.
+
+    An unreadable timestamp sorts OLDEST on purpose, so it falls out of the recent
+    window and can never be the thing a suppression decision rests on. This guard
+    fails open -- toward sending -- because a duplicate is visible and recoverable
+    while a wrongly withheld reply is neither.
+    """
+    raw = (data or {}).get("sentDateTime") or (data or {}).get("receivedDateTime") \
+        or (data or {}).get("timestamp")
+    if raw is None:
+        return float("-inf")
+    if hasattr(raw, "timestamp"):
+        try:
+            return float(raw.timestamp())
+        except Exception:
+            return float("-inf")
+    text = str(raw).strip().replace("Z", "+00:00")
+    if " " in text and "T" not in text:
+        text = text.replace(" ", "T", 1)
+    text = _FRACTIONAL_SECONDS_RE.sub(r".\1", text)
+    try:
+        parsed = _dt.fromisoformat(text)
+    except Exception:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_tz.utc)
+    return parsed.timestamp()
+
+
 def _recent_outbound_bodies(user_id: str, thread_id: str, limit: int = _OUTBOUND_REPEAT_LOOKBACK):
     """Chronological authored bodies of the last few outbound messages in a thread."""
     try:
@@ -4900,11 +4943,9 @@ def _recent_outbound_bodies(user_id: str, thread_id: str, limit: int = _OUTBOUND
                 continue
             body = data.get("body")
             content = (body.get("content") if isinstance(body, dict) else body) or data.get("content") or ""
-            stamp = str(data.get("sentDateTime") or data.get("receivedDateTime")
-                        or data.get("timestamp") or "")
-            rows.append((stamp, content))
+            rows.append((_message_time_key(data), content))
         rows.sort(key=lambda row: row[0])
-        return [content for _stamp, content in rows[-limit:]]
+        return [content for _key, content in rows[-limit:]]
     except Exception as exc:
         # Never let a history read stop a legitimate reply going out.
         print(f"⚠️ Could not read recent outbound history for repeat check: {exc}")

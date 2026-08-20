@@ -96,3 +96,52 @@ class RepeatDetectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MessageOrderingTests(unittest.TestCase):
+    """Ordering the thread's outbound history must survive MIXED timestamp shapes.
+
+    Found by reviewing this session's own diff. The first cut sorted the stored
+    timestamps as STRINGS. The stores in this system do not agree on a format --
+    some records carry an ISO string with a "T" separator, some a datetime object
+    whose text form uses a space. A space sorts before "T", so under string
+    comparison every space-formatted record lands before every "T"-formatted one
+    regardless of when it actually happened.
+
+    That is not a hypothetical: comparing these as strings produced five separate
+    false-positive sweeps earlier in this same session. Here the consequence is
+    worse than a bad report -- picking the wrong "recent" messages makes the repeat
+    guard compare against the wrong history, and it can suppress a reply that was
+    never a duplicate.
+    """
+
+    def test_mixed_timestamp_shapes_sort_chronologically(self):
+        from datetime import datetime, timezone
+        rows = [
+            {"sentDateTime": "2026-08-12T03:57:31Z", "body": {"content": "third"}},
+            {"sentDateTime": "2026-08-12 03:43:09+00:00", "body": {"content": "first"}},
+            {"sentDateTime": datetime(2026, 8, 12, 3, 46, 57, tzinfo=timezone.utc),
+             "body": {"content": "second"}},
+        ]
+        ordered = sorted(rows, key=processing._message_time_key)
+        self.assertEqual(
+            [r["body"]["content"] for r in ordered], ["first", "second", "third"]
+        )
+
+    def test_fractional_seconds_do_not_break_parsing(self):
+        a = processing._message_time_key({"sentDateTime": "2026-08-10T01:24:47.233430Z"})
+        b = processing._message_time_key({"sentDateTime": "2026-08-10T01:24:48Z"})
+        self.assertLess(a, b)
+
+    def test_an_unreadable_timestamp_sorts_oldest_so_it_cannot_cause_suppression(self):
+        """Fail OPEN: an unparseable record drops out of the recent window."""
+        unknown = processing._message_time_key({"sentDateTime": "not a date"})
+        known = processing._message_time_key({"sentDateTime": "2026-01-01T00:00:00Z"})
+        self.assertLess(unknown, known)
+
+    def test_the_fallback_chain_is_honoured(self):
+        only_received = processing._message_time_key(
+            {"receivedDateTime": "2026-08-12T03:43:09Z"})
+        only_timestamp = processing._message_time_key(
+            {"timestamp": "2026-08-12T03:43:10Z"})
+        self.assertLess(only_received, only_timestamp)
