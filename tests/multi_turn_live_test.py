@@ -80,7 +80,6 @@ OUTLOOK_USER_ID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
 DEFAULT_WAIT_SECONDS = 75
 RESULTS_DIR = PROJECT_ROOT / "tests" / "results"
 STATE_FILE = PROJECT_ROOT / "tests" / ".multi_turn_state.json"
-RUN_PRODUCTION_SCRIPT = PROJECT_ROOT / "run_production.sh"
 
 # Required fields for "complete" detection
 REQUIRED_FIELDS = ["Total SF", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]
@@ -274,19 +273,43 @@ class MultiTurnTestRunner:
     # ------------------------------------------------------------------
     # Pipeline execution
     # ------------------------------------------------------------------
+    @staticmethod
+    def pipeline_command_and_env(base_env: Optional[dict] = None) -> Tuple[List[str], dict]:
+        """The pipeline invocation, with user scope PINNED to the test account.
+
+        This used to shell out to ``run_production.sh``, which has never existed in
+        git -- never committed, not deleted, not moved -- so the harness could not
+        run at all. Recreating it as a wrapper around a bare ``python3 main.py`` is
+        the wrong repair twice over: the scheduler defaults to every user, and the
+        other mailboxes hold real third-party broker correspondence.
+
+        So the harness calls main.py directly and pins the dev-scoped scheduler to
+        this one account. main.py already fails closed on an unrecognized runtime,
+        and pinning here means the harness cannot widen even if that gate moves.
+        """
+        env = dict(base_env if base_env is not None else os.environ)
+        env["SITESIFT_DEV_SCOPED_SCHEDULER"] = "1"
+        env["SITESIFT_SCHEDULER_TARGET_USER_IDS"] = OUTLOOK_USER_ID
+        env["SITESIFT_SCHEDULER_ALLOWED_USER_IDS"] = OUTLOOK_USER_ID
+        # Belt and braces: never let an inherited all-user opt-in survive into a test run.
+        env.pop("SITESIFT_SCHEDULER_ALLOW_ALL_USERS", None)
+        return [sys.executable, str(PROJECT_ROOT / "main.py")], env
+
     def _run_pipeline(self) -> Tuple[float, str]:
         """
-        Run main.py via run_production.sh.
+        Run main.py directly, scoped to the single test user.
         Returns (duration_seconds, stdout_output).
         """
-        print(f"\n>>> Running pipeline (main.py) ...")
+        print(f"\n>>> Running pipeline (main.py, scoped to {OUTLOOK_USER_ID[:10]}...) ...")
         start = time.time()
 
+        cmd, env = self.pipeline_command_and_env()
         result = subprocess.run(
-            ["bash", str(RUN_PRODUCTION_SCRIPT)],
+            cmd,
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
+            env=env,
             timeout=300,
         )
         duration = time.time() - start
