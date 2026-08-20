@@ -27,7 +27,11 @@ from email_automation import email as email_module
 
 
 class _Doc:
-    pass
+    def __init__(self, **fields):
+        self._fields = fields
+
+    def to_dict(self):
+        return dict(self._fields)
 
 
 class _Query:
@@ -114,6 +118,74 @@ class ScriptOrdinalIsScopedToTheCampaign(unittest.TestCase):
             seen.get("client_id"), "campaign-B",
             "the selector must scope its own count; otherwise the filter exists but is never used",
         )
+
+
+class TheOrdinalCountsPropertiesNotThreads(unittest.TestCase):
+    """The number that indexes the scripts is a PROPERTY ordinal.
+
+    Scoping the query to the campaign fixed WHICH threads are counted. It did
+    not fix WHAT is being counted: `len(results)` is a count of thread
+    documents, and a thread is not a property. One property can carry more than
+    one thread -- a thread re-created after a bounce, a second thread matched to
+    the same row -- and each extra one silently advances the broker's ordinal.
+
+    The consequence is the same sentence PROD-0806-1 was filed for: at a count of
+    two the selector appends "I'm sending separate emails for each of your
+    properties I'm inquiring about" to a broker who has been asked about exactly
+    one. Now that a thread carries `propertyRef`, the count can be what it always
+    claimed to be.
+    """
+
+    def _count(self, docs, **kwargs):
+        recorder = []
+        fs = _FS(recorder, docs)
+        with patch.object(email_module, "_fs_for", return_value=fs):
+            return email_module.get_contact_email_count(
+                "user-1", "broker@example.invalid", **kwargs
+            )
+
+    def test_two_threads_on_one_property_are_one_property(self):
+        docs = [
+            _Doc(propertyRef="prop_aaaa1111"),
+            _Doc(propertyRef="prop_aaaa1111"),
+        ]
+        self.assertEqual(
+            self._count(docs, client_id="campaign-B"), 1,
+            "one property asked about twice is still the broker's first property; "
+            "counting the second thread hands them a repeat-contact script and the "
+            "'separate emails for each of your properties' note",
+        )
+
+    def test_two_threads_on_two_properties_are_two(self):
+        docs = [
+            _Doc(propertyRef="prop_aaaa1111"),
+            _Doc(propertyRef="prop_bbbb2222"),
+        ]
+        self.assertEqual(self._count(docs, client_id="campaign-B"), 2)
+
+    def test_threads_without_a_ref_still_count_one_each(self):
+        # Threads that predate the ref have no identity to dedupe on. Counting
+        # each as its own property preserves exactly today's behaviour for them,
+        # so adopting the ref cannot move an existing campaign's ordinal down.
+        docs = [_Doc(), _Doc(propertyRef=""), _Doc(propertyRef=None)]
+        self.assertEqual(self._count(docs, client_id="campaign-B"), 3)
+
+    def test_refs_and_unrefed_threads_add_up(self):
+        docs = [
+            _Doc(propertyRef="prop_aaaa1111"),
+            _Doc(propertyRef="prop_aaaa1111"),
+            _Doc(),
+        ]
+        self.assertEqual(self._count(docs, client_id="campaign-B"), 2)
+
+    def test_a_document_that_cannot_be_read_still_counts(self):
+        # Never let an unreadable thread doc silently lower the ordinal.
+        class _Broken:
+            def to_dict(self):
+                raise RuntimeError("unreadable")
+
+        self.assertEqual(self._count([_Broken(), _Broken()], client_id="campaign-B"), 2)
+
 
 
 if __name__ == "__main__":

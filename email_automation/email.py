@@ -2632,7 +2632,33 @@ def get_contact_email_count(user_id: str, recipient_email: str, runtime=None,
 
     results = list(query.stream())
 
-    return len(results)
+    # Count PROPERTIES, not thread documents. Scoping to the campaign fixed
+    # which threads are counted; it did not fix what is being counted. A
+    # property can carry more than one thread -- one re-created after a bounce,
+    # one matched to the same row a second time -- and every extra thread
+    # advances the broker's ordinal by one. At two, the selector appends "I'm
+    # sending separate emails for each of your properties I'm inquiring about"
+    # to a broker who has been asked about exactly one, which is the sentence
+    # PROD-0806-1 was filed for.
+    #
+    # Threads with no ref are counted one each, so a campaign whose threads
+    # predate the ref keeps exactly today's ordinal -- adopting the ref can
+    # never move an existing broker's script index down.
+    seen_refs = set()
+    unidentified = 0
+    for doc in results:
+        try:
+            ref = str(((doc.to_dict() or {}).get("propertyRef") or "")).strip()
+        except Exception:
+            # An unreadable thread is still a thread; never let a read error
+            # quietly lower the ordinal.
+            ref = ""
+        if ref:
+            seen_refs.add(ref)
+        else:
+            unidentified += 1
+
+    return len(seen_refs) + unidentified
 
 
 def _extract_requirements_from_primary(primary_script: str) -> str:
