@@ -30,6 +30,7 @@ from .column_config import (
     sheet_values_equal_for_column,
 )
 from .notification_payloads import sanitize_new_property_referral_response
+from .property_ref import normalize_anchor
 from .openai_usage import track_openai_usage_safely
 from . import file_handling as _file_handling
 from .file_handling import project_safe_native_image_manifest
@@ -6293,7 +6294,11 @@ def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
         print(f"⚠️ Could not create AI_META tab: {e}")
 
 def _normalize_ai_meta_anchor(anchor: str) -> str:
-    return " ".join((anchor or "").strip().lower().replace(",", " ").split())
+    # AI_META has folded anchors this exact way since it started detecting row
+    # drift. `property_ref.normalize_anchor` is the same fold, promoted to a leaf
+    # module so the event key and the ref mint agree with AI_META about when two
+    # anchors describe the same property, instead of each carrying its own copy.
+    return normalize_anchor(anchor)
 
 
 def _load_ai_meta_rows(sheets, spreadsheet_id: str) -> List[List[Any]]:

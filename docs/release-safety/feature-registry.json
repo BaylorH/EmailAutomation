@@ -226,7 +226,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/processing.py", "email_automation/messaging.py"],
+        "backend": ["email_automation/processing.py", "email_automation/messaging.py", "email_automation/property_ref.py"],
         "frontend": ["src/components/ConversationsPanel.jsx"],
         "functions": [],
         "firestoreRules": []

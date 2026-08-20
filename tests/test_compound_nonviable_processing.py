@@ -289,7 +289,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             notifications.append({"args": args, "kwargs": kwargs, "id": notif_id})
             return notif_id
 
-        def fake_mark_event_handled(_user_id, _thread_id, event_key, _msg_id, notif_id):
+        def fake_mark_event_handled(_user_id, _thread_id, event_key, _msg_id, notif_id, **_kwargs):
             handled_events.append({"eventKey": event_key, "notifId": notif_id})
             if persist_handled_events:
                 thread_ref._data.setdefault("handledEvents", {})[event_key] = {
@@ -2722,7 +2722,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             notifications.append({"args": args, "kwargs": kwargs, "id": notif_id})
             return notif_id
 
-        def fake_mark_event_handled(_user_id, _thread_id, event_key, _msg_id, notif_id):
+        def fake_mark_event_handled(_user_id, _thread_id, event_key, _msg_id, notif_id, **_kwargs):
             handled_events.append({"eventKey": event_key, "notifId": notif_id})
 
         def fake_update_thread_status(_user_id, _thread_id, status, reason):

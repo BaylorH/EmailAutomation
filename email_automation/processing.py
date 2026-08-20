@@ -27,6 +27,7 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id,
                        is_event_handled, mark_event_handled, build_event_key,
                        update_thread_status, get_thread_status, THREAD_STATUS)
+from .property_ref import resolve_property_ref
 from .logging import write_message_order_test
 from .ai_processing import (
     _ANCILLARY_SUBJECT_RE,
@@ -7262,6 +7263,22 @@ def process_inbox_message(
             # Process events from the proposal
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
+            # Which property this thread is about, as an identity rather than as
+            # a display string. `get_row_anchor` returns the literal "Row data
+            # incomplete"/"Unknown property" for rows it cannot read, and those
+            # are non-empty, so keying anything on the raw anchor lets two
+            # different properties on one surviving thread share one identity --
+            # the 2026-08-06 suppressed-tour defect, one level down from where it
+            # was fixed. The ref is minted once, kept across cosmetic anchor
+            # edits, and re-minted only when the thread genuinely moves to
+            # another property.
+            property_ref = resolve_property_ref(
+                thread_data,
+                client_id=client_id,
+                row_anchor=row_anchor,
+                thread_id=thread_id,
+                row_number=rownum,
+            )
             row_aliases = _server_owned_row_aliases(
                 rowvals,
                 header,
@@ -7400,7 +7417,8 @@ def process_inbox_message(
 
                 # Build event key for deduplication
                 event_key = build_event_key(
-                    event_type, event, thread_id, row_anchor=row_anchor
+                    event_type, event, thread_id, row_anchor=row_anchor,
+                    property_ref=property_ref,
                 )
                 if (
                     event_type == "tour_requested"
@@ -7436,7 +7454,8 @@ def process_inbox_message(
                         "   ℹ️ Skipping stale original-row event after non-viable move; "
                         "replacement/opt-out events will continue."
                     )
-                    mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                    mark_event_handled(user_id, thread_id, event_key, msg_id, None,
+                                       property_ref=property_ref, row_anchor=row_anchor)
                     continue
 
                 print(f"   ➡️ Processing event...")
@@ -7470,7 +7489,8 @@ def process_inbox_message(
                             meta=meta,
                             dedupe_key=f"call_requested:{thread_id}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
                         print(f"📞 Created call_requested notification" + (f" with phone: {phone_number}" if phone_number else ""))
 
                         # Update thread status to paused - waiting for user to handle call
@@ -7534,6 +7554,8 @@ def process_inbox_message(
                                 event_key,
                                 msg_id,
                                 None,
+                                property_ref=property_ref,
+                                row_anchor=row_anchor,
                             ):
                                 raise RetryableProcessingError(
                                     "tour handoff event marker update failed"
@@ -7644,6 +7666,8 @@ def process_inbox_message(
                             event_key,
                             msg_id,
                             notif_id,
+                            property_ref=property_ref,
+                            row_anchor=row_anchor,
                         ):
                             raise RetryableProcessingError(
                                 "tour handoff event marker update failed"
@@ -7701,7 +7725,8 @@ def process_inbox_message(
                             meta=meta,
                             dedupe_key=f"needs_user_input:{thread_id}:{reason}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
                         print(f"⚠️ Created needs_user_input notification (reason: {reason})")
 
                         # Update thread status to paused - waiting for user action
@@ -7774,7 +7799,8 @@ def process_inbox_message(
                                 "followUpStatus": "stopped",
                                 "updatedAt": SERVER_TIMESTAMP,
                             }, merge=True)
-                            mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                            mark_event_handled(user_id, thread_id, event_key, msg_id, None,
+                                       property_ref=property_ref, row_anchor=row_anchor)
                             old_row_became_nonviable = True
                             proposal["skip_response"] = True
                             print(
@@ -7905,7 +7931,8 @@ def process_inbox_message(
                                 },
                                 dedupe_key=f"property_unavailable:{thread_id}:{new_rownum}:moved"
                             )
-                            mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                            mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
                             print(f"🚫 Moved property to non-viable and created notification")
                     except Exception as e:
                         print(f"❌ Failed to handle property_unavailable: {e}")
@@ -8084,7 +8111,8 @@ def process_inbox_message(
                             },
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{new_property_email}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
                         new_property_pending_created = True
                         print(f"🏢 Created new property pending approval notification (no row created yet)")
 
@@ -8165,7 +8193,8 @@ def process_inbox_message(
                             },
                             dedupe_key=f"conversation_closed:{thread_id}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
 
                         # Only skip response if AI didn't generate a closing email
                         # If AI generated a response (e.g., thanking broker), send it before closing
@@ -8283,7 +8312,8 @@ def process_inbox_message(
                             },
                             dedupe_key=f"contact_optout:{thread_id}:{sender_addr_lower}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
                         print(f"🚫 Contact opted out ({reason}): {sender_addr_lower}")
 
                         # Skip auto-response - don't email someone who asked not to be contacted
@@ -8363,7 +8393,8 @@ def process_inbox_message(
                             },
                             dedupe_key=f"wrong_contact:{thread_id}:{suggested_email or suggested_contact or sender_addr_lower}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
                         print(f"👤 Wrong contact detected ({reason}) - redirect to: {suggested_contact or 'unknown'} ({suggested_email or 'no email'})")
 
                         # For "forwarded" (someone covering), don't block - just notify as FYI
@@ -8452,7 +8483,8 @@ def process_inbox_message(
                             },
                             dedupe_key=f"property_issue:{thread_id}:{issue[:50]}"
                         )
-                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id,
+                                           property_ref=property_ref, row_anchor=row_anchor)
                         print(f"⚠️ Property issue detected ({severity}): {issue}")
 
                     except Exception as e:

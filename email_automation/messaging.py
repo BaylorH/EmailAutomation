@@ -5,6 +5,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 from google.cloud.firestore_v1.field_path import FieldPath
 from .automation_runtime import AutomationRuntime, firestore_for
 from .clients import _fs
+from .property_ref import is_identifying_anchor
 from .utils import b64url_id, clean_email_content, normalize_message_id, strip_email_quotes
 
 
@@ -788,7 +789,8 @@ def is_event_handled(user_id: str, thread_id: str, event_key: str) -> bool:
 
 
 def mark_event_handled(user_id: str, thread_id: str, event_key: str,
-                       msg_id: str = None, notif_id: str = None) -> bool:
+                       msg_id: str = None, notif_id: str = None,
+                       property_ref: str = None, row_anchor: str = None) -> bool:
     """
     Record that an event has been handled for this thread.
     Prevents duplicate notifications when AI re-detects the same event from history.
@@ -799,6 +801,10 @@ def mark_event_handled(user_id: str, thread_id: str, event_key: str,
         event_key: Event identifier like "needs_user_input:confidential" or "call_requested"
         msg_id: Optional message ID where event was first detected
         notif_id: Optional notification ID that was created
+        property_ref: Optional minted identity of the property this thread is
+            currently about, persisted in the SAME update as the handled entry
+        row_anchor: The anchor `property_ref` was minted from, so a later run can
+            tell a cosmetic anchor edit from an actual property replacement
 
     Returns:
         True on success, False on failure
@@ -806,13 +812,22 @@ def mark_event_handled(user_id: str, thread_id: str, event_key: str,
     try:
         thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
         event_path = FieldPath("handledEvents", event_key).to_api_repr()
-        thread_ref.update({
+        payload = {
             event_path: {
                 "detectedAt": SERVER_TIMESTAMP,
                 "detectedInMessageId": msg_id,
                 "notificationId": notif_id
             }
-        })
+        }
+        if property_ref:
+            # Rides the handled-event write rather than taking one of its own.
+            # The handled entry is keyed BY the ref, so the two belong in one
+            # update: any run that has a ref worth remembering is already
+            # writing here, and a separate write would only add a second way
+            # for identity bookkeeping to fail or stall in front of it.
+            payload["propertyRef"] = property_ref
+            payload["propertyRefAnchor"] = str(row_anchor or "")
+        thread_ref.update(payload)
         print(f"📌 Marked event as handled: {event_key}")
         return True
     except Exception as e:
@@ -821,7 +836,7 @@ def mark_event_handled(user_id: str, thread_id: str, event_key: str,
 
 
 def build_event_key(event_type: str, event: dict = None, thread_id: str = None,
-                    row_anchor: str = None) -> str:
+                    row_anchor: str = None, property_ref: str = None) -> str:
     """
     Build a unique event key for deduplication.
 
@@ -886,12 +901,25 @@ def build_event_key(event_type: str, event: dict = None, thread_id: str = None,
         # already-handled event re-fire at most once after deploy. A duplicate
         # notification is visible and recoverable; a suppressed one is
         # invisible, which is the defect being fixed.
+        # A MINTED ref, when the caller has one, is the identity. The anchor is
+        # only a display string: `get_row_anchor` really returns the literal
+        # "Row data incomplete"/"Unknown property" for rows it cannot read, and
+        # both are non-empty, so an `if not anchor` guard waves them straight
+        # through as a property NAME. Every unidentified property in the
+        # campaign then collapses onto the one key "tour_requested:Row data
+        # incomplete", only the first is ever seen, and the suppressed-tour
+        # defect is back on exactly the thread it was fixed on. The anchor is
+        # also rebuilt from cells the customer edits, so correcting a street
+        # spelling re-keys an already-handled event into a duplicate.
+        ref = str(property_ref or "").strip()
+        if ref:
+            return f"{event_type}:{ref}"
+
         anchor = str(row_anchor or "").strip()
-        if not anchor:
-            # get_row_anchor really returns "Row data incomplete"/"Unknown
-            # property" for rows it cannot read, so an unidentified property is
-            # a normal occurrence rather than an impossible one. Keep such
-            # events distinguishable by thread instead of letting every
-            # unidentified property on every thread collapse onto one key.
+        if not is_identifying_anchor(anchor):
+            # No ref and nothing that names the property. Fall back to the
+            # thread rather than to a sentinel, so at least two threads stay
+            # distinguishable; two unreadable properties on the SAME thread need
+            # the ref, which is why callers on the replacement path pass one.
             anchor = f"unanchored:{str(thread_id or 'unknown-thread')}"
         return f"{event_type}:{anchor}"
