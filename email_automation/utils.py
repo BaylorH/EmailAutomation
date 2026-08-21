@@ -1079,6 +1079,29 @@ def _is_legacy_mohr_signature_user(user_email: str = None) -> bool:
     return False
 
 
+def _apply_signature_website_policy(footer_html: str) -> str:
+    """Tier-1 (offline) signature-website gate. Inert unless the flag is on.
+
+    Fail-open by construction: the validator returns the input unchanged on any
+    error, and this wrapper swallows even an import failure. A dangerous link is
+    de-linked (text preserved); the message still sends.
+    """
+    try:
+        from .signature_website_validation import apply_signature_website_policy
+
+        cleaned, findings = apply_signature_website_policy(footer_html)
+        if findings:
+            logger.warning(
+                "Signature website neutralised before send: %s",
+                ", ".join(sorted({f.code for f in findings})),
+            )
+            print(f"⚠️ Signature website link neutralised ({len(findings)} finding(s))")
+        return cleaned
+    except Exception:
+        logger.exception("signature website policy unavailable; sending signature unchanged")
+        return footer_html
+
+
 def get_email_footer(custom_signature: str = None, signature_mode: str = None, user_email: str = None) -> str:
     """
     Returns HTML formatted email footer.
@@ -1108,8 +1131,10 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None, u
             # the send surface so cached/unsubstituted placeholders never reach a
             # recipient's inbox (build_professional_signature_html already does this
             # for structured fields; the footer paths must match).
-            return convert_plain_text_signature_to_html(
-                _strip_signature_placeholders_preserving_lines(custom_signature)
+            return _apply_signature_website_policy(
+                convert_plain_text_signature_to_html(
+                    _strip_signature_placeholders_preserving_lines(custom_signature)
+                )
             )
         # Custom mode but no signature text - return empty
         return ""
@@ -1126,8 +1151,10 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None, u
             # Strip unresolved mail-merge tokens ([NAME], {{company}}, ...) before
             # the send surface so cached/unsubstituted placeholders never reach a
             # recipient's inbox.
-            return convert_plain_text_signature_to_html(
-                _strip_signature_placeholders_preserving_lines(custom_signature)
+            return _apply_signature_website_policy(
+                convert_plain_text_signature_to_html(
+                    _strip_signature_placeholders_preserving_lines(custom_signature)
+                )
             )
         return ""
     else:

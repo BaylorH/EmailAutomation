@@ -4007,6 +4007,33 @@ def _record_operation_state(operation_states, state) -> None:
         operation_states.append(state)
 
 
+def _record_signature_website_advisory(fs, user_id: str, user_data: Dict[str, Any]) -> None:
+    """Non-blocking signature-website advisory for the settings UI.
+
+    ADVISORY ONLY. Nothing here can stop, delay, or alter a send. The optional
+    reachability probe is unreliable by nature (a firewall or a brief outage
+    looks identical to a dead domain), so its verdict is written for a human to
+    read and is never consulted by send logic. Fully swallowed on error.
+    """
+    try:
+        from .signature_website_validation import signature_website_advisory
+
+        advisory = signature_website_advisory(user_data)
+        existing = user_data.get("signatureWebsiteAdvisory")
+        if not advisory and not existing:
+            return
+        if advisory:
+            print(
+                "⚠️ Signature website advisory: "
+                + ", ".join(sorted({f["code"] for f in advisory["findings"]}))
+            )
+        fs.collection("users").document(user_id).set(
+            {"signatureWebsiteAdvisory": advisory or None}, merge=True
+        )
+    except Exception as error:
+        print(f"⚠️ Signature website advisory skipped: {error}")
+
+
 def send_outboxes(
     user_id: str,
     headers: Dict[str, str],
@@ -4046,6 +4073,7 @@ def send_outboxes(
             print(f"📝 Signature mode: {signature_mode}")
         elif user_signature:
             print(f"📝 Using custom email signature for user")
+        _record_signature_website_advisory(fs, user_id, user_data)
 
     outbox_ref = fs.collection("users").document(user_id).collection("outbox")
     # Order by createdAt to send emails in the order they were queued (oldest first)

@@ -426,7 +426,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/utils.py", "email_automation/email.py", "email_automation/outbound_safety.py"],
+        "backend": ["email_automation/utils.py", "email_automation/email.py", "email_automation/outbound_safety.py", "email_automation/signature_website_validation.py"],
         "frontend": ["src/components/SettingsPage.jsx", "src/utils/signatureBuilder.js"],
         "functions": [],
         "firestoreRules": ["firestore.rules"]
