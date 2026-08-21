@@ -55,6 +55,31 @@ def allowed(email: str) -> bool:
 
 
 
+#: Fields an outbox item may carry its own recipient in. Initial-outreach items
+#: have NO threadId at all -- they name the recipient directly -- so the item is
+#: always read before falling back to the thread. Getting this wrong made the
+#: most common send in the product (the first email to a broker) the one case the
+#: audit could not name.
+_ITEM_ADDRESS_FIELDS = ("assignedEmails", "recipient", "recipients", "to", "emails", "email")
+
+
+def _item_addresses(data):
+    """Recipient addresses carried on the outbox item itself, or None."""
+    for field in _ITEM_ADDRESS_FIELDS:
+        if field not in data:
+            continue
+        value = data.get(field)
+        if value is None or value == "" or value == []:
+            continue
+        if isinstance(value, str):
+            return [value]
+        try:
+            return [str(v) for v in value]
+        except TypeError:
+            continue
+    return None
+
+
 def _thread_addresses(base, thread_id):
     """Recipient addresses for one thread, or None if they cannot be resolved.
 
@@ -118,7 +143,9 @@ def audit(fs, expect_live: Iterable[str] = ()) -> "tuple[list[str], list[str]]":
             external, internal, unresolved = [], 0, 0
             for item in pending:
                 data = item.to_dict() or {}
-                addresses = _thread_addresses(base, data.get("threadId"))
+                addresses = _item_addresses(data)
+                if addresses is None:
+                    addresses = _thread_addresses(base, data.get("threadId"))
                 if addresses is None:
                     unresolved += 1
                     continue

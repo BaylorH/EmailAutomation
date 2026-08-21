@@ -225,5 +225,57 @@ class OutboxRecipientTests(unittest.TestCase):
         self.assertEqual(problems, [])
 
 
+
+class OutboxItemCarriedRecipientTests(unittest.TestCase):
+    """Initial outreach names its recipient on the item and has NO threadId.
+
+    That is the most common send in the whole product -- the first email to a
+    broker -- and resolving only through the thread made it the one case the
+    audit could not name. Observed on real queued items, not assumed.
+    """
+
+    def _run(self, outbox):
+        fs = OutboxRecipientTests._FS("U1234567890", outbox, {})
+        return audit_send_exposure.audit(fs)
+
+    def test_an_outreach_item_to_our_own_inbox_is_recognised(self):
+        problems, _ = self._run([AuditShapeTests._Doc("o1", {
+            "status": "queued",
+            "assignedEmails": ["bp21harrison+ev8tourno@gmail.com"],
+            "clientId": "c1", "rowNumber": 6,
+        })])
+        joined = " | ".join(problems)
+        self.assertIn("1 allow-listed", joined)
+        self.assertNotIn("UNRESOLVED", joined)
+        self.assertNotIn("NON-ALLOW-LISTED", joined)
+
+    def test_an_outreach_item_to_a_stranger_is_named(self):
+        problems, _ = self._run([AuditShapeTests._Doc("o1", {
+            "status": "queued",
+            "assignedEmails": ["dgee@gardenstaterealty.net"],
+        })])
+        joined = " | ".join(problems)
+        self.assertIn("NON-ALLOW-LISTED", joined)
+        self.assertIn("dgee@gardenstaterealty.net", joined)
+
+    def test_one_stranger_among_allowed_recipients_still_trips_it(self):
+        problems, _ = self._run([AuditShapeTests._Doc("o1", {
+            "status": "queued",
+            "assignedEmails": ["bp21harrison+row2@gmail.com", "someoneelse@example.com"],
+        })])
+        self.assertIn("someoneelse@example.com", " | ".join(problems))
+
+    def test_a_single_string_recipient_field_is_handled(self):
+        """Dead-letter items carry `recipient` as a bare string, not a list."""
+        problems, _ = self._run([AuditShapeTests._Doc("o1", {
+            "status": "queued", "recipient": "dgee@gardenstaterealty.net",
+        })])
+        self.assertIn("NON-ALLOW-LISTED", " | ".join(problems))
+
+    def test_an_item_naming_nobody_is_unresolved_not_safe(self):
+        problems, _ = self._run([AuditShapeTests._Doc("o1", {"status": "queued"})])
+        self.assertIn("UNRESOLVED", " | ".join(problems))
+
+
 if __name__ == "__main__":
     unittest.main()
