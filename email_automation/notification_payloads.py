@@ -7,7 +7,17 @@ def _first_name(name_or_email: str) -> str:
         return ""
     if "@" in value:
         value = value.split("@", 1)[0].replace(".", " ").replace("_", " ")
-    return value.split()[0].strip().title()
+    # The empty guard above runs BEFORE the "@" strip, so it does not cover the
+    # case where the input is non-empty but its local part reduces to nothing --
+    # "@somebrokerage.com", "@", "._@x.com". Those reach here as "" and the old
+    # unguarded [0] raised IndexError, killing the whole reply-processing turn for
+    # that message. The inputs are the model's raw contactName/email event fields,
+    # which are never validated as addresses, so this is reachable from ordinary
+    # model output rather than from a malformed mailbox.
+    parts = value.split()
+    if not parts:
+        return ""
+    return parts[0].strip().title()
 
 
 def build_wrong_contact_suggested_email(
