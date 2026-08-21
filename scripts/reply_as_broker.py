@@ -145,9 +145,15 @@ def main() -> int:
     msg["To"] = dest
     msg["Subject"] = subject
     if target["message_id"]:
-        msg["In-Reply-To"] = target["message_id"]
-        refs = (target["references"] + " " + target["message_id"]).strip()
-        msg["References"] = refs
+        # Unfold before setting. A References header on a thread more than one
+        # message deep arrives folded across several lines, and passing it back
+        # verbatim raises "Header values may not contain linefeed" -- so the
+        # replier worked on the first reply of a thread and broke on the second.
+        def unfold(value: str) -> str:
+            return " ".join((value or "").split())
+
+        msg["In-Reply-To"] = unfold(target["message_id"])
+        msg["References"] = unfold(target["references"] + " " + target["message_id"])
     msg.set_content(body)
 
     print("=== BROKER REPLY ===")
