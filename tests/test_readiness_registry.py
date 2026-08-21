@@ -1936,7 +1936,14 @@ class CommittedReadinessArtifactsTests(unittest.TestCase):
             if line.startswith("| core.")
         }
 
-        self.assertEqual(16, len(core_ids))
+        # 16 -> 17 on 2026-08-20: core.openai_budget_guard (global monthly OpenAI
+        # spend cap) was added. This count is a deliberate ratchet — a core feature
+        # must not appear without someone editing this number, so the addition is a
+        # reviewed decision rather than a silent one. The guard enters the full view
+        # as UNPROVEN with no evidence, which is the honest state: it has never run
+        # in production with enforcement switched on. Do not attach evidence ids to
+        # it until a live run under an enforced limit has actually been observed.
+        self.assertEqual(17, len(core_ids))
         self.assertEqual(core_ids, rows)
         followups_row = next(
             line

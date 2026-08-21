@@ -9,6 +9,7 @@ from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token, upload_excel
 from google.cloud import firestore
 from google.cloud.firestore import SERVER_TIMESTAMP
+from email_automation.openai_usage import track_openai_usage_safely
 import re
 import time
 import hashlib
@@ -2065,6 +2066,29 @@ OUTPUT ONLY valid JSON in this exact format:
             model=OPENAI_ASSISTANT_MODEL,
             input=[{"role": "user", "content": input_content}],
             temperature=0.1
+        )
+
+        # Meter this paid call. Without it this path's spend is invisible, which
+        # matters beyond the dashboard: budget_guard sums the metered rollups, so
+        # an unmetered caller makes the guard under-count and overshoot its limit.
+        # Best-effort — track_openai_usage_safely never raises into the caller.
+        track_openai_usage_safely(
+            db=_fs,
+            user_id=uid,
+            client_id=client_id,
+            thread_id=thread_id,
+            operation="ai.propose_sheet_updates",
+            model=OPENAI_ASSISTANT_MODEL,
+            usage=getattr(response, "usage", None),
+            request_id=getattr(response, "id", None),
+            endpoint="responses",
+            metadata={
+                "sheetId": sheet_id,
+                "rowNumber": rownum,
+                "headerCount": len(header or []),
+                "fileManifestCount": len(file_manifest or []),
+                "urlTextCount": len(url_texts or []),
+            },
         )
 
         raw_response = (response.output_text or "").strip()

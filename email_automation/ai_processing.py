@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
 from .automation_runtime import ai_for, clock_for, firestore_for
+from .budget_guard import should_block_openai_call
 from .messaging import build_conversation_payload
 from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execute_with_retry
 from .column_config import (
@@ -7335,6 +7336,18 @@ def propose_sheet_updates(uid: str,
         dry_run: If True, skips Firestore logging (useful for testing).
     """
     try:
+        # Hard OpenAI budget stop (flag-gated: ENFORCE_OPENAI_BUDGET, default OFF).
+        # When enforcement is ON and global current-month spend has reached
+        # USAGE_MONTHLY_BUDGET_USD, DEFER this turn — return None (as on a failed
+        # call) so processing.py's `if proposal:` gate SKIPS it and the message is
+        # retried once budget frees up, rather than making the paid call. dry_run
+        # still bills the model, so this guards that path too. No-op when the flag
+        # is off (byte-identical to today).
+        if should_block_openai_call(_fs):
+            print("⛔ OpenAI monthly budget reached — deferring extraction "
+                  "(ENFORCE_OPENAI_BUDGET on; raise USAGE_MONTHLY_BUDGET_USD or wait for next month).")
+            return None
+
         # Build conversation payload (chronological; latest last)
         # If conversation is provided directly (e.g., from tests), use it; otherwise fetch from Firestore
         if conversation is None:
@@ -8001,32 +8014,38 @@ OUTPUT ONLY valid JSON in this exact format:
             "input": [{"role": "user", "content": input_content}],
             "temperature": 0.1,
         })
-        if not dry_run:
-            track_openai_usage_safely(
-                # Cost is state: a certification run must record its spend into
-                # its OWN store on its OWN clock, or it corrupts a real user's
-                # rollups and reads another tenant's numbers back.
-                db=firestore_for(runtime, _fs),
-                now=clock_for(runtime, lambda: datetime.now(timezone.utc))(),
-                user_id=uid,
-                client_id=client_id,
-                thread_id=thread_id,
-                operation="ai.extract_sheet_updates",
-                model="gpt-5.2",
-                usage=getattr(response, "usage", None),
-                request_id=getattr(response, "id", None),
-                endpoint="responses",
-                metadata={
-                    "sheetId": sheet_id,
-                    "rowNumber": rownum,
-                    "headerCount": len(header or []),
-                    "conversationMessageCount": len(conversation or []),
-                    "hasPdfManifest": bool(prepared_attachment_manifest),
-                    "pdfCount": len(prepared_attachment_manifest),
-                    "urlTextCount": len(url_texts or []),
-                    "configuredExtractionFieldCount": len(extraction_fields or []),
-                },
-            )
+        # The OpenAI call above ALWAYS bills, even under dry_run — dry_run only
+        # skips the sheetChangeLog Firestore write further down, not the paid API
+        # call. Metering must therefore NOT be gated on it: budget_guard sums these
+        # rollups, so every unmetered billed call makes the guard under-count and
+        # overshoot its limit. The certification-runtime seams below already send a
+        # dry run's spend to its own store on its own clock, so recording it here
+        # cannot corrupt a real user's rollups.
+        track_openai_usage_safely(
+            # Cost is state: a certification run must record its spend into
+            # its OWN store on its OWN clock, or it corrupts a real user's
+            # rollups and reads another tenant's numbers back.
+            db=firestore_for(runtime, _fs),
+            now=clock_for(runtime, lambda: datetime.now(timezone.utc))(),
+            user_id=uid,
+            client_id=client_id,
+            thread_id=thread_id,
+            operation="ai.extract_sheet_updates",
+            model="gpt-5.2",
+            usage=getattr(response, "usage", None),
+            request_id=getattr(response, "id", None),
+            endpoint="responses",
+            metadata={
+                "sheetId": sheet_id,
+                "rowNumber": rownum,
+                "headerCount": len(header or []),
+                "conversationMessageCount": len(conversation or []),
+                "hasPdfManifest": bool(prepared_attachment_manifest),
+                "pdfCount": len(prepared_attachment_manifest),
+                "urlTextCount": len(url_texts or []),
+                "configuredExtractionFieldCount": len(extraction_fields or []),
+            },
+        )
 
         raw_response = (response.output_text or "").strip()
 

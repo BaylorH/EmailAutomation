@@ -88,6 +88,16 @@ jobs:
           SITESIFT_DEV_SCOPED_SCHEDULER: "1"
           SITESIFT_SCHEDULER_TARGET_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
           SITESIFT_SCHEDULER_ALLOWED_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
+          # Global monthly OpenAI spend cap. Both come from repo VARIABLES (not
+          # secrets) so the cap can be raised, lowered or switched off from the
+          # repo settings without a code change or a redeploy. Unset resolves to
+          # an empty string, which budget_guard reads as enforcement OFF and no
+          # limit — so the guard stays inert, and costs zero Firestore reads,
+          # until someone deliberately sets ENFORCE_OPENAI_BUDGET=true AND a
+          # positive USAGE_MONTHLY_BUDGET_USD. Without this passthrough the guard
+          # could never be turned on at all.
+          ENFORCE_OPENAI_BUDGET: ${{ vars.ENFORCE_OPENAI_BUDGET }}
+          USAGE_MONTHLY_BUDGET_USD: ${{ vars.USAGE_MONTHLY_BUDGET_USD }}
         # run: python noPopup_signin_emails_to_excel.py
         run: python main.py
         # run: python scheduler_runner.py

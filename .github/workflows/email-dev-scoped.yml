@@ -63,4 +63,10 @@ jobs:
           SITESIFT_DEV_SCOPED_SCHEDULER: "1"
           SITESIFT_SCHEDULER_TARGET_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
           SITESIFT_SCHEDULER_ALLOWED_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
+          # Same global monthly OpenAI spend cap as the main worker — see the
+          # comment in email.yml. Repo variables, unset = enforcement OFF.
+          # Both schedulers must read the same switch, or turning the cap on
+          # would leave one of them still spending without it.
+          ENFORCE_OPENAI_BUDGET: ${{ vars.ENFORCE_OPENAI_BUDGET }}
+          USAGE_MONTHLY_BUDGET_USD: ${{ vars.USAGE_MONTHLY_BUDGET_USD }}
         run: python main.py

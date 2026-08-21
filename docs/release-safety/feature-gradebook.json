@@ -1609,6 +1609,48 @@
       ],
       "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
     },
+    "core.openai_budget_guard": {
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only",
+        "token_or_graph_failure"
+      ],
+      "variationAxes": [
+        "timing",
+        "campaign_state",
+        "attachment_shape",
+        "data_quality",
+        "operator_action"
+      ],
+      "combinationPlaybooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "manual_reply_before_retry"
+      ],
+      "statePermutations": [
+        "live_waiting",
+        "action_needed",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "enforcement flag unset must be a total no-op: no block, and no Firestore read issued at all",
+        "a zero or unparsable monthly limit must never block, even with enforcement on",
+        "a spend-read failure must fail OPEN and allow the call, never fail closed onto the pipeline",
+        "a blocked turn must DEFER and stay retryable, never mark the message processed or drop it",
+        "a billed call site left unmetered must be treated as a guard defect: it makes the cap under-count"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass when the disabled default is proven inert by an exploding-datastore double, an at-or-over-limit spend blocks and defers without losing the message, a read failure allows the call, and every billed OpenAI call site is metered so the summed spend the guard reads is complete."
+    },
     "core.scheduler_scope": {
       "eventClasses": [
         "followup_due",
@@ -2532,6 +2574,7 @@
         "core.inbox_auto_reply",
         "core.event_classifier",
         "core.property_extraction",
+        "core.openai_budget_guard",
         "core.sheet_update",
         "core.followups",
         "core.stop_cancel_dismiss",
@@ -2863,6 +2906,23 @@
         "admin cost chart reads another user activity"
       ],
       "mustProve": "Stopped/cancelled/dismissed states suppress autonomous work, and admin-only usage/health evidence is visible only to allowed admins."
+    },
+    "spend_cap_defers_without_losing_work": {
+      "features": [
+        "core.openai_budget_guard",
+        "core.property_extraction",
+        "core.health_recovery",
+        "core.scheduler_scope",
+        "admin.usage_readonly"
+      ],
+      "breakThisBy": [
+        "limit reached mid-scan with unprocessed messages still in the batch",
+        "a billed call site that was never metered, so the summed spend is short",
+        "spend read fails while enforcement is on",
+        "enforcement switched on with a zero or unparsable limit",
+        "month boundary crossed between the block and the retry"
+      ],
+      "mustProve": "A blocked turn DEFERS and stays retryable \u2014 never marked processed, never dropped, never silently reported as an extraction failure \u2014 the operator can see why work paused, the spend the guard reads matches what the usage readback shows, and a read failure allows the call rather than stalling the pipeline."
     },
     "map_route_cost_surface": {
       "features": [

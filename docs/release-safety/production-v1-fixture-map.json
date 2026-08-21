@@ -19,9 +19,9 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 102,
-    "needs_live_proof": 10,
-    "needs_fixture": 7
+    "covered": 103,
+    "needs_fixture": 13,
+    "needs_live_proof": 10
   },
   "featureFixtureMatrix": {
     "core.upload_mapping": {
@@ -2766,6 +2766,136 @@
         "gapReason": "admin.usage_readonly has partial automated coverage, but this operator_visible_failure class needs source-of-truth readback in the Baylor/BP21 proof.",
         "nextProof": "Capture Firestore/Sheet/dashboard evidence for admin.usage_readonly / operator_visible_failure during the Production V1 base campaign proof."
       }
+    },
+    "core.openai_budget_guard": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated"
+        ],
+        "testFiles": [
+          "tests/test_budget_guard.py"
+        ],
+        "testIds": [
+          "test_off_never_blocks_even_over_budget",
+          "test_under_budget_allows",
+          "test_at_or_over_budget_blocks"
+        ],
+        "provesBehavior": "Drives should_block_openai_call directly across the three decision states with a fake datastore: with the flag unset it returns False even when spend is over the limit AND issues no datastore read at all, under the limit it allows, and at or over the limit it returns True so the caller defers the paid call. Proves the cap's decision boundary and its zero-cost disabled default, not merely that the module imports."
+      },
+      "terminal_state": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated"
+        ],
+        "gapReason": "No deterministic test drives the guard against a stopped/completed campaign, so it is unproven that a terminal campaign is never blocked-and-deferred into looking retryable.",
+        "nextProof": "Add a fixture that reaches the limit while the only pending work belongs to a terminal campaign, and assert nothing is deferred or resurrected."
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated"
+        ],
+        "gapReason": "Not a placeholder-bearing surface \u2014 the guard never composes outbound text \u2014 but the cell is required, and the real risk is the adjacent one: a deferral must not let a half-built row reach a send surface on the retry.",
+        "nextProof": "Assert a turn deferred by the cap resumes through the ordinary placeholder validation on retry rather than bypassing it."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated"
+        ],
+        "gapReason": "The guard is recipient-agnostic, but no test proves a deferred-then-retried turn still re-derives its recipient rather than reusing stale state.",
+        "nextProof": "Assert recipient resolution is recomputed after a budget deferral, not carried over."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "action_needed"
+        ],
+        "evidence": [
+          "automated"
+        ],
+        "gapReason": "Unproven that an operator manually continuing a conversation during a budget block is not silently swallowed by the deferral.",
+        "nextProof": "Drive a manual continuation while over limit and assert the operator action is honored or visibly refused, never dropped."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "The deferral relies on the message staying unprocessed and being retried later; no deterministic test proves the retry happens exactly once and does not double-charge once budget frees up.",
+        "nextProof": "Assert a blocked turn is retried and metered exactly once after the limit is raised or the month rolls over."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "action_needed"
+        ],
+        "evidence": [
+          "automated",
+          "ui"
+        ],
+        "gapReason": "A budget block currently returns the same empty result as a failed extraction, so an operator cannot tell 'we paused on cost' from 'the model failed'. That indistinguishability is the guard's main product risk.",
+        "nextProof": "Give the deferral a distinct, operator-visible state and assert it renders differently from an extraction failure."
+      }
     }
   },
   "stressFixtureClasses": [
@@ -3427,11 +3557,61 @@
         "gapReason": "No test proves admin.usage_readonly rejects a near-miss input that resembles but is not a real trigger, so false-positive resistance is unproven for this feature.",
         "nextProof": "Add a fixture pairing a real trigger (positive control) with a near-miss variant for admin.usage_readonly and asserting the guard fires only on the real one."
       }
+    },
+    "core.openai_budget_guard": {
+      "rate_limit_429": {
+        "status": "needs_fixture",
+        "stressScenario": "spend cap while the datastore is throttling: the spend read must fail OPEN and allow the call rather than stalling extraction.",
+        "gapReason": "test_fail_open_on_db_error proves a generic read error fails open, but not specifically a throttled/429 datastore under load.",
+        "nextProof": "Drive the spend read against a simulated throttle and assert the call is allowed and the incident is logged."
+      },
+      "concurrent_runner": {
+        "status": "needs_fixture",
+        "stressScenario": "two workers checking the cap at once near the limit: both may read under-limit and both proceed, overshooting.",
+        "gapReason": "The guard reads and decides without any reservation or lock, so a concurrent overshoot is possible and untested.",
+        "nextProof": "Model two simultaneous checks at limit-minus-one-call and record the overshoot bound."
+      },
+      "malformed_data": {
+        "status": "covered",
+        "stressScenario": "unparsable limit or garbage cost values must not block and must not crash.",
+        "testFiles": [
+          "tests/test_budget_guard.py"
+        ],
+        "testIds": [
+          "test_limit_parse",
+          "test_handles_missing_or_garbage_cost"
+        ],
+        "provesBehavior": "Feeds an unparsable USAGE_MONTHLY_BUDGET_USD and cost rollups containing None and non-numeric strings, and proves the guard treats a garbage limit as 'no limit' (never blocks) and skips uncastable cost values while still summing the valid ones \u2014 so malformed spend data can neither crash extraction nor silently block it."
+      },
+      "partial_batch_failure": {
+        "status": "needs_fixture",
+        "stressScenario": "the cap trips midway through a batch: already-processed rows must stay processed and the rest must remain retryable.",
+        "gapReason": "No test drives the cap tripping mid-batch, so partial-batch behavior at the boundary is unproven.",
+        "nextProof": "Assert a mid-batch block leaves earlier rows done and later rows untouched and retryable."
+      },
+      "retry_storm": {
+        "status": "needs_fixture",
+        "stressScenario": "every turn deferring while over limit: the scheduler must not spin retrying the same messages each tick.",
+        "gapReason": "A deferral leaves work retryable by design, so a sustained over-limit period could retry the same set every scan without backoff.",
+        "nextProof": "Run repeated scans while over limit and assert bounded, backed-off retry rather than a per-tick storm."
+      },
+      "near_miss_negative": {
+        "status": "covered",
+        "stressScenario": "just under the limit must allow; exactly at the limit must block.",
+        "testFiles": [
+          "tests/test_budget_guard.py"
+        ],
+        "testIds": [
+          "test_under_budget_allows",
+          "test_at_or_over_budget_blocks"
+        ],
+        "provesBehavior": "Pins the boundary from both sides: spend one cent under the limit allows the call, spend exactly at the limit blocks it. Proves the comparison is >= rather than >, so the cap cannot be walked one call past its ceiling."
+      }
     }
   },
   "stressSummary": {
-    "needs_fixture": 101,
-    "covered": 1
+    "covered": 3,
+    "needs_fixture": 105
   },
   "crossFeatureMatrix": {
     "placeholder_name_through_send_path": {
@@ -3609,11 +3789,31 @@
       "status": "needs_fixture",
       "gapReason": "Intentionally isolated from Base-V1 tonight: 'firebase_worker_execution_plane' models the next-gen infra worker plane (Cloud Scheduler, Cloud Tasks, Firestore lane rules, observability) that sits beneath the Results/Tour/Map migration rather than the Base-V1 send core, so it stays a fenced-off gap for tonight's reopen with no Base-V1 e2e - the current single-process scheduler scope is already exercised under core.scheduler_scope.",
       "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'firebase_worker_execution_plane' end-to-end across core.scheduler_scope, infra.cloud_scheduler, infra.cloud_tasks, infra.firestore_lane_rules, infra.observability and wire its testId here."
+    },
+    "spend_cap_defers_without_losing_work": {
+      "features": [
+        "core.openai_budget_guard",
+        "core.property_extraction",
+        "core.health_recovery",
+        "core.scheduler_scope",
+        "admin.usage_readonly"
+      ],
+      "breakThisBy": [
+        "limit reached mid-scan with unprocessed messages still in the batch",
+        "a billed call site that was never metered, so the summed spend is short",
+        "spend read fails while enforcement is on",
+        "enforcement switched on with a zero or unparsable limit",
+        "month boundary crossed between the block and the retry"
+      ],
+      "inBaseV1Scope": true,
+      "status": "needs_fixture",
+      "gapReason": "No integration test drives the cap together with extraction, retry/health and the usage readback. The interaction that matters \u2014 a blocked turn must DEFER and stay retryable, never be mistaken for a processed or failed one \u2014 is only covered unit-side today.",
+      "nextProof": "Drive a real extraction turn over an enforced limit and assert the message is not marked processed, is retried once budget frees, and the spend the guard read matches the usage readback."
     }
   },
   "crossFeatureSummary": {
     "covered": 3,
-    "needs_fixture": 5
+    "needs_fixture": 6
   },
   "combinationDeckMatrix": {
     "karsen_launch_placeholder_and_tour_leak": {

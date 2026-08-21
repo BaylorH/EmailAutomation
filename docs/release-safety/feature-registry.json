@@ -518,6 +518,33 @@
       }
     },
     {
+      "id": "core.openai_budget_guard",
+      "name": "Global monthly OpenAI spend cap",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_guarded",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/budget_guard.py"],
+        "frontend": [],
+        "functions": [],
+        "firestoreRules": [],
+        "githubActions": [".github/workflows/email.yml", ".github/workflows/email-dev-scoped.yml"]
+      },
+      "dependencies": ["admin.usage_readonly"],
+      "sendRisk": "none",
+      "dataWrites": [],
+      "promptContracts": [],
+      "uiSurfaces": ["GitHub repo variables ENFORCE_OPENAI_BUDGET and USAGE_MONTHLY_BUDGET_USD"],
+      "testFixtures": ["budget_guard_disabled_is_a_no_op", "budget_guard_blocks_at_or_over_limit", "budget_guard_fails_open_on_read_error"],
+      "manualScreenshotRubrics": ["deferred_turn_is_visible_not_silent", "spend_readback_matches_enforced_limit"],
+      "codeRabbitChecks": ["Flag defaults OFF", "Fails open on read error", "No Firestore reads while disabled"],
+      "adversarialRubrics": ["ai_failure_visibility", "dashboard_state_truth"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["enforcement_on_without_positive_limit", "billed_call_site_left_unmetered"]
+      }
+    },
+    {
       "id": "core.scheduler_scope",
       "name": "Current GitHub scheduler scope and processing order",
       "lane": "production_v1_core",
