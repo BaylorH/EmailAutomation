@@ -54,6 +54,32 @@ def allowed(email: str) -> bool:
     return address.startswith(ALLOWED_PREFIX) and address.endswith(ALLOWED_DOMAIN)
 
 
+
+def _thread_addresses(base, thread_id):
+    """Recipient addresses for one thread, or None if they cannot be resolved.
+
+    None is deliberately distinct from []: "we could not tell who this is
+    addressed to" must never be reported as "addressed to nobody". An
+    unresolved recipient is surfaced, not silently treated as safe.
+    """
+    if not thread_id:
+        return None
+    try:
+        snapshot = base.collection("threads").document(str(thread_id)).get()
+    except Exception:
+        return None
+    if not getattr(snapshot, "exists", False):
+        return None
+    data = snapshot.to_dict() or {}
+    addresses = data.get("email") or []
+    if isinstance(addresses, str):
+        addresses = [addresses]
+    try:
+        return [str(a) for a in addresses]
+    except TypeError:
+        return None
+
+
 def audit(fs, expect_live: Iterable[str] = ()) -> "tuple[list[str], list[str]]":
     """Return (problems, notes). Pure over the Firestore client it is handed."""
     expected = set(expect_live or ())
@@ -83,7 +109,38 @@ def audit(fs, expect_live: Iterable[str] = ()) -> "tuple[list[str], list[str]]":
             if str((item.to_dict() or {}).get("status") or "").lower() not in TERMINAL_OUTBOX
         ]
         if pending:
-            problems.append(f"OUTBOX has {len(pending)} unsent item(s) for user {uid[:10]}")
+            # WHO is it queued to? Without this the audit is least useful exactly
+            # when it matters most: during an authorised live test the outbox is
+            # never empty, so "N unsent items" is permanently red and a genuine
+            # queued send to a stranger looks identical to a queued send to our
+            # own test inbox. The address is not on the outbox item -- it lives on
+            # the thread the item belongs to -- so it has to be resolved.
+            external, internal, unresolved = [], 0, 0
+            for item in pending:
+                data = item.to_dict() or {}
+                addresses = _thread_addresses(base, data.get("threadId"))
+                if addresses is None:
+                    unresolved += 1
+                    continue
+                bad = [a for a in addresses if not allowed(a)]
+                if bad:
+                    external.extend(bad)
+                else:
+                    internal += 1
+
+            if external:
+                # Loudest line the audit can produce: something is queued to
+                # someone who is not us. Named, because you cannot act on a count.
+                problems.append(
+                    f"OUTBOX queued to NON-ALLOW-LISTED address(es) for user {uid[:10]}: "
+                    + ", ".join(sorted(set(external)))
+                )
+            detail = f"{internal} allow-listed"
+            if unresolved:
+                detail += f", {unresolved} UNRESOLVED recipient"
+            problems.append(
+                f"OUTBOX has {len(pending)} unsent item(s) for user {uid[:10]} ({detail})"
+            )
 
         queued = list(base.collection("pendingResponses").stream())
         if queued:

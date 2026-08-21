@@ -111,5 +111,119 @@ class AuditShapeTests(unittest.TestCase):
         self.assertEqual(notes, [])
 
 
+
+class OutboxRecipientTests(unittest.TestCase):
+    """A queued send must say WHO it is queued to.
+
+    During an authorised live test the outbox is never empty, so a bare count is
+    permanently red and carries no information. The one question worth asking at
+    that moment -- is anything queued to someone who is not us? -- has to be
+    answerable, so the recipient is resolved through the thread the item belongs to.
+    """
+
+    class _Snap:
+        def __init__(self, data):
+            self._data = data
+            self.exists = data is not None
+        def to_dict(self):
+            return self._data
+
+    class _ThreadDocRef:
+        def __init__(self, data):
+            self._data = data
+        def get(self):
+            return OutboxRecipientTests._Snap(self._data)
+
+    class _ThreadsCol:
+        def __init__(self, threads):
+            self._threads = threads
+        def document(self, tid):
+            return OutboxRecipientTests._ThreadDocRef(self._threads.get(tid))
+        def stream(self):
+            return iter(())
+        def where(self, *_a, **_k):
+            return self
+
+    class _Col:
+        def __init__(self, docs=()):
+            self._docs = list(docs)
+        def stream(self):
+            return iter(self._docs)
+        def where(self, *_a, **_k):
+            return OutboxRecipientTests._Col([])
+        def document(self, _id):
+            return OutboxRecipientTests._UserRef({}, {})
+
+    class _UserRef:
+        def __init__(self, outbox, threads):
+            self._outbox = outbox
+            self._threads = threads
+        def collection(self, name):
+            if name == "outbox":
+                return OutboxRecipientTests._Col(self._outbox)
+            if name == "threads":
+                return OutboxRecipientTests._ThreadsCol(self._threads)
+            return OutboxRecipientTests._Col([])
+
+    class _FS:
+        def __init__(self, uid, outbox, threads):
+            self._uid = uid
+            self._ref = OutboxRecipientTests._UserRef(outbox, threads)
+        def collection(self, name):
+            if name == "users":
+                fs = self
+                class _Users:
+                    def stream(_s):
+                        doc = AuditShapeTests._Doc(fs._uid, {})
+                        return iter([doc])
+                    def document(_s, _id):
+                        return fs._ref
+                    def where(_s, *_a, **_k):
+                        return OutboxRecipientTests._Col([])
+                return _Users()
+            return OutboxRecipientTests._Col([])
+
+    def _run(self, outbox, threads):
+        fs = self._FS("U1234567890", outbox, threads)
+        return audit_send_exposure.audit(fs)
+
+    def test_a_queued_send_to_a_stranger_is_named_not_just_counted(self):
+        problems, _ = self._run(
+            [AuditShapeTests._Doc("o1", {"status": "queued", "threadId": "t1"})],
+            {"t1": {"email": ["dgee@gardenstaterealty.net"]}},
+        )
+        joined = " | ".join(problems)
+        self.assertIn("NON-ALLOW-LISTED", joined)
+        self.assertIn("dgee@gardenstaterealty.net", joined,
+                      "the address must be named -- a count cannot be acted on")
+
+    def test_a_queued_send_to_our_own_test_inbox_is_not_flagged_as_external(self):
+        problems, _ = self._run(
+            [AuditShapeTests._Doc("o1", {"status": "queued", "threadId": "t1"})],
+            {"t1": {"email": ["bp21harrison+row3@gmail.com"]}},
+        )
+        joined = " | ".join(problems)
+        self.assertNotIn("NON-ALLOW-LISTED", joined)
+        self.assertIn("1 allow-listed", joined)
+        self.assertTrue(any("unsent item" in p for p in problems),
+                        "still reported: anything that can send is still exposure")
+
+    def test_an_unresolvable_recipient_is_surfaced_not_assumed_safe(self):
+        problems, _ = self._run(
+            [AuditShapeTests._Doc("o1", {"status": "queued", "threadId": "missing"})],
+            {},
+        )
+        joined = " | ".join(problems)
+        self.assertIn("UNRESOLVED", joined)
+        self.assertNotIn("NON-ALLOW-LISTED", joined)
+
+    def test_a_sent_item_is_not_pending(self):
+        problems, _ = self._run(
+            [AuditShapeTests._Doc("o1", {"status": "sent", "threadId": "t1"})],
+            {"t1": {"email": ["dgee@gardenstaterealty.net"]}},
+        )
+        self.assertEqual(problems, [])
+
+
 if __name__ == "__main__":
     unittest.main()
