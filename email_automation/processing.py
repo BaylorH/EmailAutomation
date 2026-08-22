@@ -578,6 +578,49 @@ def _record_asset_extraction_warning(
         return False
 
 
+# The persisted fields that mean "this conversation is over". They are written
+# by the terminal handlers and, until 2026-08-22, were read by almost nothing:
+# `nonViableAt` and `nonViableReason` had NO reader anywhere in the repo, and
+# `pendingTerminalReason` -- written to every thread root on the row precisely
+# so a terminal decision survives the fallible sheet work that follows -- was
+# read only by the follow-up lane.
+THREAD_RESOLVED_STATUSES = frozenset({"stopped", "completed", "archived"})
+
+
+def thread_resolved_send_block_reason(thread_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why an automatic reply must not go into this thread, or None.
+
+    Reads PERSISTED state, deliberately. The defect this closes was a send
+    decision made from in-request Python locals: a conversation could carry a
+    recorded terminal decision from an earlier, partly-completed pass and still
+    be asked for a property's square footage on the next inbound, because the
+    local that gated the reply had been recomputed from scratch and said the row
+    was alive.
+
+    This is applied at `send_reply_in_thread`, the single chokepoint every
+    automatic reply passes through -- which loaded the whole thread document and
+    then read exactly one field off it, `clientId`. Guarding here rather than at
+    each caller is the point: a per-caller fix protects the callers somebody
+    remembered, and the queued-reply replay lane, which never re-reads the
+    thread at all, was not one of them.
+
+    A reply that IS the terminal acknowledgement passes `allow_terminal_thread`.
+    """
+    data = thread_data or {}
+    pending_terminal = str(data.get("pendingTerminalReason") or "").strip()
+    if pending_terminal:
+        return f"the thread carries a pending terminal decision ({pending_terminal})"
+    if data.get("nonViableAt"):
+        reason = str(data.get("nonViableReason") or "non-viable").strip()
+        return f"the property is recorded as {reason}"
+    if data.get("optedOutAt"):
+        return "the contact has opted out"
+    status = str(data.get("status") or "").strip().lower()
+    if status in THREAD_RESOLVED_STATUSES:
+        return f"the thread is {status}"
+    return None
+
+
 def _queue_response_retry_or_reconciliation(
     user_id: str,
     thread_id: str,
@@ -605,6 +648,11 @@ def _queue_response_retry_or_reconciliation(
         return "campaign_stopped"
     if send_outcome.outcome == "suppressed_recipient_optout":
         print("⏭️ Reply recipient opted out; no retry was queued")
+        return "recipient_suppressed"
+    if send_outcome.outcome == "suppressed_thread_resolved":
+        # Deliberate silence, not a failure. Queueing this would post the very
+        # message the guard just refused, a few minutes later.
+        print("⏭️ Conversation already resolved; no retry was queued")
         return "recipient_suppressed"
     if sent_but_unindexed:
         _restore_deferred_terminal_reply(user_id, thread_id,
@@ -6113,8 +6161,14 @@ def _reply_delivery_transport_for(runtime, headers, base, *, retry, max_retries)
     )
 
 
-def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str, runtime=None) -> bool:
-    """Send a reply to the current message being processed and index it for future replies"""
+def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str, runtime=None, *, allow_terminal_thread: bool = False) -> bool:
+    """Send a reply to the current message being processed and index it for future replies.
+
+    `allow_terminal_thread` is for the replies that ARE the terminal
+    acknowledgement -- "thank you for letting me know that property is no longer
+    available" has to reach a thread the product has just resolved. Every other
+    caller gets the guard, including the ones written after this comment.
+    """
     _reset_reply_send_outcome()
     outbound_mode = resolve_outbound_mode()
     if outbound_mode != OUTBOUND_MODE_LIVE:
@@ -6180,6 +6234,18 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             .get()
         )
         thread_data = thread_doc.to_dict() if thread_doc.exists else {}
+        if not allow_terminal_thread:
+            resolved_reason = thread_resolved_send_block_reason(thread_data)
+            if resolved_reason:
+                _set_reply_send_outcome(
+                    error=(
+                        "Automatic reply refused because "
+                        f"{resolved_reason}; the conversation is already resolved"
+                    ),
+                    outcome="suppressed_thread_resolved",
+                )
+                print(f"   🤐 Not replying: {resolved_reason}")
+                return False
         client_id = (thread_data or {}).get("clientId")
         decision = get_client_automation_decision(user_id, client_id)
         if decision.denies_autonomous_work:
@@ -9044,7 +9110,13 @@ def process_inbox_message(
                     elif llm_response_email:
                         print("⚠️ Ignoring LLM response because it requested a Note/Skip field")
                     
-                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
+                    # The terminal acknowledgement itself. This reply EXISTS to answer a
+                    # conversation the product has just resolved, so it is the one lane
+                    # that must pass the resolved-thread guard.
+                    sent = send_reply_in_thread(
+                        user_id, headers, response_body, msg_id, to_addr_lower, thread_id,
+                        allow_terminal_thread=True,
+                    )
                     if sent:
                         print(f"📧 Sent thank you + closing (new property suggested) to: {to_addr_lower}")
                         response_sent = True
@@ -9078,7 +9150,13 @@ def process_inbox_message(
                     elif llm_response_email:
                         print("⚠️ Ignoring LLM response because it requested a Note/Skip field")
                     
-                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
+                    # The terminal acknowledgement itself. This reply EXISTS to answer a
+                    # conversation the product has just resolved, so it is the one lane
+                    # that must pass the resolved-thread guard.
+                    sent = send_reply_in_thread(
+                        user_id, headers, response_body, msg_id, to_addr_lower, thread_id,
+                        allow_terminal_thread=True,
+                    )
                     if sent:
                         print(f"📧 Sent thank you + ask for alternatives to: {to_addr_lower}")
                         response_sent = True
