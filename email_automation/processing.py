@@ -236,6 +236,7 @@ class GraphMailboxReadRefused(RuntimeError):
 GRAPH_MAILBOX_READ_OPERATIONS = frozenset({
     "sent_items_for_conversation",      # reconcile a just-sent reply
     "message_envelope_by_id",           # exact-message identity readback
+    "message_id_by_internet_id",        # translate an internet Message-ID to the provider's own id
     "reply_target_metadata",            # recipients of the message being replied to
     "reply_conversation_id",            # conversation of the message being replied to
     "mailbox_identity",                 # who this mailbox is (/me)
@@ -2017,20 +2018,78 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
     return result
 
 
+MESSAGE_ENVELOPE_SELECT = (
+    "id,subject,from,sender,replyTo,toRecipients,ccRecipients,"
+    "receivedDateTime,sentDateTime,conversationId,internetMessageId,"
+    "internetMessageHeaders,bodyPreview,hasAttachments"
+)
+
+
+def _looks_like_internet_message_id(message_id: str) -> bool:
+    """RFC 5322 message ids are angle-bracketed; the provider's own ids are not."""
+    value = str(message_id or "").strip()
+    return value.startswith("<") and value.endswith(">")
+
+
+def _resolve_provider_message_id(headers: Dict[str, str], internet_message_id: str) -> Optional[str]:
+    """Translate an internet Message-ID into the provider's own message id."""
+    quoted = str(internet_message_id or "").replace("'", "''")
+    response = exponential_backoff_request(
+        lambda: _mailbox_reader().read(
+            "message_id_by_internet_id",
+            "https://graph.microsoft.com/v1.0/me/messages",
+            headers=headers,
+            params={
+                "$filter": f"internetMessageId eq '{quoted}'",
+                "$select": "id",
+                "$top": 1,
+            },
+            timeout=30,
+        )
+    )
+    items = (response.json() or {}).get("value") or []
+    for item in items:
+        candidate = (item or {}).get("id")
+        if candidate:
+            return candidate
+    return None
+
+
 def _fetch_graph_message_by_id(headers: Dict[str, str], message_id: str) -> Dict[str, Any]:
-    encoded_id = quote(str(message_id or ""), safe="")
+    """Fetch one message envelope, given EITHER kind of identifier.
+
+    LIVE BREAK, and it made the retry queue a queue that could never drain.
+    A message parked for retry stores its INTERNET Message-ID -- the
+    angle-bracketed RFC 5322 one that travels in the headers. This lookup asked
+    the provider for `/me/messages/<that value>`, and that endpoint addresses
+    messages by the PROVIDER'S OWN opaque id. They are different kinds of
+    identifier, so the request was rejected 400 Bad Request every single time,
+    on every attempt, forever -- while the dashboard and the logs both reported
+    the message as waiting to be retried. Two messages sat parked in the account
+    for weeks behind exactly this, each recording the same rejected URL.
+
+    So the id is now translated first when it is the internet kind. The other
+    kind is passed straight through, because most callers already hold it.
+    """
+    raw_id = str(message_id or "")
+    lookup_id = raw_id
+    if _looks_like_internet_message_id(raw_id):
+        resolved = _resolve_provider_message_id(headers, raw_id)
+        if not resolved:
+            # Say which id failed and why. "Bad Request" alone is what made this
+            # read as a transient provider problem for weeks.
+            raise ValueError(
+                "no message in the mailbox carries internet message id "
+                f"{raw_id!r}; it may have been deleted or moved out of scope"
+            )
+        lookup_id = resolved
+    encoded_id = quote(lookup_id, safe="")
     response = exponential_backoff_request(
         lambda: _mailbox_reader().read(
             "message_envelope_by_id",
             f"https://graph.microsoft.com/v1.0/me/messages/{encoded_id}",
             headers=headers,
-            params={
-                "$select": (
-                    "id,subject,from,sender,replyTo,toRecipients,ccRecipients,"
-                    "receivedDateTime,sentDateTime,conversationId,internetMessageId,"
-                    "internetMessageHeaders,bodyPreview,hasAttachments"
-                )
-            },
+            params={"$select": MESSAGE_ENVELOPE_SELECT},
             timeout=30,
         )
     )

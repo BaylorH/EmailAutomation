@@ -1193,6 +1193,11 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "id": "graph-message-1",
             "internetMessageId": "<internet-message-1@example.test>",
             "conversationId": "conversation-1",
+            # Also answers the internet-id -> provider-id translation the retry
+            # now performs first. The parked record stores an internet
+            # Message-ID, and asking the provider for a message BY that id was
+            # rejected every time, which is what made the retry queue undrainable.
+            "value": [{"id": "graph-message-1"}],
         }
 
         with patch.object(processing, "_fs", fake_fs), \
@@ -1209,7 +1214,12 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
             result,
         )
-        fetch_graph_message.assert_called_once()
+        # Two provider round trips now, not one, and that is the fix rather than
+        # a regression: the parked record holds an INTERNET Message-ID, so the
+        # retry must translate it into the provider's own id before it can ask
+        # for the message. Asking with the wrong kind of id is what made every
+        # retry fail with 400 and the queue undrainable.
+        self.assertEqual(2, fetch_graph_message.call_count)
         process_message.assert_not_called()
         mark_processed.assert_not_called()
         update_payload = failure_doc.reference.set.call_args.args[0]
@@ -1254,6 +1264,11 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "id": "graph-message-1",
             "internetMessageId": "<internet-message-1@example.test>",
             "conversationId": "conversation-1",
+            # Also answers the internet-id -> provider-id translation the retry
+            # now performs first. The parked record stores an internet
+            # Message-ID, and asking the provider for a message BY that id was
+            # rejected every time, which is what made the retry queue undrainable.
+            "value": [{"id": "graph-message-1"}],
         }
         sent_items_response = MagicMock()
         sent_items_response.status_code = 200
@@ -1350,6 +1365,11 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "id": "graph-message-1",
             "internetMessageId": "<internet-message-1@example.test>",
             "conversationId": "conversation-1",
+            # Also answers the internet-id -> provider-id translation the retry
+            # now performs first. The parked record stores an internet
+            # Message-ID, and asking the provider for a message BY that id was
+            # rejected every time, which is what made the retry queue undrainable.
+            "value": [{"id": "graph-message-1"}],
         }
 
         with patch.object(processing, "_fs", fake_fs), \

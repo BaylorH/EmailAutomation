@@ -265,7 +265,7 @@ class ReconciliationTests(unittest.TestCase):
     def test_scope_b_is_the_deployed_application_surface(self):
         """Scope B: what the '33 across 9' figure was reaching for - measured at 36/10."""
         scope_b = self.report["scopeB"]
-        self.assertEqual(scope_b["readCount"], 36, scope_b["byModule"])
+        self.assertEqual(scope_b["readCount"], 37, scope_b["byModule"])
         self.assertEqual(len(scope_b["byModule"]), 10, sorted(scope_b["byModule"]))
         for added in (
             "app.py",
@@ -286,8 +286,8 @@ class ReconciliationTests(unittest.TestCase):
         convergence would be rewarded with a smaller number.
         """
         scope_b = self.report["scopeB"]
-        self.assertEqual(scope_b["readCount"], 36)
-        self.assertEqual(scope_b["readRoutes"], {"direct": 24, "boundary": 12})
+        self.assertEqual(scope_b["readCount"], 37)
+        self.assertEqual(scope_b["readRoutes"], {"direct": 24, "boundary": 13})
 
     def test_every_boundary_routed_read_is_in_the_converged_module(self):
         """One module has converged so far. Say which, rather than implying more."""
@@ -300,18 +300,30 @@ class ReconciliationTests(unittest.TestCase):
     def test_the_two_undercounted_modules_are_pinned_at_their_true_counts(self):
         """The corrections the 33 figure was right to make, and one it got wrong.
 
-        ``processing.py`` really does hold twelve reads rather than eleven. But
+        AMENDED 2026-08-22: ``processing.py`` now holds THIRTEEN. The thirteenth
+        is ``_resolve_provider_message_id``, added because the retry queue stored
+        an internet Message-ID and then asked the provider for a message by its
+        OWN id -- two different kinds of identifier, so every retry was rejected
+        and the queue could never drain. Translating the id costs one extra read,
+        and it is a read taken ONLY when the stored id is the internet kind.
+
+        A bump here is meant to be argued with, not absorbed: the whole value of
+        this census is that each number has a reviewed reason, so the count and
+        the reason move together or neither moves.
+
+        ``processing.py`` really does hold more reads than the old figure said.
+        But
         ``sent_mail_guard.py`` holds THREE, not the two that figure recorded -
         both of its paginating continuation guards reach ``requests.get``
         through a lambda default, and both were invisible.
         """
         scope_b = self.report["scopeB"]["byModule"]
-        self.assertEqual(scope_b["email_automation/processing.py"], 12)
+        self.assertEqual(scope_b["email_automation/processing.py"], 13)
         self.assertEqual(scope_b["email_automation/sent_mail_guard.py"], 3)
 
     def test_scope_c_is_every_read_including_scripts_and_the_boundary(self):
         scope_c = self.report["scopeC"]
-        self.assertEqual(scope_c["readCount"], 56, scope_c["byModule"])
+        self.assertEqual(scope_c["readCount"], 57, scope_c["byModule"])
         self.assertIn("scheduler_runner.py", scope_c["byModule"])
         self.assertIn("email_automation/message_transport.py", scope_c["byModule"])
 
@@ -323,7 +335,7 @@ class ReconciliationTests(unittest.TestCase):
         two numbers that disagree.
         """
         delta = self.report["reconciliation"]["scopeBOnly"]
-        self.assertEqual(len(delta), 28, [f"{e['module']}:{e['line']}" for e in delta])
+        self.assertEqual(len(delta), 29, [f"{e['module']}:{e['line']}" for e in delta])
 
         # Scope A's raw count includes reads that do not exist, so the books only
         # balance once those are taken back out. That is the reconciliation's
@@ -442,7 +454,7 @@ class ProcessingReadConvergenceTests(unittest.TestCase):
     def _processing_ops(self):
         return [op for op in self.report["operations"] if op["module"] == PROCESSING]
 
-    def test_processing_still_holds_all_twelve_of_its_mailbox_reads(self):
+    def test_processing_still_holds_all_thirteen_of_its_mailbox_reads(self):
         """Convergence MOVES reads; it must never appear to remove them.
 
         If the inventory stopped counting a read the moment it was routed
@@ -451,7 +463,7 @@ class ProcessingReadConvergenceTests(unittest.TestCase):
         blind to it.
         """
         reads = [op for op in self._processing_ops() if op["classification"] == "read"]
-        self.assertEqual(len(reads), 12, [f"{o['line']}:{o['function']}" for o in reads])
+        self.assertEqual(len(reads), 13, [f"{o['line']}:{o['function']}" for o in reads])
 
     def test_all_twelve_are_routed_and_none_is_a_direct_provider_call(self):
         reads = [op for op in self._processing_ops() if op["classification"] == "read"]
@@ -522,7 +534,7 @@ class ProcessingReadConvergenceTests(unittest.TestCase):
             if isinstance(first, ast.Constant) and isinstance(first.value, str):
                 used.add(first.value)
         self.assertEqual(used, set(processing.GRAPH_MAILBOX_READ_OPERATIONS))
-        self.assertEqual(len(used), 12, sorted(used))
+        self.assertEqual(len(used), 13, sorted(used))
 
     def test_nothing_imports_the_fence_binding_by_value(self):
         """The hazard that has bitten this project twice, checked for a third shape.

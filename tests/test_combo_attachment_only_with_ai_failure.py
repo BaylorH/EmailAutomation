@@ -206,6 +206,11 @@ class ComboAttachmentOnlyWithAiFailureTests(unittest.TestCase):
             "id": "graph-msg-att",
             "internetMessageId": "<msg-att@broker.test>",
             "conversationId": "conversation-att",
+            # Also answers the internet-id -> provider-id translation the retry
+            # now performs first. The parked record stores an internet
+            # Message-ID, and asking the provider for a message BY that id was
+            # rejected every time, which is what made the retry queue undrainable.
+            "value": [{"id": "graph-msg-att"}],
         }
         sent_items_response = MagicMock()
         sent_items_response.status_code = 200
