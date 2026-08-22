@@ -4986,6 +4986,19 @@ def _deferral_holds_missing_fields_reply(full_text: str) -> bool:
     return "?" not in fresh
 
 
+# Scenarios in which the conversation is already RESOLVED. A reply composed for
+# one of these may acknowledge and close; it may never request a field, because
+# the thing it would be asking about is settled.
+RESOLVED_RESPONSE_SCENARIOS = frozenset({
+    "nonviable",
+    "nonviable_with_alternative",
+    "requirements_mismatch",
+    "requirements_mismatch_with_alternative",
+    "closed",
+    "closed_with_alternative",
+})
+
+
 def _select_automatic_response_body(
     scenario: str,
     llm_response_email: Optional[str],
@@ -5010,12 +5023,23 @@ Thanks for the details. When you have a moment, could you also confirm:
 {field_list}"""
 
     truth_locked_mismatch = scenario.startswith("requirements_mismatch")
+    # A resolved conversation is never asked for its numbers again -- not by the
+    # deterministic composer, and not by a model draft slipping through here.
+    # `_response_requests_nonrequestable_fields` only guards Note/Skip/formula
+    # columns, so "before I close this out, could you send the square footage?"
+    # went out VERBATIM on a building that was already off the market. Closing
+    # only the deterministic route would have moved the defect, not fixed it.
+    resolved_scenario = scenario in RESOLVED_RESPONSE_SCENARIOS
     if (
         llm_response_email
         and not truth_locked_mismatch
         and not _response_requests_nonrequestable_fields(
             llm_response_email,
             column_config,
+        )
+        and not (
+            resolved_scenario
+            and get_requested_ask_fields(llm_response_email, column_config)
         )
         and (
             scenario != "complete"
@@ -5052,6 +5076,14 @@ Do you have any other properties that might be a better fit?""",
         "complete": f"""{greeting}
 
 Thanks for sending those details over. That gives me everything I need for now.""",
+        "closed_with_alternative": f"""{greeting}
+
+Thank you for the update, and thanks for pointing me to the other property.
+
+I'll take a look and come back to you if anything comes up.""",
+        "closed": f"""{greeting}
+
+Thank you for the update - I appreciate you letting me know.""",
     }
     if scenario not in fallbacks:
         raise ValueError(f"Unknown automatic response scenario: {scenario}")
@@ -5100,14 +5132,19 @@ def _nonviable_status_reason(event: Dict[str, Any]) -> str:
     return normalized
 
 
-def _pending_nonviable_followup_patch(
+def _grounded_property_unavailable_event(
     events: List[Dict[str, Any]],
     *,
     row_anchor: str,
     row_aliases: Optional[List[str]] = None,
     message_text: str,
 ) -> Optional[Dict[str, Any]]:
-    """Stop follow-up eligibility before retryable sheet work begins."""
+    """The ONE place that decides a terminal event belongs to THIS row.
+
+    Follow-up staging, the stale-event gate and the reply lane all read this, so
+    a broker whose building is gone can never be graded dead by one of them and
+    still alive by another. That divergence is the whole of `LOOP-0821-1`.
+    """
     for event in (events or []):
         if (event or {}).get("type") != "property_unavailable":
             continue
@@ -5119,16 +5156,94 @@ def _pending_nonviable_followup_patch(
             unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
         ):
             continue
-        return {
-            "followUpStatus": "stopped",
-            "followUpConfig.nextFollowUpAt": None,
-            "followUpConfig.processingBy": None,
-            "followUpConfig.processingAt": None,
-            "pendingTerminalReason": _nonviable_status_reason(event),
-            "pendingTerminalAt": SERVER_TIMESTAMP,
-            "updatedAt": SERVER_TIMESTAMP,
-        }
+        return event
     return None
+
+
+def _reply_terminal_state(
+    events: List[Dict[str, Any]],
+    *,
+    row_anchor: str,
+    row_aliases: Optional[List[str]] = None,
+    message_text: str,
+    old_row_became_nonviable: bool = False,
+    deferred_terminal_reason: Optional[str] = None,
+) -> str:
+    """Reply-time terminal truth, read off the CLASSIFICATION, never off a write.
+
+    LIVE BREAK (2026-08-21). A broker said a building had gone under lease with
+    nothing comparable. The product thanked him for details he never gave and
+    asked for that building's square footage, rent, operating expenses, dock
+    doors, clear height and power. Internally it had it right the whole time:
+    conversation closed, reason recorded, follow-ups stopped.
+
+    The wiring is why. `old_row_became_nonviable` is a RECEIPT FOR A SHEETS
+    ROW-MOVE -- set only on the success tail of a mutation that is skipped when
+    the row already sits below the divider, skipped when the event key was
+    stamped handled on an earlier pass, and skipped whenever the grounding guard
+    rejects the event. The missing-fields lane was gated on its NEGATION, so
+    every route that understood the property was gone but wrote no row landed in
+    the specification request BY DEFAULT.
+
+    So the send decision now asks the classification. Returns the terminal
+    reason, or "" when the row is genuinely still live.
+    """
+    # Opt-out is checked FIRST and beats everything else. A broker who writes
+    # "it's leased, and take me off your list" has said two terminal things,
+    # and the quieter one wins: acknowledging the lease would still be a reply
+    # to a man who asked not to be replied to.
+    if any((event or {}).get("type") == "contact_optout" for event in (events or [])):
+        return "contact_optout"
+    unavailable = _grounded_property_unavailable_event(
+        events,
+        row_anchor=row_anchor,
+        row_aliases=row_aliases,
+        message_text=message_text,
+    )
+    if unavailable is not None:
+        return _nonviable_status_reason(unavailable)
+    # The receipt is still evidence when it IS set -- a row the sheet already
+    # moved is terminal even with no grounded event on this pass.
+    if old_row_became_nonviable:
+        return "property_unavailable"
+    close_reasons = [
+        _close_reason_from_event(event)
+        for event in (events or [])
+        if (event or {}).get("type") == "close_conversation"
+    ]
+    if deferred_terminal_reason:
+        close_reasons.append(deferred_terminal_reason)
+    for reason in close_reasons:
+        if reason in TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS:
+            return reason
+    return ""
+
+
+def _pending_nonviable_followup_patch(
+    events: List[Dict[str, Any]],
+    *,
+    row_anchor: str,
+    row_aliases: Optional[List[str]] = None,
+    message_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Stop follow-up eligibility before retryable sheet work begins."""
+    event = _grounded_property_unavailable_event(
+        events,
+        row_anchor=row_anchor,
+        row_aliases=row_aliases,
+        message_text=message_text,
+    )
+    if event is None:
+        return None
+    return {
+        "followUpStatus": "stopped",
+        "followUpConfig.nextFollowUpAt": None,
+        "followUpConfig.processingBy": None,
+        "followUpConfig.processingAt": None,
+        "pendingTerminalReason": _nonviable_status_reason(event),
+        "pendingTerminalAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    }
 
 
 def _stage_row_thread_roots_for_terminal_transition(
@@ -7505,17 +7620,12 @@ def process_inbox_message(
             # last, an informational event (tour/call/question) for a row this
             # SAME proposal is about to kill must still be skipped — precompute
             # the outcome instead of depending on the LLM's event order.
-            row_will_go_nonviable = any(
-                (e or {}).get("type") == "property_unavailable"
-                and _property_unavailable_event_applies_to_row(
-                    e,
-                    row_anchor=row_anchor,
-                    row_aliases=row_aliases,
-                    message_text=nonviable_message_text,
-                    unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
-                )
-                for e in events
-            )
+            row_will_go_nonviable = _grounded_property_unavailable_event(
+                events,
+                row_anchor=row_anchor,
+                row_aliases=row_aliases,
+                message_text=nonviable_message_text,
+            ) is not None
             pending_nonviable_patch = _pending_nonviable_followup_patch(
                 events,
                 row_anchor=row_anchor,
@@ -8875,17 +8985,51 @@ def process_inbox_message(
                     proposal.get("response_email"),
                     contact_name,
                 )
-                requirements_mismatch_nonviable = any(
-                    (event or {}).get("type") == "property_unavailable"
-                    and _nonviable_status_reason(event) == "requirements_mismatch"
-                    for event in events
+                # The sheet move is a SIDE EFFECT; the classification is the
+                # FACT. Read the fact. Every gate below used to read
+                # `old_row_became_nonviable`, which only records that a Sheets
+                # row actually moved -- and a broker whose building is gone
+                # routinely leaves that False.
+                reply_terminal_state = _reply_terminal_state(
+                    events,
+                    row_anchor=row_anchor,
+                    row_aliases=row_aliases,
+                    message_text=nonviable_message_text,
+                    old_row_became_nonviable=old_row_became_nonviable,
+                    deferred_terminal_reason=deferred_terminal_reason,
                 )
+                row_is_resolved = bool(reply_terminal_state)
+                # An opt-out is the one terminal state that must produce NO
+                # outgoing message at all. The handler normally suppresses the
+                # reply itself, but it does so at the END of a try block whose
+                # handler only prints -- so a Firestore blip loses the
+                # suppression. Without this limb the new gate would route that
+                # case into the non-viable acknowledgement and ASK A MAN WHO
+                # ASKED TO BE REMOVED whether he has other properties. Silence
+                # is the only correct answer here.
+                if reply_terminal_state == "contact_optout":
+                    _set_reply_send_outcome(outcome="suppressed_contact_optout")
+                    print("🔇 Contact opted out - sending nothing")
+                    return
+                # Grounded, unlike the old scan: an unavailable event about a
+                # COMPETITOR building was previously able to flip this copy to
+                # the truth-locked mismatch text even though the same event had
+                # already been rejected for this row.
+                requirements_mismatch_nonviable = (
+                    reply_terminal_state == "requirements_mismatch"
+                )
+                conversation_closed_terminally = (
+                    reply_terminal_state in TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS
+                )
+                print(f"   reply_terminal_state: {reply_terminal_state or 'live'}")
 
                 # Scenario 1: Property became non-viable AND new property was suggested
-                if old_row_became_nonviable and has_new_property_path:
-                    print(f"   📍 SCENARIO 1: Non-viable + new property suggested")
+                if row_is_resolved and has_new_property_path:
+                    print(f"   📍 SCENARIO 1: Resolved + new property suggested")
                     response_scenario = (
-                        "requirements_mismatch_with_alternative"
+                        "closed_with_alternative"
+                        if conversation_closed_terminally
+                        else "requirements_mismatch_with_alternative"
                         if requirements_mismatch_nonviable
                         else "nonviable_with_alternative"
                     )
@@ -8911,10 +9055,15 @@ def process_inbox_message(
                         )
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
-                elif old_row_became_nonviable and not has_new_property_path:
-                    print(f"   📍 SCENARIO 2: Non-viable, no new property")
+                elif row_is_resolved and not has_new_property_path:
+                    print(f"   📍 SCENARIO 2: Resolved, no new property")
+                    # A broker who closed the thread with a natural end never
+                    # said "unavailable", and must not be told we appreciate him
+                    # letting us know the property is no longer available.
                     response_scenario = (
-                        "requirements_mismatch"
+                        "closed"
+                        if conversation_closed_terminally
+                        else "requirements_mismatch"
                         if requirements_mismatch_nonviable
                         else "nonviable"
                     )
@@ -8958,7 +9107,7 @@ Could you please provide your phone number so I can give you a call?"""
                         )
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
-                if not response_sent and not old_row_became_nonviable:
+                if not response_sent and not row_is_resolved:
                     print(f"   📍 SCENARIO 3/4: Property viable, checking missing fields")
                     sheets = _sheets_client()
                     tab_title = _get_first_tab_title(sheets, sheet_id)
