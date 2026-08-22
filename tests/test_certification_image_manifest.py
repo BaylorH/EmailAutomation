@@ -184,6 +184,31 @@ class DockerfileContractTests(unittest.TestCase):
         manifest_at = self.dockerfile.index(im.MANIFEST_NAME)
         self.assertGreater(manifest_at, copy_at)
 
+    def test_the_heredoc_frontend_is_declared_on_the_first_line(self):
+        """Without this the image cannot be built AT ALL, by anyone.
+
+        The manifest step is a heredoc, which is a Dockerfile 1.4+ frontend
+        feature. A Dockerfile carrying no `# syntax=` directive is parsed by the
+        daemon's BUILT-IN frontend whatever DOCKER_BUILDKIT is set to, and that
+        parser reads the heredoc body as instructions -- dying on the manifest
+        script's own `import` line with `unknown instruction: IMPORT`.
+
+        This is pinned rather than trusted because the failure is invisible in
+        the repository: every test here passes, the file reads correctly, and
+        the break only appears at `docker build` time. It cost a release on
+        2026-08-22, when the sending service had to be rebuilt to get off an
+        image 132 commits behind and could not be built at all.
+
+        Docker only honours the directive as the FIRST line, so position is
+        asserted, not mere presence.
+        """
+        first_line = self.dockerfile.splitlines()[0]
+        self.assertTrue(
+            first_line.startswith("# syntax=docker/dockerfile:"),
+            f"first Dockerfile line must declare the heredoc-capable frontend, got {first_line!r}",
+        )
+        self.assertIn("<<", self.dockerfile, "the directive exists to serve a heredoc")
+
 
 if __name__ == "__main__":
     unittest.main()

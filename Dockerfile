@@ -1,3 +1,15 @@
+# syntax=docker/dockerfile:1.7
+#
+# The syntax directive is LOAD-BEARING and must stay the first line.
+#
+# The source-manifest step below uses a heredoc (`RUN python - <<'PYMANIFEST'`).
+# Heredocs are a Dockerfile 1.4+ frontend feature, and a Dockerfile with no
+# syntax directive is parsed by the daemon's built-in frontend regardless of
+# whether BuildKit is enabled. That parser reads the heredoc body as
+# instructions and dies with `unknown instruction: IMPORT` on the manifest
+# script's own `import` line -- so WITHOUT this line the image cannot be built
+# by anyone, with or without DOCKER_BUILDKIT=1. Found 2026-08-22 when the
+# sending service needed a rebuild to leave a 132-commit-old pinned image.
 # Cloud Run Job image for the SiteSiftAI EmailAutomation scheduler worker.
 # Entry point is `python main.py` (the live per-user pipeline wrapped in the
 # Firestore single-runner lease). Auth is via ADC — Cloud Run injects the
